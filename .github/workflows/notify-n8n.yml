@@ -1,0 +1,18 @@
+name: Notify n8n
+on: push
+
+jobs:
+    notify:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Send webhook to n8n
+              run: |
+                  curl -X POST https://n8n.jeong-yujin.com/webhook/futerM \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "ref": "${{ github.ref }}",
+                      "before": "${{ github.event.before }}",
+                      "after": "${{ github.event.after }}",
+                      "repository": {"full_name": "${{ github.repository }}"},
+                      "commits": ${{ toJson(github.event.commits) }}
+                    }'
