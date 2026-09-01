@@ -1,0 +1,13 @@
+# 환경변수 (키 값은 절대 커밋하지 않는다)
+.env
+.env.*
+!.env.example
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 기타
+.DS_Store
