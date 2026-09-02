@@ -1283,9 +1283,6 @@ def make_storage(cfg: Config) -> Storage:
 SEED_KEYWORDS: list[tuple[str, str]] = (
     [("그룹사", k) for k in
      ["포스코", "포스코홀딩스", "포스코퓨처엠", "포스코DX", "포스코인터내셔널", "포스코이앤씨", "POSCO"]]
-    + [("지역", k) for k in
-       ["포항 포스코", "광양 포스코", "세종 포스코퓨처엠", "구미 포스코퓨처엠",
-        "서울 포스코", "송도 포스코이앤씨", "인천 포스코", "포항 이차전지", "광양 양극재"]]
     + [("산업", k) for k in
        ["이차전지", "배터리 소재", "양극재", "음극재", "전구체", "리튬", "니켈", "흑연",
         "전고체 배터리", "나트륨 배터리", "LFP"]]
@@ -1503,16 +1500,11 @@ GROUP_COMPANIES: dict[str, list[str]] = {
     "포스코": ["포스코", "POSCO"],
 }
 
-# 포스코 그룹의 사업장·본사 소재지 (PRD F3.1 / F3.2)
-#   포항·광양(제철·양극재), 세종·구미(음극재), 서울(홀딩스·인터내셔널 본사),
-#   송도·인천(이앤씨 본사), 그 밖 사업장(울산·여수·양산).
-POSCO_REGIONS = ["포항", "광양", "세종", "구미", "서울", "송도", "인천",
-                 "울산", "여수", "양산", "포스코센터", "포스코타워"]
-
 # 카테고리 태깅 규칙 (PRD F3.1)
 #   제목+요약에서만 판정한다. 본문 전체를 스캔하면 부차적 언급까지 걸려
 #   거의 모든 기사가 3~4개 카테고리를 달아 필터가 무의미해진다.
 #   그래서 '정부'·'정책'·'셀'·'실적' 같은 흔한 단어는 넣지 않고 구체적 용어만 쓴다.
+#   '지역'은 폐지했다 — 포스코 키워드가 들어간 기사만 수집하므로 지역 태깅이 무의미하다.
 CATEGORY_RULES: dict[str, list[str]] = {
     "배터리·이차전지": ["이차전지", "2차전지", "배터리", "양극재", "음극재", "전구체", "리튬",
                         "니켈", "코발트", "흑연", "전고체", "LFP", "NCM", "ESS", "전기차", "배터리셀"],
@@ -1526,7 +1518,6 @@ CATEGORY_RULES: dict[str, list[str]] = {
                   "정부 지원", "정책 지원", "육성 방안"],
     "법령": ["법안", "법률안", "개정안", "시행령", "시행규칙", "특별법", "입법", "규제",
              "인허가", "과징금", "행정처분", "제재", "고시", "조례"],
-    "지역": POSCO_REGIONS,
     "시장/주가": ["주가", "증권", "코스피", "코스닥", "목표주가", "시황", "상한가", "하한가",
                   "거래량", "거래대금", "시가총액", "PER", "PBR", "공매도", "외국인 순매수",
                   "기관 순매수", "배당"],
@@ -1537,13 +1528,11 @@ SCORE_FUTUREM_TITLE = 50
 SCORE_FUTUREM_BODY = 40
 SCORE_GROUP = 25
 SCORE_POLICY = 20
-SCORE_REGION = 15
 SCORE_MAJOR_PRESS = 10
 SCORE_MARKET_PENALTY = -15
 
 POLICY_KEYWORDS = ["정책", "규제", "법안", "수사", "사고", "화재", "제재", "과징금",
                    "국회", "산업부", "환경부", "보조금", "특화단지", "인허가", "감사", "고발"]
-REGION_KEYWORDS = POSCO_REGIONS
 MARKET_ONLY_KEYWORDS = ["목표주가", "투자의견", "코스피", "시황", "주가 전망", "증권가"]
 
 
@@ -2247,8 +2236,6 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
 
     if any(w.lower() in full_l for w in POLICY_KEYWORDS):
         score += SCORE_POLICY
-    if any(w in full_l for w in REGION_KEYWORDS):
-        score += SCORE_REGION
     if press_tier <= 1:
         score += SCORE_MAJOR_PRESS
 
@@ -2884,6 +2871,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             continue
 
         rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
+        # 포스코·계열사가 제목·스니펫·본문 어디에도 없으면 무관 기사 — 저장하지 않는다. (사용자 지정)
+        relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
+        if not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
+            storage.upsert_ledger(item.url_source, "off_topic")
+            ctx.seen_cache.add(item.url_source)
+            continue
         # 카테고리는 제목+스니펫으로만 잡고, 분석 후 요약으로 다시 계산한다.
         categories = detect_categories(item.title, item.snippet or "")
         score = score_article(item.title, body, rule_groups, press_tier)
@@ -3893,7 +3886,7 @@ def create_app(ctx: Context):
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
     GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
-    CATEGORY_ORDER = ["배터리·이차전지", "산업", "시장/주가", "정부/정책", "법령", "지역"]
+    CATEGORY_ORDER = ["배터리·이차전지", "산업", "시장/주가", "정부/정책", "법령"]
 
     def _ordered(values: list[str], priority: list[str]) -> list[str]:
         uniq = dedupe_chips(values)
@@ -4454,8 +4447,7 @@ def cmd_selftest() -> int:
           site_name_from_html('<meta property="og:site_name" content="BusinessPost"/>'), "")
 
     print("\n[8-1] 카테고리 태깅 (PRD F3.1)")
-    check("사업장 지명만 '지역'", "지역" in detect_categories("포항 공장에서 사고"), True)
-    check("일반어 '공장'은 '지역' 아님", "지역" in detect_categories("공장 사업장 지역 확대"), False)
+    check("'지역' 카테고리는 폐지됨", "지역" in detect_categories("포항 공장에서 사고"), False)
     check("배터리 태그", "배터리·이차전지" in detect_categories("양극재 증설"), True)
     check("'정부' 단독은 정책 태그 아님",
           "정부/정책" in detect_categories("정부 관계자 만난 수출입은행"), False)
@@ -4470,10 +4462,15 @@ def cmd_selftest() -> int:
           "시장/주가" in detect_categories("포스코 주가 코스피 상한가"), True)
     check("본문 언급은 카테고리에 안 잡힌다(제목·요약만 스캔)",
           detect_categories("장인화 회장 호주 방문", "핵심광물 공급망 협력을 제안했다"), [])
-    check("서울 본사도 '지역'", "지역" in detect_categories("포스코홀딩스 서울 본사 이사회"), True)
-    check("송도 사옥도 '지역'", "지역" in detect_categories("포스코이앤씨 송도 신사옥 입주"), True)
 
     print("\n[8-2] 네이버 관련성 필터 (제목 기준, 그룹사 쏠림 방지)")
+    check("포스코 무관 기사(수집 게이트)",
+          bool(detect_group_companies("해병대 포병대대 포항 소외계층 무료급식 봉사")
+               or POSCO_MENTION_RE.search("해병대 포병대대 포항 소외계층 무료급식 봉사")), False)
+    check("포스코 언급 기사(수집 게이트)",
+          bool(POSCO_MENTION_RE.search("포스코 포항제철소 3고로 개수 완료")), True)
+    check("계열사만 언급된 기사(수집 게이트)",
+          bool(detect_group_companies("삼척블루파워 석탄화력 준공")), True)
     check("그룹사 키워드: 제목에 포스코 없음 → 제외",
           _naver_item_relevant("영진전문대 수시모집 2309명 선발", "그룹사"), False)
     check("그룹사 키워드: 제목에 포스코DX 있음 → 통과",
