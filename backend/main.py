@@ -3828,6 +3828,14 @@ def create_app(ctx: Context):
             "items": cards[start:start + size],
         })
 
+    # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
+    GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
+    CATEGORY_ORDER = ["배터리·이차전지", "산업", "시장/주가", "정부/정책", "법령", "지역"]
+
+    def _ordered(values: list[str], priority: list[str]) -> list[str]:
+        uniq = dedupe_chips(values)
+        return [p for p in priority if p in uniq] + [v for v in uniq if v not in priority]
+
     @app.get("/api/filters")
     def api_filters():
         """현재 데이터에 실제로 존재하는 필터 값만 돌려준다."""
@@ -3841,9 +3849,9 @@ def create_app(ctx: Context):
             if card["press_name"]:
                 presses.append(card["press_name"])
         return JSONResponse({
-            "groups": dedupe_chips(groups),
-            "categories": dedupe_chips(cats),
-            "presses": sorted(dedupe_chips(presses)),
+            "groups": _ordered(groups, GROUP_ORDER),
+            "categories": _ordered(cats, CATEGORY_ORDER),
+            "presses": [p for p, _ in Counter(presses).most_common()],  # 기사 많은 순
             "periods": [{"key": "today", "label": "오늘"}, {"key": "7d", "label": "7일"},
                         {"key": "30d", "label": "30일"}, {"key": "all", "label": "전체"}],
         })
