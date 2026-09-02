@@ -62,6 +62,13 @@ body {
   padding: 7px 13px; border-radius: 999px;
   background: rgba(255, 255, 255, .12); white-space: nowrap;
 }
+.header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.fav-tab {
+  font-size: 13px; font-weight: 700; color: #fff; cursor: pointer;
+  padding: 8px 16px; border-radius: 999px; white-space: nowrap;
+  background: rgba(255, 255, 255, .12); border: 1px solid rgba(255, 255, 255, .28);
+}
+.fav-tab[aria-pressed="true"] { background: #f4b740; color: var(--navy); border-color: #f4b740; }
 
 /* ── 시세 티커 (F9.3) ─────────────────────────────────────────────── */
 .ticker { background: var(--navy-dark); color: #fff; border-bottom: 1px solid rgba(255,255,255,.08); }
@@ -123,6 +130,12 @@ body {
   font-size: 11.5px; font-weight: 700;
   background: var(--navy); color: #fff; border-radius: 999px; padding: 2px 9px;
 }
+
+.filter-summary {
+  margin: 10px 0 0; font-size: 12.5px; line-height: 1.6; color: var(--ink-mid);
+}
+.filter-summary[hidden] { display: none; }
+.filter-summary b { color: var(--navy); font-weight: 700; }
 
 .filter-body { margin-top: 12px; }
 .filter-body[hidden] { display: none; }

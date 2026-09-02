@@ -252,6 +252,7 @@ function buildCard(item) {
     const on = star.classList.toggle('on');
     star.textContent = on ? '★' : '☆';
     saveFavorite(item.id, on);
+    if (!on && favView) card.remove();   // 즐겨찾기 화면에서 해제하면 즉시 제거
   });
   if (isFavorite(item.id)) { star.classList.add('on'); star.textContent = '★'; }
   right.append(star);
@@ -470,6 +471,36 @@ function saveFavorite(id, on) {
   } catch { /* 사생활 보호 모드 등에서 실패할 수 있다. 무시한다. */ }
 }
 
+/* ── 즐겨찾기 보기 ─────────────────────────────────────────────── */
+
+let favView = false;
+
+function toggleFavView() {
+  favView = !favView;
+  $('favTab').setAttribute('aria-pressed', String(favView));
+  $('favTab').textContent = favView ? '← 전체 기사' : '★ 즐겨찾기';
+  document.querySelector('.filters').hidden = favView;
+  if (favView) renderFavorites(); else refresh(true);
+}
+
+async function renderFavorites() {
+  const ids = [...favorites()];
+  $('resultCount').textContent = `${ids.length}건`;
+  $('loadMore').hidden = true;
+  $('emptyMsg').hidden = true;
+  if (!ids.length) {
+    $('grid').replaceChildren(el('p', 'empty', '즐겨찾기한 기사가 없습니다.'));
+    return;
+  }
+  $('grid').replaceChildren(...Array.from(
+    { length: Math.min(ids.length, 3) }, () => el('div', 'skeleton')));
+  const cards = await Promise.all(
+    ids.map((id) => getJSON(`/api/articles/${id}`).catch(() => null)));
+  const nodes = cards.filter(Boolean).map(buildCard);
+  $('grid').replaceChildren(...(nodes.length
+    ? nodes : [el('p', 'empty', '즐겨찾기 기사를 불러오지 못했습니다.')]));
+}
+
 /* ── 목록 로드 ──────────────────────────────────────────────────── */
 
 function buildQuery() {
@@ -520,11 +551,29 @@ function activeFilterCount() {
     + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0);
 }
 
+const PERIOD_LABEL = { today: '오늘', '7d': '7일', '30d': '30일', all: '전체' };
+
 function updateActiveFilterCount() {
   const n = activeFilterCount();
   const badge = $('activeFilterCount');
   badge.textContent = `필터 ${n}`;
   badge.hidden = n === 0;
+
+  // 걸린 필터를 "기간: 7일 · 그룹사: A, B · 카테고리: 전체 …" 형태로 요약한다.
+  const box = $('filterSummary');
+  box.replaceChildren();
+  if (n === 0) { box.hidden = true; return; }
+  const seg = (label, val) => {
+    if (box.childNodes.length) box.append(document.createTextNode('   ·   '));
+    box.append(el('b', null, `${label}: `));
+    box.append(document.createTextNode(val));
+  };
+  seg('기간', PERIOD_LABEL[state.period] || '전체');
+  seg('그룹사', state.group.size ? [...state.group].join(', ') : '전체');
+  seg('카테고리', state.cat.size ? [...state.cat].join(', ') : '전체');
+  seg('언론사', state.press.size ? [...state.press].join(', ') : '전체');
+  if (state.q) seg('검색', state.q);
+  box.hidden = false;
 }
 
 function setFilterCollapsed(collapsed) {
@@ -612,6 +661,8 @@ function init() {
   });
 
   $('loadMore').addEventListener('click', () => { state.page += 1; refresh(false); });
+
+  $('favTab').addEventListener('click', toggleFavView);
 
   $('urlAddForm').addEventListener('submit', submitUrl);
 

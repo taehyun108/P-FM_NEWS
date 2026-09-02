@@ -18,7 +18,10 @@
         <p class="brand-sub">포스코 그룹 · 이차전지 뉴스 실시간 수집 · 요약 · 아카이브</p>
       </div>
     </div>
-    <div class="strip" id="sourceStrip">SUPABASE · NEWS RSS · POSCO SIGNAL</div>
+    <div class="header-right">
+      <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
+      <div class="strip" id="sourceStrip">SUPABASE · NEWS RSS · POSCO SIGNAL</div>
+    </div>
   </div>
 </header>
 
@@ -49,6 +52,8 @@
         <button type="button" class="btn-clear" id="clearAll">전체 해제</button>
       </div>
     </div>
+
+    <p class="filter-summary" id="filterSummary" hidden></p>
 
     <div class="filter-body" id="filterBody">
       <div class="filter-row">
