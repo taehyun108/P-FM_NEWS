@@ -1,0 +1,23 @@
+{
+  // 로컬 서버 주소 — Simple Browser / 포트 패널에서 바로 열기 위한 참고값
+  "livePreview.defaultPreviewPath": "/",
+  "livePreview.portNumber": 8000,
+
+  // 파이썬
+  "python.analysis.extraPaths": ["./backend"],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": false,
+
+  // 자동 포트 포워딩 시 브라우저 자동 실행 안 함 (Simple Browser 수동 사용)
+  "remote.autoForwardPortsSource": "process",
+
+  // 한글 파일 인코딩 고정
+  "files.encoding": "utf8",
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "backend/pfm_news.db-wal": true,
+    "backend/pfm_news.db-shm": true
+  }
+}

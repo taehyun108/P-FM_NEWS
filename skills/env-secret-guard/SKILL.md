@@ -17,7 +17,7 @@ description: API 키·토큰을 .env 환경변수로만 다루는 시크릿 관�
 
 ```dotenv
 # LLM
-ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
 
 # Supabase
 SUPABASE_URL=
@@ -52,7 +52,7 @@ def require_env(name: str) -> str:
         raise SystemExit(f"환경변수 {name} 가 설정되지 않았습니다. .env 파일을 확인하세요.")
     return value
 
-ANTHROPIC_API_KEY = require_env("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = require_env("OPENAI_API_KEY")
 ```
 
 - 필수 키는 **프로그램 시작 직후 한 번에 전부 검증**한다.

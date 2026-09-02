@@ -1,0 +1,56 @@
+{
+  // VS Code 작업 정의 — 터미널 > 작업 실행(Ctrl+Shift+P → "Tasks: Run Task")
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // 수집 루프 + API 서버 + 텔레그램 봇을 함께 실행한다 (운영 모드)
+      "label": "P-FM: 서버 실행 (run)",
+      "type": "shell",
+      "command": "python",
+      "args": ["backend/main.py", "run"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^(.*)$",
+          "file": 1,
+          "location": 1,
+          "message": 1
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*수집 루프 시작.*",
+          "endsPattern": ".*서버: http.*"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      // API 서버만 실행한다 (수집 루프 없이 화면 확인용)
+      "label": "P-FM: API 서버만 (serve)",
+      "type": "shell",
+      "command": "python",
+      "args": ["backend/main.py", "serve"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "P-FM: 1회 수집 (once)",
+      "type": "shell",
+      "command": "python",
+      "args": ["backend/main.py", "once"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "P-FM: 셀프테스트 (selftest)",
+      "type": "shell",
+      "command": "python",
+      "args": ["backend/main.py", "selftest"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}
