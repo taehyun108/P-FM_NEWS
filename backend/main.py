@@ -4226,6 +4226,43 @@ def cmd_fixlinks(ctx: Context) -> None:
     log.info("링크 보정: %d건 · 기자명 추가 %d건", fixed_url, fixed_author)
 
 
+def cmd_fixofftopic(ctx: Context) -> None:
+    """포스코·계열사가 어디에도 없는 기존 기사를 보관 처리한다 (일회성).
+
+    제목·요약·키워드로 먼저 거르고, 남은 후보만 원문을 병렬로 다시 받아
+    본문에 포스코 언급이 있으면 유지한다. 확인 불가(요청 실패)면 유지한다.
+    """
+    rows = ctx.storage.list_articles(5000, 0, None, "")
+    cands = []
+    for r in rows:
+        text = "\n".join([
+            r.get("title") or "", r.get("summary_text") or "",
+            " ".join(jload(r.get("keywords"), [])),
+            " ".join(jload(r.get("group_companies"), [])),
+        ])
+        if not (detect_group_companies(text) or POSCO_MENTION_RE.search(text)):
+            cands.append(r)
+    log.info("1차 무관 후보 %d건 — 원문 재확인 중...", len(cands))
+
+    urls = [r.get("url_original") or r.get("url_canonical") or "" for r in cands]
+    prefetched = prefetch_articles(ctx.http, [u for u in urls if u])
+    archived = kept = unchecked = 0
+    for r, u in zip(cands, urls):
+        _, html = prefetched.get(u, ("", ""))
+        body = extract_body(html) if html else ""
+        if not body:
+            unchecked += 1
+            continue  # 확인 불가 → 유지
+        probe = f"{r.get('title') or ''}\n{body}"
+        if detect_group_companies(probe) or POSCO_MENTION_RE.search(probe):
+            kept += 1
+        else:
+            ctx.storage.update_article(r["id"], {"status": "archived"})
+            archived += 1
+    log.info("무관 기사 정리: 보관 %d건 · 본문에 포스코 있어 유지 %d건 · 확인 불가 유지 %d건",
+             archived, kept, unchecked)
+
+
 def cmd_fixdates(ctx: Context) -> None:
     """타임존 오파싱으로 미래에 저장된 발행시각을 보정한다 (일회성).
 
@@ -4609,6 +4646,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
+  fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -4646,6 +4684,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixgroups(ctx)
     elif command == "fixcategories":
         cmd_fixcategories(ctx)
+    elif command == "fixofftopic":
+        cmd_fixofftopic(ctx)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":
