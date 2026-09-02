@@ -3032,9 +3032,13 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     # 태깅하는 경향이 강하다. LLM 이 보탠 그룹사는 제목·본문에 회사명(별칭)이
     # 실제로 등장하는 것만 채택한다.
     rule_groups = normalize_group_list(list(row.get("group_companies") or []))
-    mentioned = set(detect_group_companies(f"{row['title']}\n{body}"))
+    # 제목·본문에 더해 LLM 키워드도 근거로 본다 — 키워드에만 계열사명이 남은 경우를 잡는다.
+    kw_text = " ".join(analysis.keywords)
+    mentioned = set(detect_group_companies(f"{row['title']}\n{body}\n{kw_text}"))
     llm_verified = [g for g in analysis.group_companies if g in mentioned]
-    groups = normalize_group_list(rule_groups + llm_verified)
+    # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다.
+    kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코"]
+    groups = normalize_group_list(rule_groups + llm_verified + kw_groups)
     # 그룹사로 표기된 값은 키워드에서 제외한다 — 칩 중복의 근본 원인이다.
     keywords = dedupe_chips(analysis.keywords, exclude=groups)[:6]
     score = score_article(row["title"], body, groups, 3 if not row.get("press_id") else 1)
@@ -3777,8 +3781,13 @@ def build_card(row: dict) -> dict:
     # LLM 이 group_companies 를 비워 보냈으면 제목·요약에서 룰 기반으로 채운다.
     # 카드에 '어느 그룹사 뉴스인지'를 항상 보이게 하기 위한 폴백이다.
     if not groups:
-        probe = f"{row.get('title') or ''} {row.get('summary_text') or ''}"
-        groups = normalize_group_list(detect_group_companies(probe))
+        probe = " ".join([
+            row.get("title") or "", row.get("summary_text") or "",
+            " ".join(jload(row.get("keywords"), [])),
+        ])
+        # active 기사는 수집 게이트에서 이미 포스코 관련이 확인됐다.
+        # 계열사를 특정 못 하면 최소한 '포스코'로 표시한다.
+        groups = normalize_group_list(detect_group_companies(probe)) or ["포스코"]
     # 칩 정리는 여기서 끝낸다 — 프런트는 받은 그대로 그린다(중복 로직 금지).
     # 그룹사·카테고리와 겹치는 키워드는 칩이 두 번 보이므로 제외한다.
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
@@ -4173,28 +4182,25 @@ def cmd_fixcategories(ctx: Context) -> None:
 
 
 def cmd_fixgroups(ctx: Context) -> None:
-    """LLM 이 과잉 태깅한 그룹사를 제목·요약·키워드 기준으로 재검증한다 (일회성).
+    """제목·요약·키워드에 계열사명이 있는데 빠진 그룹사 태그를 채운다 (일회성).
 
-    '이차전지 뉴스니까 포스코퓨처엠' 식으로 붙은 태그가 필터를 오염시킨다.
-    회사명이 어디에도 등장하지 않는 그룹사 태그는 제거한다(빈 배열 허용).
+    기존 태그는 지우지 않는다(수집 시 이미 본문 검증을 거쳤다).
+    카드·필터에 계열사가 더 잘 드러나도록 '추가'만 한다.
     """
     rows = ctx.storage.list_articles(5000, 0, None, "")
     fixed = 0
     for r in rows:
         cur = normalize_group_list(jload(r.get("group_companies"), []))
-        if not cur:
-            continue
         probe = "\n".join([
             r.get("title") or "",
             r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
         ])
-        mentioned = set(detect_group_companies(probe))
-        new = [g for g in cur if g in mentioned]
+        new = normalize_group_list(list(cur) + detect_group_companies(probe))
         if new != cur:
             ctx.storage.update_article(r["id"], {"group_companies": jdump(new)})
             fixed += 1
-    log.info("그룹사 태그 재검증: %d건 정리", fixed)
+    log.info("그룹사 태그 보강: %d건", fixed)
 
 
 def cmd_fixlinks(ctx: Context) -> None:
@@ -4606,6 +4612,9 @@ def cmd_selftest() -> int:
     check("본문에 회사명 없으면 탈락",
           [g for g in ["포스코퓨처엠"] if g in set(detect_group_companies("청주시가 이차전지 국책사업을 유치했다"))],
           [])
+    check("키워드에만 있는 계열사도 태그로 추가",
+          normalize_group_list(detect_group_companies("에너지 스타트업 투자상담 포스코모빌리티솔루션")),
+          ["포스코모빌리티솔루션"])
 
     print("\n[11] 코사인 유사도 (PRD F2.2 4단계)")
     check("동일 벡터", round(cosine([1, 0, 1], [1, 0, 1]), 6), 1.0)
