@@ -9,5 +9,10 @@ __pycache__/
 .venv/
 venv/
 
+# 로컬 DB (개발용 SQLite — 기사 원문이 담기므로 커밋하지 않는다)
+*.db
+*.db-wal
+*.db-shm
+
 # 기타
 .DS_Store

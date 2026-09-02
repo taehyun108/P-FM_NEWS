@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POSCO Future M News Intelligence</title>
+<link rel="stylesheet" href="./style.css?v=20260902-1630">
+</head>
+<body>
+
+<!-- 헤더 (PRD F6.1-1) -->
+<header class="header">
+  <div class="wrap header-inner">
+    <div class="brand">
+      <span class="brand-mark">P</span>
+      <div>
+        <h1>POSCO Future M <em>News Intelligence</em></h1>
+        <p class="brand-sub">포스코 그룹 · 이차전지 뉴스 실시간 수집 · 요약 · 아카이브</p>
+      </div>
+    </div>
+    <div class="strip" id="sourceStrip">SUPABASE · NEWS RSS · POSCO SIGNAL</div>
+  </div>
+</header>
+
+<!-- 시세 티커 (PRD F9.3) -->
+<section class="ticker" aria-label="실시간 주가 및 환율">
+  <div class="wrap ticker-inner">
+    <ul class="ticker-list" id="tickerList">
+      <li class="ticker-empty">시세 불러오는 중…</li>
+    </ul>
+    <span class="ticker-time" id="tickerTime"></span>
+  </div>
+</section>
+
+<main class="wrap">
+
+  <!-- 요약 통계 바 (PRD F6.1-3) -->
+  <section class="stats" id="stats" aria-label="수집 현황"></section>
+
+  <!-- 필터 (PRD F6.1-4, F6.1a) -->
+  <section class="filters" aria-label="기사 필터">
+    <div class="filter-head">
+      <button type="button" class="filter-toggle" id="filterToggle" aria-expanded="true" aria-controls="filterBody">
+        <span class="filter-caret" aria-hidden="true">▾</span> 필터
+      </button>
+      <div class="filter-head-right">
+        <span class="result-count" id="resultCount">—</span>
+        <span class="active-filter-count" id="activeFilterCount" hidden></span>
+        <button type="button" class="btn-clear" id="clearAll">전체 해제</button>
+      </div>
+    </div>
+
+    <div class="filter-body" id="filterBody">
+      <div class="filter-row">
+        <label class="filter-label" for="searchInput">검색</label>
+        <input type="search" id="searchInput" class="search" placeholder="제목·요약·기자·언론사 검색" autocomplete="off">
+      </div>
+
+      <div class="filter-row">
+        <span class="filter-label">기간 <em>단일 선택</em></span>
+        <div class="chips" id="periodChips" data-single="true"></div>
+      </div>
+
+      <div class="filter-row">
+        <span class="filter-label">그룹사 <em>중복 선택</em></span>
+        <div class="chips" id="groupChips"></div>
+      </div>
+
+      <div class="filter-row">
+        <span class="filter-label">카테고리 <em>중복 선택</em></span>
+        <div class="chips" id="catChips"></div>
+      </div>
+
+      <div class="filter-row">
+        <span class="filter-label">언론사 <em>중복 선택</em></span>
+        <div class="chips" id="pressChips"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 포토카드 그리드 (PRD F6.2) -->
+  <section class="grid" id="grid" aria-live="polite"></section>
+
+  <div class="more-wrap">
+    <button type="button" class="btn-more" id="loadMore" hidden>더 보기</button>
+    <p class="empty" id="emptyMsg" hidden>조건에 맞는 기사가 없습니다.</p>
+  </div>
+
+  <!-- 수동 URL 등록 (PRD F8) -->
+  <section class="url-add" aria-label="URL 직접 등록">
+    <h2>URL로 포토카드 만들기</h2>
+    <p class="url-add-desc">뉴스 기사 링크를 넣으면 같은 방식(요약 · 포스코 관점 · 키워드 · SWOT)으로 분석해 카드를 만듭니다.</p>
+    <form class="url-add-form" id="urlAddForm">
+      <input type="url" id="urlAddInput" class="url-add-input"
+             placeholder="https://..." autocomplete="off" required>
+      <button type="submit" class="url-add-btn" id="urlAddBtn">분석</button>
+    </form>
+    <p class="url-add-msg" id="urlAddMsg" hidden></p>
+    <div class="grid url-add-result" id="urlAddResult"></div>
+  </section>
+</main>
+
+<!-- 푸터 (PRD §7-6) -->
+<footer class="footer">
+  <div class="wrap">
+    <p><strong>저작권 안내</strong> — 이 화면은 기사 제목·언론사·발행시각·요약·원문 링크만 제공합니다.
+       본문 전문은 게시하지 않으며, 요약은 원문을 재서술한 것입니다. 저작권은 각 언론사에 있습니다.</p>
+    <p><strong>투자권유 아님</strong> — 표시되는 주가·환율은 참고용이며 투자 권유가 아닙니다.
+       시세는 지연될 수 있습니다.</p>
+  </div>
+</footer>
+
+<!-- SWOT 툴팁 (PRD F6.2a) — 카드 경계를 넘어 표시되도록 body 직속으로 둔다 -->
+<div class="swot-tip" id="swotTip" role="tooltip" hidden></div>
+
+<script src="./app.js?v=20260902-1630"></script>
+</body>
+</html>

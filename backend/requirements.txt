@@ -1,0 +1,12 @@
+# 승인된 라이브러리 목록 (PLAN 0-2)
+# 이 목록 밖의 패키지는 사용 전 사용자에게 확인한다. (CLAUDE.md 규약)
+requests>=2.31
+feedparser>=6.0
+beautifulsoup4>=4.12
+readability-lxml>=0.8
+openai>=1.40
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn>=0.29
+# DB_BACKEND=supabase 로 전환할 때만 필요
+supabase>=2.4
