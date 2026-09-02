@@ -1424,7 +1424,8 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "industrynews.co.kr": ("인더스트리뉴스", 3), "mediawatch.kr": ("미디어워치", 3),
     "newsworker.co.kr": ("뉴스워커", 3), "the-biz.co.kr": ("더비즈온", 3),
     "srtimes.kr": ("SR타임스", 3), "ulsanpress.net": ("울산신문", 3),
-    "iusm.co.kr": ("울산매일신문", 3),
+    "iusm.co.kr": ("울산매일신문", 3), "koreatimes.co.kr": ("코리아타임스", 2),
+    "sateconomy.co.kr": ("토요경제", 3), "socialvalue.kr": ("소셜밸류", 3),
 }
 
 # 그룹사 정규 명칭 — LLM 이 만든 그룹사명은 이 목록에 없으면 버린다. (PRD F4.2)
