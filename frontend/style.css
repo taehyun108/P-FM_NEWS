@@ -264,6 +264,7 @@ body {
 .tag-senti.neu { background: #eef1f6; color: var(--ink-mid); }
 .tag-senti.neg { background: #fdeceb; color: var(--neg); }
 .tag-backfill { background: #f4f0e4; color: #8a6d1f; }
+.tag-pending  { background: #eef1f6; color: var(--ink-soft); font-style: italic; }
 
 /* SWOT 배지 및 툴팁 (F6.2a) */
 .swot-badge {

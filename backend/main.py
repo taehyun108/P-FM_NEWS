@@ -3040,8 +3040,10 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     score = score_article(row["title"], body, groups, 3 if not row.get("press_id") else 1)
     score = max(int(row.get("importance_score") or 0), score)
 
-    # 카테고리는 제목+요약 기준으로 다시 계산한다(수집 때는 스니펫만 봤다).
-    categories = detect_categories(row["title"], analysis.summary_text)
+    # 카테고리는 제목 + 요약 + LLM 키워드로 다시 계산한다(수집 때는 스니펫만 봤다).
+    # 키워드는 LLM 이 뽑은 핵심어 6개뿐이라, 본문 전체를 스캔할 때 같은 과태깅 없이
+    # 요약에서 빠진 주제('인허가', '이차전지 소재' 등)를 잡아 준다.
+    categories = detect_categories(row["title"], f"{analysis.summary_text}\n{' '.join(keywords)}")
 
     ctx.storage.update_article(article_id, {
         "sentiment": analysis.sentiment,
@@ -3777,8 +3779,10 @@ def build_card(row: dict) -> dict:
     if not groups:
         probe = f"{row.get('title') or ''} {row.get('summary_text') or ''}"
         groups = normalize_group_list(detect_group_companies(probe))
-    keywords = dedupe_chips(jload(row.get("keywords"), []), exclude=groups)
-    categories = dedupe_chips(jload(row.get("categories"), []))
+    # 칩 정리는 여기서 끝낸다 — 프런트는 받은 그대로 그린다(중복 로직 금지).
+    # 그룹사·카테고리와 겹치는 키워드는 칩이 두 번 보이므로 제외한다.
+    categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
+    keywords = dedupe_chips(jload(row.get("keywords"), []), exclude=groups + categories)
 
     swot = None
     if row.get("swot_total") is not None:
@@ -4160,7 +4164,8 @@ def cmd_fixcategories(ctx: Context) -> None:
     fixed = 0
     for r in rows:
         cur = dedupe_chips(jload(r.get("categories"), []))
-        new = detect_categories(r.get("title") or "", r.get("summary_text") or "")
+        probe = f"{r.get('summary_text') or ''}\n{' '.join(jload(r.get('keywords'), []))}"
+        new = detect_categories(r.get("title") or "", probe)
         if new != cur:
             ctx.storage.update_article(r["id"], {"categories": jdump(new)})
             fixed += 1
@@ -4261,6 +4266,43 @@ def cmd_fixofftopic(ctx: Context) -> None:
             archived += 1
     log.info("무관 기사 정리: 보관 %d건 · 본문에 포스코 있어 유지 %d건 · 확인 불가 유지 %d건",
              archived, kept, unchecked)
+
+
+def cmd_reanalyze(ctx: Context) -> None:
+    """분석이 끊긴 기사를 원문에서 되살린다 (일회성).
+
+    분석에 한 번 실패하면 임시 본문이 지워지므로(§7-3) 백로그 큐에서 빠져
+    요약·키워드가 영영 비어 있게 된다. 원문을 다시 받아 재분석한다.
+    """
+    rows = [r for r in ctx.storage.list_articles(5000, 0, None, "") if not r.get("analyzed_at")]
+    log.info("미분석 %d건 — 원문에서 본문을 다시 받아 분석합니다.", len(rows))
+    done = failed = 0
+    for r in rows:
+        target = r.get("url_canonical") or r.get("url_original") or ""
+        if not target:
+            failed += 1
+            continue
+        try:
+            _, html = resolve_canonical(ctx.http, target)
+            body = extract_body(html)
+            source = "fulltext" if len(body) >= 300 else "snippet"
+            if source == "snippet":
+                body = r.get("summary_text") or r.get("title") or ""
+            ctx.storage.save_body(r["id"], body, source)
+            row = {
+                "id": r["id"], "title": r.get("title") or "",
+                "press_id": r.get("press_id"), "press_name": r.get("press_name") or "",
+                "importance_score": r.get("importance_score") or 0,
+                "group_companies": jload(r.get("group_companies"), []),
+            }
+            if analyze_and_save(ctx, r["id"], row, body, source) is not None:
+                done += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            log.debug("재분석 실패 %s: %s", target, exc)
+            failed += 1
+    log.info("재분석: 성공 %d건 · 실패 %d건", done, failed)
 
 
 def cmd_fixdates(ctx: Context) -> None:
@@ -4647,6 +4689,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
+  reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -4686,6 +4729,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixcategories(ctx)
     elif command == "fixofftopic":
         cmd_fixofftopic(ctx)
+    elif command == "reanalyze":
+        cmd_reanalyze(ctx)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":

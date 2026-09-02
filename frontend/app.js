@@ -329,8 +329,10 @@ function buildCard(item) {
     groups.sort((a, b) =>
       (activeGroupKeys.has(chipKey(b)) ? 1 : 0) - (activeGroupKeys.has(chipKey(a)) ? 1 : 0));
   }
-  const categories = dedupeChips(item.categories || [], groups);
-  const keywords = dedupeChips(item.keywords, [...groups, ...categories]);
+  // 칩 정리(그룹사·카테고리와 겹치는 키워드 제거)는 백엔드 build_card 가 끝냈다.
+  // 여기서는 표시 직전 중복만 한 번 더 막는다. (F6.2b)
+  const categories = dedupeChips(item.categories || []);
+  const keywords = dedupeChips(item.keywords || []);
 
   // 감성·중요도 배지 앞에 대표 그룹사(첫 번째)를 붙인다. 그룹사가 없으면 생략한다.
   const cls = item.sentiment === '긍정' ? 'pos' : item.sentiment === '부정' ? 'neg' : 'neu';
@@ -342,6 +344,8 @@ function buildCard(item) {
   groups.slice(1).forEach((g) => chips.append(el('span', 'tag tag-group', g)));
 
   if (item.is_backfill) chips.append(el('span', 'tag tag-backfill', '지연 수집'));
+  // 아직 LLM 분석 전이면 요약·키워드가 없다. 빈 카드처럼 보이지 않게 상태를 알린다.
+  if (!item.summary_text) chips.append(el('span', 'tag tag-pending', '분석 대기'));
   categories.forEach((c) => chips.append(el('span', 'tag tag-cat', c)));
   keywords.forEach((k) => chips.append(el('span', 'tag tag-key', k)));
   card.append(chips);
