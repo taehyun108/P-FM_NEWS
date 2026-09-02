@@ -19,12 +19,14 @@ PRD.md v0.5 / PLAN.md 기준 구현.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html as html_mod
 import importlib
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -186,6 +188,7 @@ class Config:
     llm_per_run: int
     api_host: str
     api_port: int
+    master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
 
     @property
     def telegram_enabled(self) -> bool:
@@ -252,6 +255,7 @@ def load_config() -> Config:
         llm_per_run=get_env_int("LLM_PER_RUN", 6, 1),
         api_host=get_env("API_HOST", "127.0.0.1"),
         api_port=get_env_int("API_PORT", 8000, 1, 65535),
+        master_password=get_env("MASTER_PASSWORD"),
     )
 
 
@@ -486,7 +490,7 @@ class Storage(ABC):
         """articles.press_name 을 press_outlets 의 현재 이름으로 다시 맞춘다. 갱신 건수 반환."""
 
     @abstractmethod
-    def queue_notification(self, article_id: str, chat_id: str, status: str) -> bool: ...
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool: ...
 
     @abstractmethod
     def pending_notifications(self, limit: int) -> list[dict]: ...
@@ -568,7 +572,11 @@ class SqliteStorage(Storage):
             "alter table run_state add column notify_paused INTEGER not null default 0",
             "alter table run_state add column notify_threshold INTEGER",
             "alter table run_state add column tg_offset INTEGER not null default 0",
+            "alter table run_state add column always_notify_keywords TEXT default '[]'",
+            "alter table run_state add column master_pw_hash TEXT",
+            "alter table run_state add column web_pw_hash TEXT",
             "alter table articles add column categories TEXT default '[]'",
+            "alter table notifications add column priority INTEGER not null default 0",
         ]
         for sql in migrations:
             try:
@@ -887,12 +895,12 @@ class SqliteStorage(Storage):
         )
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-    def queue_notification(self, article_id: str, chat_id: str, status: str) -> bool:
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool:
         try:
             self._exec(
-                "insert into notifications (id,article_id,channel,chat_id,status,retry_count,created_at)"
-                " values (?,?,?,?,?,0,?)",
-                (new_id(), article_id, "telegram", chat_id, status, iso(now_utc())),
+                "insert into notifications (id,article_id,channel,chat_id,status,priority,retry_count,created_at)"
+                " values (?,?,?,?,?,?,0,?)",
+                (new_id(), article_id, "telegram", chat_id, status, int(priority), iso(now_utc())),
             )
             return True
         except sqlite3.IntegrityError:
@@ -1219,11 +1227,12 @@ class SupabaseStorage(Storage):
                 changed += 1
         return changed
 
-    def queue_notification(self, article_id: str, chat_id: str, status: str) -> bool:
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool:
         try:
             self._t("notifications").insert({
                 "article_id": article_id, "channel": "telegram", "chat_id": chat_id,
-                "status": status, "retry_count": 0, "created_at": iso(now_utc()),
+                "status": status, "priority": int(priority), "retry_count": 0,
+                "created_at": iso(now_utc()),
             }).execute()
             return True
         except Exception as exc:
@@ -2838,8 +2847,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
     new_count = 0
     dup_count = 0
-    # (article_id, score, is_backfill, published_at)
-    saved_for_notify: list[tuple[str, int, bool, datetime]] = []
+    # (article_id, score, is_backfill, published_at, is_priority)
+    saved_for_notify: list[tuple[str, int, bool, datetime, bool]] = []
+    # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
+    always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
 
     # ── G3: 리다이렉트 해제 + HTML 확보 (병렬) ───────────────────────
     prefetched = prefetch_articles(http, [item.url_original for item, _ in fresh])
@@ -2928,7 +2939,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             analyzed = analyze_and_save(ctx, article_id, dict(row), body, summary_source)
             if analyzed is not None:
                 score = analyzed
-        saved_for_notify.append((article_id, score, is_backfill, item.published_at))
+        probe = f"{item.title}\n{body}"
+        is_priority = (ALWAYS_NOTIFY_GROUP in normalize_group_list(rule_groups)
+                       or any(k in probe for k in always_kws))
+        saved_for_notify.append((article_id, score, is_backfill, item.published_at, is_priority))
 
     # ── 분석 백로그 드레인 ───────────────────────────────────────────
     # 이전 실행에서 저장만 되고 분석이 밀린 기사를 예산 안에서 처리한다.
@@ -2955,22 +2969,20 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
     notify_threshold = effective_threshold(ctx)
-    for article_id, score, is_backfill, published_at in saved_for_notify:
+    for article_id, score, is_backfill, published_at, is_priority in saved_for_notify:
         if not cfg.telegram_enabled:
             break
-        detail = storage.article_detail(article_id)
-        groups = normalize_group_list(jload(detail.get("group_companies"), [])) if detail else []
-        # 포스코퓨처엠이 언급된 기사는 중요도와 무관하게 알림한다. (사용자 지정)
-        is_priority = ALWAYS_NOTIFY_GROUP in groups
+        # is_priority: 포스코퓨처엠 언급 또는 마스터 지정 키워드 → 중요도 게이트 우회
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
             and (not is_backfill)                  # 6시간 넘은 기사는 웹에만
-            and (score >= notify_threshold or is_priority)  # 중요도 게이트(포스코퓨처엠은 우회)
+            and (score >= notify_threshold or is_priority)  # 중요도 게이트(우선 기사는 우회)
             and published_at is not None
             and published_at >= bootstrap_at       # 파이프라인 가동 이전 기사는 절대 알림 안 함
         )
         status = "queued" if should_send else "skipped"
-        if storage.queue_notification(article_id, cfg.telegram_chat_id, status):
+        if storage.queue_notification(article_id, cfg.telegram_chat_id, status,
+                                      1 if is_priority else 0):
             queued += 1 if should_send else 0
 
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -3341,11 +3353,14 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
     if not pending:
         return 0
     def _is_priority(p: dict) -> bool:
+        # 큐 적재 시 run_once 가 판정해 둔 값(포스코퓨처엠 또는 마스터 키워드).
+        if p.get("priority"):
+            return True
         groups = normalize_group_list(jload(p.get("group_companies"), []))
         return ALWAYS_NOTIFY_GROUP in groups
 
     # /threshold 로 조정한 임계값을 큐 단계에서 한 번 더 적용 (큐 적재는 .env 기준으로 됐을 수 있음)
-    # 포스코퓨처엠 언급 기사는 임계값·야간 게이트를 우회한다. (사용자 지정)
+    # 우선 기사(포스코퓨처엠·마스터 키워드)는 임계값·야간 게이트를 우회한다.
     th = effective_threshold(ctx)
     pending = [p for p in pending if int(p.get("importance_score") or 0) >= th or _is_priority(p)]
     if not pending:
@@ -3711,6 +3726,54 @@ def telegram_bot_loop(ctx: Context, stop: threading.Event) -> None:
 PERIOD_HOURS = {"today": 24, "7d": 24 * 7, "30d": 24 * 30, "all": 0}
 MAX_SCAN_ROWS = 3000   # 배열 필터는 애플리케이션에서 처리하므로 스캔 범위를 제한한다
 
+# ── 마스터 패널 인증 ─────────────────────────────────────────────────
+MASTER_TOKEN_TTL = timedelta(hours=24)      # 로그인 유지 (사용자 지정)
+RECOMMENDED_MIN_SCORE = 40                  # 관련도 하한 권장값 (마스터는 0~100 자유)
+_MASTER_TOKENS: dict[str, datetime] = {}    # token -> 만료시각 (서버 메모리, 재시작 시 소멸)
+
+
+def hash_password(pw: str) -> str:
+    """pbkdf2-sha256. 결과는 'pbkdf2_sha256$반복수$salt$hash' 한 줄."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
+    return f"pbkdf2_sha256$200000${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        _, iters, salt_hex, hash_hex = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                                 bytes.fromhex(salt_hex), int(iters))
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _issue_master_token() -> str:
+    now = now_utc()
+    for tok, exp in list(_MASTER_TOKENS.items()):
+        if exp <= now:
+            _MASTER_TOKENS.pop(tok, None)
+    tok = secrets.token_urlsafe(24)
+    _MASTER_TOKENS[tok] = now + MASTER_TOKEN_TTL
+    return tok
+
+
+def _valid_master_token(tok: str) -> bool:
+    exp = _MASTER_TOKENS.get(tok or "")
+    return bool(exp and exp > now_utc())
+
+
+def check_master_password(ctx: Context, pw: str) -> bool:
+    """DB 에 변경된 해시가 있으면 그것을, 없으면 .env 의 MASTER_PASSWORD 를 쓴다."""
+    if not pw:
+        return False
+    stored = ctx.storage.get_run_state().get("master_pw_hash")
+    if stored:
+        return verify_password(pw, stored)
+    env_pw = ctx.cfg.master_password
+    return bool(env_pw) and hmac.compare_digest(pw, env_pw)
+
 
 def build_card(row: dict) -> dict:
     """카드 1건의 표시용 형태를 만든다. 칩 중복 제거를 여기서 한 번 더 한다. (PRD F6.2b)"""
@@ -3905,6 +3968,78 @@ def create_app(ctx: Context):
         if ok:
             return JSONResponse({"ok": True})
         return JSONResponse({"ok": False, "error": err or "발송에 실패했습니다."}, status_code=502)
+
+    # ── 마스터 패널 (PRD 추가) ──────────────────────────────────────
+    def _master_guard(token: str) -> JSONResponse | None:
+        if not _valid_master_token(token or ""):
+            return JSONResponse({"ok": False, "error": "마스터 인증이 필요합니다."}, status_code=401)
+        return None
+
+    @app.post("/api/master/login")
+    async def api_master_login(payload: dict):
+        pw = (payload or {}).get("password", "")
+        if not isinstance(pw, str) or not check_master_password(ctx, pw):
+            return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
+                                status_code=401)
+        return JSONResponse({"ok": True, "token": _issue_master_token(),
+                             "ttl_hours": int(MASTER_TOKEN_TTL.total_seconds() // 3600)})
+
+    @app.get("/api/master/settings")
+    async def api_master_settings_get(x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        st = ctx.storage.get_run_state()
+        return JSONResponse({
+            "ok": True,
+            "threshold": effective_threshold(ctx),
+            "recommended_min": RECOMMENDED_MIN_SCORE,
+            "keywords": jload(st.get("always_notify_keywords"), []),
+            "always_group": ALWAYS_NOTIFY_GROUP,
+        })
+
+    @app.post("/api/master/settings")
+    async def api_master_settings_post(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        patch: dict[str, Any] = {}
+        if "threshold" in (payload or {}):
+            try:
+                patch["notify_threshold"] = int(clamp(int(payload["threshold"]), 0, 100))
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
+                                    status_code=400)
+        if "keywords" in (payload or {}):
+            kws = payload["keywords"]
+            if not isinstance(kws, list):
+                return JSONResponse({"ok": False, "error": "키워드는 목록이어야 합니다."},
+                                    status_code=400)
+            clean = dedupe_chips(str(k).strip() for k in kws if str(k).strip())[:30]
+            patch["always_notify_keywords"] = jdump(clean)
+        if patch:
+            ctx.storage.set_run_state(patch)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/master/password")
+    async def api_master_password(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        target = (payload or {}).get("target", "")
+        new_pw = (payload or {}).get("new_password", "")
+        if target not in ("master", "web"):
+            return JSONResponse({"ok": False, "error": "target 은 master 또는 web 이어야 합니다."},
+                                status_code=400)
+        if not isinstance(new_pw, str) or len(new_pw) < 4:
+            return JSONResponse({"ok": False, "error": "새 비밀번호는 4자 이상이어야 합니다."},
+                                status_code=400)
+        if target == "master":
+            cur = (payload or {}).get("current_password", "")
+            if not check_master_password(ctx, cur):
+                return JSONResponse({"ok": False, "error": "현재 비밀번호가 올바르지 않습니다."},
+                                    status_code=401)
+            ctx.storage.set_run_state({"master_pw_hash": hash_password(new_pw)})
+        else:
+            ctx.storage.set_run_state({"web_pw_hash": hash_password(new_pw)})
+        return JSONResponse({"ok": True})
 
     @app.post("/api/analyze-url")
     async def api_analyze_url(payload: dict):
@@ -4440,6 +4575,16 @@ def cmd_selftest() -> int:
     _prio = lambda g: ALWAYS_NOTIFY_GROUP in normalize_group_list(g)
     check("포스코퓨처엠 언급 → 우선 알림", _prio(["포스코퓨처엠", "포스코"]), True)
     check("포스코퓨처엠 미언급 → 우선 아님", _prio(["포스코인터내셔널"]), False)
+
+    print("\n[13-3] 마스터 비밀번호 (pbkdf2)")
+    _h = hash_password("s3cret!")
+    check("정상 비번 검증", verify_password("s3cret!", _h), True)
+    check("틀린 비번 거부", verify_password("nope", _h), False)
+    check("손상된 해시 거부", verify_password("s3cret!", "garbage"), False)
+    check("빈 문자열 거부", verify_password("", _h), False)
+    _kw = ["수소환원제철", "장인화"]
+    check("키워드 본문 매칭", any(k in "포스코가 장인화 회장 주재로 회의" for k in _kw), True)
+    check("키워드 미포함", any(k in "삼성전자 실적 발표" for k in _kw), False)
 
     print("\n[14] 수동 URL 등록 (PRD F8)")
     check("제목 추출 + 사이트명 꼬리 제거",

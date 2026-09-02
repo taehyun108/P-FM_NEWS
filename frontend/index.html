@@ -20,10 +20,65 @@
     </div>
     <div class="header-right">
       <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
-      <div class="strip" id="sourceStrip">SUPABASE · NEWS RSS · POSCO SIGNAL</div>
+      <button type="button" class="fav-tab" id="masterBtn">🔒 마스터</button>
     </div>
   </div>
 </header>
+
+<!-- 마스터 패널 (텔레그램 발송 설정 · 비밀번호) -->
+<div class="modal-backdrop" id="masterModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="masterTitle">
+    <div class="modal-head">
+      <h2 id="masterTitle">마스터</h2>
+      <button type="button" class="modal-close" id="masterClose" aria-label="닫기">×</button>
+    </div>
+
+    <!-- 로그인 -->
+    <form class="modal-body" id="masterLogin">
+      <p class="modal-desc">마스터 비밀번호를 입력하세요. 인증은 24시간 유지됩니다.</p>
+      <input type="password" id="masterPw" class="url-add-input" placeholder="비밀번호" autocomplete="current-password" required>
+      <p class="url-add-msg err" id="masterLoginMsg" hidden></p>
+      <button type="submit" class="url-add-btn">로그인</button>
+    </form>
+
+    <!-- 설정 패널 -->
+    <div class="modal-body" id="masterPanel" hidden>
+      <section class="master-section">
+        <h3>텔레그램 발송 기준</h3>
+        <label class="master-field">
+          <span>관련도 점수 임계값 <b id="thVal">50</b> 이상</span>
+          <input type="range" id="thRange" min="0" max="100" step="5">
+          <small id="thHint">권장: <b id="thRec">40</b> 이상 · 마스터는 0~100 자유롭게 지정</small>
+        </label>
+      </section>
+
+      <section class="master-section">
+        <h3>항상 발송 키워드</h3>
+        <small>기사 <b>본문</b>에 이 단어가 있으면 점수와 무관하게 발송합니다. (<b id="alwaysGroup">포스코퓨처엠</b> 언급은 기본 포함)</small>
+        <div class="kw-input">
+          <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 추가">
+          <button type="button" class="url-add-btn" id="kwAdd">추가</button>
+        </div>
+        <div class="kw-list" id="kwList"></div>
+      </section>
+
+      <section class="master-section">
+        <h3>비밀번호 변경</h3>
+        <form class="master-pwform" id="pwMasterForm">
+          <input type="password" id="pwMasterCur" class="url-add-input" placeholder="현재 마스터 비밀번호" autocomplete="current-password">
+          <input type="password" id="pwMasterNew" class="url-add-input" placeholder="새 마스터 비밀번호 (4자 이상)" autocomplete="new-password">
+          <button type="submit" class="url-add-btn">마스터 비밀번호 변경</button>
+        </form>
+        <form class="master-pwform" id="pwWebForm">
+          <input type="password" id="pwWebNew" class="url-add-input" placeholder="새 웹페이지 비밀번호 (4자 이상)" autocomplete="new-password">
+          <button type="submit" class="url-add-btn">웹페이지 비밀번호 변경</button>
+        </form>
+      </section>
+
+      <p class="url-add-msg" id="masterMsg" hidden></p>
+    </div>
+  </div>
+</div>
 
 <!-- 시세 티커 (PRD F9.3) -->
 <section class="ticker" aria-label="실시간 주가 및 환율">

@@ -371,6 +371,181 @@ async function shareToTelegram(articleId, btn) {
   }, 2500);
 }
 
+/* ── 마스터 패널 ───────────────────────────────────────────────── */
+
+let masterKeywords = [];
+let thTimer;
+
+function masterAuth() {
+  try {
+    const a = JSON.parse(localStorage.getItem('pfm.master') || 'null');
+    if (a && a.token && a.exp > Date.now()) return a.token;
+  } catch { /* noop */ }
+  return null;
+}
+function saveMasterAuth(token, ttlHours) {
+  try {
+    localStorage.setItem('pfm.master',
+      JSON.stringify({ token, exp: Date.now() + (ttlHours || 24) * 3600 * 1000 }));
+  } catch { /* noop */ }
+}
+function clearMasterAuth() { try { localStorage.removeItem('pfm.master'); } catch { /* noop */ } }
+
+async function masterFetch(path, opts = {}) {
+  const res = await fetch(API + path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Master-Token': masterAuth() || '',
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401) { clearMasterAuth(); showMasterLogin(); throw new Error('unauthorized'); }
+  return res;
+}
+
+function masterMsg(kind, text) {
+  const m = $('masterMsg');
+  m.className = `url-add-msg ${kind}`;
+  m.textContent = text;
+  m.hidden = false;
+  setTimeout(() => { m.hidden = true; }, 3000);
+}
+
+function openMaster() {
+  $('masterModal').hidden = false;
+  if (masterAuth()) showMasterPanel(); else showMasterLogin();
+}
+function closeMaster() { $('masterModal').hidden = true; }
+
+function showMasterLogin() {
+  $('masterLogin').hidden = false;
+  $('masterPanel').hidden = true;
+  $('masterPw').value = '';
+  $('masterLoginMsg').hidden = true;
+}
+async function showMasterPanel() {
+  $('masterLogin').hidden = true;
+  $('masterPanel').hidden = false;
+  await loadMasterSettings();
+}
+
+async function loadMasterSettings() {
+  try {
+    const d = await (await masterFetch('/api/master/settings')).json();
+    $('thRange').value = d.threshold;
+    $('thVal').textContent = d.threshold;
+    $('thRec').textContent = d.recommended_min;
+    $('alwaysGroup').textContent = d.always_group;
+    masterKeywords = d.keywords || [];
+    renderKwList();
+  } catch (e) {
+    if (e.message !== 'unauthorized') masterMsg('err', '설정을 불러오지 못했습니다.');
+  }
+}
+
+function renderKwList() {
+  $('kwList').replaceChildren(...masterKeywords.map((kw) => {
+    const chip = el('span', 'kw-chip', kw);
+    const x = el('button', null, '×');
+    x.type = 'button';
+    x.addEventListener('click', () => {
+      masterKeywords = masterKeywords.filter((k) => k !== kw);
+      renderKwList();
+      saveKeywords();
+    });
+    chip.append(x);
+    return chip;
+  }));
+}
+
+async function saveKeywords() {
+  try {
+    await masterFetch('/api/master/settings',
+      { method: 'POST', body: JSON.stringify({ keywords: masterKeywords }) });
+    masterMsg('ok', '키워드를 저장했습니다.');
+  } catch (e) {
+    if (e.message !== 'unauthorized') masterMsg('err', '저장에 실패했습니다.');
+  }
+}
+
+function initMaster() {
+  $('masterBtn').addEventListener('click', openMaster);
+  $('masterClose').addEventListener('click', closeMaster);
+  $('masterModal').addEventListener('click', (e) => {
+    if (e.target === $('masterModal')) closeMaster();
+  });
+
+  $('masterLogin').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(API + '/api/master/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: $('masterPw').value }),
+      });
+      const d = await res.json();
+      if (!d.ok) { $('masterLoginMsg').textContent = d.error || '로그인 실패'; $('masterLoginMsg').hidden = false; return; }
+      saveMasterAuth(d.token, d.ttl_hours);
+      showMasterPanel();
+    } catch {
+      $('masterLoginMsg').textContent = '서버에 연결하지 못했습니다.';
+      $('masterLoginMsg').hidden = false;
+    }
+  });
+
+  $('thRange').addEventListener('input', (e) => {
+    $('thVal').textContent = e.target.value;
+    clearTimeout(thTimer);
+    thTimer = setTimeout(async () => {
+      try {
+        await masterFetch('/api/master/settings',
+          { method: 'POST', body: JSON.stringify({ threshold: Number(e.target.value) }) });
+        masterMsg('ok', `임계값 ${e.target.value} 저장`);
+      } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+    }, 400);
+  });
+
+  $('kwAdd').addEventListener('click', () => {
+    const v = $('kwNew').value.trim();
+    if (v && !masterKeywords.includes(v)) {
+      masterKeywords.push(v);
+      $('kwNew').value = '';
+      renderKwList();
+      saveKeywords();
+    }
+  });
+  $('kwNew').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('kwAdd').click(); } });
+
+  $('pwMasterForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const d = await (await masterFetch('/api/master/password', {
+        method: 'POST',
+        body: JSON.stringify({
+          target: 'master',
+          current_password: $('pwMasterCur').value,
+          new_password: $('pwMasterNew').value,
+        }),
+      })).json();
+      if (d.ok) { masterMsg('ok', '마스터 비밀번호를 변경했습니다.'); e.target.reset(); }
+      else masterMsg('err', d.error || '변경 실패');
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '변경 실패'); }
+  });
+
+  $('pwWebForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const d = await (await masterFetch('/api/master/password', {
+        method: 'POST',
+        body: JSON.stringify({ target: 'web', new_password: $('pwWebNew').value }),
+      })).json();
+      if (d.ok) { masterMsg('ok', '웹페이지 비밀번호를 저장했습니다.'); e.target.reset(); }
+      else masterMsg('err', d.error || '변경 실패');
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '변경 실패'); }
+  });
+}
+
 /* ── 로고 썸네일 (사진이 없을 때 그룹사 로고 배지로 대체) ───────── */
 
 /* 그룹사별 배경색. 각사 브랜드 톤에 맞춘 근사값이다. */
@@ -663,6 +838,7 @@ function init() {
   $('loadMore').addEventListener('click', () => { state.page += 1; refresh(false); });
 
   $('favTab').addEventListener('click', toggleFavView);
+  initMaster();
 
   $('urlAddForm').addEventListener('submit', submitUrl);
 

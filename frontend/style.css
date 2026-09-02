@@ -342,3 +342,49 @@ body {
 }
 .footer p { margin: 0 0 6px; }
 .footer strong { color: var(--ink-mid); }
+
+/* ── 마스터 패널 모달 ─────────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(14, 36, 86, .42);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 16px; overflow-y: auto;
+}
+.modal-backdrop[hidden] { display: none; }
+.modal {
+  background: #fff; border-radius: 14px; width: 100%; max-width: 520px;
+  box-shadow: 0 20px 60px rgba(14, 36, 86, .3);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--line);
+}
+.modal-head h2 { margin: 0; font-size: 16px; color: var(--navy); }
+.modal-close {
+  border: 0; background: none; font-size: 22px; line-height: 1;
+  color: var(--ink-soft); cursor: pointer; padding: 0 4px;
+}
+.modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.modal-body[hidden] { display: none; }
+.modal-desc { margin: 0; font-size: 12.5px; color: var(--ink-soft); }
+
+.master-section { border-top: 1px solid var(--line); padding-top: 14px; }
+.master-section:first-child { border-top: 0; padding-top: 0; }
+.master-section h3 { margin: 0 0 8px; font-size: 13px; color: var(--navy); }
+.master-section small { display: block; font-size: 11.5px; color: var(--ink-soft); line-height: 1.6; }
+.master-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--ink-mid); }
+.master-field input[type="range"] { width: 100%; }
+.master-field b { color: var(--navy); }
+
+.kw-input { display: flex; gap: 8px; margin: 10px 0 8px; }
+.kw-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.kw-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--navy-soft); color: var(--navy-dark);
+  border-radius: 999px; padding: 4px 6px 4px 11px; font-size: 12px;
+}
+.kw-chip button {
+  border: 0; background: none; color: var(--navy); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 2px;
+}
+.master-pwform { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }

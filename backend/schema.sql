@@ -64,6 +64,9 @@ create table if not exists run_state (
   notify_paused   boolean not null default false,      -- 텔레그램 /stop 로 알림 일시중지
   notify_threshold int,                     -- /threshold 로 지정한 임계값 (null 이면 .env 값)
   tg_offset       bigint not null default 0,           -- 텔레그램 getUpdates offset
+  always_notify_keywords text default '[]', -- 이 단어가 본문에 있으면 점수 무관 알림 (마스터 설정)
+  master_pw_hash  text,                     -- 마스터 비밀번호 (pbkdf2, null 이면 .env 값 사용)
+  web_pw_hash     text,                     -- 웹페이지 비밀번호 (값만 보관, 게이트는 추후)
   updated_at      timestamptz default now()
 );
 
@@ -132,6 +135,7 @@ create table if not exists notifications (
   status      text not null,                 -- 'queued' | 'sent' | 'failed' | 'skipped'
   error       text,
   retry_count int default 0,
+  priority    int not null default 0,        -- 1이면 임계값·야간 게이트를 우회해 발송
   sent_at     timestamptz,
   created_at  timestamptz default now(),
   -- 중복 발송 0건을 DB 제약으로 보장한다 (§6 정합성)
