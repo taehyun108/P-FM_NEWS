@@ -4326,6 +4326,46 @@ def cmd_reanalyze(ctx: Context) -> None:
     log.info("재분석: 성공 %d건 · 실패 %d건", done, failed)
 
 
+def cmd_reswot(ctx: Context) -> None:
+    """SWOT 가 전부 0(카드에서 숨겨짐)인 fulltext 기사를 재분석한다 (일회성).
+
+    프롬프트를 적극화한 뒤, 예전에 전 항목 0으로 저장된 기사를 다시 돌린다.
+    """
+    rows = ctx.storage.list_articles(5000, 0, None, "")
+    targets = []
+    for r in rows:
+        if not r.get("analyzed_at") or r.get("summary_source") == "snippet":
+            continue
+        scores = [int(r.get(k) or 0) for k in ("s_score", "w_score", "o_score", "t_score")]
+        if r.get("swot_total") is None or not any(scores):
+            targets.append(r)
+    log.info("SWOT 재분석 대상 %d건", len(targets))
+    done = failed = 0
+    for r in targets:
+        target = r.get("url_canonical") or r.get("url_original") or ""
+        try:
+            _, html = resolve_canonical(ctx.http, target)
+            body = extract_body(html)
+            if len(body) < 300:
+                failed += 1
+                continue
+            ctx.storage.save_body(r["id"], body, "fulltext")
+            row = {
+                "id": r["id"], "title": r.get("title") or "",
+                "press_id": r.get("press_id"), "press_name": r.get("press_name") or "",
+                "importance_score": r.get("importance_score") or 0,
+                "group_companies": jload(r.get("group_companies"), []),
+            }
+            if analyze_and_save(ctx, r["id"], row, body, "fulltext") is not None:
+                done += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            log.debug("SWOT 재분석 실패 %s: %s", target, exc)
+            failed += 1
+    log.info("SWOT 재분석: 성공 %d건 · 실패 %d건", done, failed)
+
+
 def cmd_fixdates(ctx: Context) -> None:
     """타임존 오파싱으로 미래에 저장된 발행시각을 보정한다 (일회성).
 
@@ -4714,6 +4754,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
+  reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -4755,6 +4796,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixofftopic(ctx)
     elif command == "reanalyze":
         cmd_reanalyze(ctx)
+    elif command == "reswot":
+        cmd_reswot(ctx)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":
