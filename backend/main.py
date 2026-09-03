@@ -1548,6 +1548,30 @@ GROUP_COMPANIES: dict[str, list[str]] = {
     "포스코": ["포스코", "POSCO"],
 }
 
+TRADE_CATEGORY = "글로벌 통상환경"
+# '특정 국가의 명시적 통상 조치' 만 넣는다. '공급망 재편'·'디리스킹' 같은 일반 트렌드어는
+# 노사·실적 기사에도 스치듯 나와 오태깅되므로 제외한다.
+TRADE_MEASURE_KW = [
+    # 미국
+    "IRA", "인플레이션감축법", "OBBBA", "FEOC", "해외우려기관", "무역확장법 232조", "232조 관세",
+    "무역법 301조", "301조 관세", "세이프가드", "상호관세", "보편관세",
+    # 유럽
+    "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금 규정",
+    "EU 배터리규정", "공급망실사지침", "CSDDD",
+    # 중국
+    "흑연 수출통제", "갈륨 수출", "게르마늄 수출", "안티모니 수출", "희토류 수출통제",
+    "요소 수출제한", "반도체 장비 수출통제", "수출허가 대상",
+    # 무역구제 (공식 절차)
+    "반덤핑 관세", "반덤핑관세", "반덤핑 조사", "상계관세", "덤핑 판정", "긴급수입제한",
+]
+# 통상 기사가 '포스코 관련 산업'인지 판정.
+TRADE_INDUSTRY_KW = [
+    "배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
+    "흑연", "전기차", "ESS", "핵심광물",
+    "철강", "제철", "후판", "열연", "냉연", "선재", "강판", "스테인리스", "합금철", "봉형강",
+    "포스코",
+]
+
 # 카테고리 태깅 규칙 (PRD F3.1)
 #   제목+요약에서만 판정한다. 본문 전체를 스캔하면 부차적 언급까지 걸려
 #   거의 모든 기사가 3~4개 카테고리를 달아 필터가 무의미해진다.
@@ -1575,16 +1599,9 @@ CATEGORY_RULES: dict[str, list[str]] = {
                   "정부 지원", "정책 지원", "육성 방안"],
     "법령": ["법안", "법률안", "개정안", "시행령", "시행규칙", "특별법", "입법", "규제",
              "인허가", "과징금", "행정처분", "제재", "고시", "조례"],
-    # 미국·유럽·중국 등 주요국 통상 조치. 정의는 TRADE_SIGNAL_KW 와 맞춘다.
-    "글로벌 통상환경": [
-        "IRA", "인플레이션감축법", "OBBBA", "FEOC", "해외우려기관", "무역확장법", "232조", "301조",
-        "세이프가드", "상호관세", "보편관세", "관세 폭탄",
-        "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금",
-        "EU 배터리규정", "공급망실사지침",
-        "흑연 수출통제", "갈륨", "게르마늄", "안티모니", "화이트리스트", "요소 수출제한",
-        "반덤핑", "상계관세", "무역장벽", "통상마찰", "무역분쟁", "무역전쟁",
-        "디리스킹", "프렌드쇼어링", "니어쇼어링", "탈중국", "USMCA",
-    ],
+    # 미국·유럽·중국 등 주요국의 명시적 통상 조치. 정의는 TRADE_MEASURE_KW 와 맞춘다.
+    # detect_categories 가 '제목에 조치명' 조건을 한 번 더 건다.
+    "글로벌 통상환경": TRADE_MEASURE_KW,
     "시장/주가": ["주가", "증권", "코스피", "코스닥", "목표주가", "시황", "상한가", "하한가",
                   "거래량", "거래대금", "시가총액", "PER", "PBR", "공매도", "외국인 순매수",
                   "기관 순매수", "배당"],
@@ -1843,40 +1860,19 @@ POLICY_RELEVANCE_KW = [
 
 POLICY_BRIEF_PRESS = "대한민국 정책브리핑"
 
-TRADE_CATEGORY = "글로벌 통상환경"
-# 통상 신호어 — 미국·유럽·중국 등 주요국의 통상 조치·규제.
-TRADE_SIGNAL_KW = [
-    # 미국
-    "IRA", "인플레이션감축법", "OBBBA", "FEOC", "해외우려기관", "리쇼어링",
-    "무역확장법", "232조", "301조", "슈퍼301", "세이프가드", "상호관세", "보편관세", "관세 폭탄",
-    # 유럽
-    "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금",
-    "EU 배터리규정", "배터리 여권", "공급망실사지침", "CSDDD",
-    # 중국
-    "흑연 수출통제", "갈륨", "게르마늄", "안티모니", "희토류 수출", "화이트리스트",
-    "요소 수출제한", "반도체 수출통제",
-    # 일반
-    "반덤핑", "상계관세", "덤핑관세", "무역장벽", "통상마찰", "무역분쟁", "무역전쟁",
-    "공급망 재편", "디리스킹", "프렌드쇼어링", "니어쇼어링", "탈중국", "수출규제", "수입규제",
-    "쿼터", "자유무역협정", "FTA", "USMCA", "무역합의",
-]
-# 통상 기사가 '포스코 관련 산업'인지 판정.
-TRADE_INDUSTRY_KW = [
-    "배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
-    "흑연", "전기차", "ESS", "핵심광물",
-    "철강", "제철", "후판", "열연", "냉연", "선재", "강판", "스테인리스", "합금철", "봉형강",
-    "포스코",
-]
-
-
-def is_trade_topic(text: str) -> bool:
-    """글로벌 통상환경 기사인가 — 통상 신호어 + 포스코 관련 산업어가 함께 있어야 한다."""
-    return _kw_hit_any(text, TRADE_SIGNAL_KW) and _kw_hit_any(text, TRADE_INDUSTRY_KW)
-
-
 def _kw_hit_any(text: str, keywords: Sequence[str]) -> bool:
     """_kw_hit 과 달리 빈 목록이면 False (조건이 반드시 있어야 하는 경우)."""
     return any(k in text for k in keywords)
+
+
+def is_trade_topic(title: str, extra: str = "") -> bool:
+    """글로벌 통상환경 기사인가.
+
+    통상 조치는 헤드라인에 드러나므로 '제목'에 조치명이 있어야 한다.
+    (요약·본문에만 스친 언급은 부차 주제 — 오태깅을 막는다.)
+    포스코 관련 산업(철강·배터리)이 제목·요약에 함께 있어야 한다.
+    """
+    return _kw_hit_any(title, TRADE_MEASURE_KW) and _kw_hit_any(f"{title}\n{extra}", TRADE_INDUSTRY_KW)
 
 
 def is_policy_brief(row: dict) -> bool:
@@ -1887,12 +1883,10 @@ def is_policy_brief(row: dict) -> bool:
 
 
 def is_trade_article(row: dict) -> bool:
-    """저장된 기사가 통상환경 기사인지 — 카테고리 태그 또는 제목·요약·키워드로 판정."""
+    """저장된 기사가 통상환경 기사인지 — 카테고리 태그 또는 제목 기준으로 판정."""
     if TRADE_CATEGORY in jload(row.get("categories"), []):
         return True
-    probe = " ".join([row.get("title") or "", row.get("summary_text") or "",
-                      " ".join(jload(row.get("keywords"), []))])
-    return is_trade_topic(probe)
+    return is_trade_topic(row.get("title") or "", row.get("summary_text") or "")
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -2379,6 +2373,10 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     lowered = f"{title or ''}\n{summary or ''}".lower()
     found = [name for name, words in CATEGORY_RULES.items()
              if any(w.lower() in lowered for w in words)]
+    # 글로벌 통상환경은 조치명이 '제목'에 있을 때만 — 요약에 스친 언급은 부차 주제라 뺀다.
+    if TRADE_CATEGORY in found and not _kw_hit_any((title or "").lower(),
+                                                  [w.lower() for w in TRADE_MEASURE_KW]):
+        found.remove(TRADE_CATEGORY)
     # '그룹사'는 별도의 그룹사 필터가 담당하므로 카테고리에는 넣지 않는다.
     return dedupe_chips(found)
 
@@ -3071,9 +3069,9 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
         rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
-        # 글로벌 통상환경 기사: 통상 신호어 + 포스코 관련 산업어가 함께 있으면
+        # 글로벌 통상환경 기사: 제목에 통상 조치명 + 포스코 관련 산업어가 함께 있으면
         # 포스코 미언급이어도 수집한다. (사용자 지정)
-        is_trade = is_trade_topic(relevance_probe)
+        is_trade = is_trade_topic(item.title, item.snippet or "")
         if is_policy:
             # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집.
             if not matches_keywords(relevance_probe, POLICY_RELEVANCE_KW):
@@ -3286,9 +3284,7 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     categories = detect_categories(row["title"], f"{analysis.summary_text}\n{' '.join(keywords)}")
     if is_policy_brief(row) and "정부/정책" not in categories:
         categories = ["정부/정책"] + categories
-    _probe = f"{row['title']}\n{analysis.summary_text}\n{' '.join(keywords)}"
-    if is_trade_topic(_probe) and TRADE_CATEGORY not in categories:
-        categories = categories + [TRADE_CATEGORY]
+    # 통상환경은 detect_categories 가 '제목에 조치명' 조건으로 이미 판정한다 — 강제 추가 안 함.
 
     ctx.storage.update_article(article_id, {
         "sentiment": analysis.sentiment,
@@ -4550,8 +4546,6 @@ def cmd_fixcategories(ctx: Context) -> None:
         new = detect_categories(r.get("title") or "", probe)
         if is_policy_brief(r) and "정부/정책" not in new:
             new = ["정부/정책"] + new
-        if is_trade_topic(f"{r.get('title') or ''}\n{probe}") and TRADE_CATEGORY not in new:
-            new = new + [TRADE_CATEGORY]
         if new != cur:
             ctx.storage.update_article(r["id"], {"categories": jdump(new)})
             fixed += 1
@@ -5022,20 +5016,23 @@ def cmd_selftest() -> int:
     check("정책 키워드 불일치 시 제외",
           any(k in "쌀값 안정 대책" for k in _pk), False)
 
-    print("\n[8-2c] 글로벌 통상환경 수집")
-    check("통상 신호 + 산업어 → 통상환경",
-          is_trade_topic("美 IRA 세부지침…배터리 FEOC 규정 강화"), True)
-    check("CBAM + 철강 → 통상환경", is_trade_topic("EU CBAM 시행에 철강업계 비상"), True)
-    check("중국 흑연 수출통제 + 이차전지 → 통상환경",
+    print("\n[8-2c] 글로벌 통상환경 — 제목에 조치명 + 산업어일 때만")
+    check("제목에 CBAM + 철강 → 통상환경",
+          is_trade_topic("EU CBAM 시행에 철강업계 비상"), True)
+    check("제목에 흑연 수출통제 + 이차전지 → 통상환경",
           is_trade_topic("중국 흑연 수출통제 확대…이차전지 타격"), True)
-    check("통상 신호만 있고 산업어 없으면 아님",
-          is_trade_topic("한미 FTA 개정 협상 재개"), False)
-    check("산업어만 있고 통상 신호 없으면 아님",
-          is_trade_topic("포스코 철강 신제품 출시"), False)
+    check("조치명이 제목 아닌 요약에만 있으면 제외",
+          is_trade_topic("포스코 노사, 타협점 찾아야", "철강업계는 반덤핑 관세와 중국산 저가재로 삼중고"), False)
+    check("일반 무역 트렌드어(공급망 재편)는 통상환경 아님",
+          is_trade_topic("종합상사 부활…공급망 재편 수혜"), False)
+    check("조치명만 있고 산업어 없으면 아님", is_trade_topic("美, 對中 반도체 301조 관세"), False)
+    check("산업어만 있고 조치명 없으면 아님", is_trade_topic("포스코 철강 신제품 출시"), False)
     check("통상환경 카테고리 태그로 판정",
           is_trade_article({"categories": ["글로벌 통상환경"]}), True)
-    check("detect_categories 가 통상 신호어를 잡음",
-          "글로벌 통상환경" in detect_categories("美 232조 철강 관세 부과"), True)
+    check("detect_categories: 제목에 조치명 있을 때만 태깅",
+          "글로벌 통상환경" in detect_categories("美 무역확장법 232조 철강 관세 부과"), True)
+    check("detect_categories: 요약에만 조치명이면 태깅 안 함",
+          "글로벌 통상환경" in detect_categories("포스코 실적 회복세", "CBAM 대응 비용이 변수"), False)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),
