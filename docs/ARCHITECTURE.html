@@ -252,7 +252,7 @@
     <p class="eyebrow">POSCO Future M · 뉴스 인텔리전스</p>
     <h1>P-FM NEWS 설계도</h1>
     <p class="lede">
-      포스코 그룹·이차전지 뉴스를 60초 주기로 수집해 요약·SWOT 분석하고, 웹 포토카드와
+      포스코 그룹·이차전지 뉴스를 5분 주기로 수집해 요약·SWOT 분석하고, 웹 포토카드와
       텔레그램 채널로 내보내는 파이프라인. 프런트엔드·백엔드·DB 구성과 기사가 거쳐 가는
       게이트, 그리고 무엇을 얼마나 보관하는지를 정리했다.
     </p>
@@ -302,8 +302,8 @@
 
               <rect class="box" x="228" y="150" width="292" height="70" rx="7"/>
               <text class="lbl-b" x="244" y="175">스레드 A · 수집 루프</text>
-              <text class="lbl-sm" x="244" y="194">60초 주기 · run_once() + send_notifications()</text>
-              <text class="lbl-sm" x="244" y="210">시세 갱신 60초</text>
+              <text class="lbl-sm" x="244" y="194">300초 주기 · run_once() + send_notifications()</text>
+              <text class="lbl-sm" x="244" y="210">시세는 별도 스레드 60초</text>
 
               <rect class="box" x="228" y="236" width="292" height="60" rx="7"/>
               <text class="lbl-b" x="244" y="261">스레드 B · 텔레그램 봇</text>
@@ -881,7 +881,8 @@
         <div class="tw"><table>
           <thead><tr><th>항목</th><th class="num">값</th><th>이유</th></tr></thead>
           <tbody>
-            <tr><td>수집 주기</td><td class="num">60초</td><td><code>POLL_INTERVAL_SEC</code> · 30–300 범위</td></tr>
+            <tr><td>수집 주기</td><td class="num">300초</td><td><code>POLL_INTERVAL_SEC</code> · 네이버 호출도 300초 주기</td></tr>
+            <tr><td>시세 갱신</td><td class="num">60초</td><td>수집과 분리된 전용 스레드</td></tr>
             <tr><td>네이버 호출 간격</td><td class="num">300초</td><td>하루 25,000회 한도 대응</td></tr>
             <tr><td>1회 처리 상한</td><td class="num">12건</td><td>실행 20초 목표를 지키기 위한 절단</td></tr>
             <tr><td>1회 LLM 분석</td><td class="num">6건</td><td>모델 호출 1회에 5–10초</td></tr>

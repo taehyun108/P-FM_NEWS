@@ -235,7 +235,7 @@ def load_config() -> Config:
         telegram_channel_url=get_env("TELEGRAM_CHANNEL_URL"),
         naver_client_id=get_env("NAVER_CLIENT_ID"),
         naver_client_secret=get_env("NAVER_CLIENT_SECRET"),
-        poll_interval_sec=get_env_int("POLL_INTERVAL_SEC", 60, 30, 300),
+        poll_interval_sec=get_env_int("POLL_INTERVAL_SEC", 300, 30, 600),
         # 네이버 뉴스 검색 하루 25,000회 한도 대응. 300초면 29키워드 기준 하루 약 8,400회.
         naver_interval_sec=get_env_int("NAVER_INTERVAL_SEC", 300, 60),
         fresh_cutoff_hours=get_env_int("FRESH_CUTOFF_HOURS", 6, 1),
@@ -4825,26 +4825,34 @@ def cmd_once(ctx: Context, max_llm: int | None) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+QUOTE_REFRESH_SEC = 60   # 시세는 수집 주기와 무관하게 항상 60초로 갱신한다. (PRD F9.2)
+
+
 def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
-    """수집 루프. 시세 갱신은 주기가 다르므로 별도로 관리한다. (PRD F9.2)"""
-    last_quote_refresh = 0.0
+    """수집·분석·알림 루프. 시세는 quote_loop 가 따로 돈다."""
     while not stop.is_set():
         started = time.monotonic()
         try:
-            # 시세: 주가 60초 / 환율 5분 → 가장 짧은 60초 주기로 갱신한다.
-            if time.monotonic() - last_quote_refresh >= 60:
-                refresh_quotes(ctx)
-                last_quote_refresh = time.monotonic()
             run_once(ctx)
             send_notifications(ctx)
         except Exception as exc:
             log.exception("파이프라인 실행 중 오류: %s", exc)
 
         elapsed = time.monotonic() - started
-        if elapsed > 20:
-            # 다음 주기와 겹치면 해당 회차를 스킵한다. (PRD §6 실행 시간)
-            log.warning("실행이 %.1f초 걸렸습니다(목표 20초). 다음 주기가 밀릴 수 있습니다.", elapsed)
+        if elapsed > ctx.cfg.poll_interval_sec:
+            log.warning("실행이 %.1f초 걸렸습니다(주기 %d초). 다음 회차가 밀릴 수 있습니다.",
+                        elapsed, ctx.cfg.poll_interval_sec)
         stop.wait(max(1.0, ctx.cfg.poll_interval_sec - elapsed))
+
+
+def quote_loop(ctx: Context, stop: threading.Event) -> None:
+    """시세 갱신 전용 루프 — 수집 주기(60~300초)와 독립적으로 60초마다."""
+    while not stop.is_set():
+        try:
+            refresh_quotes(ctx)
+        except Exception as exc:
+            log.debug("시세 갱신 실패: %s", exc)
+        stop.wait(QUOTE_REFRESH_SEC)
 
 
 def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
@@ -4854,7 +4862,8 @@ def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
     threads: list[threading.Thread] = []
     if with_pipeline:
         threads.append(threading.Thread(target=pipeline_loop, args=(ctx, stop), daemon=True))
-        log.info("수집 루프 시작 (%d초 주기)", ctx.cfg.poll_interval_sec)
+        threads.append(threading.Thread(target=quote_loop, args=(ctx, stop), daemon=True))
+        log.info("수집 루프 시작 (%d초 주기) · 시세 갱신 %d초", ctx.cfg.poll_interval_sec, QUOTE_REFRESH_SEC)
         if ctx.cfg.telegram_enabled:
             threads.append(threading.Thread(target=telegram_bot_loop, args=(ctx, stop), daemon=True))
     for t in threads:
