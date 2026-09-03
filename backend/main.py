@@ -573,6 +573,7 @@ class SqliteStorage(Storage):
             "alter table run_state add column web_pw_hash TEXT",
             "alter table run_state add column web_password TEXT",
             "alter table run_state add column notify_policy INTEGER not null default 0",
+            "alter table run_state add column policy_notify_keywords TEXT default '[]'",
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
         ]
@@ -2912,10 +2913,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
     new_count = 0
     dup_count = 0
-    # (article_id, score, is_backfill, published_at, is_priority)
-    saved_for_notify: list[tuple[str, int, bool, datetime, bool]] = []
+    # (article_id, score, is_backfill, published_at, is_priority, is_policy, policy_ok)
+    saved_for_notify: list[tuple[str, int, bool, datetime, bool, bool, bool]] = []
     # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
+    # 마스터가 지정한 정책 알림 키워드 — 비면 모든 정책 기사, 있으면 이 중 하나에 닿는 것만
+    policy_notify_kws = [k for k in jload(state.get("policy_notify_keywords"), []) if k]
 
     # ── G3: 리다이렉트 해제 + HTML 확보 (병렬) ───────────────────────
     prefetched = prefetch_articles(http, [item.url_original for item, _ in fresh])
@@ -3041,8 +3044,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         probe = f"{item.title}\n{body}"
         is_priority = (ALWAYS_NOTIFY_GROUP in normalize_group_list(rule_groups)
                        or any(k in probe for k in always_kws))
+        # 정책 기사가 마스터의 정책 알림 키워드에 닿는가 (키워드 없으면 전부 통과)
+        policy_ok = (not policy_notify_kws) or any(k in probe for k in policy_notify_kws)
         saved_for_notify.append(
-            (article_id, score, is_backfill, item.published_at, is_priority, is_policy))
+            (article_id, score, is_backfill, item.published_at, is_priority, is_policy, policy_ok))
 
     # ── 분석 백로그 드레인 ───────────────────────────────────────────
     # 이전 실행에서 저장만 되고 분석이 밀린 기사를 예산 안에서 처리한다.
@@ -3071,14 +3076,15 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     notify_threshold = effective_threshold(ctx)
     # 정책브리핑 기사는 기본적으로 웹에만 노출. 마스터가 켜야 알림한다. (사용자 지정)
     notify_policy = str(state.get("notify_policy") or "0") not in ("0", "False", "false", "")
-    for article_id, score, is_backfill, published_at, is_priority, is_policy in saved_for_notify:
+    for article_id, score, is_backfill, published_at, is_priority, is_policy, policy_ok in saved_for_notify:
         if not cfg.telegram_enabled:
             break
         # is_priority: 포스코퓨처엠 언급 또는 마스터 지정 키워드 → 중요도 게이트 우회
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
             and (not is_backfill)                  # 6시간 넘은 기사는 웹에만
-            and (not is_policy or notify_policy)   # 정책 기사는 마스터가 켠 경우만
+            # 정책 기사: 마스터가 알림을 켜고, (키워드 미설정이거나) 키워드에 닿을 때만
+            and (not is_policy or (notify_policy and policy_ok))
             and (score >= notify_threshold or is_priority)  # 중요도 게이트(우선 기사는 우회)
             and published_at is not None
             and published_at >= bootstrap_at       # 파이프라인 가동 이전 기사는 절대 알림 안 함
@@ -4178,6 +4184,7 @@ def create_app(ctx: Context):
             "always_group": ALWAYS_NOTIFY_GROUP,
             "web_password": st.get("web_password") or "",
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
+            "policy_keywords": jload(st.get("policy_notify_keywords"), []),
         })
 
     @app.post("/api/master/settings")
@@ -4200,6 +4207,13 @@ def create_app(ctx: Context):
             patch["always_notify_keywords"] = jdump(clean)
         if "notify_policy" in (payload or {}):
             patch["notify_policy"] = 1 if payload["notify_policy"] else 0
+        if "policy_keywords" in (payload or {}):
+            kws = payload["policy_keywords"]
+            if not isinstance(kws, list):
+                return JSONResponse({"ok": False, "error": "키워드는 목록이어야 합니다."},
+                                    status_code=400)
+            clean = dedupe_chips(str(k).strip() for k in kws if str(k).strip())[:30]
+            patch["policy_notify_keywords"] = jdump(clean)
         if patch:
             ctx.storage.set_run_state(patch)
         return JSONResponse({"ok": True})
@@ -4836,6 +4850,13 @@ def cmd_selftest() -> int:
           extract_ministry("", "본문에 부처 언급 없음"), "정책브리핑")
     check("press_name 으로 정책브리핑 판정",
           is_policy_brief({"press_name": "대한민국 정책브리핑"}), True)
+    # 정책 알림 키워드: 비면 전부 통과, 있으면 본문에 있는 것만
+    _pk = ["전기요금", "탄소중립"]
+    check("정책 키워드 비면 통과", (lambda kw: (not kw) or any(k in "아무 본문" for k in kw))([]), True)
+    check("정책 키워드 매칭 시 통과",
+          any(k in "전기요금 개편안 발표" for k in _pk), True)
+    check("정책 키워드 불일치 시 제외",
+          any(k in "쌀값 안정 대책" for k in _pk), False)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),
