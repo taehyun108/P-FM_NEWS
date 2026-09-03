@@ -3593,7 +3593,11 @@ def _bot_recent_cards(ctx: Context, hours: int | None, limit: int) -> list[dict]
 
 
 def handle_telegram_update(ctx: Context, update: dict) -> None:
-    msg = update.get("message") or update.get("channel_post") or {}
+    # 채널 글에는 응답하지 않는다 — 방송 채널은 단방향이라 봇이 끼어들면 안 된다.
+    # (channel_post 를 수신은 하되 여기서 무시해 chat_id 탐지·오프셋 정합성만 유지)
+    if update.get("channel_post") or update.get("edited_channel_post"):
+        return
+    msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or "").strip()
@@ -3718,7 +3722,10 @@ def telegram_bot_loop(ctx: Context, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             resp = ctx.http.get(base, params={
-                "offset": offset, "timeout": 25, "allowed_updates": '["message"]',
+                "offset": offset, "timeout": 25,
+                # channel_post 도 받는다(수신만 — handle_telegram_update 가 무시).
+                # 안 받으면 텔레그램이 큐에 안 쌓아 나중에 채널 chat_id 탐지가 막힌다.
+                "allowed_updates": '["message","channel_post","my_chat_member"]',
             }, timeout=35)
             data = resp.json()
             updates = data.get("result", []) if data.get("ok") else []
