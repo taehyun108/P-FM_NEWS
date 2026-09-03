@@ -9,7 +9,7 @@
    ===================================================================== */
 
 const API = '';                 // 같은 오리진에서 서빙된다
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 9;             // 포토카드 페이지당 개수 (3열 × 3행)
 
 /* 선택 상태 — 기간만 단일 선택, 나머지는 다중 선택 */
 const state = {
@@ -94,6 +94,7 @@ function readStateFromURL() {
   load('press', state.press);
   state.period = p.get('period') || 'all';
   state.q = p.get('q') || '';
+  state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
 }
 
 function writeStateToURL() {
@@ -103,6 +104,7 @@ function writeStateToURL() {
   if (state.press.size) p.set('press', [...state.press].join(','));
   if (state.period !== 'all') p.set('period', state.period);
   if (state.q) p.set('q', state.q);
+  if (state.page > 1) p.set('page', String(state.page));
   const qs = p.toString();
   history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
 }
@@ -718,7 +720,7 @@ function toggleFavView() {
 async function renderFavorites() {
   const ids = [...favorites()];
   $('resultCount').textContent = `${ids.length}건`;
-  $('loadMore').hidden = true;
+  $('pagination').hidden = true;
   $('emptyMsg').hidden = true;
   if (!ids.length) {
     $('grid').replaceChildren(el('p', 'empty', '즐겨찾기한 기사가 없습니다.'));
@@ -873,30 +875,72 @@ async function refresh(reset) {
   // (필터를 숨기는 것만으로는 방어가 약하다 — 단축키·코드 변경에 취약)
   if (favView || weeklyView || state.loading) return;
   state.loading = true;
-  if (reset) {
-    state.page = 1;
-    $('grid').replaceChildren(...Array.from({ length: 3 }, () => el('div', 'skeleton')));
-  }
+  if (reset) state.page = 1;
+  $('grid').replaceChildren(...Array.from({ length: 6 }, () => el('div', 'skeleton')));
   writeStateToURL();
   syncChipStates();
 
   try {
     const data = await getJSON('/api/articles?' + buildQuery());
     state.total = data.total;
-    const cards = data.items.map(buildCard);
-    if (reset) $('grid').replaceChildren(...cards);
-    else $('grid').append(...cards);
-
+    // 필터가 좁아져 현재 페이지가 범위를 벗어나면 마지막 페이지로 되돌린다.
+    const pages = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
+    if (state.page > pages) {
+      state.page = pages;
+      state.loading = false;
+      return refresh(false);
+    }
+    $('grid').replaceChildren(...data.items.map(buildCard));
     $('resultCount').textContent = `${data.total.toLocaleString('ko-KR')}건`;
     $('emptyMsg').hidden = data.total !== 0;
-    $('loadMore').hidden = state.page * PAGE_SIZE >= data.total;
+    renderPagination(state.page, data.total);
     updateActiveFilterCount();
   } catch (err) {
     console.error('기사 조회 실패', err);
     $('grid').replaceChildren(el('p', 'empty', '기사를 불러오지 못했습니다.'));
+    renderPagination(1, 0);
   } finally {
     state.loading = false;
   }
+}
+
+/* ── 페이지네이션 ──────────────────────────────────────────────── */
+
+function gotoPage(n) {
+  if (n === state.page || state.loading) return;
+  state.page = n;
+  refresh(false);
+  const grid = document.querySelector('.grid');
+  const top = grid.getBoundingClientRect().top + window.scrollY - 90;
+  window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+}
+
+function renderPagination(page, total) {
+  const nav = $('pagination');
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (total === 0 || pages <= 1) { nav.hidden = true; nav.replaceChildren(); return; }
+  nav.hidden = false;
+
+  const btn = (label, target, opt = {}) => {
+    const b = el('button', 'pager-btn' + (opt.current ? ' is-current' : ''), label);
+    b.type = 'button';
+    if (opt.disabled || opt.current) b.disabled = true;
+    else b.addEventListener('click', () => gotoPage(target));
+    if (opt.aria) b.setAttribute('aria-label', opt.aria);
+    return b;
+  };
+
+  const items = [btn('‹', page - 1, { disabled: page <= 1, aria: '이전 페이지' })];
+  const near = new Set([1, pages, page, page - 1, page + 1, page - 2, page + 2]);
+  const shown = [...near].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+  let prev = 0;
+  for (const n of shown) {
+    if (n - prev > 1) items.push(el('span', 'pager-gap', '…'));
+    items.push(btn(String(n), n, { current: n === page }));
+    prev = n;
+  }
+  items.push(btn('›', page + 1, { disabled: page >= pages, aria: '다음 페이지' }));
+  nav.replaceChildren(...items);
 }
 
 /* ── 필터 접기/펼치기 ──────────────────────────────────────────── */
@@ -1047,7 +1091,6 @@ function init() {
   $('clearAll').addEventListener('click', goHome);
   $('brandHome').addEventListener('click', (e) => { e.preventDefault(); goHome(); });
 
-  $('loadMore').addEventListener('click', () => { state.page += 1; refresh(false); });
 
   $('favTab').addEventListener('click', toggleFavView);
   $('weeklyTab').addEventListener('click', toggleWeeklyView);
@@ -1068,7 +1111,8 @@ function init() {
   $('urlConfirmBtn').addEventListener('click', confirmDraft);
   $('urlDiscardBtn').addEventListener('click', discardDraft);
 
-  loadFilters().then(() => refresh(true));
+  // 첫 로드는 URL 의 page 를 살리기 위해 reset 하지 않는다.
+  loadFilters().then(() => refresh(false));
   loadStats();
   loadQuotes();
 

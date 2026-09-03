@@ -296,14 +296,24 @@ a.brand:hover .brand-mark { background: rgba(255, 255, 255, .28); }
 .swot-tip dt span { opacity: .6; font-weight: 400; font-variant-numeric: tabular-nums; }
 .swot-tip dd { margin: 0; opacity: .9; }
 
-/* ── 더 보기 / 빈 상태 ────────────────────────────────────────────── */
+/* ── 페이지네이션 / 빈 상태 ──────────────────────────────────────── */
 .more-wrap { text-align: center; padding: 26px 0 40px; }
-.btn-more {
-  border: 1px solid var(--navy-line); background: #fff; color: var(--navy);
-  border-radius: 999px; padding: 10px 26px; font-size: 13px; font-weight: 600;
-  cursor: pointer; font-family: inherit;
+.pager {
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 5px;
 }
-.btn-more:hover { background: var(--navy); border-color: var(--navy); color: #fff; }
+.pager[hidden] { display: none; }
+.pager-btn {
+  min-width: 36px; height: 36px; padding: 0 10px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink-mid);
+  border-radius: 9px; font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; font-variant-numeric: tabular-nums;
+}
+.pager-btn:hover:not(:disabled) { border-color: var(--navy); color: var(--navy); }
+.pager-btn.is-current {
+  background: var(--navy); border-color: var(--navy); color: #fff; cursor: default;
+}
+.pager-btn:disabled:not(.is-current) { opacity: .35; cursor: default; }
+.pager-gap { color: var(--ink-soft); padding: 0 3px; }
 .empty { color: var(--ink-soft); }
 .skeleton {
   background: var(--surface); border: 1px solid var(--line);
