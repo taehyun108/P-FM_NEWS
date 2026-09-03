@@ -502,6 +502,16 @@ class Storage(ABC):
 
 ARTICLE_JSON_FIELDS = ("url_source_aliases", "keywords", "group_companies", "categories", "title_embedding")
 
+# 카드 표시에 필요한 articles 컬럼. title_embedding(행당 ~31KB)·url_source_aliases 는
+# 목록 조회에 쓰이지 않으므로 제외한다 — a.* 로 읽으면 목록 API 가 10배 느려진다.
+ARTICLE_CARD_COLS = ", ".join(f"a.{c}" for c in (
+    "id", "url_source", "url_canonical", "url_original", "title",
+    "press_id", "press_name", "author", "published_at", "collected_at",
+    "source_type", "thumbnail_url", "content_hash", "dedup_group_id",
+    "is_representative", "is_backfill", "importance_score", "sentiment",
+    "keywords", "group_companies", "categories", "analyzed_at", "status",
+))
+
 
 class SqliteStorage(Storage):
     """로컬 개발용. 배열·JSON 컬럼은 JSON 문자열로 저장한다."""
@@ -756,8 +766,11 @@ class SqliteStorage(Storage):
         return int(row["n"]) if row else 0
 
     def list_articles(self, limit: int, offset: int, since: datetime | None, query: str) -> list[dict]:
+        # a.* 를 쓰지 않는다 — title_embedding(행당 ~31KB)까지 읽어 목록 조회가 10배 느려진다.
+        # 카드에 필요한 컬럼만 고른다. (임베딩은 recent_articles_for_dedup 이 따로 읽는다)
         sql = (
-            "select a.*, s.summary_text, s.perspective_text, s.summary_source,"
+            f"select {ARTICLE_CARD_COLS},"
+            " s.summary_text, s.perspective_text, s.summary_source,"
             " w.total_score as swot_total, w.s_score, w.w_score, w.o_score, w.t_score,"
             " w.s_text, w.w_text, w.o_text, w.t_text"
             " from articles a"
@@ -1118,8 +1131,10 @@ class SupabaseStorage(Storage):
         return res.count or 0
 
     def list_articles(self, limit: int, offset: int, since: datetime | None, query: str) -> list[dict]:
+        # '*' 를 쓰지 않는다 — title_embedding(행당 ~31KB)까지 실어와 목록 조회가 크게 느려진다.
+        cols = ARTICLE_CARD_COLS.replace("a.", "")
         q = (self._t("articles")
-             .select("*, summaries(summary_text,perspective_text,summary_source),"
+             .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
                      " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
              .eq("status", "active").eq("is_representative", True))
         if since is not None:
@@ -1319,7 +1334,11 @@ SEED_KEYWORDS: list[tuple[str, str]] = (
         # 양극재·음극재·차세대 배터리 개발·연구 (포스코퓨처엠 사업 직결)
         "전고체 전해질", "리튬메탈 배터리", "황리튬 배터리", "실리콘 음극재", "하이니켈 양극재",
         "단결정 양극재", "건식 전극", "차세대 배터리", "배터리 소재 개발", "이차전지 신소재",
-        "배터리 연구", "양극재 신기술", "음극재 신기술"]]
+        "배터리 연구", "양극재 신기술", "음극재 신기술",
+        # 전방 수요 — 셀 업체·전기차·ESS (사용자 지정)
+        "배터리 수주", "배터리 공장 투자", "전기차 판매", "전기차 캐즘", "전기차 보조금",
+        "테슬라 배터리", "CATL 배터리", "BYD 배터리", "LG에너지솔루션", "삼성SDI", "SK온",
+        "ESS 시장", "에너지저장장치", "ESS 수주", "탄산리튬 가격", "니켈 가격"]]
     # '정책' 카테고리는 Google 검색 시 site:www.korea.kr 로 한정된다 (대한민국 정책브리핑).
     # 포스코 산업(철강·이차전지·에너지·통상·환경규제·인프라)에 영향이 있는 부처 발표를 폭넓게 수집.
     + [("정책", k) for k in
@@ -1893,22 +1912,38 @@ def is_trade_article(row: dict) -> bool:
     return is_trade_topic(row.get("title") or "", row.get("summary_text") or "")
 
 
-# 포스코퓨처엠 사업(양극재·음극재·소재)에 직결되는 차세대 배터리·소재 기술.
-# 이런 개발·연구 기사는 포스코 회사명이 없어도 수집한다. (사용자 지정)
-BATTERY_TECH_KW = [
-    "전고체", "전고체 배터리", "리튬메탈", "리튬금속 배터리", "황리튬", "황-리튬", "리튬황",
+# 포스코퓨처엠 사업(양극재·음극재)에 영향을 주는 배터리 생태계 전반.
+# 소재·기술 개발뿐 아니라 셀 업체·전기차 수요·ESS 시장까지 — 전부 전방 수요다.
+# 이 범위에 들면 포스코 회사명이 없어도 수집한다. (사용자 지정)
+BATTERY_SCOPE_KW = [
+    # 소재·차세대 기술
+    "전고체", "리튬메탈", "리튬금속 배터리", "황리튬", "황-리튬", "리튬황",
     "나트륨이온", "나트륨 배터리", "소듐이온", "소듐 배터리",
-    "하이니켈", "단결정 양극재", "코발트프리", "망간리치", "LMFP", "LFP 양극재",
+    "하이니켈", "단결정 양극재", "코발트프리", "망간리치", "LMFP", "LFP",
     "실리콘 음극", "실리콘음극재", "SiOx", "리튬메탈 음극", "무음극",
-    "고체 전해질", "고분자 전해질", "건식 전극", "드라이 전극",
-    "양극재 개발", "음극재 개발", "전구체 기술", "배터리 소재 개발", "이차전지 소재 개발",
-    "차세대 배터리", "차세대 이차전지", "차세대 전지", "배터리 기술 개발",
+    "고체 전해질", "고분자 전해질", "건식 전극", "드라이 전극", "전해액", "분리막",
+    "양극재", "음극재", "전구체", "차세대 배터리", "차세대 이차전지",
+    # 전지·셀
+    "이차전지", "2차전지", "배터리셀", "배터리 셀", "배터리팩", "배터리 공장", "기가팩토리",
+    "배터리 수주", "배터리 합작", "배터리 투자", "배터리 시장", "배터리 수요",
+    # 셀·완성차 업체 (전방 수요)
+    "LG에너지솔루션", "삼성SDI", "SK온", "CATL", "BYD", "파나소닉",
+    "테슬라", "Tesla", "리비안", "루시드", "폭스바겐 배터리", "GM 배터리", "포드 배터리",
+    # 전기차 수요
+    "전기차 판매", "전기차 수요", "전기차 보조금", "전기차 캐즘", "EV 수요", "전기차 시장",
+    # ESS (에너지저장)
+    "ESS", "에너지저장장치", "에너지저장시스템", "전력저장", "계통 안정화", "BESS",
+    # 원료
+    "리튬 가격", "니켈 가격", "코발트 가격", "탄산리튬", "수산화리튬", "흑연 공급",
 ]
 
 
-def is_battery_tech(title: str, extra: str = "") -> bool:
-    """양극재·음극재·차세대 배터리 소재 기술(개발·연구) 기사인가."""
-    return _kw_hit_any(f"{title}\n{extra}", BATTERY_TECH_KW)
+def is_battery_scope(title: str, extra: str = "") -> bool:
+    """포스코퓨처엠 전·후방(소재·셀·전기차·ESS·원료) 기사인가.
+
+    이 범위면 포스코 미언급이어도 수집한다 — 전방 수요·경쟁 동향이 사업에 직결된다.
+    """
+    return _kw_hit_any(f"{title}\n{extra}", BATTERY_SCOPE_KW)
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -3102,8 +3137,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                 continue
         elif is_trade:
             pass  # 통상 신호 + 산업 키워드가 확인됨 — 포스코 미언급 허용
-        elif is_battery_tech(item.title, f"{item.snippet or ''}\n{body[:1500]}"):
-            pass  # 양극재·음극재·차세대 배터리 소재 기술 — 포스코 미언급 허용 (사용자 지정)
+        elif is_battery_scope(item.title, f"{item.snippet or ''}\n{body[:1500]}"):
+            pass  # 배터리 생태계(소재·셀·전기차·ESS·원료) — 포스코 미언급 허용 (사용자 지정)
         elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
             # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
@@ -4066,7 +4101,7 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
         # 일반 기사는 수집 게이트에서 포스코 관련이 확인됐으므로 최소 '포스코'.
         if (not groups and not is_policy_brief(row)
                 and TRADE_CATEGORY not in jload(row.get("categories"), [])
-                and not is_battery_tech(row.get("title") or "", row.get("summary_text") or "")):
+                and not is_battery_scope(row.get("title") or "", row.get("summary_text") or "")):
             groups = ["포스코"]
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
     return groups, categories, row.get("press_name") or ""
@@ -4644,7 +4679,7 @@ def cmd_fixofftopic(ctx: Context) -> None:
     cands = []
     for r in rows:
         if (is_policy_brief(r) or is_trade_article(r)
-                or is_battery_tech(r.get("title") or "", r.get("summary_text") or "")):
+                or is_battery_scope(r.get("title") or "", r.get("summary_text") or "")):
             continue  # 정책·통상·배터리기술 기사는 포스코 미언급이어도 유지 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
@@ -5061,16 +5096,21 @@ def cmd_selftest() -> int:
     check("detect_categories: 요약에만 조치명이면 태깅 안 함",
           "글로벌 통상환경" in detect_categories("포스코 실적 회복세", "CBAM 대응 비용이 변수"), False)
 
-    print("\n[8-2d] 배터리·소재 기술 기사 (포스코 미언급 허용)")
-    check("전고체 배터리 개발 → 수집 대상",
-          is_battery_tech("전고체 배터리 상온 구동 성공…에너지밀도 2배"), True)
-    check("황-리튬 배터리 연구 → 수집 대상",
-          is_battery_tech("황 원소 활용한 황-리튬 배터리, 2천배 빠른 충방전"), True)
-    check("실리콘 음극재 신기술 → 수집 대상",
-          is_battery_tech("실리콘 음극재 팽창 잡는 바인더 개발"), True)
-    check("일반 전기차 판매 기사 → 아님",
-          is_battery_tech("테슬라 3분기 인도량 사상 최대"), False)
-    check("배터리 화재 사고 → 아님", is_battery_tech("ESS 배터리 화재로 공장 가동 중단"), False)
+    print("\n[8-2d] 배터리 생태계 기사 (포스코 미언급 허용)")
+    check("전고체 배터리 개발 → 수집",
+          is_battery_scope("전고체 배터리 상온 구동 성공…에너지밀도 2배"), True)
+    check("황-리튬 배터리 연구 → 수집",
+          is_battery_scope("황 원소 활용한 황-리튬 배터리, 2천배 빠른 충방전"), True)
+    check("실리콘 음극재 신기술 → 수집",
+          is_battery_scope("실리콘 음극재 팽창 잡는 바인더 개발"), True)
+    check("테슬라 인도량(전방 수요) → 수집",
+          is_battery_scope("테슬라 3분기 인도량 사상 최대"), True)
+    check("ESS 시장 기사 → 수집",
+          is_battery_scope("ESS 배터리 화재로 공장 가동 중단"), True)
+    check("전기차 캐즘 → 수집", is_battery_scope("전기차 캐즘 장기화…배터리 수요 둔화"), True)
+    check("리튬 가격 → 수집", is_battery_scope("탄산리튬 가격 반등"), True)
+    check("무관 기사는 여전히 제외", is_battery_scope("아파트 분양가 상승세"), False)
+    check("반도체 기사도 제외", is_battery_scope("삼성전자 HBM 신제품 공개"), False)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),
