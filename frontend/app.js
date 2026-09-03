@@ -270,7 +270,8 @@ function buildCard(item) {
     img.src = item.thumbnail_url;
     img.alt = '';
     img.loading = 'lazy';
-    img.addEventListener('error', () => thumb.replaceWith(buildLogoThumb(item)));
+    img.decoding = 'async';   // 디코딩을 메인 스레드에서 떼어내 스크롤 끊김을 줄인다
+    img.addEventListener('error', () => thumb.replaceWith(buildLogoThumb(item)), { once: true });
     if (item.url) {
       const a = el('a');
       a.href = item.url;

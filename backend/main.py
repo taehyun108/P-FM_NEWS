@@ -3820,23 +3820,27 @@ def check_master_password(ctx: Context, pw: str) -> bool:
     return bool(env_pw) and hmac.compare_digest(pw, env_pw)
 
 
-def build_card(row: dict) -> dict:
-    """카드 1건의 표시용 형태를 만든다. 칩 중복 제거를 여기서 한 번 더 한다. (PRD F6.2b)"""
-    # 저장 단계에서 이미 정리했지만 표시 단계에서 한 번 더 막는다(2중 방어).
+def card_tags(row: dict) -> tuple[list[str], list[str], str]:
+    """카드의 필터 대상 태그 (그룹사, 카테고리, 언론사명). build_card 와 같은 폴백을 쓴다.
+
+    목록·필터 응답에서 전체 행을 build_card 하지 않고 필터만 걸 때 쓴다.
+    """
     groups = normalize_group_list(jload(row.get("group_companies"), []))
-    # LLM 이 group_companies 를 비워 보냈으면 제목·요약에서 룰 기반으로 채운다.
-    # 카드에 '어느 그룹사 뉴스인지'를 항상 보이게 하기 위한 폴백이다.
     if not groups:
+        # LLM 이 group_companies 를 비워 보냈으면 제목·요약·키워드에서 룰 기반으로 채운다.
+        # active 기사는 수집 게이트에서 이미 포스코 관련이 확인됐으므로 최소 '포스코'.
         probe = " ".join([
             row.get("title") or "", row.get("summary_text") or "",
             " ".join(jload(row.get("keywords"), [])),
         ])
-        # active 기사는 수집 게이트에서 이미 포스코 관련이 확인됐다.
-        # 계열사를 특정 못 하면 최소한 '포스코'로 표시한다.
         groups = normalize_group_list(detect_group_companies(probe)) or ["포스코"]
-    # 칩 정리는 여기서 끝낸다 — 프런트는 받은 그대로 그린다(중복 로직 금지).
-    # 그룹사·카테고리와 겹치는 키워드는 칩이 두 번 보이므로 제외한다.
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
+    return groups, categories, row.get("press_name") or ""
+
+
+def build_card(row: dict) -> dict:
+    """카드 1건의 표시용 형태를 만든다. 칩 중복 제거를 여기서 한 번 더 한다. (PRD F6.2b)"""
+    groups, categories, _ = card_tags(row)
     keywords = dedupe_chips(jload(row.get("keywords"), []), exclude=groups + categories)
 
     swot = None
@@ -3883,17 +3887,27 @@ def _split_multi(value: str) -> list[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
 
-def apply_filters(cards: list[dict], groups: list[str], cats: list[str], presses: list[str]) -> list[dict]:
-    """같은 그룹 안은 OR, 다른 그룹 사이는 AND. (PRD F6.1a)"""
-    def matches(card: dict) -> bool:
-        if groups and not (set(map(normalize_chip, groups)) & set(map(normalize_chip, card["group_companies"]))):
+def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses: list[str]) -> list[dict]:
+    """행 목록을 필터한다. 같은 그룹 안은 OR, 다른 그룹 사이는 AND. (PRD F6.1a)
+
+    카드로 변환하지 않고 card_tags 만 계산해 필터한다 — 전체 스캔 비용을 줄인다.
+    """
+    g_keys = {normalize_chip(x) for x in groups}
+    c_keys = {normalize_chip(x) for x in cats}
+    p_keys = {normalize_chip(x) for x in presses}
+    if not (g_keys or c_keys or p_keys):
+        return list(rows)
+
+    def matches(row: dict) -> bool:
+        rg, rc, rp = card_tags(row)
+        if g_keys and not (g_keys & {normalize_chip(x) for x in rg}):
             return False
-        if cats and not (set(map(normalize_chip, cats)) & set(map(normalize_chip, card["categories"]))):
+        if c_keys and not (c_keys & {normalize_chip(x) for x in rc}):
             return False
-        if presses and normalize_chip(card["press_name"]) not in set(map(normalize_chip, presses)):
+        if p_keys and normalize_chip(rp) not in p_keys:
             return False
         return True
-    return [c for c in cards if matches(c)]
+    return [r for r in rows if matches(r)]
 
 
 def create_app(ctx: Context):
@@ -3923,24 +3937,25 @@ def create_app(ctx: Context):
     # 수동 URL 등록이 겹치지 않게 직렬화한다(SQLite 쓰기 경합 방지).
     _manual_lock = threading.Lock()
 
-    def _scan(period: str, query: str) -> list[dict]:
+    def _scan_rows(period: str, query: str) -> list[dict]:
         hours = PERIOD_HOURS.get(period, 0)
         since = now_utc() - timedelta(hours=hours) if hours else None
-        rows = ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
-        return [build_card(r) for r in rows]
+        return ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
 
     @app.get("/api/articles")
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
-        cards = apply_filters(_scan(period, q), _split_multi(group), _split_multi(cat), _split_multi(press))
+        matched = apply_filters(_scan_rows(period, q),
+                                _split_multi(group), _split_multi(cat), _split_multi(press))
         start = (page - 1) * size
+        # 필터를 통과한 행만 세고, 화면에 보일 페이지 분량만 카드로 만든다.
         return JSONResponse({
-            "total": len(cards),
+            "total": len(matched),
             "page": page,
             "size": size,
-            "items": cards[start:start + size],
+            "items": [build_card(r) for r in matched[start:start + size]],
         })
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
@@ -3966,11 +3981,12 @@ def create_app(ctx: Context):
         groups: list[str] = []
         cats: list[str] = []
         presses: list[str] = []
-        for card in _scan("all", ""):
-            groups += card["group_companies"]
-            cats += card["categories"]
-            if card["press_name"]:
-                presses.append(card["press_name"])
+        for row in _scan_rows("all", ""):
+            g, c, pname = card_tags(row)
+            groups += g
+            cats += c
+            if pname:
+                presses.append(pname)
         data = {
             "groups": _ordered(groups, GROUP_ORDER),
             "categories": _ordered(cats, CATEGORY_ORDER),
@@ -4154,19 +4170,27 @@ def create_app(ctx: Context):
     if os.path.isdir(FRONTEND_DIR):
         from fastapi.responses import HTMLResponse
 
-        @app.get("/")
-        def index():
+        _index_cache: dict[str, Any] = {"sig": None, "html": ""}
+        _index_files = [os.path.join(FRONTEND_DIR, n)
+                        for n in ("index.html", "style.css", "app.js")]
+
+        def _render_index() -> str:
             # JS·CSS 를 HTML 에 인라인해서 내보낸다. 별도 정적 요청이 없으므로
             # 쿼리스트링을 무시하는 프록시가 있어도 옛 파일을 내줄 수 없다.
-            html = open(os.path.join(FRONTEND_DIR, "index.html"), "r", encoding="utf-8").read()
-            css = open(os.path.join(FRONTEND_DIR, "style.css"), "r", encoding="utf-8").read()
-            js = open(os.path.join(FRONTEND_DIR, "app.js"), "r", encoding="utf-8").read()
+            html, css, js = (open(p, "r", encoding="utf-8").read() for p in _index_files)
             # 리터럴 치환만 한다(re.sub 은 repl 의 \s 등을 이스케이프로 해석해 깨진다).
             html = html.replace('<link rel="stylesheet" href="./style.css">',
                                 f"<style>\n{css}\n</style>")
-            html = html.replace('<script src="./app.js"></script>',
+            return html.replace('<script src="./app.js"></script>',
                                 f"<script>\n{js}\n</script>")
-            return HTMLResponse(html)
+
+        @app.get("/")
+        def index():
+            # 세 파일의 수정시각이 그대로면 조립 결과를 재사용한다(매 요청 디스크 3회 읽기·치환 방지).
+            sig = tuple(os.path.getmtime(p) for p in _index_files)
+            if _index_cache["sig"] != sig:
+                _index_cache.update(sig=sig, html=_render_index())
+            return HTMLResponse(_index_cache["html"])
 
         # 직접 접근(디버그)용으로 파일도 계속 서빙한다.
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
