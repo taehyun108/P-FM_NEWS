@@ -4077,10 +4077,11 @@ def create_app(ctx: Context):
             html = open(os.path.join(FRONTEND_DIR, "index.html"), "r", encoding="utf-8").read()
             css = open(os.path.join(FRONTEND_DIR, "style.css"), "r", encoding="utf-8").read()
             js = open(os.path.join(FRONTEND_DIR, "app.js"), "r", encoding="utf-8").read()
-            html = re.sub(r'<link[^>]+href="\./style\.css[^"]*"[^>]*>',
-                          f"<style>\n{css}\n</style>", html)
-            html = re.sub(r'<script[^>]+src="\./app\.js[^"]*"[^>]*></script>',
-                          f"<script>\n{js}\n</script>", html)
+            # 리터럴 치환만 한다(re.sub 은 repl 의 \s 등을 이스케이프로 해석해 깨진다).
+            html = html.replace('<link rel="stylesheet" href="./style.css">',
+                                f"<style>\n{css}\n</style>")
+            html = html.replace('<script src="./app.js"></script>',
+                                f"<script>\n{js}\n</script>")
             return HTMLResponse(html)
 
         # 직접 접근(디버그)용으로 파일도 계속 서빙한다.
