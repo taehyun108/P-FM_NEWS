@@ -2287,8 +2287,12 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 주가 호재/악재가 아니라 포스코 그룹의 대외협력 대응 필요성 기준으로 판단한다
 
 [SWOT]
-- swot: 포스코퓨처엠 관점의 S/W/O/T. 각 항목 score(0~100 정수)와 text(1~2줄 근거)
-- 기사에 근거가 없는 항목은 score 0, text "해당 없음". 억지로 채우지 않는다
+- swot: 이 기사의 사안이 포스코 그룹(철강·이차전지소재·인프라 전반)에 주는
+  영향을 S/W/O/T 로 평가한다. 각 항목 score(0~100 정수)와 text(1~2줄 근거)
+- 기사 본문에서 실제로 읽어낼 수 있는 함의를 적고, 최소한 한 항목은 채운다.
+  신사업·수요 확대·우호적 협력 = O / 경쟁 심화·규제·공급과잉·자원 리스크 = T /
+  자사 기술력·생산능력·계약·점유율 = S / 비용 부담·생산 차질·구조적 약점 = W
+- 정말로 근거를 찾을 수 없는 항목만 score 0, text "해당 없음"
 
 [출력 형식 — 이 구조를 정확히 지킨다]
 {{"summary":["문장1","문장2","문장3"],"perspective":"...","keywords":["..."],
@@ -4064,9 +4068,20 @@ def create_app(ctx: Context):
         return JSONResponse(result, status_code=code)
 
     if os.path.isdir(FRONTEND_DIR):
+        from fastapi.responses import HTMLResponse
+
         @app.get("/")
         def index():
-            return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+            path = os.path.join(FRONTEND_DIR, "index.html")
+            html = open(path, "r", encoding="utf-8").read()
+            # 정적 파일 참조에 파일 수정시각을 붙여 배포마다 캐시를 자동 무효화한다.
+            # (프록시가 옛 ?v=... 를 계속 내주던 문제를 원천 차단)
+            for name in ("app.js", "style.css"):
+                fp = os.path.join(FRONTEND_DIR, name)
+                if os.path.exists(fp):
+                    ver = int(os.path.getmtime(fp))
+                    html = re.sub(rf"\./{name}(\?v=[^\"']*)?", f"./{name}?v={ver}", html)
+            return HTMLResponse(html)
 
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
