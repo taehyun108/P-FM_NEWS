@@ -415,3 +415,29 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
   background: var(--navy-soft); font-size: 13px; color: var(--navy-dark);
 }
 .url-add-confirm[hidden] { display: none; }
+
+/* ── 주간동향 패널 ─────────────────────────────────────────────── */
+.weekly-panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 20px 22px; margin: 22px 0 16px;
+}
+.weekly-panel[hidden] { display: none; }
+.weekly-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 14px; flex-wrap: wrap; margin-bottom: 14px;
+  border-bottom: 1px solid var(--line); padding-bottom: 12px;
+}
+.weekly-head h2 { margin: 0; font-size: 17px; color: var(--navy); }
+.weekly-meta { margin: 4px 0 0; font-size: 12px; color: var(--ink-soft); }
+.weekly-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.weekly-pick {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px;
+  font-family: inherit; font-size: 12.5px; color: var(--ink-mid); background: #fff;
+}
+.weekly-pick[hidden] { display: none; }
+.weekly-body { font-size: 14px; }
+.weekly-body .weekly-report { max-width: none !important; }
+.weekly-body h2 { font-size: 15px; }
+.weekly-body ol { line-height: 1.6; }
+.weekly-body .empty { color: var(--ink-soft); padding: 24px 0; text-align: center; }

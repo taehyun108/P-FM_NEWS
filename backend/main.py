@@ -180,10 +180,23 @@ class Config:
     api_host: str
     api_port: int
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
+    # 주간 레포트 (월요일 아침 이메일)
+    weekly_enabled: bool
+    weekly_to: list[str]          # 수신자 이메일 (쉼표로 여러 명)
+    weekly_hour: int              # 월요일 발송 시각 (0~23, 서버 로컬시간)
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str                # 발신 Gmail 주소
+    smtp_app_password: str        # Gmail 앱 비밀번호 16자리
 
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def smtp_enabled(self) -> bool:
+        """이메일 발송 가능 여부. 미설정이면 레포트는 생성·저장만 하고 발송은 건너뛴다."""
+        return bool(self.smtp_user and self.smtp_app_password and self.weekly_to)
 
     @property
     def naver_enabled(self) -> bool:
@@ -248,6 +261,14 @@ def load_config() -> Config:
         api_host=get_env("API_HOST", "127.0.0.1"),
         api_port=get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
+        weekly_enabled=get_env("WEEKLY_REPORT_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        weekly_to=[e.strip() for e in get_env("WEEKLY_REPORT_TO", "").replace(";", ",").split(",")
+                   if e.strip()],
+        weekly_hour=get_env_int("WEEKLY_REPORT_HOUR", 7, 0, 23),
+        smtp_host=get_env("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=get_env_int("SMTP_PORT", 587, 1, 65535),
+        smtp_user=get_env("SMTP_USER"),
+        smtp_app_password=get_env("SMTP_APP_PASSWORD").replace(" ", ""),
     )
 
 
@@ -444,6 +465,20 @@ class Storage(ABC):
     def stats(self) -> dict: ...
 
     @abstractmethod
+    def save_weekly_report(self, row: dict) -> None: ...
+
+    @abstractmethod
+    def list_weekly_reports(self, limit: int) -> list[dict]:
+        """이력 목록 — payload·html 제외, 메타만."""
+
+    @abstractmethod
+    def get_weekly_report(self, report_id: str | None) -> dict | None:
+        """report_id 가 None 이면 가장 최근 레포트."""
+
+    @abstractmethod
+    def mark_weekly_sent(self, report_id: str, sent_at: str | None, error: str | None) -> None: ...
+
+    @abstractmethod
     def upsert_quote(self, row: dict) -> None: ...
 
     @abstractmethod
@@ -596,6 +631,7 @@ class SqliteStorage(Storage):
             "alter table run_state add column trade_required_keywords TEXT default '[]'",
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
+            "alter table run_state add column last_weekly_report_at TEXT",
         ]
         for sql in migrations:
             try:
@@ -834,6 +870,39 @@ class SqliteStorage(Storage):
             "notify_failed": int(failed["n"]) if failed else 0,
             "analysis_pending": self.unanalyzed_count(),
         }
+
+    # ── 주간 레포트 ──────────────────────────────────────────────────
+    def save_weekly_report(self, row: dict) -> None:
+        self._exec(
+            "insert into weekly_reports"
+            " (id, period_start, period_end, generated_at, sent_at, send_error, payload, html)"
+            " values (?,?,?,?,?,?,?,?)",
+            (row["id"], row["period_start"], row["period_end"], row["generated_at"],
+             row.get("sent_at"), row.get("send_error"),
+             jdump(row["payload"]) if not isinstance(row["payload"], str) else row["payload"],
+             row["html"]),
+        )
+
+    def list_weekly_reports(self, limit: int) -> list[dict]:
+        return self._rows(
+            "select id, period_start, period_end, generated_at, sent_at, send_error"
+            " from weekly_reports order by generated_at desc limit ?", (limit,))
+
+    def get_weekly_report(self, report_id: str | None) -> dict | None:
+        if report_id:
+            rows = self._rows("select * from weekly_reports where id=?", (report_id,))
+        else:
+            rows = self._rows(
+                "select * from weekly_reports order by generated_at desc limit 1")
+        if not rows:
+            return None
+        row = rows[0]
+        row["payload"] = jload(row.get("payload"), {})
+        return row
+
+    def mark_weekly_sent(self, report_id: str, sent_at: str | None, error: str | None) -> None:
+        self._exec("update weekly_reports set sent_at=?, send_error=? where id=?",
+                   (sent_at, error, report_id))
 
     def upsert_quote(self, row: dict) -> None:
         data = self._encode(row)
@@ -1206,6 +1275,38 @@ class SupabaseStorage(Storage):
             "notify_failed": failed,
             "analysis_pending": self.unanalyzed_count(),
         }
+
+    def save_weekly_report(self, row: dict) -> None:
+        payload = row["payload"]
+        self._t("weekly_reports").insert({
+            "id": row["id"], "period_start": row["period_start"], "period_end": row["period_end"],
+            "generated_at": row["generated_at"], "sent_at": row.get("sent_at"),
+            "send_error": row.get("send_error"),
+            "payload": jload(payload, {}) if isinstance(payload, str) else payload,
+            "html": row["html"],
+        }).execute()
+
+    def list_weekly_reports(self, limit: int) -> list[dict]:
+        return (self._t("weekly_reports")
+                .select("id, period_start, period_end, generated_at, sent_at, send_error")
+                .order("generated_at", desc=True).limit(limit).execute().data)
+
+    def get_weekly_report(self, report_id: str | None) -> dict | None:
+        q = self._t("weekly_reports").select("*")
+        if report_id:
+            q = q.eq("id", report_id)
+        else:
+            q = q.order("generated_at", desc=True).limit(1)
+        rows = q.execute().data
+        if not rows:
+            return None
+        row = rows[0]
+        row["payload"] = jload(row.get("payload"), {})
+        return row
+
+    def mark_weekly_sent(self, report_id: str, sent_at: str | None, error: str | None) -> None:
+        (self._t("weekly_reports").update({"sent_at": sent_at, "send_error": error})
+         .eq("id", report_id).execute())
 
     def upsert_quote(self, row: dict) -> None:
         self._t("market_quotes").upsert(row, on_conflict="symbol").execute()
@@ -1656,29 +1757,13 @@ CATEGORY_RULES: dict[str, list[str]] = {
              # 포스코 그룹 사업 전반 — 건설·인프라·로봇·자동화
              "재건축", "재개발", "정비사업", "시공", "수주", "분양", "플랜트", "EPC",
              "로봇", "협동로봇", "휴머노이드", "스마트팩토리"],
-    # '정부/정책'과 '법령'을 분리한다. 둘 다 '정부'·'정책' 같은 흔한 단어는 넣지 않고
-    # 행정·입법을 각각 가리키는 구체 용어만 쓴다.
+    # 정부/정책: '정부'·'정책' 같은 흔한 단어는 넣지 않고 행정·입법을 가리키는 구체 용어만.
     # '관세'·'IRA' 는 뺐다 — 통상 조치는 '글로벌 통상환경'이 담당하고, 여기 두면
     # 관세를 스치듯 언급한 실적·시황 기사까지 정책으로 태깅된다.
     "정부/정책": ["국회 예산", "산업부", "환경부", "기재부", "공정위", "보조금", "특화단지",
                   "국정감사", "예비타당성", "예타", "국정과제", "부처 합동", "범부처",
-                  "정부 지원", "정책 지원", "육성 방안", "규제 완화", "규제 혁신", "규제 샌드박스"],
-    # 법령: '규제'·'제재'·'입법' 같은 흔한 낱말은 뺀다(비즈니스 기사에서 관용적으로 쓰여
-    #   23/29건이 오태깅됐다). 입법 절차·행정처분·판결·개별 법률명만 남기고,
-    #   detect_categories 가 '핵심어가 제목에 있을 때만' 태깅한다(TITLE_ANCHORED_CATEGORIES).
-    "법령": [
-        # 입법 절차
-        "개정안", "법률안", "제정안", "법안 발의", "법안 통과", "입법예고", "입법 예고",
-        "본회의 통과", "국회 통과", "법사위", "상임위 통과", "시행령", "시행규칙", "특별법 제정",
-        # 행정처분·제재
-        "과징금", "과태료", "행정처분", "시정명령", "영업정지", "인가 취소", "허가 취소",
-        "면허 취소", "리콜 명령", "제재금 부과", "검찰 송치", "압수수색",
-        # 사법
-        "위헌", "합헌", "대법원 판결", "파기환송", "손해배상 판결", "직접고용 판결", "무죄 선고",
-        # 개별 법률
-        "중대재해처벌법", "공정거래법", "하도급법", "화학물질관리법", "화평법", "화관법",
-        "자원순환기본법", "탄소중립기본법", "노란봉투법",
-    ],
+                  "정부 지원", "정책 지원", "육성 방안", "규제 완화", "규제 혁신", "규제 샌드박스",
+                  "개정안", "시행령", "특별법", "입법예고", "본회의 통과", "중대재해처벌법"],
     # 미국·유럽·중국 등 주요국의 명시적 통상 조치. 정의는 TRADE_MEASURE_KW 와 맞춘다.
     # detect_categories 가 '제목에 조치명' 조건을 한 번 더 건다.
     "글로벌 통상환경": TRADE_MEASURE_KW,
@@ -1687,10 +1772,9 @@ CATEGORY_RULES: dict[str, list[str]] = {
                   "기관 순매수", "배당"],
 }
 
-LAW_CATEGORY = "법령"
 # 이 카테고리들은 '핵심어가 제목에 있을 때만' 태깅한다. 요약·본문에 스친 언급은
-# 부차 주제라, 넣으면 필터가 변별력을 잃는다(법령은 23/29건이 '규제' 한 낱말로 오태깅됐다).
-TITLE_ANCHORED_CATEGORIES = (TRADE_CATEGORY, LAW_CATEGORY)
+# 부차 주제라, 넣으면 필터가 변별력을 잃는다.
+TITLE_ANCHORED_CATEGORIES = (TRADE_CATEGORY,)
 
 # 중요도 가중치 (PRD F3.2)
 SCORE_FUTUREM_TITLE = 50
@@ -2498,7 +2582,7 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     title_l = (title or "").lower()
     found = [name for name, words in CATEGORY_RULES.items()
              if any(w.lower() in lowered for w in words)]
-    # 제목 고정 카테고리(통상·법령): 핵심어가 제목에 없으면 부차 주제라 뺀다.
+    # 제목 고정 카테고리(글로벌 통상환경): 핵심어가 제목에 없으면 부차 주제라 뺀다.
     for cat in TITLE_ANCHORED_CATEGORIES:
         if cat in found and not _kw_hit_any(
                 title_l, [w.lower() for w in CATEGORY_RULES[cat]]):
@@ -2698,6 +2782,39 @@ class LLMClient:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
         return resp.choices[0].message.content or ""
+
+    def weekly_brief(self, kind: str, name: str, articles: list[dict]) -> dict:
+        """주간 레포트 섹션 1건을 합성한다.
+
+        kind='swot'  → {"s","w","o","t"} 각 2~3문장 (그룹사 섹션)
+        kind='impact'→ {"impact": 3~4문장}          (정부/정책·글로벌 통상 섹션)
+        기사가 없으면 빈 dict. 실패해도 레포트 전체가 죽지 않도록 예외를 삼킨다.
+        """
+        if not articles:
+            return {}
+        digest = "\n".join(
+            f"- ({a.get('published_at','')[:10]}) {a.get('title','')}\n  {a.get('summary_text') or ''}"
+            for a in articles)
+        if kind == "swot":
+            system = ("당신은 포스코 그룹 전략 담당 애널리스트다. 아래 한 주간 기사만 근거로 "
+                      "해당 계열사 관점의 주간 SWOT 를 한국어로 작성하고 JSON 으로만 답한다.")
+            user = (f"[대상] {name}\n[이번 주 주요 기사]\n{digest}\n\n"
+                    "각 항목 2~3문장, 기사에서 실제로 읽어낼 수 있는 내용만. 근거가 없으면 "
+                    '"이번 주 해당 신호 없음". 형식: '
+                    '{"s":"...","w":"...","o":"...","t":"..."}')
+        else:
+            system = ("당신은 포스코 그룹 대외전략 담당이다. 아래 한 주간 기사만 근거로 "
+                      "이 이슈들이 포스코 그룹(철강·이차전지소재·인프라)에 미치는 영향을 "
+                      "한국어로 정리하고 JSON 으로만 답한다.")
+            user = (f"[주제] {name}\n[이번 주 주요 기사]\n{digest}\n\n"
+                    "3~4문장으로 영향과 대응 관점을 정리한다. 단정하지 말고 검토 필요 톤. "
+                    '형식: {"impact":"..."}')
+        try:
+            content, _ = self._chat(system, user)
+            return _parse_json_object(content) or {}
+        except Exception as exc:
+            log.warning("주간 브리핑 생성 실패 (%s/%s): %s", kind, name, exc)
+            return {}
 
     def embed(self, text: str) -> list[float] | None:
         if self._embed_calls >= self.max_embed_per_run:
@@ -4126,6 +4243,242 @@ def telegram_bot_loop(ctx: Context, stop: threading.Event) -> None:
 
 
 # =====================================================================
+# 14c. 주간 레포트 (월요일 아침 이메일)
+#      최근 7일 기사를 섹션별로 모아 LLM 이 주간 SWOT·영향분석을 합성하고,
+#      HTML 로 렌더해 Gmail SMTP 로 보낸다. 같은 HTML 을 웹 '주간동향' 탭이 재사용한다.
+# =====================================================================
+
+WEEKLY_PERIOD_DAYS = 7
+WEEKLY_ARTICLES_PER_SECTION = 5
+
+# (제목, 종류, 매칭기준)  종류: 'group'=그룹사 태그 / 'topic'=카테고리 태그
+#   group  → LLM 주간 종합 SWOT
+#   topic  → LLM '포스코 그룹 영향' 분석
+WEEKLY_SECTIONS: list[tuple[str, str, str]] = [
+    ("포스코퓨처엠", "group", "포스코퓨처엠"),
+    ("포스코홀딩스", "group", "포스코홀딩스"),
+    ("포스코", "group", "포스코"),
+    ("포스코이앤씨", "group", "포스코이앤씨"),
+    ("포스코인터내셔널", "group", "포스코인터내셔널"),
+    ("정부/정책", "topic", "정부/정책"),
+    ("글로벌 통상환경", "topic", "글로벌 통상환경"),
+]
+
+
+def weekly_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """집계 구간 — 발송 시점 기준 최근 7일. (사용자 지정)"""
+    end = now or now_utc()
+    return end - timedelta(days=WEEKLY_PERIOD_DAYS), end
+
+
+def _weekly_pick(rows: list[dict], kind: str, key: str) -> list[dict]:
+    """섹션 대상 기사를 최대 5건 고른다. rows 는 이미 기간·활성·대표만.
+
+    그룹사 섹션은 '제목에 회사명이 있는 기사'를 먼저 올린다. 태그만 붙은
+    시황·기관수급 기사(제목은 다른 종목)가 상위를 차지하는 것을 막는다.
+    """
+    aliases = [a.lower() for a in GROUP_COMPANIES.get(key, [key])] if kind == "group" else []
+    hits = []
+    for r in rows:
+        groups, cats, _ = card_tags(r)
+        if not ((key in groups) if kind == "group" else (key in cats)):
+            continue
+        title_hit = any(a in (r.get("title") or "").lower() for a in aliases)
+        # 제목에 회사명이 없는데 카테고리가 시황뿐이면 = 코스피 종가표 같은 잡음. 건너뛴다.
+        if kind == "group" and not title_hit and cats and set(cats) <= {"시장/주가"}:
+            continue
+        hits.append((title_hit, r))
+    hits.sort(key=lambda t: (t[0], int(t[1].get("importance_score") or 0),
+                             t[1].get("published_at") or ""), reverse=True)
+    return [r for _, r in hits[:WEEKLY_ARTICLES_PER_SECTION]]
+
+
+def _weekly_article_view(r: dict) -> dict:
+    """레포트 payload 에 담을 기사 1건의 표시용 형태."""
+    return {
+        "title": r.get("title") or "",
+        "url": r.get("url_canonical") or r.get("url_original") or r.get("url_source") or "",
+        "press": r.get("press_name") or "",
+        "published_at": r.get("published_at") or "",
+        "score": int(r.get("importance_score") or 0),
+        "summary": r.get("summary_text") or "",
+    }
+
+
+def build_weekly_report(ctx: Context) -> dict:
+    """주간 레포트 payload 를 만든다. LLM 을 섹션당 최대 1회 호출한다(총 7회)."""
+    start, end = weekly_window()
+    rows = ctx.storage.list_articles(3000, 0, start, "")
+    rows = [r for r in rows if (r.get("published_at") or "") <= iso(end)]
+
+    sections = []
+    for label, kind, key in WEEKLY_SECTIONS:
+        picked = _weekly_pick(rows, kind, key)
+        brief = ctx.llm.weekly_brief(
+            "swot" if kind == "group" else "impact", label, picked) if picked else {}
+        sections.append({
+            "label": label,
+            "kind": kind,
+            "articles": [_weekly_article_view(r) for r in picked],
+            "swot": {k: brief.get(k, "") for k in ("s", "w", "o", "t")} if kind == "group" else None,
+            "impact": brief.get("impact", "") if kind == "topic" else None,
+        })
+    return {
+        "period_start": iso(start),
+        "period_end": iso(end),
+        "generated_at": iso(now_utc()),
+        "article_count": len(rows),
+        "sections": sections,
+    }
+
+
+_SWOT_LABELS = {"s": "강점 (S)", "w": "약점 (W)", "o": "기회 (O)", "t": "위협 (T)"}
+
+
+def render_weekly_html(payload: dict) -> str:
+    """이메일·웹 공용 HTML. 이메일 클라이언트 호환을 위해 인라인 스타일·표 레이아웃만 쓴다."""
+    ps = (payload.get("period_start") or "")[:10]
+    pe = (payload.get("period_end") or "")[:10]
+    out = [
+        '<div class="weekly-report" style="max-width:760px;margin:0 auto;'
+        'font-family:-apple-system,BlinkMacSystemFont,\'Malgun Gothic\',\'맑은 고딕\',sans-serif;'
+        'color:#1a1a1a;line-height:1.6;">',
+        f'<h1 style="font-size:20px;margin:0 0 4px;">📈 포스코 그룹 주간동향</h1>',
+        f'<p style="color:#667085;font-size:13px;margin:0 0 24px;">집계 기간 {esc(ps)} ~ {esc(pe)}'
+        f' · 대상 기사 {payload.get("article_count", 0)}건</p>',
+    ]
+    for i, sec in enumerate(payload.get("sections", []), 1):
+        out.append(
+            f'<h2 style="font-size:16px;margin:28px 0 10px;padding-bottom:6px;'
+            f'border-bottom:2px solid #16337A;color:#16337A;">{i}. {esc(sec["label"])}</h2>')
+        arts = sec.get("articles") or []
+        if not arts:
+            out.append('<p style="color:#98a2b3;font-size:13px;">이번 주 해당 기사가 없습니다.</p>')
+            continue
+        out.append('<ol style="margin:0 0 14px;padding-left:20px;font-size:14px;">')
+        for a in arts:
+            d = (a.get("published_at") or "")[:10]
+            out.append(
+                f'<li style="margin-bottom:8px;">'
+                f'<a href="{esc(a["url"])}" style="color:#16337A;text-decoration:none;font-weight:600;">'
+                f'{esc(a["title"])}</a>'
+                f'<br><span style="color:#98a2b3;font-size:12px;">{esc(a["press"])} · {esc(d)} · 중요도 {a["score"]}</span>'
+                f'<br><span style="color:#475467;font-size:13px;">{esc(a["summary"])}</span></li>')
+        out.append('</ol>')
+
+        if sec.get("kind") == "group" and sec.get("swot"):
+            out.append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                       'style="border-collapse:collapse;margin:6px 0 4px;font-size:13px;">')
+            sw = sec["swot"]
+            for row_keys in (("s", "w"), ("o", "t")):
+                out.append('<tr>')
+                for k in row_keys:
+                    out.append(
+                        f'<td width="50%" valign="top" style="border:1px solid #e4e7ec;padding:10px;">'
+                        f'<b style="color:#16337A;">{_SWOT_LABELS[k]}</b><br>'
+                        f'<span style="color:#344054;">{esc(sw.get(k) or "—")}</span></td>')
+                out.append('</tr>')
+            out.append('</table>')
+        elif sec.get("kind") == "topic" and sec.get("impact"):
+            out.append(
+                '<div style="background:#f2f5fb;border-left:3px solid #16337A;padding:10px 12px;'
+                'font-size:13px;color:#344054;margin:4px 0;">'
+                f'<b style="color:#16337A;">포스코 그룹 영향</b><br>{esc(sec["impact"])}</div>')
+    out.append('<p style="color:#98a2b3;font-size:11px;margin-top:32px;border-top:1px solid #e4e7ec;'
+               'padding-top:12px;">이 레포트는 수집·요약된 공개 기사와 AI 분석을 기반으로 자동 생성되었습니다. '
+               '원문 저작권은 각 언론사에 있습니다.</p>')
+    out.append('</div>')
+    return "\n".join(out)
+
+
+def _html_to_text(html: str) -> str:
+    """이메일 plain 대체본 — 태그를 지운 최소 텍스트."""
+    text = re.sub(r"<(br|/p|/h[12]|/li|/tr)[^>]*>", "\n", html, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return html_mod.unescape(text).strip()
+
+
+def send_report_email(cfg: Config, subject: str, html_body: str) -> tuple[bool, str | None]:
+    """Gmail SMTP(STARTTLS)로 HTML 메일 1건을 보낸다. 표준 라이브러리만 사용."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.utils import formatdate, make_msgid
+
+    if not cfg.smtp_enabled:
+        return False, "SMTP 미설정 (SMTP_USER · SMTP_APP_PASSWORD · WEEKLY_REPORT_TO 확인)"
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = cfg.smtp_user
+    msg["To"] = ", ".join(cfg.weekly_to)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.attach(MIMEText(_html_to_text(html_body), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    try:
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(cfg.smtp_user, cfg.smtp_app_password)
+            s.sendmail(cfg.smtp_user, cfg.weekly_to, msg.as_string())
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def run_weekly_report(ctx: Context, send: bool = True) -> dict:
+    """레포트를 생성·저장하고, send 면 이메일까지 보낸다. 저장된 레포트 dict 를 돌려준다."""
+    log.info("주간 레포트 생성 시작 (최근 %d일)", WEEKLY_PERIOD_DAYS)
+    payload = build_weekly_report(ctx)
+    html = render_weekly_html(payload)
+    report_id = new_id()
+    pe = (payload["period_end"] or "")[:10]
+    row = {
+        "id": report_id,
+        "period_start": payload["period_start"],
+        "period_end": payload["period_end"],
+        "generated_at": payload["generated_at"],
+        "sent_at": None,
+        "send_error": None,
+        "payload": payload,
+        "html": html,
+    }
+    ctx.storage.save_weekly_report(row)
+
+    if send:
+        ok, err = send_report_email(ctx.cfg, f"[P-FM] 포스코 그룹 주간동향 ({pe})", html)
+        if ok:
+            sent_at = iso(now_utc())
+            ctx.storage.mark_weekly_sent(report_id, sent_at, None)
+            row["sent_at"] = sent_at
+            log.info("주간 레포트 발송 완료 → %s", ", ".join(ctx.cfg.weekly_to))
+        else:
+            ctx.storage.mark_weekly_sent(report_id, None, err)
+            row["send_error"] = err
+            log.warning("주간 레포트 발송 실패: %s", err)
+    ctx.storage.set_run_state({"last_weekly_report_at": iso(now_utc())})
+    return row
+
+
+def maybe_run_weekly(ctx: Context) -> None:
+    """파이프라인 매 회차 호출 — 월요일 지정 시각이 지났고 이번 주 미발송이면 실행."""
+    cfg = ctx.cfg
+    if not cfg.weekly_enabled:
+        return
+    now_local = datetime.now()
+    if now_local.weekday() != 0 or now_local.hour < cfg.weekly_hour:
+        return
+    last = parse_dt(ctx.storage.get_run_state().get("last_weekly_report_at"))
+    if last is not None and (now_utc() - last) < timedelta(days=6):
+        return  # 이번 주 이미 처리됨
+    try:
+        run_weekly_report(ctx, send=True)
+    except Exception as exc:
+        log.exception("주간 레포트 처리 중 오류: %s", exc)
+
+
+# =====================================================================
 # 15. API 서버 (PRD F6)
 #     프론트엔드는 외부 API 와 DB 에 직접 접근하지 않고 여기만 호출한다.
 # =====================================================================
@@ -4327,7 +4680,7 @@ def create_app(ctx: Context):
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
     GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
     CATEGORY_ORDER = ["양극재", "음극재", "배터리·이차전지", "산업", "시장/주가",
-                      "정부/정책", "법령", "글로벌 통상환경"]
+                      "정부/정책", "글로벌 통상환경"]
 
     def _ordered(values: list[str], priority: list[str]) -> list[str]:
         uniq = dedupe_chips(values)
@@ -4568,6 +4921,55 @@ def create_app(ctx: Context):
         if row.get("status") == "draft":
             ctx.storage.update_article(article_id, {"status": "archived"})
         return JSONResponse({"ok": True})
+
+    @app.get("/api/weekly")
+    def api_weekly(id: str = ""):
+        """주간 레포트 1건 (기본: 최신). payload + html 포함."""
+        report = ctx.storage.get_weekly_report(id or None)
+        if report is None:
+            return JSONResponse({"ok": True, "report": None,
+                                 "enabled": ctx.cfg.weekly_enabled})
+        return JSONResponse({
+            "ok": True,
+            "enabled": ctx.cfg.weekly_enabled,
+            "report": {
+                "id": report.get("id"),
+                "period_start": report.get("period_start"),
+                "period_end": report.get("period_end"),
+                "generated_at": report.get("generated_at"),
+                "sent_at": report.get("sent_at"),
+                "send_error": report.get("send_error"),
+                "payload": report.get("payload"),
+                "html": report.get("html"),
+            },
+        })
+
+    @app.get("/api/weekly/history")
+    def api_weekly_history():
+        rows = ctx.storage.list_weekly_reports(30)
+        return JSONResponse({"items": [{
+            "id": r.get("id"),
+            "period_start": r.get("period_start"),
+            "period_end": r.get("period_end"),
+            "generated_at": r.get("generated_at"),
+            "sent_at": r.get("sent_at"),
+        } for r in rows]})
+
+    _weekly_lock = threading.Lock()
+
+    @app.post("/api/weekly/generate")
+    def api_weekly_generate(x_master_token: str = fastapi.Header(default="")):
+        """지금 새로 생성(+설정돼 있으면 발송). 마스터 전용 · LLM 7회 과금."""
+        if not _valid_master_token(x_master_token):
+            return JSONResponse({"ok": False, "error": "마스터 인증이 필요합니다."}, status_code=401)
+        if not _weekly_lock.acquire(blocking=False):
+            return JSONResponse({"ok": False, "error": "이미 생성 중입니다."}, status_code=409)
+        try:
+            report = run_weekly_report(ctx, send=ctx.cfg.smtp_enabled)
+        finally:
+            _weekly_lock.release()
+        return JSONResponse({"ok": True, "id": report["id"], "sent_at": report.get("sent_at"),
+                             "send_error": report.get("send_error")})
 
     if os.path.isdir(FRONTEND_DIR):
         from fastapi.responses import HTMLResponse
@@ -4972,6 +5374,7 @@ def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
         try:
             run_once(ctx)
             send_notifications(ctx)
+            maybe_run_weekly(ctx)
         except Exception as exc:
             log.exception("파이프라인 실행 중 오류: %s", exc)
 
@@ -5189,22 +5592,14 @@ def cmd_selftest() -> int:
     check("셀·전기차는 배터리·이차전지", "배터리·이차전지" in detect_categories("전기차 배터리셀 계약"), True)
     check("'정부' 단독은 정책 태그 아님",
           "정부/정책" in detect_categories("정부 관계자 만난 수출입은행"), False)
-    check("행정 용어는 '정부/정책'", "정부/정책" in detect_categories("특화단지 지정, 국회 통과"), True)
-    check("입법 용어는 '법령'", "법령" in detect_categories("이차전지 특별법 개정안 발의"), True)
-    check("'정부/정책'과 '법령'은 별개",
-          "정부/정책" in detect_categories("이차전지 특별법 개정안 발의"), False)
-    # 법령: '규제' 한 낱말로 오태깅되던 문제 (23/29건). 이제 제목에 입법·처분어가 있어야 한다.
-    check("'규제' 스친 시황 기사는 법령 아님",
-          "법령" in detect_categories("탄소 규제에 짓눌린 철강 삼중고", "환경규제 대응 비용이 늘었다"), False)
-    check("'EU 규제 대응 포럼'은 법령 아님",
-          "법령" in detect_categories("전북TP, 이차전지 EU 규제 대응 포럼 개최"), False)
-    check("요약에만 개정안 언급 → 법령 아님(제목 고정)",
-          "법령" in detect_categories("포스코 2분기 실적 개선", "중대재해처벌법 개정안이 변수로 꼽힌다"), False)
-    check("제목에 과징금 → 법령", "법령" in detect_categories("공정위, 포스코에 과징금 부과"), True)
-    check("제목에 대법원 판결 → 법령", "법령" in detect_categories("포스코 사내하청 직접고용 판결 확정"), True)
+    check("행정 용어는 '정부/정책'", "정부/정책" in detect_categories("특화단지 지정, 산업부 발표"), True)
+    check("입법 용어도 '정부/정책'", "정부/정책" in detect_categories("이차전지 특별법 개정안 발의"), True)
+    check("'법령' 카테고리는 폐지됨", "법령" in detect_categories("공정위 과징금 부과 개정안"), False)
     # 정부/정책: '관세'·'IRA' 제거 — 통상 조치는 '글로벌 통상환경'이 담당
     check("'관세' 스친 실적 기사는 정책 아님",
           "정부/정책" in detect_categories("美 철강 관세에 포스코 현대제철 공동전선"), False)
+    check("'규제' 한 낱말로는 정책 태깅 안 함",
+          "정부/정책" in detect_categories("탄소 규제에 짓눌린 철강 삼중고"), False)
     check("철강 공정어는 '산업'", "산업" in detect_categories("포스코 포항 3고로 개수 완료"), True)
     check("'실적' 단독은 시장/주가 태그 아님",
           "시장/주가" in detect_categories("포스코 2분기 실적 발표"), False)
@@ -5456,6 +5851,46 @@ def cmd_selftest() -> int:
           True)
     check("발행일 없음 → None", extract_published("<html>본문</html>"), None)
 
+    print("\n[15] 주간 레포트 (월요일 이메일)")
+    _ws, _we = weekly_window(datetime(2026, 9, 7, 7, 0, tzinfo=timezone.utc))
+    check("집계 구간은 7일", (_we - _ws).days, 7)
+    check("섹션 7개", len(WEEKLY_SECTIONS), 7)
+    check("그룹사 5 + 주제 2",
+          (sum(1 for _, k, _ in WEEKLY_SECTIONS if k == "group"),
+           sum(1 for _, k, _ in WEEKLY_SECTIONS if k == "topic")), (5, 2))
+    _rows = [
+        {"title": "포스코퓨처엠 양극재 증설", "importance_score": 80,
+         "group_companies": '["포스코퓨처엠"]', "categories": "[]", "published_at": "2026-09-05T00:00:00Z"},
+        {"title": "포스코퓨처엠 소식 2", "importance_score": 30,
+         "group_companies": '["포스코퓨처엠"]', "categories": "[]", "published_at": "2026-09-04T00:00:00Z"},
+        {"title": "무관 기사", "importance_score": 90,
+         "group_companies": "[]", "categories": '["산업"]', "published_at": "2026-09-05T00:00:00Z"},
+    ]
+    _picked = _weekly_pick(_rows, "group", "포스코퓨처엠")
+    check("섹션 매칭 + 중요도 정렬", [a["title"] for a in _picked],
+          ["포스코퓨처엠 양극재 증설", "포스코퓨처엠 소식 2"])
+    check("무관 기사는 제외", any("무관" in a["title"] for a in _picked), False)
+    _html = render_weekly_html({
+        "period_start": "2026-08-31T00:00:00Z", "period_end": "2026-09-07T00:00:00Z",
+        "article_count": 12, "sections": [
+            {"label": "포스코퓨처엠", "kind": "group",
+             "articles": [{"title": "제목<&>", "url": "http://a", "press": "머니투데이",
+                           "published_at": "2026-09-05", "score": 70, "summary": "요약"}],
+             "swot": {"s": "강점", "w": "약점", "o": "기회", "t": "위협"}, "impact": None},
+            {"label": "정부/정책", "kind": "topic", "articles": [], "swot": None, "impact": ""},
+        ]})
+    check("HTML 렌더 + 이스케이프", "제목&lt;&amp;&gt;" in _html and "강점" in _html, True)
+    check("기사 없는 섹션 안내", "이번 주 해당 기사가 없습니다" in _html, True)
+    check("plain 대체본은 태그 제거", "<" not in _html_to_text("<p>가<b>나</b>다</p>"), True)
+    _ok, _err = send_report_email(
+        Config(**{**{f: "" for f in Config.__dataclass_fields__},
+                  "smtp_port": 587, "api_port": 8000, "poll_interval_sec": 300,
+                  "naver_interval_sec": 300, "fresh_cutoff_hours": 6, "backfill_cutoff_hours": 72,
+                  "notify_threshold": 50, "llm_daily_limit": 1500, "llm_per_run": 6,
+                  "weekly_enabled": False, "weekly_to": [], "weekly_hour": 7}),
+        "제목", "<p>본문</p>")
+    check("SMTP 미설정이면 발송 스킵", (_ok, "SMTP 미설정" in (_err or "")), (False, True))
+
     print()
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))
@@ -5484,6 +5919,7 @@ USAGE = """사용법: python backend/main.py <명령>
   notify     대기 중인 텔레그램 알림만 발송
   chatid     텔레그램 chat_id 확인 (봇에게 메시지를 한 번 보낸 뒤 실행)
   sendtest   텔레그램 시험 메시지 1건 발송 (연결 확인용)
+  weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
   selftest   내장 검증 (DB · 네트워크 · API 키 불필요)
 """
 
@@ -5535,6 +5971,13 @@ def main(argv: Sequence[str]) -> int:
         cmd_chatid(ctx)
     elif command == "sendtest":
         cmd_sendtest(ctx)
+    elif command == "weekly":
+        dry = "--dry" in argv[2:]
+        rep = run_weekly_report(ctx, send=not dry)
+        if dry:
+            log.info("주간 레포트 생성·저장 완료 (id=%s, 발송 안 함)", rep["id"])
+        elif rep.get("send_error"):
+            raise SystemExit(f"발송 실패: {rep['send_error']}")
     elif command == "serve":
         cmd_serve(ctx, with_pipeline=False)
     elif command == "run":

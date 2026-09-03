@@ -167,6 +167,19 @@ create table if not exists market_quotes (
   fetched_at  TEXT not null
 );
 
+-- 주간 레포트 (월요일 아침 이메일). payload = 섹션별 구조화 데이터, html = 렌더 결과(이메일·웹 공용)
+create table if not exists weekly_reports (
+  id           TEXT primary key,
+  period_start TEXT not null,     -- 집계 시작 (ISO UTC)
+  period_end   TEXT not null,     -- 집계 끝 = 생성 시각
+  generated_at TEXT not null,
+  sent_at      TEXT,              -- 이메일 발송 완료 시각 (null = 미발송)
+  send_error   TEXT,              -- 마지막 발송 실패 사유
+  payload      TEXT not null,
+  html         TEXT not null
+);
+create index if not exists idx_weekly_generated on weekly_reports (generated_at desc);
+
 -- 인덱스 (SQLite 에는 GIN 이 없다. 배열 필터는 애플리케이션에서 처리한다)
 create index if not exists idx_articles_published  on articles (published_at desc);
 create index if not exists idx_articles_score      on articles (importance_score desc, published_at desc);

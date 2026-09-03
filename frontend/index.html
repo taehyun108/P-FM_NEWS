@@ -23,6 +23,7 @@
     </a>
     <div class="header-right">
       <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
+      <button type="button" class="fav-tab" id="weeklyTab" aria-pressed="false">📈 주간동향</button>
       <a class="fav-tab" id="tgLink" href="#" target="_blank" rel="noopener noreferrer" hidden>✈ Telegram</a>
       <button type="button" class="fav-tab" id="masterBtn">🔒 마스터</button>
     </div>
@@ -148,6 +149,21 @@
 
   <!-- 요약 통계 바 (PRD F6.1-3) -->
   <section class="stats" id="stats" aria-label="수집 현황"></section>
+
+  <!-- 주간동향 (월요일 아침 이메일 레포트와 동일) -->
+  <section class="weekly-panel" id="weeklyPanel" aria-label="주간동향" hidden>
+    <div class="weekly-head">
+      <div>
+        <h2>📈 포스코 그룹 주간동향</h2>
+        <p class="weekly-meta" id="weeklyMeta">불러오는 중…</p>
+      </div>
+      <div class="weekly-actions">
+        <select id="weeklyPick" class="weekly-pick" aria-label="지난 레포트 선택" hidden></select>
+        <button type="button" class="url-add-btn" id="weeklyGenBtn" hidden>지금 새로 생성</button>
+      </div>
+    </div>
+    <div class="weekly-body" id="weeklyBody"></div>
+  </section>
 
   <!-- 필터 (PRD F6.1-4, F6.1a) -->
   <section class="filters" aria-label="기사 필터">

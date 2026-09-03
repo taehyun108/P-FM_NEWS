@@ -173,6 +173,19 @@ create table if not exists market_quotes (
   fetched_at  timestamptz not null default now()
 );
 
+-- ── 주간 레포트 (월요일 아침 이메일) ──────────────────────────────
+create table if not exists weekly_reports (
+  id           text primary key,
+  period_start timestamptz not null,
+  period_end   timestamptz not null,
+  generated_at timestamptz not null default now(),
+  sent_at      timestamptz,
+  send_error   text,
+  payload      jsonb not null,
+  html         text not null
+);
+create index if not exists idx_weekly_generated on weekly_reports (generated_at desc);
+
 -- ── 인덱스 ─────────────────────────────────────────────────────────
 create index if not exists idx_articles_published  on articles (published_at desc);
 create index if not exists idx_articles_score      on articles (importance_score desc, published_at desc);
@@ -191,9 +204,11 @@ alter table summaries      enable row level security;
 alter table swot_analyses  enable row level security;
 alter table market_quotes  enable row level security;
 alter table press_outlets  enable row level security;
+alter table weekly_reports enable row level security;
 
 create policy "public read articles"  on articles      for select using (status = 'active');
 create policy "public read summaries" on summaries     for select using (true);
 create policy "public read swot"      on swot_analyses for select using (true);
 create policy "public read quotes"    on market_quotes for select using (true);
 create policy "public read press"     on press_outlets for select using (status = 'approved');
+-- 주간 레포트는 마스터 전용 데이터라 공개 정책을 두지 않는다 (service role 로만 접근).

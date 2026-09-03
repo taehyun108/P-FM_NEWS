@@ -696,6 +696,7 @@ function saveFavorite(id, on) {
 let favView = false;
 
 function toggleFavView() {
+  if (weeklyView && !favView) toggleWeeklyView();   // 주간동향 화면이면 먼저 닫는다
   favView = !favView;
   $('favTab').setAttribute('aria-pressed', String(favView));
   $('favTab').textContent = favView ? '← 전체 기사' : '★ 즐겨찾기';
@@ -721,6 +722,91 @@ async function renderFavorites() {
     ? nodes : [el('p', 'empty', '즐겨찾기 기사를 불러오지 못했습니다.')]));
 }
 
+/* ── 주간동향 보기 ────────────────────────────────────────────── */
+
+let weeklyView = false;
+let weeklyLoaded = false;
+
+function toggleWeeklyView() {
+  if (favView) toggleFavView();            // 즐겨찾기 화면이면 먼저 닫는다
+  weeklyView = !weeklyView;
+  $('weeklyTab').setAttribute('aria-pressed', String(weeklyView));
+  $('weeklyTab').textContent = weeklyView ? '← 전체 기사' : '📈 주간동향';
+  $('weeklyPanel').hidden = !weeklyView;
+  document.querySelector('.filters').hidden = weeklyView;
+  $('grid').hidden = weeklyView;
+  document.querySelector('.more-wrap').hidden = weeklyView;
+  document.querySelector('.url-add').hidden = weeklyView;
+  if (weeklyView) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (!weeklyLoaded) { weeklyLoaded = true; loadWeekly(); loadWeeklyHistory(); }
+  } else {
+    refresh(true);
+  }
+}
+
+async function loadWeekly(id) {
+  $('weeklyBody').innerHTML = '<p class="empty">불러오는 중…</p>';
+  let d;
+  try {
+    d = await getJSON('/api/weekly' + (id ? `?id=${encodeURIComponent(id)}` : ''));
+  } catch {
+    $('weeklyMeta').textContent = '레포트를 불러오지 못했습니다.';
+    $('weeklyBody').innerHTML = '';
+    return;
+  }
+  $('weeklyGenBtn').hidden = false;   // 생성 버튼은 항상 노출(누르면 마스터 인증)
+  if (!d.report) {
+    $('weeklyMeta').textContent = d.enabled
+      ? '아직 생성된 레포트가 없습니다. 월요일 아침에 자동 생성되거나, 지금 새로 생성할 수 있습니다.'
+      : '주간 레포트가 비활성 상태입니다 (.env WEEKLY_REPORT_ENABLED).';
+    $('weeklyBody').innerHTML = '';
+    return;
+  }
+  const r = d.report;
+  const gen = r.generated_at ? new Date(r.generated_at).toLocaleString('ko-KR') : '';
+  const sent = r.sent_at ? ` · 발송됨 ${new Date(r.sent_at).toLocaleString('ko-KR')}`
+    : (r.send_error ? ` · 발송 실패(${r.send_error})` : ' · 미발송');
+  $('weeklyMeta').textContent = `생성 ${gen}${sent}`;
+  $('weeklyBody').innerHTML = r.html || '';
+}
+
+async function loadWeeklyHistory() {
+  let items = [];
+  try { items = (await getJSON('/api/weekly/history')).items || []; } catch { return; }
+  const sel = $('weeklyPick');
+  if (items.length < 2) { sel.hidden = true; return; }
+  sel.innerHTML = '';
+  items.forEach((it, i) => {
+    const s = (it.period_start || '').slice(5, 10);
+    const e = (it.period_end || '').slice(5, 10);
+    const o = el('option', '', `${s} ~ ${e}${i === 0 ? ' (최신)' : ''}`);
+    o.value = it.id;
+    sel.appendChild(o);
+  });
+  sel.hidden = false;
+  sel.onchange = () => loadWeekly(sel.value);
+}
+
+async function generateWeekly() {
+  if (!masterAuth()) { showMasterLogin(); return; }
+  const btn = $('weeklyGenBtn');
+  btn.disabled = true;
+  btn.textContent = '생성 중… (1~2분)';
+  try {
+    const res = await masterFetch('/api/weekly/generate', { method: 'POST' });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || '생성 실패');
+    await loadWeekly();
+    await loadWeeklyHistory();
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert('생성 실패: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '지금 새로 생성';
+  }
+}
+
 /* ── 목록 로드 ──────────────────────────────────────────────────── */
 
 function buildQuery() {
@@ -738,7 +824,7 @@ function buildQuery() {
 async function refresh(reset) {
   // 즐겨찾기 화면일 때는 일반 목록이 덮어쓰지 않게 막는다.
   // (필터를 숨기는 것만으로는 방어가 약하다 — 단축키·코드 변경에 취약)
-  if (favView || state.loading) return;
+  if (favView || weeklyView || state.loading) return;
   state.loading = true;
   if (reset) {
     state.page = 1;
@@ -903,6 +989,7 @@ function init() {
   });
 
   const goHome = () => {
+    if (weeklyView) toggleWeeklyView();     // 주간동향 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     state.group.clear(); state.cat.clear(); state.press.clear();
     state.period = 'all'; state.q = '';
@@ -916,6 +1003,8 @@ function init() {
   $('loadMore').addEventListener('click', () => { state.page += 1; refresh(false); });
 
   $('favTab').addEventListener('click', toggleFavView);
+  $('weeklyTab').addEventListener('click', toggleWeeklyView);
+  $('weeklyGenBtn').addEventListener('click', generateWeekly);
   initMaster();
 
   // 헤더 Telegram 버튼 — 봇 대화방 주소를 받아 링크를 채운다(실패하면 숨김).
