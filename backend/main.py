@@ -423,6 +423,9 @@ class Storage(ABC):
     def purge_stale_drafts(self, older_than_hours: int) -> int: ...
 
     @abstractmethod
+    def purge_stale_embeddings(self, older_than_hours: int) -> int: ...
+
+    @abstractmethod
     def save_summary(self, row: dict) -> None: ...
 
     @abstractmethod
@@ -736,6 +739,19 @@ class SqliteStorage(Storage):
         """등록도 취소도 안 한 미리보기(draft) 기사를 지운다."""
         cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
         cur = self._exec("delete from articles where status='draft' and collected_at < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def purge_stale_embeddings(self, older_than_hours: int) -> int:
+        """오래된 title_embedding 을 비운다 — 중복 판정 창(약 25시간) 밖이면 다시 안 읽는다.
+
+        임베딩은 행당 ~31KB 로 DB 용량의 대부분을 차지하는데, 캐시일 뿐이라 지워도
+        무방하다(필요하면 재계산). 저장 공간을 되찾는 게 목적이다.
+        """
+        cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
+        cur = self._exec(
+            "update articles set title_embedding=null"
+            " where title_embedding is not null"
+            " and coalesce(published_at, collected_at) < ?", (cutoff,))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def save_summary(self, row: dict) -> None:
@@ -1117,6 +1133,12 @@ class SupabaseStorage(Storage):
         cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
         res = (self._t("articles").delete()
                .eq("status", "draft").lt("collected_at", cutoff).execute())
+        return len(res.data or [])
+
+    def purge_stale_embeddings(self, older_than_hours: int) -> int:
+        cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
+        res = (self._t("articles").update({"title_embedding": None})
+               .not_.is_("title_embedding", "null").lt("published_at", cutoff).execute())
         return len(res.data or [])
 
     def save_summary(self, row: dict) -> None:
@@ -3242,6 +3264,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     dropped = storage.purge_stale_drafts(24)
     if dropped:
         log.info("미확정 미리보기 %d건 정리", dropped)
+    # 48시간 지난 제목 임베딩 정리 — 중복 판정 창(25시간) 밖이면 다시 안 읽는다.
+    # 행당 ~31KB 로 DB 용량의 대부분을 차지하므로 매일 되찾는다.
+    cleared = storage.purge_stale_embeddings(48)
+    if cleared:
+        log.info("오래된 제목 임베딩 %d건 정리", cleared)
 
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
@@ -5193,6 +5220,23 @@ def cmd_selftest() -> int:
     check("모르는 id 는 기타(3)", _tmp.press_tier_by_id("nope"), 3)
     check("상위 tier 로만 승격", 1 < _tmp.press_tier_by_id(None), True)   # tier1 < 3
     check("동급이면 승격 안 함", 3 < _tmp.press_tier_by_id(None), False)  # tier3 !< 3
+
+    print("\n[11-2] 오래된 제목 임베딩 정리 (purge_stale_embeddings)")
+    _old = iso(now_utc() - timedelta(hours=100))
+    _new = iso(now_utc() - timedelta(hours=1))
+    for _eid, _pub in (("emb-old", _old), ("emb-new", _new)):
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, title_embedding) values (?,?,?,?,?,?,?,?,?)",
+            (_eid, f"http://x/{_eid}", f"http://x/{_eid}", f"http://x/{_eid}", "제목",
+             _pub, _pub, "search", "[0.1,0.2]"))
+    check("48시간 밖 임베딩만 비움 → 1건", _tmp.purge_stale_embeddings(48), 1)
+    check("오래된 행 임베딩 제거됨",
+          _tmp._one("select title_embedding from articles where id='emb-old'")["title_embedding"], None)
+    check("최근 행 임베딩 보존됨",
+          _tmp._one("select title_embedding from articles where id='emb-new'")["title_embedding"] is not None, True)
+    check("두 번째 호출은 대상 없음 → 0건", _tmp.purge_stale_embeddings(48), 0)
+
     shutil.rmtree(_dbdir, ignore_errors=True)
 
     print("\n[12] .env 인라인 주석 처리")
