@@ -165,6 +165,7 @@ class Config:
     # 알림
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_channel_url: str      # 헤더 'Telegram' 버튼이 여는 주소 (채널 초대 링크 등). 없으면 봇 DM
     # 수집 소스 (선택)
     naver_client_id: str
     naver_client_secret: str
@@ -231,6 +232,7 @@ def load_config() -> Config:
         supabase_service_role_key=supabase_key,
         telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=get_env("TELEGRAM_CHAT_ID"),
+        telegram_channel_url=get_env("TELEGRAM_CHANNEL_URL"),
         naver_client_id=get_env("NAVER_CLIENT_ID"),
         naver_client_secret=get_env("NAVER_CLIENT_SECRET"),
         poll_interval_sec=get_env_int("POLL_INTERVAL_SEC", 60, 30, 300),
@@ -4015,7 +4017,13 @@ def create_app(ctx: Context):
 
     @app.get("/api/telegram-link")
     def api_telegram_link():
-        """헤더 Telegram 버튼용 — 봇 대화방 주소(t.me/<봇아이디>)를 돌려준다."""
+        """헤더 Telegram 버튼용 주소.
+
+        TELEGRAM_CHANNEL_URL 이 있으면 그 값(채널 초대 링크 등)을,
+        없으면 봇 대화방(t.me/<봇아이디>)을 돌려준다.
+        """
+        if ctx.cfg.telegram_channel_url:
+            return JSONResponse({"ok": True, "url": ctx.cfg.telegram_channel_url, "kind": "channel"})
         if not ctx.cfg.telegram_enabled:
             return JSONResponse({"ok": False, "error": "텔레그램이 설정되지 않았습니다."})
         url = _tg_link_cache.get("url")
@@ -4031,7 +4039,7 @@ def create_app(ctx: Context):
                 log.debug("텔레그램 봇 주소 조회 실패: %s", exc)
         if not url:
             return JSONResponse({"ok": False, "error": "봇 주소를 확인하지 못했습니다."})
-        return JSONResponse({"ok": True, "url": url})
+        return JSONResponse({"ok": True, "url": url, "kind": "bot"})
 
     # ── 마스터 패널 (PRD 추가) ──────────────────────────────────────
     def _master_guard(token: str) -> JSONResponse | None:

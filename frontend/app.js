@@ -854,7 +854,11 @@ function init() {
 
   // 헤더 Telegram 버튼 — 봇 대화방 주소를 받아 링크를 채운다(실패하면 숨김).
   getJSON('/api/telegram-link').then((d) => {
-    if (d.ok && d.url) { $('tgLink').href = d.url; $('tgLink').hidden = false; }
+    if (!d.ok || !d.url) return;
+    const a = $('tgLink');
+    a.href = d.url;
+    a.textContent = d.kind === 'channel' ? '✈ Telegram 채널' : '✈ Telegram';
+    a.hidden = false;
   }).catch(() => { /* 텔레그램 미설정 — 버튼은 숨긴 채로 둔다 */ });
 
   $('urlAddForm').addEventListener('submit', submitUrl);
