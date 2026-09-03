@@ -320,32 +320,30 @@ function buildCard(item) {
   meta.append(el('span', 'card-source', 'SUPABASE'));
   card.append(meta);
 
-  /* 칩 행 — [대표 그룹사 · 감성 · 중요도] → 나머지 그룹사 → 카테고리 → 키워드. (F6.2b) */
+  /* 칩 행 — 그룹사(남색) → 감성·중요도 → 카테고리 → 키워드. 각각 독립 칩. (F6.2b) */
   const chips = el('div', 'card-chips');
   const groups = dedupeChips(item.group_companies);
-  // 그룹사 필터가 켜져 있으면, 그 그룹사를 대표 배지로 앞세운다 (필터 결과와 배지 일치).
+  // 그룹사 필터가 켜져 있으면 그 그룹사를 앞에 세운다 (필터 결과와 칩 순서 일치).
   const activeGroupKeys = new Set([...state.group].map(chipKey));
   if (activeGroupKeys.size) {
     groups.sort((a, b) =>
       (activeGroupKeys.has(chipKey(b)) ? 1 : 0) - (activeGroupKeys.has(chipKey(a)) ? 1 : 0));
   }
-  // 칩 정리(그룹사·카테고리와 겹치는 키워드 제거)는 백엔드 build_card 가 끝냈다.
-  // 여기서는 표시 직전 중복만 한 번 더 막는다. (F6.2b)
   const categories = dedupeChips(item.categories || []);
   const keywords = dedupeChips(item.keywords || []);
 
-  // 감성·중요도 배지 앞에 대표 그룹사(첫 번째)를 붙인다. 그룹사가 없으면 생략한다.
-  const cls = item.sentiment === '긍정' ? 'pos' : item.sentiment === '부정' ? 'neg' : 'neu';
-  const lead = groups.length ? `${groups[0]} · ` : '';
-  const senti = item.sentiment || '중립';
-  chips.append(el('span', `tag tag-senti ${cls}`, `${lead}${senti} · ${item.importance_score}`));
+  // ① 그룹사(회사명) — 감성·점수와 섞지 않고 별도 칩으로 낸다.
+  groups.forEach((g) => chips.append(el('span', 'tag tag-group', g)));
 
-  // 그룹사가 2곳 이상이면 나머지는 별도 남색 칩으로 보여준다.
-  groups.slice(1).forEach((g) => chips.append(el('span', 'tag tag-group', g)));
+  // ② 감성 · 중요도 — 회사명 없이 독립.
+  const cls = item.sentiment === '긍정' ? 'pos' : item.sentiment === '부정' ? 'neg' : 'neu';
+  const senti = item.sentiment || '중립';
+  chips.append(el('span', `tag tag-senti ${cls}`, `${senti} · ${item.importance_score}`));
 
   if (item.is_backfill) chips.append(el('span', 'tag tag-backfill', '지연 수집'));
   // 아직 LLM 분석 전이면 요약·키워드가 없다. 빈 카드처럼 보이지 않게 상태를 알린다.
   if (!item.summary_text) chips.append(el('span', 'tag tag-pending', '분석 대기'));
+  // ③ 카테고리 → ④ 키워드
   categories.forEach((c) => chips.append(el('span', 'tag tag-cat', c)));
   keywords.forEach((k) => chips.append(el('span', 'tag tag-key', k)));
   card.append(chips);
