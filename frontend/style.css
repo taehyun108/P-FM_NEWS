@@ -438,6 +438,7 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .weekly-pick[hidden] { display: none; }
 .weekly-body { font-size: 14px; }
 .weekly-body .weekly-report { max-width: none !important; }
+.weekly-body .wr-head { display: none; }   /* 제목·기간은 패널 헤더가 담당 (이메일에서만 노출) */
 .weekly-body h2 { font-size: 15px; }
 .weekly-body ol { line-height: 1.6; }
 .weekly-body .empty { color: var(--ink-soft); padding: 24px 0; text-align: center; }

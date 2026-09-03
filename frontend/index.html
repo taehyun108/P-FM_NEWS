@@ -106,6 +106,16 @@
       </section>
 
       <section class="master-section">
+        <h3>주간 레포트 수신자</h3>
+        <small id="weeklyToHint">월요일 아침 이 주소들로 주간동향 레포트가 발송됩니다. (비우면 .env WEEKLY_REPORT_TO 사용)</small>
+        <div class="kw-input">
+          <input type="email" id="weeklyToNew" class="url-add-input" placeholder="이메일 주소 입력 후 추가">
+          <button type="button" class="url-add-btn" id="weeklyToAdd">추가</button>
+        </div>
+        <div class="kw-list" id="weeklyToList"></div>
+      </section>
+
+      <section class="master-section">
         <h3>항상 발송 키워드</h3>
         <small>기사 <b>본문</b>에 이 단어가 있으면 관련도 점수·야간 모드와 무관하게 발송합니다. (예전 '포스코퓨처엠 자동 포함' 특례는 폐지 — 필요하면 여기에 <b>포스코퓨처엠</b>을 추가하세요)</small>
         <div class="kw-input">
@@ -159,6 +169,7 @@
       </div>
       <div class="weekly-actions">
         <select id="weeklyPick" class="weekly-pick" aria-label="지난 레포트 선택" hidden></select>
+        <button type="button" class="btn-clear" id="weeklyMailBtn" hidden>메일로 보내기</button>
         <button type="button" class="url-add-btn" id="weeklyGenBtn" hidden>지금 새로 생성</button>
       </div>
     </div>

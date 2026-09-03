@@ -385,6 +385,7 @@ let policyKeywords = [];
 let policyRequired = [];
 let tradeKeywords = [];
 let tradeRequired = [];
+let weeklyTo = [];       // 주간 레포트 수신자 이메일 목록
 let thTimer;
 
 function masterAuth() {
@@ -455,11 +456,19 @@ async function loadMasterSettings() {
     policyRequired = d.policy_required || [];
     tradeKeywords = d.trade_keywords || [];
     tradeRequired = d.trade_required || [];
+    weeklyTo = d.weekly_to || [];
+    const hint = $('weeklyToHint');
+    if (hint) {
+      hint.textContent = d.weekly_smtp_ready
+        ? '월요일 아침 이 주소들로 발송됩니다. (비우면 .env WEEKLY_REPORT_TO 사용)'
+        : '⚠ .env 에 SMTP_USER · SMTP_APP_PASSWORD 를 채워야 실제 발송됩니다.';
+    }
     renderKwList();
     renderPolicyKwList();
     renderPolicyReqList();
     renderTradeKwList();
     renderTradeReqList();
+    renderWeeklyToList();
   } catch (e) {
     if (e.message !== 'unauthorized') masterMsg('err', '설정을 불러오지 못했습니다.');
   }
@@ -482,6 +491,7 @@ function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords,
 function renderPolicyReqList() { renderChipEditor('policyReqList', policyRequired, (next) => { policyRequired = next; renderPolicyReqList(); saveKw('policy_required', policyRequired); }); }
 function renderTradeKwList() { renderChipEditor('tradeKwList', tradeKeywords, (next) => { tradeKeywords = next; renderTradeKwList(); saveKw('trade_keywords', tradeKeywords); }); }
 function renderTradeReqList() { renderChipEditor('tradeReqList', tradeRequired, (next) => { tradeRequired = next; renderTradeReqList(); saveKw('trade_required', tradeRequired); }); }
+function renderWeeklyToList() { renderChipEditor('weeklyToList', weeklyTo, (next) => { weeklyTo = next; renderWeeklyToList(); saveKw('weekly_to', weeklyTo); }); }
 
 async function saveKw(field, arr) {
   try {
@@ -558,6 +568,7 @@ function initMaster() {
   wireKwAdd('policyReqAdd', 'policyReqNew', () => policyRequired, (a) => { policyRequired = a; }, renderPolicyReqList, 'policy_required');
   wireKwAdd('tradeKwAdd', 'tradeKwNew', () => tradeKeywords, (a) => { tradeKeywords = a; }, renderTradeKwList, 'trade_keywords');
   wireKwAdd('tradeReqAdd', 'tradeReqNew', () => tradeRequired, (a) => { tradeRequired = a; }, renderTradeReqList, 'trade_required');
+  wireKwAdd('weeklyToAdd', 'weeklyToNew', () => weeklyTo, (a) => { weeklyTo = a; }, renderWeeklyToList, 'weekly_to');
 
   $('pwMasterForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -726,6 +737,8 @@ async function renderFavorites() {
 
 let weeklyView = false;
 let weeklyLoaded = false;
+let weeklyCur = null;       // 현재 화면에 표시 중인 레포트 { id, ... }
+let weeklyRecipients = [];  // 마스터 패널 수신자 목록 (참고 표시용)
 
 function toggleWeeklyView() {
   if (favView) toggleFavView();            // 즐겨찾기 화면이면 먼저 닫는다
@@ -756,7 +769,10 @@ async function loadWeekly(id) {
     return;
   }
   $('weeklyGenBtn').hidden = false;   // 생성 버튼은 항상 노출(누르면 마스터 인증)
+  weeklyRecipients = d.recipients || [];
   if (!d.report) {
+    weeklyCur = null;
+    $('weeklyMailBtn').hidden = true;
     $('weeklyMeta').textContent = d.enabled
       ? '아직 생성된 레포트가 없습니다. 월요일 아침에 자동 생성되거나, 지금 새로 생성할 수 있습니다.'
       : '주간 레포트가 비활성 상태입니다 (.env WEEKLY_REPORT_ENABLED).';
@@ -764,11 +780,18 @@ async function loadWeekly(id) {
     return;
   }
   const r = d.report;
+  weeklyCur = r;
+  const fmt = (iso) => (iso || '').slice(0, 10);
   const gen = r.generated_at ? new Date(r.generated_at).toLocaleString('ko-KR') : '';
   const sent = r.sent_at ? ` · 발송됨 ${new Date(r.sent_at).toLocaleString('ko-KR')}`
     : (r.send_error ? ` · 발송 실패(${r.send_error})` : ' · 미발송');
-  $('weeklyMeta').textContent = `생성 ${gen}${sent}`;
+  const cnt = (r.payload && r.payload.article_count) || 0;
+  $('weeklyMeta').textContent =
+    `집계 ${fmt(r.period_start)} ~ ${fmt(r.period_end)} · 대상 ${cnt}건 · 생성 ${gen}${sent}`;
   $('weeklyBody').innerHTML = r.html || '';
+  $('weeklyMailBtn').hidden = !d.smtp_ready;
+  $('weeklyMailBtn').textContent = d.recipients && d.recipients.length
+    ? `메일로 보내기 (${d.recipients.length}명)` : '메일로 보내기';
 }
 
 async function loadWeeklyHistory() {
@@ -778,8 +801,8 @@ async function loadWeeklyHistory() {
   if (items.length < 2) { sel.hidden = true; return; }
   sel.innerHTML = '';
   items.forEach((it, i) => {
-    const s = (it.period_start || '').slice(5, 10);
-    const e = (it.period_end || '').slice(5, 10);
+    const s = (it.period_start || '').slice(0, 10);   // 연도 포함
+    const e = (it.period_end || '').slice(0, 10);
     const o = el('option', '', `${s} ~ ${e}${i === 0 ? ' (최신)' : ''}`);
     o.value = it.id;
     sel.appendChild(o);
@@ -804,6 +827,30 @@ async function generateWeekly() {
   } finally {
     btn.disabled = false;
     btn.textContent = '지금 새로 생성';
+  }
+}
+
+async function sendWeeklyMail() {
+  if (!weeklyCur) return;
+  if (!masterAuth()) { showMasterLogin(); return; }
+  if (!weeklyRecipients.length &&
+      !confirm('수신자 목록이 비어 있습니다. 마스터 패널에서 수신자를 추가하세요.')) return;
+  const to = weeklyRecipients.length ? `\n\n수신: ${weeklyRecipients.join(', ')}` : '';
+  if (!confirm('이 레포트를 이메일로 보낼까요?' + to)) return;
+  const btn = $('weeklyMailBtn');
+  btn.disabled = true;
+  btn.textContent = '보내는 중…';
+  try {
+    const res = await masterFetch(`/api/weekly/${weeklyCur.id}/send`, { method: 'POST' });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || '발송 실패');
+    alert('발송 완료: ' + (d.sent_to || []).join(', '));
+    await loadWeekly(weeklyCur.id);
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert('발송 실패: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '메일로 보내기';
   }
 }
 
@@ -1005,6 +1052,7 @@ function init() {
   $('favTab').addEventListener('click', toggleFavView);
   $('weeklyTab').addEventListener('click', toggleWeeklyView);
   $('weeklyGenBtn').addEventListener('click', generateWeekly);
+  $('weeklyMailBtn').addEventListener('click', sendWeeklyMail);
   initMaster();
 
   // 헤더 Telegram 버튼 — 봇 대화방 주소를 받아 링크를 채운다(실패하면 숨김).

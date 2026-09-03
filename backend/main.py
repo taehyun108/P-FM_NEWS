@@ -36,7 +36,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any, Iterable, Sequence
@@ -194,9 +194,9 @@ class Config:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
     @property
-    def smtp_enabled(self) -> bool:
-        """이메일 발송 가능 여부. 미설정이면 레포트는 생성·저장만 하고 발송은 건너뛴다."""
-        return bool(self.smtp_user and self.smtp_app_password and self.weekly_to)
+    def smtp_configured(self) -> bool:
+        """SMTP 자격 증명이 갖춰졌는가. 수신자는 .env 또는 마스터 패널에서 따로 정한다."""
+        return bool(self.smtp_user and self.smtp_app_password)
 
     @property
     def naver_enabled(self) -> bool:
@@ -632,6 +632,7 @@ class SqliteStorage(Storage):
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
             "alter table run_state add column last_weekly_report_at TEXT",
+            "alter table run_state add column weekly_report_to TEXT default '[]'",
         ]
         for sql in migrations:
             try:
@@ -4366,13 +4367,17 @@ def render_weekly_html(payload: dict) -> str:
     """이메일·웹 공용 HTML. 이메일 클라이언트 호환을 위해 인라인 스타일·표 레이아웃만 쓴다."""
     ps = (payload.get("period_start") or "")[:10]
     pe = (payload.get("period_end") or "")[:10]
+    # 헤더(제목·기간)는 .wr-head 로 감싼다 — 웹 '주간동향' 탭은 CSS 로 숨기고
+    # 자체 헤더를 쓴다(제목 중복 방지). 이메일에서는 그대로 보인다.
     out = [
         '<div class="weekly-report" style="max-width:760px;margin:0 auto;'
         'font-family:-apple-system,BlinkMacSystemFont,\'Malgun Gothic\',\'맑은 고딕\',sans-serif;'
         'color:#1a1a1a;line-height:1.6;">',
+        '<div class="wr-head">',
         f'<h1 style="font-size:20px;margin:0 0 4px;">📈 포스코 그룹 주간동향</h1>',
         f'<p style="color:#667085;font-size:13px;margin:0 0 24px;">집계 기간 {esc(ps)} ~ {esc(pe)}'
         f' · 대상 기사 {payload.get("article_count", 0)}건</p>',
+        '</div>',
     ]
     for i, sec in enumerate(payload.get("sections", []), 1):
         out.append(
@@ -4426,19 +4431,23 @@ def _html_to_text(html: str) -> str:
     return html_mod.unescape(text).strip()
 
 
-def send_report_email(cfg: Config, subject: str, html_body: str) -> tuple[bool, str | None]:
+def send_report_email(cfg: Config, subject: str, html_body: str,
+                      to_list: Sequence[str]) -> tuple[bool, str | None]:
     """Gmail SMTP(STARTTLS)로 HTML 메일 1건을 보낸다. 표준 라이브러리만 사용."""
     import smtplib
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.utils import formatdate, make_msgid
 
-    if not cfg.smtp_enabled:
-        return False, "SMTP 미설정 (SMTP_USER · SMTP_APP_PASSWORD · WEEKLY_REPORT_TO 확인)"
+    to_list = [e for e in (to_list or []) if e]
+    if not cfg.smtp_configured:
+        return False, "SMTP 미설정 (.env 의 SMTP_USER · SMTP_APP_PASSWORD 확인)"
+    if not to_list:
+        return False, "수신자가 없습니다 (마스터 패널 또는 .env WEEKLY_REPORT_TO)"
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = cfg.smtp_user
-    msg["To"] = ", ".join(cfg.weekly_to)
+    msg["To"] = ", ".join(to_list)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
     msg.attach(MIMEText(_html_to_text(html_body), "plain", "utf-8"))
@@ -4448,10 +4457,17 @@ def send_report_email(cfg: Config, subject: str, html_body: str) -> tuple[bool, 
             s.ehlo()
             s.starttls()
             s.login(cfg.smtp_user, cfg.smtp_app_password)
-            s.sendmail(cfg.smtp_user, cfg.weekly_to, msg.as_string())
+            s.sendmail(cfg.smtp_user, to_list, msg.as_string())
         return True, None
     except Exception as exc:
         return False, str(exc)
+
+
+def weekly_recipients(ctx: Context) -> list[str]:
+    """수신자 = 마스터 패널 목록이 있으면 그것, 없으면 .env WEEKLY_REPORT_TO."""
+    db = [e.strip() for e in jload(ctx.storage.get_run_state().get("weekly_report_to"), [])
+          if str(e).strip()]
+    return db or list(ctx.cfg.weekly_to)
 
 
 def run_weekly_report(ctx: Context, send: bool = True) -> dict:
@@ -4474,12 +4490,13 @@ def run_weekly_report(ctx: Context, send: bool = True) -> dict:
     ctx.storage.save_weekly_report(row)
 
     if send:
-        ok, err = send_report_email(ctx.cfg, f"[P-FM] 포스코 그룹 주간동향 ({pe})", html)
+        to_list = weekly_recipients(ctx)
+        ok, err = send_report_email(ctx.cfg, f"[P-FM] 포스코 그룹 주간동향 ({pe})", html, to_list)
         if ok:
             sent_at = iso(now_utc())
             ctx.storage.mark_weekly_sent(report_id, sent_at, None)
             row["sent_at"] = sent_at
-            log.info("주간 레포트 발송 완료 → %s", ", ".join(ctx.cfg.weekly_to))
+            log.info("주간 레포트 발송 완료 → %s", ", ".join(to_list))
         else:
             ctx.storage.mark_weekly_sent(report_id, None, err)
             row["send_error"] = err
@@ -4500,7 +4517,7 @@ def maybe_run_weekly(ctx: Context) -> None:
     if last is not None and (now_utc() - last) < timedelta(days=6):
         return  # 이번 주 이미 처리됨
     try:
-        run_weekly_report(ctx, send=True)
+        run_weekly_report(ctx, send=cfg.smtp_configured)
     except Exception as exc:
         log.exception("주간 레포트 처리 중 오류: %s", exc)
 
@@ -4854,6 +4871,9 @@ def create_app(ctx: Context):
             "notify_trade": str(st.get("notify_trade") or "0") not in ("0", "False", "false", ""),
             "trade_keywords": jload(st.get("trade_notify_keywords"), []),
             "trade_required": jload(st.get("trade_required_keywords"), []),
+            "weekly_to": weekly_recipients(ctx),
+            "weekly_env_to": list(ctx.cfg.weekly_to),
+            "weekly_smtp_ready": ctx.cfg.smtp_configured,
         })
 
     @app.post("/api/master/settings")
@@ -4883,6 +4903,20 @@ def create_app(ctx: Context):
         for field, col in (("notify_policy", "notify_policy"), ("notify_trade", "notify_trade")):
             if field in (payload or {}):
                 patch[col] = 1 if payload[field] else 0
+        if "weekly_to" in (payload or {}):
+            raw = payload["weekly_to"]
+            if not isinstance(raw, list):
+                return JSONResponse({"ok": False, "error": "수신자는 목록이어야 합니다."}, status_code=400)
+            emails: list[str] = []
+            for e in raw:
+                e = str(e).strip()
+                if not e or e.lower() in [x.lower() for x in emails]:
+                    continue
+                if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e):
+                    return JSONResponse({"ok": False, "error": f"이메일 형식이 아닙니다: {e}"},
+                                        status_code=400)
+                emails.append(e)
+            patch["weekly_report_to"] = jdump(emails[:30])
         if patch:
             ctx.storage.set_run_state(patch)
         return JSONResponse({"ok": True})
@@ -4953,12 +4987,16 @@ def create_app(ctx: Context):
     def api_weekly(id: str = ""):
         """주간 레포트 1건 (기본: 최신). payload + html 포함."""
         report = ctx.storage.get_weekly_report(id or None)
-        if report is None:
-            return JSONResponse({"ok": True, "report": None,
-                                 "enabled": ctx.cfg.weekly_enabled})
-        return JSONResponse({
+        meta = {
             "ok": True,
             "enabled": ctx.cfg.weekly_enabled,
+            "smtp_ready": ctx.cfg.smtp_configured,
+            "recipients": weekly_recipients(ctx),
+        }
+        if report is None:
+            return JSONResponse({**meta, "report": None})
+        return JSONResponse({
+            **meta,
             "report": {
                 "id": report.get("id"),
                 "period_start": report.get("period_start"),
@@ -4985,18 +5023,38 @@ def create_app(ctx: Context):
     _weekly_lock = threading.Lock()
 
     @app.post("/api/weekly/generate")
-    def api_weekly_generate(x_master_token: str = fastapi.Header(default="")):
-        """지금 새로 생성(+설정돼 있으면 발송). 마스터 전용 · LLM 7회 과금."""
+    def api_weekly_generate(payload: dict | None = None,
+                            x_master_token: str = fastapi.Header(default="")):
+        """지금 새로 생성. 마스터 전용 · LLM 7회 과금.
+        payload {"send": true} 면 생성 직후 이메일까지 보낸다(기본 false)."""
         if not _valid_master_token(x_master_token):
             return JSONResponse({"ok": False, "error": "마스터 인증이 필요합니다."}, status_code=401)
         if not _weekly_lock.acquire(blocking=False):
             return JSONResponse({"ok": False, "error": "이미 생성 중입니다."}, status_code=409)
+        want_send = bool((payload or {}).get("send"))
         try:
-            report = run_weekly_report(ctx, send=ctx.cfg.smtp_enabled)
+            report = run_weekly_report(ctx, send=want_send and ctx.cfg.smtp_configured)
         finally:
             _weekly_lock.release()
         return JSONResponse({"ok": True, "id": report["id"], "sent_at": report.get("sent_at"),
                              "send_error": report.get("send_error")})
+
+    @app.post("/api/weekly/{report_id}/send")
+    def api_weekly_send(report_id: str, x_master_token: str = fastapi.Header(default="")):
+        """이미 생성된 레포트를 지금 이메일로 보낸다. 마스터 전용."""
+        if not _valid_master_token(x_master_token):
+            return JSONResponse({"ok": False, "error": "마스터 인증이 필요합니다."}, status_code=401)
+        report = ctx.storage.get_weekly_report(report_id)
+        if report is None:
+            return JSONResponse({"ok": False, "error": "레포트를 찾을 수 없습니다."}, status_code=404)
+        pe = (report.get("period_end") or "")[:10]
+        to_list = weekly_recipients(ctx)
+        ok, err = send_report_email(
+            ctx.cfg, f"[P-FM] 포스코 그룹 주간동향 ({pe})", report.get("html") or "", to_list)
+        ctx.storage.mark_weekly_sent(report_id, iso(now_utc()) if ok else None, err)
+        return JSONResponse({"ok": ok, "error": err,
+                             "sent_to": to_list if ok else []},
+                            status_code=200 if ok else 400)
 
     if os.path.isdir(FRONTEND_DIR):
         from fastapi.responses import HTMLResponse
@@ -5925,14 +5983,17 @@ def cmd_selftest() -> int:
     check("HTML 렌더 + 이스케이프", "제목&lt;&amp;&gt;" in _html and "강점" in _html, True)
     check("기사 없는 섹션 안내", "이번 주 해당 기사가 없습니다" in _html, True)
     check("plain 대체본은 태그 제거", "<" not in _html_to_text("<p>가<b>나</b>다</p>"), True)
-    _ok, _err = send_report_email(
-        Config(**{**{f: "" for f in Config.__dataclass_fields__},
-                  "smtp_port": 587, "api_port": 8000, "poll_interval_sec": 300,
-                  "naver_interval_sec": 300, "fresh_cutoff_hours": 6, "backfill_cutoff_hours": 72,
-                  "notify_threshold": 50, "llm_daily_limit": 1500, "llm_per_run": 6,
-                  "weekly_enabled": False, "weekly_to": [], "weekly_hour": 7}),
-        "제목", "<p>본문</p>")
+    _cfg_blank = Config(**{**{f: "" for f in Config.__dataclass_fields__},
+                           "smtp_port": 587, "api_port": 8000, "poll_interval_sec": 300,
+                           "naver_interval_sec": 300, "fresh_cutoff_hours": 6, "backfill_cutoff_hours": 72,
+                           "notify_threshold": 50, "llm_daily_limit": 1500, "llm_per_run": 6,
+                           "weekly_enabled": False, "weekly_to": [], "weekly_hour": 7})
+    _ok, _err = send_report_email(_cfg_blank, "제목", "<p>본문</p>", ["a@b.com"])
     check("SMTP 미설정이면 발송 스킵", (_ok, "SMTP 미설정" in (_err or "")), (False, True))
+    _cfg_creds = replace(_cfg_blank, smtp_user="x@gmail.com", smtp_app_password="pw")
+    _ok2, _err2 = send_report_email(_cfg_creds, "제목", "<p>본문</p>", [])
+    check("수신자 없으면 발송 스킵", (_ok2, "수신자" in (_err2 or "")), (False, True))
+    check("주간 HTML 헤더는 .wr-head 로 감싼다", 'class="wr-head"' in _html, True)
 
     print()
     if failures:
