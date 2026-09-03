@@ -862,12 +862,16 @@ function init() {
     timer = setTimeout(() => { state.q = e.target.value.trim(); refresh(true); }, 300);
   });
 
-  $('clearAll').addEventListener('click', () => {
+  const goHome = () => {
+    if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     state.group.clear(); state.cat.clear(); state.press.clear();
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
     refresh(true);
-  });
+  };
+  $('clearAll').addEventListener('click', goHome);
+  $('brandHome').addEventListener('click', (e) => { e.preventDefault(); goHome(); });
 
   $('loadMore').addEventListener('click', () => { state.page += 1; refresh(false); });
 

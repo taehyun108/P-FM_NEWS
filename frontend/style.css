@@ -47,7 +47,8 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   gap: 16px; padding-top: 18px; padding-bottom: 18px; flex-wrap: wrap;
 }
-.brand { display: flex; align-items: center; gap: 14px; }
+.brand { display: flex; align-items: center; gap: 14px; color: inherit; text-decoration: none; cursor: pointer; }
+a.brand:hover .brand-mark { background: rgba(255, 255, 255, .28); }
 .brand-mark {
   width: 42px; height: 42px; flex: none; border-radius: 11px;
   background: rgba(255, 255, 255, .16);
