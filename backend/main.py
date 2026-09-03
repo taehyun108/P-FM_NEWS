@@ -4360,7 +4360,13 @@ def build_weekly_report(ctx: Context) -> dict:
     }
 
 
-_SWOT_LABELS = {"s": "강점 (S)", "w": "약점 (W)", "o": "기회 (O)", "t": "위협 (T)"}
+# SWOT 4분면 색상 — 이메일 클라이언트 호환을 위해 배경·글자색을 직접 지정한다.
+_SWOT_QUADRANTS = {
+    "s": ("강점", "Strengths",  "#0E6E4A", "#e7f4ee", "#20402f"),
+    "w": ("약점", "Weaknesses", "#B4610C", "#fbf0e3", "#4a3520"),
+    "o": ("기회", "Opportunities", "#1D63C4", "#e8f1fc", "#20344f"),
+    "t": ("위협", "Threats",    "#C0392B", "#fbeae8", "#4a2723"),
+}
 
 
 def render_weekly_html(payload: dict) -> str:
@@ -4381,8 +4387,10 @@ def render_weekly_html(payload: dict) -> str:
     ]
     for i, sec in enumerate(payload.get("sections", []), 1):
         out.append(
-            f'<h2 style="font-size:16px;margin:28px 0 10px;padding-bottom:6px;'
-            f'border-bottom:2px solid #16337A;color:#16337A;">{i}. {esc(sec["label"])}</h2>')
+            f'<h2 style="font-size:16px;margin:30px 0 10px;padding-bottom:6px;'
+            f'border-bottom:2px solid #16337A;color:#16337A;">'
+            f'<span style="background:#16337A;color:#fff;border-radius:5px;'
+            f'padding:1px 8px;font-size:13px;margin-right:7px;">{i}</span>{esc(sec["label"])}</h2>')
         arts = sec.get("articles") or []
         if not arts:
             out.append('<p style="color:#98a2b3;font-size:13px;">이번 주 해당 기사가 없습니다.</p>')
@@ -4399,23 +4407,34 @@ def render_weekly_html(payload: dict) -> str:
         out.append('</ol>')
 
         if sec.get("kind") == "group" and sec.get("swot"):
-            out.append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-                       'style="border-collapse:collapse;margin:6px 0 4px;font-size:13px;">')
             sw = sec["swot"]
+            out.append('<table role="presentation" width="100%" cellpadding="0" cellspacing="8" '
+                       'style="margin:10px 0 6px;">')
             for row_keys in (("s", "w"), ("o", "t")):
                 out.append('<tr>')
                 for k in row_keys:
+                    name, en, accent, bg, ink = _SWOT_QUADRANTS[k]
                     out.append(
-                        f'<td width="50%" valign="top" style="border:1px solid #e4e7ec;padding:10px;">'
-                        f'<b style="color:#16337A;">{_SWOT_LABELS[k]}</b><br>'
-                        f'<span style="color:#344054;">{esc(sw.get(k) or "—")}</span></td>')
+                        f'<td width="50%" valign="top" style="background:{bg};border-radius:8px;'
+                        f'padding:12px 14px;">'
+                        f'<div style="font-weight:700;color:{accent};font-size:12px;'
+                        f'letter-spacing:.3px;margin-bottom:5px;">'
+                        f'<span style="font-size:9px;vertical-align:2px;">●</span> {name} '
+                        f'<span style="opacity:.55;font-weight:600;">{k.upper()} · {en}</span></div>'
+                        f'<div style="color:{ink};font-size:13px;line-height:1.6;">'
+                        f'{esc(sw.get(k) or "이번 주 해당 신호 없음")}</div></td>')
                 out.append('</tr>')
             out.append('</table>')
         elif sec.get("kind") == "topic" and sec.get("impact"):
             out.append(
-                '<div style="background:#f2f5fb;border-left:3px solid #16337A;padding:10px 12px;'
-                'font-size:13px;color:#344054;margin:4px 0;">'
-                f'<b style="color:#16337A;">포스코 그룹 영향</b><br>{esc(sec["impact"])}</div>')
+                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                'style="margin:10px 0 6px;">'
+                '<tr><td style="background:#16337A;padding:9px 16px;border-radius:8px 8px 0 0;">'
+                '<span style="color:#fff;font-weight:700;font-size:13px;">'
+                '🎯 이 이슈가 포스코 그룹에 미치는 영향</span></td></tr>'
+                '<tr><td style="background:#eef2fb;padding:14px 16px;border-radius:0 0 8px 8px;'
+                'color:#2b3a55;font-size:13.5px;line-height:1.75;">'
+                f'{esc(sec["impact"])}</td></tr></table>')
     out.append('<p style="color:#98a2b3;font-size:11px;margin-top:32px;border-top:1px solid #e4e7ec;'
                'padding-top:12px;">이 레포트는 수집·요약된 공개 기사와 AI 분석을 기반으로 자동 생성되었습니다. '
                '원문 저작권은 각 언론사에 있습니다.</p>')
