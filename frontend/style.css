@@ -405,3 +405,5 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
   font-size: 13px; color: var(--ink-mid); cursor: pointer;
 }
 .master-toggle input { margin-top: 2px; flex: none; }
+.kw-label { margin: 12px 0 5px; font-size: 12px; font-weight: 700; color: var(--navy); }
+.kw-label span { font-weight: 400; color: var(--ink-soft); }

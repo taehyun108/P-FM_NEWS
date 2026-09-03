@@ -382,6 +382,7 @@ async function shareToTelegram(articleId, btn) {
 
 let masterKeywords = [];
 let policyKeywords = [];
+let policyRequired = [];
 let thTimer;
 
 function masterAuth() {
@@ -444,13 +445,14 @@ async function loadMasterSettings() {
     $('thRange').value = d.threshold;
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
-    $('alwaysGroup').textContent = d.always_group;
     $('webPwNow').textContent = d.web_password || '(미설정)';
     $('notifyPolicy').checked = !!d.notify_policy;
     masterKeywords = d.keywords || [];
     policyKeywords = d.policy_keywords || [];
+    policyRequired = d.policy_required || [];
     renderKwList();
     renderPolicyKwList();
+    renderPolicyReqList();
   } catch (e) {
     if (e.message !== 'unauthorized') masterMsg('err', '설정을 불러오지 못했습니다.');
   }
@@ -468,24 +470,15 @@ function renderChipEditor(container, arr, save) {
   }));
 }
 
-function renderKwList() { renderChipEditor('kwList', masterKeywords, (next) => { masterKeywords = next; renderKwList(); saveKeywords(); }); }
-function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords, (next) => { policyKeywords = next; renderPolicyKwList(); savePolicyKeywords(); }); }
+function renderKwList() { renderChipEditor('kwList', masterKeywords, (next) => { masterKeywords = next; renderKwList(); saveKw('keywords', masterKeywords); }); }
+function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords, (next) => { policyKeywords = next; renderPolicyKwList(); saveKw('policy_keywords', policyKeywords); }); }
+function renderPolicyReqList() { renderChipEditor('policyReqList', policyRequired, (next) => { policyRequired = next; renderPolicyReqList(); saveKw('policy_required', policyRequired); }); }
 
-async function saveKeywords() {
+async function saveKw(field, arr) {
   try {
     await masterFetch('/api/master/settings',
-      { method: 'POST', body: JSON.stringify({ keywords: masterKeywords }) });
-    masterMsg('ok', '키워드를 저장했습니다.');
-  } catch (e) {
-    if (e.message !== 'unauthorized') masterMsg('err', '저장에 실패했습니다.');
-  }
-}
-
-async function savePolicyKeywords() {
-  try {
-    await masterFetch('/api/master/settings',
-      { method: 'POST', body: JSON.stringify({ policy_keywords: policyKeywords }) });
-    masterMsg('ok', '정책 알림 키워드를 저장했습니다.');
+      { method: 'POST', body: JSON.stringify({ [field]: arr }) });
+    masterMsg('ok', '저장했습니다.');
   } catch (e) {
     if (e.message !== 'unauthorized') masterMsg('err', '저장에 실패했습니다.');
   }
@@ -536,21 +529,22 @@ function initMaster() {
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 
-  const wireKwAdd = (btnId, inputId, arrGetter, arrSetter, render, save) => {
+  const wireKwAdd = (btnId, inputId, arrGetter, arrSetter, render, field) => {
     const add = () => {
       const v = $(inputId).value.trim();
       if (v && !arrGetter().includes(v)) {
         arrSetter([...arrGetter(), v]);
         $(inputId).value = '';
         render();
-        save();
+        saveKw(field, arrGetter());
       }
     };
     $(btnId).addEventListener('click', add);
     $(inputId).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
   };
-  wireKwAdd('kwAdd', 'kwNew', () => masterKeywords, (a) => { masterKeywords = a; }, renderKwList, saveKeywords);
-  wireKwAdd('policyKwAdd', 'policyKwNew', () => policyKeywords, (a) => { policyKeywords = a; }, renderPolicyKwList, savePolicyKeywords);
+  wireKwAdd('kwAdd', 'kwNew', () => masterKeywords, (a) => { masterKeywords = a; }, renderKwList, 'keywords');
+  wireKwAdd('policyKwAdd', 'policyKwNew', () => policyKeywords, (a) => { policyKeywords = a; }, renderPolicyKwList, 'policy_keywords');
+  wireKwAdd('policyReqAdd', 'policyReqNew', () => policyRequired, (a) => { policyRequired = a; }, renderPolicyReqList, 'policy_required');
 
   $('pwMasterForm').addEventListener('submit', async (e) => {
     e.preventDefault();

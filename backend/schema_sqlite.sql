@@ -73,6 +73,7 @@ create table if not exists run_state (
   web_password     TEXT,                    -- 웹페이지 비밀번호 평문 (마스터 패널에서 확인용)
   notify_policy    INTEGER not null default 0, -- 정책브리핑 기사도 텔레그램 알림 (마스터 설정)
   policy_notify_keywords TEXT default '[]', -- 정책 알림 키워드 (마스터 설정, 비면 모든 정책기사)
+  policy_required_keywords TEXT default '[]', -- 정책 알림 필수 공통 키워드 (마스터 설정, AND 조건)
   updated_at       TEXT not null
 );
 
