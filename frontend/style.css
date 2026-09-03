@@ -400,3 +400,8 @@ body {
 .master-current b { color: var(--navy); font-family: ui-monospace, Consolas, monospace; }
 .master-current small { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 11px; }
 a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
+.master-toggle {
+  display: flex; align-items: flex-start; gap: 8px; margin: 8px 0 4px;
+  font-size: 13px; color: var(--ink-mid); cursor: pointer;
+}
+.master-toggle input { margin-top: 2px; flex: none; }

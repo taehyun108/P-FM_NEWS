@@ -445,6 +445,7 @@ async function loadMasterSettings() {
     $('thRec').textContent = d.recommended_min;
     $('alwaysGroup').textContent = d.always_group;
     $('webPwNow').textContent = d.web_password || '(미설정)';
+    $('notifyPolicy').checked = !!d.notify_policy;
     masterKeywords = d.keywords || [];
     renderKwList();
   } catch (e) {
@@ -512,6 +513,14 @@ function initMaster() {
         masterMsg('ok', `임계값 ${e.target.value} 저장`);
       } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
     }, 400);
+  });
+
+  $('notifyPolicy').addEventListener('change', async (e) => {
+    try {
+      await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ notify_policy: e.target.checked }) });
+      masterMsg('ok', e.target.checked ? '정책브리핑 기사 알림 켬' : '정책브리핑 기사 알림 끔');
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 
   $('kwAdd').addEventListener('click', () => {

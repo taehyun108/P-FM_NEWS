@@ -71,6 +71,7 @@ create table if not exists run_state (
   master_pw_hash   TEXT,                    -- 마스터 비밀번호 (pbkdf2, null 이면 .env 값 사용)
   web_pw_hash      TEXT,                    -- 웹페이지 비밀번호 해시 (게이트는 추후)
   web_password     TEXT,                    -- 웹페이지 비밀번호 평문 (마스터 패널에서 확인용)
+  notify_policy    INTEGER not null default 0, -- 정책브리핑 기사도 텔레그램 알림 (마스터 설정)
   updated_at       TEXT not null
 );
 

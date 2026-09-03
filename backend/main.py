@@ -572,6 +572,7 @@ class SqliteStorage(Storage):
             "alter table run_state add column master_pw_hash TEXT",
             "alter table run_state add column web_pw_hash TEXT",
             "alter table run_state add column web_password TEXT",
+            "alter table run_state add column notify_policy INTEGER not null default 0",
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
         ]
@@ -1295,8 +1296,16 @@ SEED_KEYWORDS: list[tuple[str, str]] = (
     + [("산업", k) for k in
        ["이차전지", "배터리 소재", "양극재", "음극재", "전구체", "리튬", "니켈", "흑연",
         "전고체 배터리", "나트륨 배터리", "LFP"]]
+    # '정책' 카테고리는 Google 검색 시 site:www.korea.kr 로 한정된다 (대한민국 정책브리핑).
+    # 포스코 산업(철강·이차전지·에너지·통상·환경규제·인프라)에 영향이 있는 부처 발표를 폭넓게 수집.
     + [("정책", k) for k in
-       ["이차전지 특화단지", "IRA 배터리", "배터리 보조금", "핵심광물", "탄소중립 철강"]]
+       ["철강", "이차전지", "배터리", "리튬", "전기요금", "전력수급", "에너지",
+        "탄소중립", "배출권거래제", "탄소국경조정제도", "RE100", "수소경제",
+        "공급망", "핵심광물", "통상", "관세", "무역협정", "산업단지", "특화단지",
+        "제조업 지원", "투자 인센티브", "국가전략기술",
+        "산업통상자원부", "기후에너지환경부", "환경부", "기획재정부",
+        "국토교통부", "고용노동부", "과학기술정보통신부", "중소벤처기업부",
+        "기획재정부 예산", "국회 예산", "예산결산특별위원회", "국정감사"]]
 )
 
 # 수집 소스 시드 — (source_type, name, url, enabled)
@@ -1725,11 +1734,16 @@ GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:
 NAVER_NEWS_API = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 
 
-def collect_google_rss(http: HttpClient, keywords: Sequence[str]) -> list[RawItem]:
+POLICY_SITE = "site:www.korea.kr"   # '정책' 키워드는 정책브리핑으로만 검색한다
+
+
+def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[RawItem]:
     feedparser = _import("feedparser", "feedparser")
     items: list[RawItem] = []
-    for keyword in keywords:
-        url = GOOGLE_NEWS_RSS.format(q=urlencode({"q": keyword})[2:])
+    for row in keyword_rows:
+        keyword = row["keyword"]
+        query = f"{POLICY_SITE} {keyword}" if row.get("category") == "정책" else keyword
+        url = GOOGLE_NEWS_RSS.format(q=urlencode({"q": query})[2:])
         try:
             resp = http.get(url)
             resp.raise_for_status()
@@ -1740,6 +1754,10 @@ def collect_google_rss(http: HttpClient, keywords: Sequence[str]) -> list[RawIte
         for entry in feed.entries:
             link = entry.get("link", "")
             if not link:
+                continue
+            src_title = (entry.get("source", {}) or {}).get("title", "")
+            # 정책브리핑 검색인데 생활정보 블로그(gonggam.korea.kr)면 버린다. (사용자 지정)
+            if row.get("category") == "정책" and "gonggam" in f"{src_title} {entry.get('title','')}".lower():
                 continue
             published = parse_feed_datetime(entry.get("published") or entry.get("updated"),
                                             entry.get("published_parsed") or entry.get("updated_parsed"))
@@ -1756,6 +1774,45 @@ def collect_google_rss(http: HttpClient, keywords: Sequence[str]) -> list[RawIte
 
 
 POSCO_MENTION_RE = re.compile(r"포스코|posco", re.IGNORECASE)
+
+# 대한민국 정책브리핑 기사 URL (생활정보 gonggam.korea.kr 은 제외).
+KOREA_KR_NEWS_RE = re.compile(r"//(?:www\.)?korea\.kr/news/", re.IGNORECASE)
+
+# 정책 기사가 '포스코 산업에 영향이 있는가' 판정용. 포스코 미언급이어도 이 중 하나면 수집한다.
+POLICY_RELEVANCE_KW = [
+    "철강", "제철", "이차전지", "배터리", "리튬", "니켈", "양극재",
+    "전기요금", "전력", "에너지", "전력수급", "송전", "발전",
+    "탄소", "배출권", "탄소중립", "탄소국경", "CBAM", "RE100", "재생에너지", "수소",
+    "산업", "제조", "공급망", "핵심광물", "통상", "관세", "무역", "수출",
+    "산업단지", "특화단지", "투자", "보조금", "세제", "인센티브", "국가전략기술",
+    "반도체", "친환경", "기후", "환경규제", "국토", "건설", "인프라", "SOC",
+    "예산", "국정감사", "규제완화", "노동", "고용",
+]
+
+
+POLICY_BRIEF_PRESS = "대한민국 정책브리핑"
+
+
+def is_policy_brief(row: dict) -> bool:
+    """정책브리핑(korea.kr) 기사인지. press_name 또는 URL 로 판정한다."""
+    if (row.get("press_name") or "") == POLICY_BRIEF_PRESS:
+        return True
+    return bool(KOREA_KR_NEWS_RE.search(row.get("url_canonical") or row.get("url_original") or ""))
+
+
+def extract_ministry(html: str, body: str) -> str:
+    """정책브리핑 기사에서 발표 부처명을 뽑는다. 못 찾으면 '정책브리핑'."""
+    text = f"{html}\n{body}"
+    for pat in (
+        r"문의\s*[:：]\s*(?:&lt;|<)?\s*총괄\s*(?:&gt;|>)?\s*([가-힣]{2,12}(?:부|처|청|위원회|실))",
+        r"문의\s*[:：]\s*([가-힣]{2,12}(?:부|처|청|위원회))",
+        r"자료\s*=\s*([가-힣]{2,12}(?:부|처|청|위원회))",
+        r"\(([가-힣]{2,12}(?:부|처|청))\s*제공\)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return "정책브리핑"
 
 
 def _naver_item_relevant(title: str, category: str) -> bool:
@@ -2757,7 +2814,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 수집 ─────────────────────────────────────────────────────────
     raw: list[RawItem] = []
     if "google_rss" in feed_types:
-        raw += collect_google_rss(http, keywords)
+        raw += collect_google_rss(http, keyword_rows)
     if "naver_api" in feed_types and cfg.naver_enabled:
         # 하루 25,000회 한도 때문에 매 실행이 아니라 일정 간격으로만 호출한다.
         due = force_naver or (time.monotonic() - ctx.last_naver_fetch) >= cfg.naver_interval_sec
@@ -2876,7 +2933,9 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             body = item.snippet or item.title
 
         press_name, press_id, press_tier = resolve_press(storage, canonical, item.press_hint, html)
-        author = extract_author(html, body, press_name)
+        is_policy = bool(KOREA_KR_NEWS_RE.search(canonical or ""))
+        # 정책브리핑 기사는 기자명 대신 발표 부처명을 넣는다. (사용자 지정)
+        author = extract_ministry(html, body) if is_policy else extract_author(html, body, press_name)
         content_hash = sha256(body) if summary_source == "fulltext" else ""
 
         # ── G5: 중복 그룹 판정 ───────────────────────────────────────
@@ -2910,14 +2969,22 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             continue
 
         rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
-        # 포스코·계열사가 제목·스니펫·본문 어디에도 없으면 무관 기사 — 저장하지 않는다. (사용자 지정)
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
-        if not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
+        if is_policy:
+            # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집. (사용자 지정)
+            if not matches_keywords(relevance_probe, POLICY_RELEVANCE_KW):
+                storage.upsert_ledger(item.url_source, "off_topic")
+                ctx.seen_cache.add(item.url_source)
+                continue
+        elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
+            # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
             ctx.seen_cache.add(item.url_source)
             continue
         # 카테고리는 제목+스니펫으로만 잡고, 분석 후 요약으로 다시 계산한다.
         categories = detect_categories(item.title, item.snippet or "")
+        if is_policy and "정부/정책" not in categories:
+            categories = ["정부/정책"] + categories
         score = score_article(item.title, body, rule_groups, press_tier)
 
         article_id = new_id()
@@ -2974,7 +3041,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         probe = f"{item.title}\n{body}"
         is_priority = (ALWAYS_NOTIFY_GROUP in normalize_group_list(rule_groups)
                        or any(k in probe for k in always_kws))
-        saved_for_notify.append((article_id, score, is_backfill, item.published_at, is_priority))
+        saved_for_notify.append(
+            (article_id, score, is_backfill, item.published_at, is_priority, is_policy))
 
     # ── 분석 백로그 드레인 ───────────────────────────────────────────
     # 이전 실행에서 저장만 되고 분석이 밀린 기사를 예산 안에서 처리한다.
@@ -3001,13 +3069,16 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
     notify_threshold = effective_threshold(ctx)
-    for article_id, score, is_backfill, published_at, is_priority in saved_for_notify:
+    # 정책브리핑 기사는 기본적으로 웹에만 노출. 마스터가 켜야 알림한다. (사용자 지정)
+    notify_policy = str(state.get("notify_policy") or "0") not in ("0", "False", "false", "")
+    for article_id, score, is_backfill, published_at, is_priority, is_policy in saved_for_notify:
         if not cfg.telegram_enabled:
             break
         # is_priority: 포스코퓨처엠 언급 또는 마스터 지정 키워드 → 중요도 게이트 우회
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
             and (not is_backfill)                  # 6시간 넘은 기사는 웹에만
+            and (not is_policy or notify_policy)   # 정책 기사는 마스터가 켠 경우만
             and (score >= notify_threshold or is_priority)  # 중요도 게이트(우선 기사는 우회)
             and published_at is not None
             and published_at >= bootstrap_at       # 파이프라인 가동 이전 기사는 절대 알림 안 함
@@ -3087,6 +3158,8 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     # 키워드는 LLM 이 뽑은 핵심어 6개뿐이라, 본문 전체를 스캔할 때 같은 과태깅 없이
     # 요약에서 빠진 주제('인허가', '이차전지 소재' 등)를 잡아 준다.
     categories = detect_categories(row["title"], f"{analysis.summary_text}\n{' '.join(keywords)}")
+    if is_policy_brief(row) and "정부/정책" not in categories:
+        categories = ["정부/정책"] + categories
 
     ctx.storage.update_article(article_id, {
         "sentiment": analysis.sentiment,
@@ -3827,13 +3900,15 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
     """
     groups = normalize_group_list(jload(row.get("group_companies"), []))
     if not groups:
-        # LLM 이 group_companies 를 비워 보냈으면 제목·요약·키워드에서 룰 기반으로 채운다.
-        # active 기사는 수집 게이트에서 이미 포스코 관련이 확인됐으므로 최소 '포스코'.
         probe = " ".join([
             row.get("title") or "", row.get("summary_text") or "",
             " ".join(jload(row.get("keywords"), [])),
         ])
-        groups = normalize_group_list(detect_group_companies(probe)) or ["포스코"]
+        groups = normalize_group_list(detect_group_companies(probe))
+        # 정책브리핑 기사는 포스코 미언급이 정상 — '포스코' 폴백을 씌우지 않는다.
+        # 일반 기사는 수집 게이트에서 포스코 관련이 확인됐으므로 최소 '포스코'.
+        if not groups and not is_policy_brief(row):
+            groups = ["포스코"]
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
     return groups, categories, row.get("press_name") or ""
 
@@ -4102,6 +4177,7 @@ def create_app(ctx: Context):
             "keywords": jload(st.get("always_notify_keywords"), []),
             "always_group": ALWAYS_NOTIFY_GROUP,
             "web_password": st.get("web_password") or "",
+            "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
         })
 
     @app.post("/api/master/settings")
@@ -4122,6 +4198,8 @@ def create_app(ctx: Context):
                                     status_code=400)
             clean = dedupe_chips(str(k).strip() for k in kws if str(k).strip())[:30]
             patch["always_notify_keywords"] = jdump(clean)
+        if "notify_policy" in (payload or {}):
+            patch["notify_policy"] = 1 if payload["notify_policy"] else 0
         if patch:
             ctx.storage.set_run_state(patch)
         return JSONResponse({"ok": True})
@@ -4300,6 +4378,8 @@ def cmd_fixcategories(ctx: Context) -> None:
         cur = dedupe_chips(jload(r.get("categories"), []))
         probe = f"{r.get('summary_text') or ''}\n{' '.join(jload(r.get('keywords'), []))}"
         new = detect_categories(r.get("title") or "", probe)
+        if is_policy_brief(r) and "정부/정책" not in new:
+            new = ["정부/정책"] + new
         if new != cur:
             ctx.storage.update_article(r["id"], {"categories": jdump(new)})
             fixed += 1
@@ -4371,6 +4451,8 @@ def cmd_fixofftopic(ctx: Context) -> None:
     rows = ctx.storage.list_articles(5000, 0, None, "")
     cands = []
     for r in rows:
+        if is_policy_brief(r):
+            continue  # 정책브리핑 기사는 포스코 미언급이어도 유지한다 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
@@ -4738,6 +4820,22 @@ def cmd_selftest() -> int:
           _naver_item_relevant("대덕SW고 학생, 포스코DX AI 유스챌린지 대상", "그룹사"), True)
     check("산업 키워드는 필터 안 함",
           _naver_item_relevant("LG엔솔 리튬 계약", "산업"), True)
+
+    print("\n[8-2b] 정책브리핑(korea.kr) 수집")
+    check("정책브리핑 URL 판정",
+          bool(KOREA_KR_NEWS_RE.search("https://www.korea.kr/news/policyNewsView.do?newsId=1")), True)
+    check("생활정보(gonggam) 는 정책브리핑 아님",
+          bool(KOREA_KR_NEWS_RE.search("https://gonggam.korea.kr/newsView.do?newsId=1")), False)
+    check("포스코 산업 관련 정책이면 수집",
+          matches_keywords("내년 전기차 보조금 역대 최대 첨단산업 전력 용수 공급 1.9조", POLICY_RELEVANCE_KW), True)
+    check("농업·복지 정책은 제외",
+          matches_keywords("쌀 직불금 인상 농가 소득 안정", POLICY_RELEVANCE_KW), False)
+    check("부처명 추출 (문의 총괄)",
+          extract_ministry("", "문의 : <총괄>기후에너지환경부 기획재정담당관(044-201-6337)"), "기후에너지환경부")
+    check("부처명 없으면 정책브리핑",
+          extract_ministry("", "본문에 부처 언급 없음"), "정책브리핑")
+    check("press_name 으로 정책브리핑 판정",
+          is_policy_brief({"press_name": "대한민국 정책브리핑"}), True)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),
