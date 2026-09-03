@@ -10,3 +10,5 @@ fastapi>=0.110
 uvicorn>=0.29
 # DB_BACKEND=supabase 로 전환할 때만 필요
 supabase>=2.4
+# LANGSMITH_TRACING=true 일 때만 필요 (LLM 호출 추적)
+langsmith>=0.11

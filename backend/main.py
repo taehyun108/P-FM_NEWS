@@ -2337,11 +2337,29 @@ class Analysis:
         return " ".join(s.strip() for s in self.summary_sentences if s.strip())
 
 
+def _make_openai_client(api_key: str):
+    """OpenAI 클라이언트. LANGSMITH_TRACING 이 켜져 있으면 LangSmith 로 감싼다.
+
+    langsmith 미설치·추적 off 면 순수 클라이언트를 그대로 쓴다(오버헤드 0).
+    """
+    openai = _import("openai", "openai")
+    client = openai.OpenAI(api_key=api_key)
+    if _clean(os.environ.get("LANGSMITH_TRACING")).lower() in ("1", "true", "yes"):
+        try:
+            from langsmith.wrappers import wrap_openai
+            client = wrap_openai(client)
+            log.info("LangSmith 트레이싱 활성화 (project=%s)",
+                     os.environ.get("LANGSMITH_PROJECT") or "default")
+        except ImportError:
+            log.warning("LANGSMITH_TRACING 이 켜졌지만 langsmith 패키지가 없습니다. "
+                        "`pip install langsmith` 후 다시 실행하세요.")
+    return client
+
+
 class LLMClient:
     def __init__(self, cfg: Config) -> None:
-        openai = _import("openai", "openai")
         _hush_libraries()  # openai/httpx 가 import 시 로깅을 다시 켜는 경우 대비
-        self.client = openai.OpenAI(api_key=cfg.openai_api_key)
+        self.client = _make_openai_client(cfg.openai_api_key)
         self.model = cfg.llm_model
         self.embedding_model = cfg.embedding_model
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
