@@ -49,7 +49,7 @@ create table if not exists articles (
   categories         TEXT default '[]',
   title_embedding    TEXT,
   analyzed_at        TEXT,
-  status             TEXT default 'active'
+  status             TEXT default 'active'   -- active | draft | archived | error
 );
 
 create table if not exists url_ledger (

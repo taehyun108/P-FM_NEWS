@@ -203,13 +203,18 @@
   <!-- 수동 URL 등록 (PRD F8) -->
   <section class="url-add" aria-label="URL 직접 등록">
     <h2>URL로 포토카드 만들기</h2>
-    <p class="url-add-desc">뉴스 기사 링크를 넣으면 같은 방식(요약 · 포스코 관점 · 키워드 · SWOT)으로 분석해 카드를 만듭니다.</p>
+    <p class="url-add-desc">뉴스 기사 링크를 넣으면 같은 방식(요약 · 포스코 관점 · 키워드 · SWOT)으로 분석해 미리보기를 만듭니다. 확인 후 <b>등록</b>을 눌러야 목록에 추가됩니다.</p>
     <form class="url-add-form" id="urlAddForm">
       <input type="url" id="urlAddInput" class="url-add-input"
              placeholder="https://..." autocomplete="off" required>
       <button type="submit" class="url-add-btn" id="urlAddBtn">분석</button>
     </form>
     <p class="url-add-msg" id="urlAddMsg" hidden></p>
+    <div class="url-add-confirm" id="urlAddConfirm" hidden>
+      <span>이 기사를 목록에 등록할까요?</span>
+      <button type="button" class="url-add-btn" id="urlConfirmBtn">등록</button>
+      <button type="button" class="btn-clear" id="urlDiscardBtn">취소</button>
+    </div>
     <div class="grid url-add-result" id="urlAddResult"></div>
   </section>
 </main>

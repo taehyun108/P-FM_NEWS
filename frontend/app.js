@@ -813,6 +813,14 @@ function urlMsg(kind, text) {
   m.hidden = false;
 }
 
+let pendingDraft = null;   // 미리보기 중인 draft 기사 {id, card}
+
+function clearUrlPreview() {
+  pendingDraft = null;
+  $('urlAddConfirm').hidden = true;
+  $('urlAddResult').replaceChildren();
+}
+
 async function submitUrl(e) {
   e.preventDefault();
   const input = $('urlAddInput');
@@ -821,6 +829,7 @@ async function submitUrl(e) {
   if (!url) return;
 
   btn.disabled = true;
+  clearUrlPreview();
   urlMsg('info', '기사를 분석하고 있습니다… (10~20초 걸릴 수 있어요)');
 
   try {
@@ -831,25 +840,43 @@ async function submitUrl(e) {
     });
     const data = await res.json();
 
-    if (!data.ok) {
-      urlMsg('err', data.error || '분석에 실패했습니다.');
-      return;
-    }
+    if (!data.ok) { urlMsg('err', data.error || '분석에 실패했습니다.'); return; }
+
+    $('urlAddResult').replaceChildren(buildCard(data.card));
     if (data.already) {
       urlMsg('info', '이미 등록된 기사입니다. 아래 카드를 확인하세요.');
-    } else {
-      urlMsg('ok', '카드를 만들었습니다. 목록 맨 위에도 추가됩니다.');
-      input.value = '';
+    } else if (data.draft_id) {
+      pendingDraft = { id: data.draft_id, card: data.card };
+      $('urlAddConfirm').hidden = false;
+      urlMsg('info', '미리보기를 만들었습니다. 확인 후 등록하세요.');
     }
-    $('urlAddResult').replaceChildren(buildCard(data.card));
-    // 새로 만든 카드를 기존 목록 맨 앞에도 끼워 넣는다.
-    if (!data.already) $('grid').prepend(buildCard(data.card));
   } catch (err) {
     console.error('URL 분석 실패', err);
     urlMsg('err', '서버에 연결하지 못했습니다.');
   } finally {
     btn.disabled = false;
   }
+}
+
+async function confirmDraft() {
+  if (!pendingDraft) return;
+  try {
+    const res = await fetch(`${API}/api/articles/${pendingDraft.id}/confirm`, { method: 'POST' });
+    if (!(await res.json()).ok) throw new Error();
+    $('grid').prepend(buildCard(pendingDraft.card));   // 목록 맨 위에 추가
+    $('urlAddInput').value = '';
+    urlMsg('ok', '목록에 등록했습니다.');
+    clearUrlPreview();
+  } catch { urlMsg('err', '등록에 실패했습니다.'); }
+}
+
+async function discardDraft() {
+  if (!pendingDraft) return;
+  try {
+    await fetch(`${API}/api/articles/${pendingDraft.id}/discard`, { method: 'POST' });
+  } catch { /* 실패해도 24시간 뒤 자동 정리된다 */ }
+  urlMsg('info', '등록하지 않았습니다.');
+  clearUrlPreview();
 }
 
 /* ── 초기화 ─────────────────────────────────────────────────────── */
@@ -901,6 +928,8 @@ function init() {
   }).catch(() => { /* 텔레그램 미설정 — 버튼은 숨긴 채로 둔다 */ });
 
   $('urlAddForm').addEventListener('submit', submitUrl);
+  $('urlConfirmBtn').addEventListener('click', confirmDraft);
+  $('urlDiscardBtn').addEventListener('click', discardDraft);
 
   loadFilters().then(() => refresh(true));
   loadStats();

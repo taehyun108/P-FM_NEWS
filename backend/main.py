@@ -420,6 +420,9 @@ class Storage(ABC):
     def cleanup_bodies(self, older_than_days: int) -> int: ...
 
     @abstractmethod
+    def purge_stale_drafts(self, older_than_hours: int) -> int: ...
+
+    @abstractmethod
     def save_summary(self, row: dict) -> None: ...
 
     @abstractmethod
@@ -717,6 +720,12 @@ class SqliteStorage(Storage):
     def cleanup_bodies(self, older_than_days: int) -> int:
         cutoff = iso(now_utc() - timedelta(days=older_than_days))
         cur = self._exec("delete from article_bodies where fetched_at < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def purge_stale_drafts(self, older_than_hours: int) -> int:
+        """등록도 취소도 안 한 미리보기(draft) 기사를 지운다."""
+        cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
+        cur = self._exec("delete from articles where status='draft' and collected_at < ?", (cutoff,))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def save_summary(self, row: dict) -> None:
@@ -1089,6 +1098,12 @@ class SupabaseStorage(Storage):
     def cleanup_bodies(self, older_than_days: int) -> int:
         cutoff = iso(now_utc() - timedelta(days=older_than_days))
         res = self._t("article_bodies").delete().lt("fetched_at", cutoff).execute()
+        return len(res.data or [])
+
+    def purge_stale_drafts(self, older_than_hours: int) -> int:
+        cutoff = iso(now_utc() - timedelta(hours=older_than_hours))
+        res = (self._t("articles").delete()
+               .eq("status", "draft").lt("collected_at", cutoff).execute())
         return len(res.data or [])
 
     def save_summary(self, row: dict) -> None:
@@ -3166,6 +3181,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     purged = storage.cleanup_bodies(30)
     if purged:
         log.info("임시 본문 %d건 정리(30일 초과)", purged)
+    # 24시간 넘게 등록·취소 안 한 URL 미리보기(draft) 정리
+    dropped = storage.purge_stale_drafts(24)
+    if dropped:
+        log.info("미확정 미리보기 %d건 정리", dropped)
 
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
@@ -3305,12 +3324,13 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     return score
 
 
-def analyze_url(ctx: Context, raw_url: str) -> dict:
+def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     """사용자가 직접 붙여넣은 URL 하나를 포토카드로 만든다. (PRD F8 수동 등록)
 
     수집 게이트(G1/G2/G2.5 신선도)는 건너뛴다 — 오래된 기사여도 등록할 수 있어야 한다.
     분석 규격(요약·관점·키워드·SWOT)은 파이프라인과 동일하다.
-    반환: {"ok": bool, "card": {...}} 또는 {"ok": False, "error": "..."}
+    activate=False 면 status='draft' 로 저장한다 — 사용자가 '등록' 을 눌러야 목록에 뜬다.
+    반환: {"ok": bool, "card": {...}, "draft_id": "..."} 또는 {"ok": False, "error": "..."}
     """
     storage, http = ctx.storage, ctx.http
     raw_url = (raw_url or "").strip()
@@ -3319,11 +3339,20 @@ def analyze_url(ctx: Context, raw_url: str) -> dict:
 
     url_source = normalize_url(raw_url)
 
-    # 이미 등록된 기사면 그대로 돌려준다 (재분석·중복 저장 안 함).
+    def _existing_result(row_id: str) -> dict:
+        """이미 있는 기사 — active 면 already, draft 면 다시 미리보기로 돌려준다."""
+        detail = storage.article_detail(row_id)
+        r = {"ok": True, "card": build_card(detail)}
+        if (detail or {}).get("status") == "draft":
+            r["draft_id"] = row_id
+        else:
+            r["already"] = True
+        return r
+
+    # 이미 등록·미리보기된 기사면 재분석·중복 저장 없이 그대로 돌려준다.
     existing = _find_article_by_any_url(storage, url_source, raw_url)
     if existing:
-        detail = storage.article_detail(existing["id"])
-        return {"ok": True, "card": build_card(detail), "already": True}
+        return _existing_result(existing["id"])
 
     # ── G3: 리다이렉트 해제 + HTML ──────────────────────────────────
     canonical, html = resolve_canonical(http, raw_url)
@@ -3332,8 +3361,7 @@ def analyze_url(ctx: Context, raw_url: str) -> dict:
 
     existing = _find_article_by_any_url(storage, canonical, "")
     if existing:
-        detail = storage.article_detail(existing["id"])
-        return {"ok": True, "card": build_card(detail), "already": True}
+        return _existing_result(existing["id"])
 
     # ── G4: 제목·본문·메타 ─────────────────────────────────────────
     title = extract_title(html)
@@ -3354,8 +3382,7 @@ def analyze_url(ctx: Context, raw_url: str) -> dict:
     dup = find_duplicate(storage, ctx.llm, title, published, content_hash, canonical, candidates)
     if dup:
         storage.append_alias(dup["id"], url_source)
-        detail = storage.article_detail(dup["id"])
-        return {"ok": True, "card": build_card(detail), "already": True}
+        return _existing_result(dup["id"])
 
     groups = detect_group_companies(f"{title}\n{body[:2000]}")
     # 카테고리는 제목 기준 임시값. 아래 analyze_and_save 에서 요약으로 다시 계산된다.
@@ -3374,7 +3401,8 @@ def analyze_url(ctx: Context, raw_url: str) -> dict:
         "is_backfill": (now_utc() - published) > timedelta(hours=ctx.cfg.fresh_cutoff_hours),
         "importance_score": score, "sentiment": None, "keywords": [],
         "group_companies": groups, "categories": categories,
-        "title_embedding": None, "analyzed_at": None, "status": "active",
+        "title_embedding": None, "analyzed_at": None,
+        "status": "active" if activate else "draft",
     }
     if not storage.insert_article(row):
         existing = _find_article_by_any_url(storage, url_source, raw_url)
@@ -3391,7 +3419,10 @@ def analyze_url(ctx: Context, raw_url: str) -> dict:
         log.warning("수동 등록 분석 실패: %s", exc)
 
     detail = storage.article_detail(article_id)
-    return {"ok": True, "card": build_card(detail), "already": False}
+    out = {"ok": True, "card": build_card(detail), "already": False}
+    if not activate:
+        out["draft_id"] = article_id      # 프런트가 '등록'/'취소' 를 호출할 때 쓴다
+    return out
 
 
 def _find_article_by_any_url(storage: Storage, url_a: str, url_b: str) -> dict | None:
@@ -4349,7 +4380,8 @@ def create_app(ctx: Context):
 
     @app.post("/api/analyze-url")
     async def api_analyze_url(payload: dict):
-        """URL 하나를 받아 포토카드를 만든다. (PRD F8 수동 등록)"""
+        """URL 하나를 분석해 미리보기 카드를 만든다. status='draft' 로만 저장하고,
+        사용자가 /confirm 을 호출해야 목록에 노출된다. (PRD F8 수동 등록)"""
         url = (payload or {}).get("url", "")
         if not isinstance(url, str) or len(url) > 2000:
             return JSONResponse({"ok": False, "error": "URL 형식이 올바르지 않습니다."}, status_code=400)
@@ -4357,11 +4389,31 @@ def create_app(ctx: Context):
 
         def _work():
             with _manual_lock:
-                return analyze_url(ctx, url)
+                return analyze_url(ctx, url, activate=False)
 
         result = await anyio.to_thread.run_sync(_work)
         code = 200 if result.get("ok") else 422
         return JSONResponse(result, status_code=code)
+
+    @app.post("/api/articles/{article_id}/confirm")
+    def api_confirm_draft(article_id: str):
+        """미리보기(draft) 기사를 목록에 등록한다."""
+        row = ctx.storage.article_detail(article_id)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
+        if row.get("status") == "draft":
+            ctx.storage.update_article(article_id, {"status": "active"})
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/articles/{article_id}/discard")
+    def api_discard_draft(article_id: str):
+        """미리보기(draft) 기사를 등록하지 않고 버린다(보관 처리)."""
+        row = ctx.storage.article_detail(article_id)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
+        if row.get("status") == "draft":
+            ctx.storage.update_article(article_id, {"status": "archived"})
+        return JSONResponse({"ok": True})
 
     if os.path.isdir(FRONTEND_DIR):
         from fastapi.responses import HTMLResponse

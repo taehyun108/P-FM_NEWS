@@ -44,7 +44,7 @@ create table if not exists articles (
   categories         jsonb default '[]',     -- 카테고리 태그 (F3.1)
   title_embedding    jsonb,                  -- 중복 판정 4단계용 캐시 (F2.2)
   analyzed_at        timestamptz,            -- LLM 분석 완료 시각. null 이면 재처리 큐 대상
-  status             text default 'active'   -- 'active' | 'hidden' | 'error'
+  status             text default 'active'   -- 'active' | 'draft' | 'archived' | 'error'
 );
 
 -- ── 영구 제외 원장 (저장하지 않기로 확정된 URL — 재조회 방지) ──────

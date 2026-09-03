@@ -409,3 +409,9 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .kw-label { margin: 12px 0 5px; font-size: 12px; font-weight: 700; color: var(--navy); }
 .kw-label span { font-weight: 400; color: var(--ink-soft); }
 /* 통상환경/정책 마스터 섹션 — 이미 .kw-label, .master-toggle 재사용 */
+.url-add-confirm {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 10px 0 4px; padding: 10px 12px; border-radius: 9px;
+  background: var(--navy-soft); font-size: 13px; color: var(--navy-dark);
+}
+.url-add-confirm[hidden] { display: none; }
