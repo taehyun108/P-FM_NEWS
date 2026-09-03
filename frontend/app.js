@@ -33,9 +33,13 @@ const el = (tag, cls, text) => {
 
 /* ── 유틸 ───────────────────────────────────────────────────────── */
 
-/** 칩 중복 제거용 정규화 키. 백엔드 normalize_chip 과 같은 규칙이다. */
+/** 칩 중복 제거용 정규화 키. 백엔드 normalize_chip 과 같은 규칙이다.
+ *
+ *  주의: JS 의 \W 는 ASCII 기준이라 한글까지 지운다(파이썬 \W 는 유니코드 인식).
+ *  그대로 쓰면 순수 한글 칩의 키가 빈 문자열이 되어 통째로 버려진다.
+ *  유니코드 문자·숫자만 남기도록 \p{L}\p{N} 을 쓴다. */
 function chipKey(text) {
-  return String(text || '').normalize('NFKC').replace(/[\s\W_]+/g, '').toLowerCase();
+  return String(text || '').normalize('NFKC').replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase();
 }
 
 /** 정규화 키 기준 중복 제거. 저장 단계에서 걸러도 표시 단계에서 한 번 더 막는다. */
@@ -697,7 +701,9 @@ function buildQuery() {
 }
 
 async function refresh(reset) {
-  if (state.loading) return;
+  // 즐겨찾기 화면일 때는 일반 목록이 덮어쓰지 않게 막는다.
+  // (필터를 숨기는 것만으로는 방어가 약하다 — 단축키·코드 변경에 취약)
+  if (favView || state.loading) return;
   state.loading = true;
   if (reset) {
     state.page = 1;

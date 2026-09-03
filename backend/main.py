@@ -132,16 +132,6 @@ def load_dotenv_file(path: str) -> None:
                 os.environ[key] = _clean(val)
 
 
-def require_env(name: str) -> str:
-    """필수 환경변수를 읽는다. 없으면 즉시 중단한다. (env-secret-guard §4)"""
-    value = _clean(os.environ.get(name))
-    if not value:
-        raise SystemExit(
-            f"환경변수 {name} 가 설정되지 않았습니다. 프로젝트 루트의 .env 파일을 확인하세요."
-        )
-    return value
-
-
 def get_env(name: str, default: str = "") -> str:
     value = _clean(os.environ.get(name))
     return value if value else default
@@ -2560,19 +2550,6 @@ def find_duplicate(
     return None
 
 
-def pick_representative(existing: dict, new_row: dict) -> bool:
-    """새 기사가 대표가 되어야 하면 True. 우선순위: ① 언론사 tier ② 본문 추출 성공 ③ 발행 빠른 순."""
-    if new_row.get("_press_tier", 3) != existing.get("_press_tier", 3):
-        return new_row.get("_press_tier", 3) < existing.get("_press_tier", 3)
-    if bool(new_row.get("content_hash")) != bool(existing.get("content_hash")):
-        return bool(new_row.get("content_hash"))
-    new_dt = parse_dt(new_row.get("published_at"))
-    old_dt = parse_dt(existing.get("published_at"))
-    if new_dt and old_dt:
-        return new_dt < old_dt
-    return False
-
-
 # =====================================================================
 # 12. 파이프라인 (PRD F1.1 게이트)
 # =====================================================================
@@ -3913,25 +3890,35 @@ def create_app(ctx: Context):
         uniq = dedupe_chips(values)
         return [p for p in priority if p in uniq] + [v for v in uniq if v not in priority]
 
+    # 필터 목록은 전체 스캔이 필요한데 수집 주기(60초)에 한 번만 바뀐다.
+    # 페이지를 열 때마다 /api/articles 와 같은 스캔을 두 번 하지 않도록 짧게 캐시한다.
+    _filters_cache: dict[str, Any] = {"at": 0.0, "data": None}
+    FILTERS_TTL_SEC = 20
+
     @app.get("/api/filters")
     def api_filters():
         """현재 데이터에 실제로 존재하는 필터 값만 돌려준다."""
-        cards = _scan("all", "")
+        now = time.monotonic()
+        if _filters_cache["data"] and now - _filters_cache["at"] < FILTERS_TTL_SEC:
+            return JSONResponse(_filters_cache["data"])
+
         groups: list[str] = []
         cats: list[str] = []
         presses: list[str] = []
-        for card in cards:
+        for card in _scan("all", ""):
             groups += card["group_companies"]
             cats += card["categories"]
             if card["press_name"]:
                 presses.append(card["press_name"])
-        return JSONResponse({
+        data = {
             "groups": _ordered(groups, GROUP_ORDER),
             "categories": _ordered(cats, CATEGORY_ORDER),
             "presses": [p for p, _ in Counter(presses).most_common()],  # 기사 많은 순
             "periods": [{"key": "today", "label": "오늘"}, {"key": "7d", "label": "7일"},
                         {"key": "30d", "label": "30일"}, {"key": "all", "label": "전체"}],
-        })
+        }
+        _filters_cache.update(at=now, data=data)
+        return JSONResponse(data)
 
     @app.get("/api/quotes")
     def api_quotes():
@@ -4531,6 +4518,17 @@ def cmd_selftest() -> int:
     check("그룹사와 겹치는 키워드 제외",
           dedupe_chips(["포스코홀딩스", "양극재"], exclude=["포스코홀딩스"]), ["양극재"])
     check("빈 값 무시", dedupe_chips(["", "  ", "리튬"]), ["리튬"])
+    # 순수 한글 칩의 키가 비면 dedupe 단계에서 통째로 버려진다.
+    # (프런트 chipKey 가 JS \W 를 쓰다가 한글을 전부 지운 회귀가 있었다)
+    check("순수 한글 칩 키 유지", normalize_chip("배터리·이차전지"), "배터리이차전지")
+    check("한글 칩 살아남음", dedupe_chips(["신재생에너지", "전력망 투자"]),
+          ["신재생에너지", "전력망 투자"])
+    check("한글+영문 혼합", normalize_chip("ESS 시장 확대"), "ess시장확대")
+    _front = os.path.join(FRONTEND_DIR, "app.js")
+    if os.path.exists(_front):
+        _js = open(_front, encoding="utf-8").read()
+        check("프런트 chipKey 가 유니코드 클래스를 쓴다",
+              "[^\\p{L}\\p{N}]+" in _js and "[\\s\\W_]+" not in _js, True)
 
     print("\n[5] 그룹사 판정 (PRD F4.2)")
     check("퓨처엠 단독", detect_group_companies("포스코퓨처엠이 증설한다"), ["포스코퓨처엠"])
