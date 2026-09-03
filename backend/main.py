@@ -1757,13 +1757,17 @@ CATEGORY_RULES: dict[str, list[str]] = {
              # 포스코 그룹 사업 전반 — 건설·인프라·로봇·자동화
              "재건축", "재개발", "정비사업", "시공", "수주", "분양", "플랜트", "EPC",
              "로봇", "협동로봇", "휴머노이드", "스마트팩토리"],
-    # 정부/정책: '정부'·'정책' 같은 흔한 단어는 넣지 않고 행정·입법을 가리키는 구체 용어만.
-    # '관세'·'IRA' 는 뺐다 — 통상 조치는 '글로벌 통상환경'이 담당하고, 여기 두면
-    # 관세를 스치듯 언급한 실적·시황 기사까지 정책으로 태깅된다.
-    "정부/정책": ["국회 예산", "산업부", "환경부", "기재부", "공정위", "보조금", "특화단지",
-                  "국정감사", "예비타당성", "예타", "국정과제", "부처 합동", "범부처",
-                  "정부 지원", "정책 지원", "육성 방안", "규제 완화", "규제 혁신", "규제 샌드박스",
-                  "개정안", "시행령", "특별법", "입법예고", "본회의 통과", "중대재해처벌법"],
+    # 정부/정책 = 한국 정부의 국내 산업·에너지 정책·입법·행정. (외국 통상조치는 '글로벌 통상환경')
+    #   detect_categories 가 '핵심어가 제목에 있을 때만' 태깅한다(TITLE_ANCHORED_CATEGORIES).
+    #   '보조금'·'정부 지원'·'관세'·'IRA' 처럼 관용적으로 쓰이는 낱말은 넣지 않는다 —
+    #   전기차 판매 기사·실적 기사까지 정책으로 태깅된다(보조금 한 낱말로 7/14건 오태깅).
+    "정부/정책": ["산업부", "환경부", "기재부", "국토부", "중기부", "과기정통부", "공정위",
+                  "국정감사", "예비타당성", "예비타당성조사", "예타 면제", "국정과제",
+                  "부처 합동", "범부처", "특화단지", "국가첨단전략산업", "소부장 특별법",
+                  "규제 완화", "규제 혁신", "규제 샌드박스", "세액공제", "국비 지원",
+                  "추가경정예산", "추경 편성", "예산안", "육성 방안", "종합대책",
+                  "개정안", "제정안", "시행령", "특별법", "입법예고", "본회의 통과",
+                  "국회 통과", "법안 발의", "중대재해처벌법", "노란봉투법"],
     # 미국·유럽·중국 등 주요국의 명시적 통상 조치. 정의는 TRADE_MEASURE_KW 와 맞춘다.
     # detect_categories 가 '제목에 조치명' 조건을 한 번 더 건다.
     "글로벌 통상환경": TRADE_MEASURE_KW,
@@ -1772,9 +1776,10 @@ CATEGORY_RULES: dict[str, list[str]] = {
                   "기관 순매수", "배당"],
 }
 
+POLICY_CATEGORY = "정부/정책"
 # 이 카테고리들은 '핵심어가 제목에 있을 때만' 태깅한다. 요약·본문에 스친 언급은
-# 부차 주제라, 넣으면 필터가 변별력을 잃는다.
-TITLE_ANCHORED_CATEGORIES = (TRADE_CATEGORY,)
+# 부차 주제라, 넣으면 필터가 변별력을 잃는다(통상·정책 모두 실제로 그랬다).
+TITLE_ANCHORED_CATEGORIES = (TRADE_CATEGORY, POLICY_CATEGORY)
 
 # 중요도 가중치 (PRD F3.2)
 SCORE_FUTUREM_TITLE = 50
@@ -2492,6 +2497,23 @@ def extract_title(html: str) -> str:
     return ""
 
 
+def repair_truncated_title(feed_title: str, html: str) -> str:
+    """네이버 검색 API 는 제목을 '...' 로 잘라 준다. 원문 HTML 의 온전한 제목으로 되돌린다.
+
+    - feed 제목이 '...'·'…' 로 끝나고,
+    - HTML 제목이 더 길며 feed 제목의 앞부분과 시작이 같으면
+    그 HTML 제목을 쓴다. 아니면 원래 제목을 그대로 둔다(오교체 방지).
+    """
+    t = (feed_title or "").strip()
+    if not (t.endswith("...") or t.endswith("…") or t.endswith("···")):
+        return feed_title
+    full = extract_title(html)
+    if not full or len(full) <= len(t):
+        return feed_title
+    head = t.rstrip(".·…").strip()[:10]
+    return full if head and head[:8] in full else feed_title
+
+
 PUBLISHED_META_PATTERNS = [
     r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
     r'<meta[^>]+property=["\']og:published_time["\'][^>]+content=["\']([^"\']+)["\']',
@@ -2582,7 +2604,7 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     title_l = (title or "").lower()
     found = [name for name, words in CATEGORY_RULES.items()
              if any(w.lower() in lowered for w in words)]
-    # 제목 고정 카테고리(글로벌 통상환경): 핵심어가 제목에 없으면 부차 주제라 뺀다.
+    # 제목 고정 카테고리(글로벌 통상환경·정부/정책): 핵심어가 제목에 없으면 부차 주제라 뺀다.
     for cat in TITLE_ANCHORED_CATEGORIES:
         if cat in found and not _kw_hit_any(
                 title_l, [w.lower() for w in CATEGORY_RULES[cat]]):
@@ -3270,6 +3292,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
         # ── G4: 본문 추출 (G3 응답을 재사용하므로 추가 요청 없음) ────
         body = extract_body(html)
+        # 네이버가 '...' 로 자른 제목을 원문 제목으로 되돌린다 (이후 모든 단계가 이 제목을 쓴다)
+        item.title = repair_truncated_title(item.title, html)
         summary_source = "fulltext" if len(body) >= 300 else "snippet"
         if summary_source == "snippet":
             body = item.snippet or item.title
@@ -4309,7 +4333,10 @@ def build_weekly_report(ctx: Context) -> dict:
     """주간 레포트 payload 를 만든다. LLM 을 섹션당 최대 1회 호출한다(총 7회)."""
     start, end = weekly_window()
     rows = ctx.storage.list_articles(3000, 0, start, "")
-    rows = [r for r in rows if (r.get("published_at") or "") <= iso(end)]
+    end_iso = iso(end)
+    # 분석 완료(요약 있음) 기사만 — 요약 없는 카드는 레포트에서 빈 줄로 보인다.
+    rows = [r for r in rows
+            if (r.get("published_at") or "") <= end_iso and (r.get("summary_text") or "").strip()]
 
     sections = []
     for label, kind, key in WEEKLY_SECTIONS:
@@ -5600,6 +5627,14 @@ def cmd_selftest() -> int:
           "정부/정책" in detect_categories("美 철강 관세에 포스코 현대제철 공동전선"), False)
     check("'규제' 한 낱말로는 정책 태깅 안 함",
           "정부/정책" in detect_categories("탄소 규제에 짓눌린 철강 삼중고"), False)
+    # 정부/정책도 제목 고정 — 요약에 '보조금' 스친 전기차 판매·시황 기사는 제외
+    check("'보조금'은 더 이상 정책 키워드 아님",
+          "정부/정책" in detect_categories("BYD 돌핀 판매 상위…9월도 전기차 보조금 지원",
+                                          "테슬라도 월 1만대 판매"), False)
+    check("요약에만 산업부 언급 → 정책 아님(제목 고정)",
+          "정부/정책" in detect_categories("포스코 2분기 실적 개선", "산업부가 지원책을 검토 중이다"), False)
+    check("제목에 산업부 장관 → 정책",
+          "정부/정책" in detect_categories("김정관 산업부 장관, G20 참석"), True)
     check("철강 공정어는 '산업'", "산업" in detect_categories("포스코 포항 3고로 개수 완료"), True)
     check("'실적' 단독은 시장/주가 태그 아님",
           "시장/주가" in detect_categories("포스코 2분기 실적 발표"), False)
@@ -5850,6 +5885,14 @@ def cmd_selftest() -> int:
           extract_published('<meta property="article:published_time" content="2026-09-01T08:30:00Z">') is not None,
           True)
     check("발행일 없음 → None", extract_published("<html>본문</html>"), None)
+    _html_full = '<meta property="og:title" content="부지·보조금만으로 투자 안해 전문가들 미싱링크 연결로 산업 경쟁력 키워야">'
+    check("네이버가 자른 제목을 원문 제목으로 복원",
+          repair_truncated_title("부지·보조금만으로 투자 안해… 전문가들, 미싱링크 연결로 산업...", _html_full),
+          "부지·보조금만으로 투자 안해 전문가들 미싱링크 연결로 산업 경쟁력 키워야")
+    check("안 잘린 제목은 그대로 둔다",
+          repair_truncated_title("포스코퓨처엠 양극재 증설", _html_full), "포스코퓨처엠 양극재 증설")
+    check("앞부분이 다르면 오교체하지 않는다",
+          repair_truncated_title("전혀 다른 기사 제목입니다...", _html_full), "전혀 다른 기사 제목입니다...")
 
     print("\n[15] 주간 레포트 (월요일 이메일)")
     _ws, _we = weekly_window(datetime(2026, 9, 7, 7, 0, tzinfo=timezone.utc))
