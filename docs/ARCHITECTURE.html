@@ -253,13 +253,14 @@
     <h1>P-FM NEWS 설계도</h1>
     <p class="lede">
       포스코 그룹·이차전지 뉴스를 5분 주기로 수집해 요약·SWOT 분석하고, 웹 포토카드와
-      텔레그램 채널로 내보내는 파이프라인. 프런트엔드·백엔드·DB 구성과 기사가 거쳐 가는
-      게이트, 그리고 무엇을 얼마나 보관하는지를 정리했다.
+      텔레그램 채널로 내보내는 파이프라인. 매주 월요일 아침에는 한 주치를 종합한 주간동향
+      레포트를 이메일로 발송한다. 프런트엔드·백엔드·DB 구성과 기사가 거쳐 가는 게이트,
+      그리고 무엇을 얼마나 보관하는지를 정리했다.
     </p>
     <div class="stamp">
       <span>기준 <b>2026-09-03</b></span>
-      <span>저장소 <b>SQLite 8.7 MB</b></span>
-      <span>노출 기사 <b>478건</b></span>
+      <span>저장소 <b>SQLite 9.4 MB</b></span>
+      <span>노출 기사 <b>561건</b></span>
       <span>코드 <b>backend/main.py 1개 파일</b></span>
     </div>
   </header>
@@ -272,9 +273,9 @@
         <h2><span class="tag">01 — 구성</span>무엇이 어디서 돌고 있나</h2>
 
         <p>
-          파이썬 파일 <code>backend/main.py</code> 하나(약 5,200줄)가 API 서버·수집 루프·
-          텔레그램 봇을 모두 담고 있다. 프런트엔드는 프레임워크 없는 바닐라 JS 3파일이고,
-          데이터는 로컬 SQLite 파일 하나에 들어간다.
+          파이썬 파일 <code>backend/main.py</code> 하나(약 6,100줄)가 API 서버·수집 루프·
+          텔레그램 봇·주간 레포트를 모두 담고 있다. 프런트엔드는 프레임워크 없는 바닐라 JS
+          3파일이고, 데이터는 로컬 SQLite 파일 하나에 들어간다.
         </p>
 
         <figure>
@@ -298,11 +299,11 @@
               <!-- 스레드 3 -->
               <rect class="box-navy" x="228" y="74" width="292" height="60" rx="7"/>
               <text class="lbl-b" x="244" y="99">메인 · FastAPI (uvicorn)</text>
-              <text class="lbl-sm" x="244" y="118">13개 엔드포인트 · 인덱스 인라인 서빙</text>
+              <text class="lbl-sm" x="244" y="118">19개 엔드포인트 · 인덱스 인라인 서빙</text>
 
               <rect class="box" x="228" y="150" width="292" height="70" rx="7"/>
               <text class="lbl-b" x="244" y="175">스레드 A · 수집 루프</text>
-              <text class="lbl-sm" x="244" y="194">300초 주기 · run_once() + send_notifications()</text>
+              <text class="lbl-sm" x="244" y="194">300초 · run_once + 알림 + 주간레포트 확인</text>
               <text class="lbl-sm" x="244" y="210">시세는 별도 스레드 60초</text>
 
               <rect class="box" x="228" y="236" width="292" height="60" rx="7"/>
@@ -331,6 +332,10 @@
               <text class="lbl" x="620" y="271">텔레그램 채널 PoscoFM_CM</text>
               <text class="lbl-sm" x="620" y="287">봇 관리자 권한으로 게시</text>
 
+              <rect class="box" x="606" y="316" width="238" height="46" rx="7"/>
+              <text class="lbl" x="620" y="337">Gmail SMTP</text>
+              <text class="lbl-sm" x="620" y="353">주간동향 레포트 이메일 발송</text>
+
               <!-- 화살표 -->
               <g color="var(--navy)">
                 <line class="arw-navy" x1="148" y1="180" x2="224" y2="112" marker-end="url(#a1)"/>
@@ -344,6 +349,7 @@
                 <line class="arw" x1="522" y1="180" x2="602" y2="142" marker-end="url(#a1)"/>
                 <line class="arw" x1="522" y1="196" x2="602" y2="206" marker-end="url(#a1)"/>
                 <line class="arw" x1="522" y1="266" x2="602" y2="272" marker-end="url(#a1)"/>
+                <line class="arw" x1="522" y1="290" x2="602" y2="338" marker-end="url(#a1)"/>
                 <line class="arw" x1="374" y1="222" x2="374" y2="308" marker-end="url(#a1)"/>
                 <line class="arw" x1="330" y1="308" x2="330" y2="138" marker-end="url(#a1)"/>
                 <line class="arw" x1="440" y1="298" x2="440" y2="308" marker-end="url(#a1)"/>
@@ -364,25 +370,28 @@
         <div class="tw"><table>
           <thead><tr><th>파일</th><th class="num">줄</th><th>역할</th></tr></thead>
           <tbody>
-            <tr><td><code>index.html</code></td><td class="num">227</td><td>뼈대 마크업, 마스터 패널 모달</td></tr>
-            <tr><td><code>app.js</code></td><td class="num">941</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
-            <tr><td><code>style.css</code></td><td class="num">424</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
+            <tr><td><code>index.html</code></td><td class="num">264</td><td>뼈대 마크업, 마스터 패널 모달, 주간동향 패널</td></tr>
+            <tr><td><code>app.js</code></td><td class="num">1,125</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
+            <tr><td><code>style.css</code></td><td class="num">454</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
           </tbody>
         </table></div>
 
         <p>
           상태는 <code>state</code> 객체 하나(필터·검색·페이지)에 모으고 URL 쿼리스트링과
-          동기화한다. 브라우저 저장소는 <code>localStorage</code>만 쓴다 — 즐겨찾기 목록,
-          마스터 토큰, 필터 접힘 상태. 서버로는 가지 않는다.
+          동기화한다 — <code>?page=</code>까지 넣어 새로고침·링크 공유 시 페이지가 유지된다.
+          목록은 <b>페이지당 9개</b> 포토카드로 끊어 페이지 번호 네비게이션으로 넘긴다(무한
+          스크롤 아님). 브라우저 저장소는 <code>localStorage</code>만 쓴다 — 즐겨찾기 목록,
+          마스터 토큰, 필터 접힘 상태. 서버로는 가지 않는다. 헤더의 탭은 <b>전체 기사 ·
+          즐겨찾기 · 주간동향</b> 셋이 서로 배타적으로 전환된다.
         </p>
 
-        <h3>백엔드 — 16개 섹션</h3>
+        <h3>백엔드 — 약 6,100줄</h3>
         <p>
           설정 → 저장소 계층 → 시드 → URL 정규화 → HTTP → 수집 → 본문추출 → 분류·중요도 →
-          LLM → 중복판정 → 파이프라인 → 시세 → 텔레그램 → API → CLI 순으로 배치돼 있다.
-          저장소는 <code>Storage</code> 추상 클래스 아래 <code>SqliteStorage</code>와
-          <code>SupabaseStorage</code> 두 구현이 있어, <code>.env</code>의
-          <code>DB_BACKEND</code> 한 줄로 전환된다.
+          LLM → 중복판정 → 파이프라인 → 시세 → 텔레그램 봇 → 주간 레포트 → API → CLI 순으로
+          배치돼 있다. 저장소는 <code>Storage</code> 추상 클래스 아래
+          <code>SqliteStorage</code>와 <code>SupabaseStorage</code> 두 구현이 있어,
+          <code>.env</code>의 <code>DB_BACKEND</code> 한 줄로 전환된다.
         </p>
       </section>
 
@@ -398,7 +407,7 @@
 
         <figure>
           <div class="fig-scroll">
-            <svg viewBox="0 0 820 470" role="img" aria-label="수집 3356건이 G0 실행내중복제거, G1 메모리캐시, G2 DB대조, G2.5 신선도, 처리상한, G3 HTTP, G4 본문추출, G5 중복판정, G6 LLM분석을 거치며 단계마다 탈락하는 깔때기">
+            <svg viewBox="0 0 820 470" role="img" aria-label="수집 3583건이 G0 실행내중복제거, G1 메모리캐시, G2 DB대조, G2.5 신선도, 처리상한, G3 HTTP, G4 본문추출, G5 중복판정, G6 LLM분석을 거치며 단계마다 탈락하는 깔때기">
               <defs>
                 <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                   <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
@@ -420,27 +429,27 @@
               <!-- 좌: 비용 0 -->
               <rect class="box" x="30" y="66" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="91">수집 <tspan class="lbl">— 구글 RSS + 네이버 API</tspan></text>
-              <text class="lbl-navy" x="284" y="91" text-anchor="end">3,356</text>
+              <text class="lbl-navy" x="284" y="91" text-anchor="end">3,583</text>
 
               <rect class="box" x="30" y="130" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="149">G0 <tspan class="lbl">실행 내 중복 URL</tspan></text>
               <text class="lbl-sm" x="44" y="164">같은 URL 여러 키워드에 잡힘</text>
-              <text class="lbl-navy" x="284" y="155" text-anchor="end">2,238</text>
+              <text class="lbl-navy" x="284" y="155" text-anchor="end">2,417</text>
 
               <rect class="box" x="30" y="194" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="213">G1 <tspan class="lbl">메모리 seen-cache</tspan></text>
               <text class="lbl-sm" x="44" y="228">최근 72시간 수집분</text>
-              <text class="lbl-navy" x="284" y="219" text-anchor="end">1,965</text>
+              <text class="lbl-navy" x="284" y="219" text-anchor="end">2,086</text>
 
               <rect class="box" x="30" y="258" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="277">G2 <tspan class="lbl">DB 전체기간 대조</tspan></text>
               <text class="lbl-sm" x="44" y="292">url_source · alias · 제외원장</text>
-              <text class="lbl-navy" x="284" y="283" text-anchor="end">1,123</text>
+              <text class="lbl-navy" x="284" y="283" text-anchor="end">1,181</text>
 
               <rect class="box" x="30" y="322" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="341">G2.5 <tspan class="lbl">신선도 컷오프</tspan></text>
               <text class="lbl-sm" x="44" y="356">발행 72시간 초과는 저장 안 함</text>
-              <text class="lbl-navy" x="284" y="347" text-anchor="end">1,123</text>
+              <text class="lbl-navy" x="284" y="347" text-anchor="end">1,181</text>
 
               <rect class="box-navy" x="30" y="386" width="268" height="40" rx="6"/>
               <text class="lbl-b" x="44" y="405">처리 상한</text>
@@ -499,9 +508,9 @@
                 <line class="arw-drop" x1="298" y1="214" x2="322" y2="214" marker-end="url(#a2)"/>
                 <line class="arw-drop" x1="298" y1="278" x2="322" y2="278" marker-end="url(#a2)"/>
               </g>
-              <text class="lbl-drop" x="300" y="142">−1,118</text>
-              <text class="lbl-drop" x="300" y="206">−273</text>
-              <text class="lbl-drop" x="300" y="270">−842</text>
+              <text class="lbl-drop" x="300" y="142">−1,166</text>
+              <text class="lbl-drop" x="300" y="206">−331</text>
+              <text class="lbl-drop" x="300" y="270">−905</text>
 
               <!-- 좌→중 -->
               <g color="var(--navy)">
@@ -526,7 +535,7 @@
             </svg>
           </div>
           <figcaption>
-            <b>3,356건이 들어와 12건만 HTTP 단계로 넘어간다.</b> 앞 세 게이트가 재조회 비용을
+            <b>3,583건이 들어와 12건만 HTTP 단계로 넘어간다.</b> 앞 세 게이트가 재조회 비용을
             0으로 만들고, 처리 상한 12건이 1회 실행 시간을 잡는다. 넘친 항목은 버려지는 게 아니라
             아직 <code>articles</code>에 없으므로 다음 주기에 다시 후보가 된다.
           </figcaption>
@@ -645,19 +654,28 @@
             </tr>
             <tr>
               <td><b>배터리 생태계</b></td>
-              <td>소재·차세대 기술, 셀 업체(LG엔솔·CATL·BYD), 전기차 수요(테슬라·캐즘), ESS, 원료 가격</td>
-              <td class="num">40</td>
+              <td>소재·차세대 기술, 셀 업체(LG엔솔·CATL·BYD), 전기차 수요(테슬라·캐즘), ESS, 원료 가격,<br><span style="color:var(--ink-3)">소재 경쟁사(에코프로비엠·엘앤에프·BTR·베이터루이·샨샨…)</span></td>
+              <td class="num">48</td>
             </tr>
             <tr><td><b>그룹사</b></td><td>포스코 및 계열사명 직접 검색</td><td class="num">7</td></tr>
           </tbody>
         </table></div>
+        <p>
+          정책 검색어는 <code>site:www.korea.kr</code>로 한정한다. 전체 검색 키워드는
+          <b>118개</b> — 그룹사 7 · 산업 48 · 정책 38 · 통상 25.
+        </p>
 
         <h3>기사에 붙는 태그</h3>
         <div class="kv">
           <dt>그룹사</dt>
-          <dd>포스코홀딩스·퓨처엠·DX·인터내셔널·이앤씨 등 51개소. 본문에 회사명이 실제로 등장할 때만 채택한다.</dd>
+          <dd>포스코홀딩스·퓨처엠·DX·인터내셔널·이앤씨 등 51개소. <b>제목 + 본문 리드 700자</b>에
+              회사명이 실제로 등장할 때만 채택한다 — 본문 말미에 스친 계열사 언급이 기사 주체를
+              가로채는 것을 막는다.</dd>
           <dt>카테고리</dt>
-          <dd>양극재 · 음극재 · 배터리·이차전지 · 산업 · 시장/주가 · 정부/정책 · 법령 · 글로벌 통상환경 — 8개. 제목+요약으로만 판정한다.</dd>
+          <dd>양극재 · 음극재 · 배터리·이차전지 · 산업 · 시장/주가 · 정부/정책 · 글로벌 통상환경 —
+              7개(<b>법령은 폐지</b>). 제목+요약으로만 판정한다. <b>정부/정책·글로벌 통상환경은
+              핵심어가 <i>제목</i>에 있을 때만</b> 붙인다 — '규제'·'보조금'·'관세' 같은 관용어가
+              요약에 스치면 실적·판매 기사까지 잘못 태깅됐기 때문이다.</dd>
           <dt>중요도</dt>
           <dd>퓨처엠 제목 +50 / 본문 +40, 다른 계열사 +25, 정책어 +20, 주요지 +10, 단순 시황 −15 → 0–100 클램프</dd>
           <dt>SWOT</dt>
@@ -717,8 +735,8 @@
               <text class="lbl-sm" x="618" y="82">중요도 80 이상만</text>
 
               <rect class="box" x="604" y="112" width="182" height="56" rx="6"/>
-              <text class="lbl-b" x="618" y="134">3건 이상이면</text>
-              <text class="lbl-sm" x="618" y="152">다이제스트로 묶음</text>
+              <text class="lbl-b" x="618" y="134">일반 기사 3건↑ 묶음</text>
+              <text class="lbl-sm" x="618" y="152">우선 기사는 항상 개별</text>
 
               <rect class="box-navy" x="604" y="182" width="182" height="56" rx="6"/>
               <text class="lbl-b" x="695" y="204" text-anchor="middle">채널 게시</text>
@@ -741,8 +759,9 @@
           </div>
           <figcaption>
             <b>네 조건의 AND.</b> 하나라도 어긋나면 <code>skipped</code>로 큐에 남아 발송되지 않는다.
-            중복 발송은 <code>(기사, 채널, 채팅방)</code> UNIQUE 제약으로 DB가 막는다 —
-            애플리케이션 버그가 있어도 같은 기사가 두 번 나갈 수 없다.
+            '항상 발송 키워드'가 적중한 <b>우선 기사</b>는 중요도·야간 게이트를 우회하고, 발송
+            단계에서도 다이제스트에 묶이지 않고 요약·SWOT이 담긴 개별 카드로 나간다. 중복 발송은
+            <code>(기사, 채널, 채팅방)</code> UNIQUE 제약으로 DB가 막는다.
           </figcaption>
         </figure>
 
@@ -754,6 +773,7 @@
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td>본문에 있으면 중요도·야간 게이트를 우회</td></tr>
             <tr><td>정책브리핑 알림</td><td>꺼짐</td><td>켜면 발송. ① 관심 키워드(OR) <b>AND</b> ② 필수 공통 키워드</td></tr>
             <tr><td>글로벌 통상환경 알림</td><td>꺼짐</td><td>위와 같은 2단 필터</td></tr>
+            <tr><td>주간 레포트 수신자</td><td>—</td><td>이메일 목록(최대 30). 비면 <code>.env WEEKLY_REPORT_TO</code></td></tr>
             <tr><td>웹페이지 비밀번호</td><td>—</td><td>값만 보관. 접속 잠금은 배포 시 적용 예정</td></tr>
           </tbody>
         </table></div>
@@ -775,13 +795,13 @@
 
         <figure>
           <div class="fig-scroll">
-            <svg viewBox="0 0 780 260" role="img" aria-label="기사 본문은 분석 완료 시 삭제되고 최대 30일, 미확정 미리보기는 24시간, 요약과 SWOT과 기사 메타데이터와 제외원장은 무기한 보관되는 보관기간 막대그래프">
+            <svg viewBox="0 0 780 296" role="img" aria-label="기사 본문은 분석 완료 시 삭제되고 최대 30일, 미확정 미리보기는 24시간, 제목 임베딩은 48시간, 요약과 SWOT과 기사 메타데이터와 주간레포트와 제외원장은 무기한 보관되는 보관기간 막대그래프">
               <!-- 눈금 -->
-              <line x1="150" y1="34" x2="150" y2="228" stroke="var(--rule)" stroke-width="1"/>
-              <line x1="330" y1="34" x2="330" y2="228" stroke="var(--rule)" stroke-width="1"/>
-              <line x1="510" y1="34" x2="510" y2="228" stroke="var(--rule)" stroke-width="1"/>
+              <line x1="150" y1="34" x2="150" y2="264" stroke="var(--rule)" stroke-width="1"/>
+              <line x1="330" y1="34" x2="330" y2="264" stroke="var(--rule)" stroke-width="1"/>
+              <line x1="510" y1="34" x2="510" y2="264" stroke="var(--rule)" stroke-width="1"/>
               <text class="lbl-sm" x="150" y="26" text-anchor="middle">즉시</text>
-              <text class="lbl-sm" x="330" y="26" text-anchor="middle">24시간</text>
+              <text class="lbl-sm" x="330" y="26" text-anchor="middle">24–48시간</text>
               <text class="lbl-sm" x="510" y="26" text-anchor="middle">30일</text>
               <text class="lbl-sm" x="660" y="26" text-anchor="middle">무기한</text>
 
@@ -794,42 +814,48 @@
               <rect x="150" y="82" width="180" height="18" rx="4" fill="var(--ember-bg)" stroke="var(--ember)" stroke-width="1"/>
               <text class="lbl-drop" x="160" y="95">등록·취소 안 하면 자동 삭제</text>
 
-              <text class="lbl" x="140" y="132" text-anchor="end">요약 · 포스코 관점</text>
-              <rect x="150" y="118" width="580" height="18" rx="4" fill="var(--moss-bg)" stroke="var(--moss)" stroke-width="1"/>
-              <text class="lbl-keep" x="160" y="131">721행</text>
+              <text class="lbl" x="140" y="132" text-anchor="end">제목 임베딩</text>
+              <rect x="150" y="118" width="205" height="18" rx="4" fill="var(--ember-bg)" stroke="var(--ember)" stroke-width="1"/>
+              <text class="lbl-drop" x="160" y="131">중복 판정 창 밖(48시간)이면 비움 — 행당 31 KB</text>
 
-              <text class="lbl" x="140" y="168" text-anchor="end">SWOT 분석</text>
+              <text class="lbl" x="140" y="168" text-anchor="end">요약 · SWOT</text>
               <rect x="150" y="154" width="580" height="18" rx="4" fill="var(--moss-bg)" stroke="var(--moss)" stroke-width="1"/>
-              <text class="lbl-keep" x="160" y="167">707행</text>
+              <text class="lbl-keep" x="160" y="167">803행 · 789행</text>
 
               <text class="lbl" x="140" y="204" text-anchor="end">기사 메타 · 알림 이력</text>
               <rect x="150" y="190" width="580" height="18" rx="4" fill="var(--moss-bg)" stroke="var(--moss)" stroke-width="1"/>
-              <text class="lbl-keep" x="160" y="203">733행 · 717행</text>
+              <text class="lbl-keep" x="160" y="203">816행 · 796행</text>
 
-              <text class="lbl" x="140" y="240" text-anchor="end">제외 원장</text>
+              <text class="lbl" x="140" y="240" text-anchor="end">주간 레포트</text>
               <rect x="150" y="226" width="580" height="18" rx="4" fill="var(--moss-bg)" stroke="var(--moss)" stroke-width="1"/>
-              <text class="lbl-keep" x="160" y="239">1,427행 — 다시 안 받으려고 남긴다</text>
+              <text class="lbl-keep" x="160" y="239">payload(JSON) + html — 매주 1건</text>
+
+              <text class="lbl" x="140" y="276" text-anchor="end">제외 원장</text>
+              <rect x="150" y="262" width="580" height="18" rx="4" fill="var(--moss-bg)" stroke="var(--moss)" stroke-width="1"/>
+              <text class="lbl-keep" x="160" y="275">1,571행 — 다시 안 받으려고 남긴다</text>
             </svg>
           </div>
           <figcaption>
-            <b>원문은 짧게, 분석 결과는 길게.</b> 본문(주황)만 시한부이고, 요약·SWOT·메타데이터(초록)는
-            아카이브로 남는다. 제외 원장은 지우면 같은 무관 기사를 다시 받아 오게 되므로 유지한다.
+            <b>원문은 짧게, 분석 결과는 길게.</b> 본문·미리보기·제목 임베딩(주황)만 시한부다.
+            임베딩은 DB 용량의 대부분을 차지하는데 중복 판정에만 쓰는 캐시라 48시간 지나면 비운다.
+            요약·SWOT·메타데이터·주간레포트(초록)는 아카이브로 남는다.
           </figcaption>
         </figure>
 
-        <h3>테이블 12개</h3>
+        <h3>테이블 13개</h3>
         <div class="tw"><table>
           <thead><tr><th>테이블</th><th class="num">행</th><th>내용</th></tr></thead>
           <tbody>
-            <tr><td><code>articles</code></td><td class="num">733</td><td>기사 메타 + 그룹사·카테고리·키워드·중요도 (노출 478 / 보관 255)</td></tr>
-            <tr><td><code>summaries</code></td><td class="num">721</td><td>LLM 요약·포스코 관점</td></tr>
-            <tr><td><code>swot_analyses</code></td><td class="num">707</td><td>S/W/O/T 점수·근거</td></tr>
-            <tr><td><code>notifications</code></td><td class="num">717</td><td>발송 큐·이력 · <code>priority</code>로 우선 발송 표시</td></tr>
-            <tr><td><code>url_ledger</code></td><td class="num">1,427</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
-            <tr><td><code>press_outlets</code></td><td class="num">385</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
-            <tr><td><code>keyword_sets</code></td><td class="num">110</td><td>검색 키워드 — 그룹사 7 · 산업 40 · 정책 38 · 통상 25</td></tr>
-            <tr><td><code>collection_logs</code></td><td class="num">1,776</td><td>실행별 수집·중복·HTTP 횟수</td></tr>
-            <tr><td><code>run_state</code></td><td class="num">1</td><td>파이프라인 상태 + 마스터 설정(임계값·키워드·비밀번호 해시)</td></tr>
+            <tr><td><code>articles</code></td><td class="num">816</td><td>기사 메타 + 그룹사·카테고리·키워드·중요도 (노출 561 / 보관 255)</td></tr>
+            <tr><td><code>summaries</code></td><td class="num">803</td><td>LLM 요약·포스코 관점</td></tr>
+            <tr><td><code>swot_analyses</code></td><td class="num">789</td><td>S/W/O/T 점수·근거</td></tr>
+            <tr><td><code>notifications</code></td><td class="num">796</td><td>발송 큐·이력 · <code>priority</code>로 우선 발송 표시</td></tr>
+            <tr><td><code>weekly_reports</code></td><td class="num">5</td><td>주간동향 레포트 — payload(JSON) + html · 발송 시각</td></tr>
+            <tr><td><code>url_ledger</code></td><td class="num">1,571</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
+            <tr><td><code>press_outlets</code></td><td class="num">400</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
+            <tr><td><code>keyword_sets</code></td><td class="num">118</td><td>검색 키워드 — 그룹사 7 · 산업 48 · 정책 38 · 통상 25</td></tr>
+            <tr><td><code>collection_logs</code></td><td class="num">1,828</td><td>실행별 수집·중복·HTTP 횟수</td></tr>
+            <tr><td><code>run_state</code></td><td class="num">1</td><td>파이프라인 상태 + 마스터 설정(임계값·키워드·수신자·비밀번호 해시)</td></tr>
             <tr><td><code>article_bodies</code></td><td class="num">3</td><td>분석 대기 중인 본문 임시 보관</td></tr>
             <tr><td><code>market_quotes</code></td><td class="num">6</td><td>주가 2 · 환율 4</td></tr>
             <tr><td><code>feed_sources</code></td><td class="num">2</td><td>수집 소스 on/off</td></tr>
@@ -837,7 +863,8 @@
         </table></div>
 
         <div class="note warn">
-          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(8.7 MB)이고
+          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(9.4 MB, 그중
+          6 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 3 MB 선에서 유지)이고
           <code>.gitignore</code>에 있어 GitHub에는 올라가지 않는다. 카드 하단의
           <code>SUPABASE</code> 글자는 하드코딩된 표시 라벨일 뿐 실제 저장소와 무관하다.
           Supabase로 옮기려면 <code>schema.sql</code>을 실행하고 <code>.env</code> 세 줄만 바꾸면 된다.
@@ -852,10 +879,12 @@
           <thead><tr><th>엔드포인트</th><th class="num">응답</th><th>비고</th></tr></thead>
           <tbody>
             <tr><td><code>GET /</code></td><td class="num">5 ms</td><td>HTML+JS+CSS 조립 결과를 파일 수정시각으로 캐시</td></tr>
-            <tr><td><code>GET /api/articles</code></td><td class="num">36 ms</td><td>필터는 원본 행에서, 카드는 보이는 20건만 생성</td></tr>
+            <tr><td><code>GET /api/articles</code></td><td class="num">36 ms</td><td>필터는 원본 행에서, 카드는 보이는 9건만 생성</td></tr>
             <tr><td><code>GET /api/filters</code></td><td class="num">3 ms</td><td>20초 캐시</td></tr>
             <tr><td><code>GET /api/stats</code></td><td class="num">21 ms</td><td>집계 쿼리</td></tr>
-            <tr><td>수집 1회</td><td class="num">14–73 초</td><td>신규 건수에 비례. 목표 20초, 초과 시 경고 로그</td></tr>
+            <tr><td><code>GET /api/weekly</code></td><td class="num">4 ms</td><td>저장된 최신 레포트 반환 (생성은 별도)</td></tr>
+            <tr><td>수집 1회</td><td class="num">3–73 초</td><td>신규 건수에 비례. 목표 20초, 초과 시 경고 로그</td></tr>
+            <tr><td>주간 레포트 생성</td><td class="num">40–60 초</td><td>섹션 7개 × LLM 1회</td></tr>
           </tbody>
         </table></div>
 
@@ -867,9 +896,9 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 175개 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 211개 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 0개</dd>
-          <dt>API 계약</dt><dd>프런트가 호출하는 13개 라우트 전부 백엔드에 존재</dd>
+          <dt>API 계약</dt><dd>프런트가 호출하는 라우트 전부 백엔드에 존재</dd>
           <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 3종. 공유 캐시는 수집 스레드 전용</dd>
         </div>
       </section>
@@ -888,8 +917,10 @@
             <tr><td>1회 LLM 분석</td><td class="num">6건</td><td>모델 호출 1회에 5–10초</td></tr>
             <tr><td>일일 LLM 상한</td><td class="num">1,500건</td><td>UTC 자정(한국 오전 9시)에 초기화</td></tr>
             <tr><td>임베딩 상한</td><td class="num">30회/실행</td><td>유사 제목 대량 유입 시 폭주 방어</td></tr>
+            <tr><td>임베딩 정리</td><td class="num">48시간</td><td>중복 판정 창 밖이면 <code>title_embedding</code> 비움 — 용량 회수</td></tr>
             <tr><td>알림 임계값</td><td class="num">50</td><td>마스터 패널에서 조절</td></tr>
             <tr><td>야간 모드</td><td class="num">23–07시</td><td>중요도 80 이상만 발송</td></tr>
+            <tr><td>주간 레포트</td><td class="num">월 07시</td><td><code>WEEKLY_REPORT_HOUR</code> · 이번 주 미발송이면 자동 생성·발송</td></tr>
             <tr><td>마스터 로그인</td><td class="num">24시간</td><td>서버 메모리 토큰 — 재시작 시 소멸</td></tr>
           </tbody>
         </table></div>
@@ -898,14 +929,86 @@
         <p>
           규칙을 바꿨을 때 기존 데이터에 소급 적용하는 CLI가 준비돼 있다.
           <code>fixcategories</code>(재태깅) · <code>fixgroups</code>(그룹사 보강) ·
-          <code>fixpress</code>(언론사명) · <code>fixofftopic</code>(무관 기사 보관) ·
-          <code>reanalyze</code>(끊긴 분석 복구) · <code>reswot</code>(SWOT 재생성) ·
-          <code>fixlinks</code> · <code>fixdates</code>.
+          <code>regroup</code>(원문 리드로 그룹사 재판정) · <code>fixpress</code>(언론사명) ·
+          <code>fixofftopic</code>(무관 기사 보관) · <code>reanalyze</code>(끊긴 분석 복구) ·
+          <code>reswot</code>(SWOT 재생성) · <code>fixlinks</code> · <code>fixdates</code>.
+          <code>weekly [--dry]</code>는 주간 레포트를 즉시 생성·발송한다.
         </p>
 
         <div class="note">
           <b>부트스트랩 억제.</b> 첫 실행 시각을 기록해 두고, 그 이전에 발행된 기사는 절대
           알림하지 않는다. 파이프라인이 오래 멈췄다 재개될 때 과거 기사가 한꺼번에 발송되는 것을 막는다.
+        </div>
+      </section>
+
+      <!-- ═══════════ 8. 주간 레포트 ═══════════ -->
+      <section id="weekly">
+        <h2><span class="tag">08 — 주간 레포트</span>월요일 아침 이메일</h2>
+
+        <p>
+          한 주치 기사를 계열사·주제별로 모아 LLM이 <b>주간 종합 SWOT</b>과
+          <b>포스코 그룹 영향</b> 분석을 합성한다. 결과는 <code>weekly_reports</code>에
+          저장하고, 같은 HTML을 이메일과 웹 <b>주간동향</b> 탭이 함께 쓴다.
+        </p>
+
+        <figure>
+          <div class="fig-scroll">
+            <svg viewBox="0 0 800 300" role="img" aria-label="파이프라인 매 회차가 월요일 07시 여부를 확인해 최근 7일 기사를 7개 섹션으로 모으고, 섹션마다 LLM을 1회 호출해 SWOT 또는 영향분석을 만든 뒤 HTML로 렌더해 저장하고 Gmail SMTP로 발송하며 웹 탭이 같은 저장분을 읽는 흐름도">
+              <defs>
+                <marker id="a8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+                </marker>
+              </defs>
+
+              <rect class="box" x="16" y="120" width="150" height="60" rx="7"/>
+              <text class="lbl-b" x="30" y="143">파이프라인 매 회차</text>
+              <text class="lbl-sm" x="30" y="161">월요일 07시 &amp; 미발송?</text>
+
+              <rect class="box-navy" x="206" y="26" width="250" height="106" rx="7"/>
+              <text class="lbl-b" x="222" y="48">섹션 7개 · 최근 7일</text>
+              <text class="lbl-sm" x="222" y="67">그룹사 5 (퓨처엠·홀딩스·포스코</text>
+              <text class="lbl-sm" x="222" y="83">·이앤씨·인터내셔널) → SWOT</text>
+              <text class="lbl-sm" x="222" y="101">정부/정책·글로벌 통상 → 영향</text>
+              <text class="lbl-sm" x="222" y="119">기사 5건 = 제목에 회사명 우선</text>
+
+              <rect class="box-drop" x="206" y="150" width="250" height="52" rx="7"/>
+              <text class="lbl-b" x="222" y="172">LLM · 섹션당 1회</text>
+              <text class="lbl-drop" x="222" y="190">총 7회 ≈ 주당 $0.02</text>
+
+              <rect class="box-keep" x="206" y="220" width="250" height="52" rx="7"/>
+              <text class="lbl-b" x="222" y="242">weekly_reports 저장</text>
+              <text class="lbl-sm" x="222" y="260">payload(JSON) + html</text>
+
+              <rect class="box" x="510" y="150" width="130" height="52" rx="7"/>
+              <text class="lbl-b" x="524" y="172">Gmail SMTP</text>
+              <text class="lbl-sm" x="524" y="190">수신자 목록으로</text>
+
+              <rect class="box" x="510" y="220" width="130" height="52" rx="7"/>
+              <text class="lbl-b" x="524" y="242">웹 주간동향 탭</text>
+              <text class="lbl-sm" x="524" y="260">같은 저장분 렌더</text>
+
+              <g color="var(--ink-3)">
+                <path class="arw" d="M166 148 L186 148 L186 79 L202 79" marker-end="url(#a8)"/>
+                <line class="arw" x1="331" y1="132" x2="331" y2="148" marker-end="url(#a8)"/>
+                <line class="arw" x1="331" y1="202" x2="331" y2="218" marker-end="url(#a8)"/>
+                <path class="arw" d="M456 240 L482 240 L482 176 L506 176" marker-end="url(#a8)"/>
+                <line class="arw" x1="456" y1="246" x2="506" y2="246" marker-end="url(#a8)"/>
+              </g>
+            </svg>
+          </div>
+          <figcaption>
+            <b>생성과 발송은 분리돼 있다.</b> 월요일에 서버가 꺼져 있었어도 켜지는 즉시 그 주 것을
+            한 번 만든다(<code>last_weekly_report_at</code>로 중복 차단). 마스터는 웹에서
+            <b>지금 새로 생성</b>·<b>메일로 보내기</b>를 눌러 수동 실행할 수 있고, 수신자 목록도
+            패널에서 편집한다. SMTP 자격 증명이 없으면 생성·저장만 하고 발송은 건너뛴다.
+          </figcaption>
+        </figure>
+
+        <div class="note">
+          <b>Gmail은 앱 비밀번호로.</b> <code>SMTP_USER</code>와 앱 비밀번호는 <b>같은 Google
+          계정</b>이어야 한다. 회사 계정이 앱 비밀번호를 막으면 개인 <code>@gmail.com</code>을
+          발신자로 두고 회사 주소를 수신자로 넣는다. SWOT 4분면은 강점(초록)·약점(주황)·기회(파랑)·
+          위협(빨강)으로 색을 나눠 이메일에서도 한눈에 구분된다.
         </div>
       </section>
 
@@ -924,6 +1027,7 @@
       <a href="#data">05 데이터</a>
       <a href="#perf">06 성능</a>
       <a href="#ops">07 운영</a>
+      <a href="#weekly">08 주간 레포트</a>
     </nav>
   </div>
 </div>
