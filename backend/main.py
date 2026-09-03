@@ -249,7 +249,7 @@ def load_config() -> Config:
         fresh_cutoff_hours=get_env_int("FRESH_CUTOFF_HOURS", 6, 1),
         backfill_cutoff_hours=get_env_int("BACKFILL_CUTOFF_HOURS", 72, 1),
         notify_threshold=get_env_int("NOTIFY_THRESHOLD", 50, 0, 100),
-        llm_daily_limit=get_env_int("LLM_DAILY_LIMIT", 500, 0),
+        llm_daily_limit=get_env_int("LLM_DAILY_LIMIT", 1500, 0),
         # 1회 실행에서 분석할 최대 건수. 나머지는 analyzed_at=null 로 남아 다음 실행에 처리된다.
         # 60초 주기를 지키려면 작게 유지한다(모델 1회 호출이 5~10초).
         llm_per_run=get_env_int("LLM_PER_RUN", 6, 1),
