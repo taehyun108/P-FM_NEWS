@@ -4072,17 +4072,18 @@ def create_app(ctx: Context):
 
         @app.get("/")
         def index():
-            path = os.path.join(FRONTEND_DIR, "index.html")
-            html = open(path, "r", encoding="utf-8").read()
-            # 정적 파일 참조에 파일 수정시각을 붙여 배포마다 캐시를 자동 무효화한다.
-            # (프록시가 옛 ?v=... 를 계속 내주던 문제를 원천 차단)
-            for name in ("app.js", "style.css"):
-                fp = os.path.join(FRONTEND_DIR, name)
-                if os.path.exists(fp):
-                    ver = int(os.path.getmtime(fp))
-                    html = re.sub(rf"\./{name}(\?v=[^\"']*)?", f"./{name}?v={ver}", html)
+            # JS·CSS 를 HTML 에 인라인해서 내보낸다. 별도 정적 요청이 없으므로
+            # 쿼리스트링을 무시하는 프록시가 있어도 옛 파일을 내줄 수 없다.
+            html = open(os.path.join(FRONTEND_DIR, "index.html"), "r", encoding="utf-8").read()
+            css = open(os.path.join(FRONTEND_DIR, "style.css"), "r", encoding="utf-8").read()
+            js = open(os.path.join(FRONTEND_DIR, "app.js"), "r", encoding="utf-8").read()
+            html = re.sub(r'<link[^>]+href="\./style\.css[^"]*"[^>]*>',
+                          f"<style>\n{css}\n</style>", html)
+            html = re.sub(r'<script[^>]+src="\./app\.js[^"]*"[^>]*></script>',
+                          f"<script>\n{js}\n</script>", html)
             return HTMLResponse(html)
 
+        # 직접 접근(디버그)용으로 파일도 계속 서빙한다.
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
     return app
