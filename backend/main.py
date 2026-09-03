@@ -1596,6 +1596,18 @@ GROUP_COMPANIES: dict[str, list[str]] = {
     "포스코": ["포스코", "POSCO"],
 }
 
+# 그룹사 판정에 쓰는 본문 길이. 기사의 '주체'는 제목과 리드 문단에 드러난다.
+#
+# 본문 전체를 스캔하면 말미의 스치는 언급이 주체를 가로챈다. 실제 사례:
+#   '포스코 직접고용 이행하겠다지만…'(부산일보) 본문 1,963자 중 1,859번째에
+#   '포스코홀딩스 장인화 회장' 이 한 번 나오는데, detect_group_companies 의
+#   `if not found` 때문에 '포스코홀딩스' 만 붙고 정작 주체인 '포스코' 는 빠졌다.
+# 리드 700자로 줄이면 위 기사는 '포스코', 계열사를 실제로 나열하는 공채 기사는
+# 4개 계열사가 그대로 잡힌다(계열사명이 0~270자에 등장). detect_categories 가
+# 제목+요약만 보는 것과 같은 이유다.
+GROUP_LEAD_CHARS = 700
+REGROUP_DAYS = 3   # `regroup` 명령이 되돌아볼 기간. 그보다 오래된 카드는 화면에서 밀려난다.
+
 TRADE_CATEGORY = "글로벌 통상환경"
 # '특정 국가의 명시적 통상 조치' 만 넣는다. '공급망 재편'·'디리스킹' 같은 일반 트렌드어는
 # 노사·실적 기사에도 스치듯 나와 오태깅되므로 제외한다.
@@ -3158,7 +3170,9 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                          press_name, item.title[:40])
             continue
 
-        rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
+        # 그룹사는 제목+리드까지만 본다 — 본문 말미의 스치는 계열사 언급이
+        # 기사 주체를 가로채는 것을 막는다. (GROUP_LEAD_CHARS 주석 참고)
+        rule_groups = detect_group_companies(f"{item.title}\n{body[:GROUP_LEAD_CHARS]}")
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
         # 글로벌 통상환경 기사: 제목에 통상 조치명 + 포스코 관련 산업어가 함께 있으면
         # 포스코 미언급이어도 수집한다. (사용자 지정)
@@ -3364,9 +3378,11 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     # 태깅하는 경향이 강하다. LLM 이 보탠 그룹사는 제목·본문에 회사명(별칭)이
     # 실제로 등장하는 것만 채택한다.
     rule_groups = normalize_group_list(list(row.get("group_companies") or []))
-    # 제목·본문에 더해 LLM 키워드도 근거로 본다 — 키워드에만 계열사명이 남은 경우를 잡는다.
+    # LLM 이 보탠 계열사의 근거는 제목 + 리드 + 요약 + 키워드에서만 찾는다.
+    # 본문 전체를 근거로 삼으면 말미의 스치는 언급까지 통과해 기사 주체가 뒤바뀐다.
     kw_text = " ".join(analysis.keywords)
-    mentioned = set(detect_group_companies(f"{row['title']}\n{body}\n{kw_text}"))
+    mentioned = set(detect_group_companies(
+        f"{row['title']}\n{body[:GROUP_LEAD_CHARS]}\n{analysis.summary_text}\n{kw_text}"))
     llm_verified = [g for g in analysis.group_companies if g in mentioned]
     # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다.
     kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코"]
@@ -3478,7 +3494,7 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
         storage.append_alias(dup["id"], url_source)
         return _existing_result(dup["id"])
 
-    groups = detect_group_companies(f"{title}\n{body[:2000]}")
+    groups = detect_group_companies(f"{title}\n{body[:GROUP_LEAD_CHARS]}")
     # 카테고리는 제목 기준 임시값. 아래 analyze_and_save 에서 요약으로 다시 계산된다.
     categories = detect_categories(title)
     score = score_article(title, body, groups, press_tier)
@@ -3687,6 +3703,18 @@ def effective_threshold(ctx: Context) -> int:
     return ctx.cfg.notify_threshold
 
 
+def split_for_digest(pending: list[dict]) -> tuple[list[dict], list[dict], bool]:
+    """발송 대기 목록을 (우선 기사, 일반 기사, 일반 기사를 묶을지)로 나눈다.
+
+    우선 기사('항상 발송 키워드' 매칭)는 절대 묶지 않는다. 다이제스트는 제목 한 줄만
+    남기므로 요약·그룹사·점수가 사라지고, 키워드를 지정한 의미 자체가 없어진다.
+    묶음은 일반 기사가 DIGEST_MIN_COUNT 건 이상일 때만 적용한다. (사용자 지정)
+    """
+    priority = [p for p in pending if p.get("priority")]
+    normal = [p for p in pending if not p.get("priority")]
+    return priority, normal, len(normal) >= DIGEST_MIN_COUNT
+
+
 def send_notifications(ctx: Context, limit: int = 20) -> int:
     cfg = ctx.cfg
     if not cfg.telegram_enabled:
@@ -3718,32 +3746,39 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
             return 0
 
     url = TELEGRAM_API.format(token=cfg.telegram_bot_token)
-    sent = 0
 
-    if len(pending) >= DIGEST_MIN_COUNT:
-        # 묶음 발송 — 1분 사이클에 3건 이상이면 다이제스트 1건으로 보낸다.
-        body = [f"📰 신규 기사 {len(pending)}건", ""]
-        for row in pending:
-            link = row.get("url_canonical") or row.get("url_original") or ""
-            score = int(row.get("importance_score") or 0)
-            mark = "🔴" if score >= 80 else "🟠"
-            body.append(f'{mark} <a href="{esc(link)}">{esc(row.get("title") or "")}</a>')
-        ok, err = _telegram_send(ctx, url, "\n".join(body))
-        for row in pending:
-            ctx.storage.mark_notification(row["id"], "sent" if ok else "queued", err)
-        return len(pending) if ok else 0
-
-    for row in pending:
+    def _send_one(row: dict) -> bool:
+        """개별 카드 발송 — 요약·그룹사·점수가 다 들어간 전체 메시지."""
         ok, err = _telegram_send(ctx, url, format_message(row))
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
-            sent += 1
         else:
             # 3회까지 재시도. retry_count 가 3이 되면 pending 조회에서 빠진다.
             status = "queued" if int(row.get("retry_count") or 0) < 2 else "failed"
             ctx.storage.mark_notification(row["id"], status, err)
         time.sleep(RATE_LIMIT_SLEEP)
-    return sent
+        return ok
+
+    priority, normal, use_digest = split_for_digest(pending)
+    if len(priority) >= 10:
+        log.warning("우선 기사가 한 회차에 %d건입니다. '항상 발송 키워드'가 너무 넓지 않은지"
+                    " 확인하세요(예: '포스코'는 사실상 전체 기사와 매칭됩니다).", len(priority))
+    sent = sum(1 for row in priority if _send_one(row))
+
+    if use_digest:
+        # 묶음 발송 — 일반 기사가 3건 이상이면 다이제스트 1건으로 보낸다.
+        body = [f"📰 신규 기사 {len(normal)}건", ""]
+        for row in normal:
+            link = row.get("url_canonical") or row.get("url_original") or ""
+            score = int(row.get("importance_score") or 0)
+            mark = "🔴" if score >= 80 else "🟠"
+            body.append(f'{mark} <a href="{esc(link)}">{esc(row.get("title") or "")}</a>')
+        ok, err = _telegram_send(ctx, url, "\n".join(body))
+        for row in normal:
+            ctx.storage.mark_notification(row["id"], "sent" if ok else "queued", err)
+        return sent + (len(normal) if ok else 0)
+
+    return sent + sum(1 for row in normal if _send_one(row))
 
 
 def warn_if_bad_chat_id(chat_id: str) -> None:
@@ -4674,6 +4709,46 @@ def cmd_fixgroups(ctx: Context) -> None:
     log.info("그룹사 태그 보강: %d건", fixed)
 
 
+def cmd_regroup(ctx: Context) -> None:
+    """그룹사 태그를 새 기준(제목 + 리드 GROUP_LEAD_CHARS)으로 다시 매긴다 (일회성).
+
+    본문 말미의 스치는 계열사 언급 때문에 엉뚱한 계열사가 붙은 기사를 바로잡는다.
+    예) '포스코 직접고용…'(부산일보)은 마지막 문단의 '포스코홀딩스 장인화 회장'
+        한 번 때문에 '포스코홀딩스'로 태깅됐다.
+
+    원문을 다시 받아 리드만 보고 판정하므로 LLM 비용은 0이다. 본문을 못 받으면
+    되돌릴 근거가 없으므로 기존 태그를 그대로 둔다(잘못 지우는 것보다 낫다).
+    """
+    cutoff = iso(now_utc() - timedelta(days=REGROUP_DAYS))
+    rows = [r for r in ctx.storage.list_articles(5000, 0, None, "")
+            if (r.get("collected_at") or "") >= cutoff]
+    log.info("최근 %d일 기사 %d건 — 원문 리드로 그룹사를 재판정합니다.", REGROUP_DAYS, len(rows))
+
+    urls = [r.get("url_original") or r.get("url_canonical") or "" for r in rows]
+    prefetched = prefetch_articles(ctx.http, [u for u in urls if u])
+    changed = unchanged = unchecked = 0
+    for r, u in zip(rows, urls):
+        _, html = prefetched.get(u, ("", ""))
+        body = extract_body(html) if html else ""
+        if not body:
+            unchecked += 1
+            continue  # 원문 확인 불가 — 기존 태그 유지
+        probe = "\n".join([
+            r.get("title") or "", body[:GROUP_LEAD_CHARS],
+            r.get("summary_text") or "", " ".join(jload(r.get("keywords"), [])),
+        ])
+        new = normalize_group_list(detect_group_companies(probe))
+        cur = normalize_group_list(jload(r.get("group_companies"), []))
+        if not new or new == cur:
+            unchanged += 1
+            continue
+        ctx.storage.update_article(r["id"], {"group_companies": jdump(new)})
+        log.info("  %s → %s | %s", cur or ["-"], new, (r.get("title") or "")[:36])
+        changed += 1
+    log.info("그룹사 재판정: 변경 %d건 · 유지 %d건 · 원문 확인 불가 %d건",
+             changed, unchanged, unchecked)
+
+
 def cmd_fixlinks(ctx: Context) -> None:
     """홈페이지 루트로 잘못 저장된 url_canonical 을 바로잡는다 (일회성).
 
@@ -4987,6 +5062,21 @@ def cmd_selftest() -> int:
     check("소규모 계열사도 판정", detect_group_companies("포스코모빌리티솔루션 신규 라인"), ["포스코모빌리티솔루션"])
     check("계열사 잡히면 '포스코' 미부착",
           "포스코" in normalize_group_list(detect_group_companies("삼척블루파워 발전소")), False)
+
+    # 본문 말미의 스치는 계열사 언급이 기사 주체를 가로채지 않아야 한다.
+    # 실제 오탐 사례: 부산일보 '포스코 직접고용…' 본문 1,859번째의 '포스코홀딩스 장인화 회장'
+    _lead = "포스코 직접고용 이행하겠다지만 부담 비용 눈덩이\n포스코가 사내하청 노동자 불법파견 소송에서 항소를 포기했다."
+    _tail = "ㅁ" * 1200 + "일각에서는 포스코홀딩스 장인화 회장 체제에서 혼란을 가중한 것 아니냐는 지적이 나온다."
+    check("본문 전체를 보면 주체가 뒤바뀐다(회귀 재현)",
+          detect_group_companies(_lead + "\n" + _tail), ["포스코홀딩스"])
+    check("리드까지만 보면 주체가 유지된다",
+          detect_group_companies((_lead + "\n" + _tail)[:GROUP_LEAD_CHARS]), ["포스코"])
+    # 계열사를 실제로 나열하는 기사는 리드 안에 다 들어와 그대로 잡힌다.
+    _hire = ("포스코그룹, 6개 계열사 하반기 공채\n포스코홀딩스 미래기술연구원과"
+             " 포스코인터내셔널, 포스코이앤씨, 포스코DX 등 6개사가 신입사원을 모집한다.")
+    check("계열사 나열 기사는 리드에서 전부 잡힘",
+          sorted(detect_group_companies(_hire[:GROUP_LEAD_CHARS])),
+          sorted(["포스코홀딩스", "포스코DX", "포스코인터내셔널", "포스코이앤씨"]))
     check("카테고리에 '그룹사' 없음", "그룹사" in detect_categories("포스코퓨처엠 양극재 증설"), False)
     check("병합 시 상위 개념 제거",
           normalize_group_list(["포스코홀딩스", "포스코", "포스코퓨처엠"]),
@@ -5300,6 +5390,16 @@ def cmd_selftest() -> int:
     check("정책: OR 매칭 but 필수 불일치 → 제외",
           _kw_hit("가정용 전기요금 인하", ["전기요금"]) and _kw_hit("가정용 전기요금 인하", ["산업"]), False)
 
+    print("\n[13-2a] 다이제스트 분리 — 우선 기사는 묶지 않는다")
+    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 0}, {"priority": 0}, {"priority": 0}])
+    check("우선 기사는 개별 발송으로 분리", len(_p), 1)
+    check("남은 일반 기사 3건 → 묶음", (len(_n), _d), (3, True))
+    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 1}, {"priority": 1}, {"priority": 0}])
+    check("우선 3건이어도 묶지 않음", (len(_p), _d), (3, False))
+    _p, _n, _d = split_for_digest([{"priority": 0}, {"priority": 0}])
+    check("일반 2건은 묶음 기준 미달 → 개별 발송", _d, False)
+    check("빈 목록 방어", split_for_digest([]), ([], [], False))
+
     print("\n[13-3] 마스터 비밀번호 (pbkdf2)")
     _h = hash_password("s3cret!")
     check("정상 비번 검증", verify_password("s3cret!", _h), True)
@@ -5335,6 +5435,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixpress   언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
+  regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
@@ -5374,6 +5475,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixauthors(ctx)
     elif command == "fixgroups":
         cmd_fixgroups(ctx)
+    elif command == "regroup":
+        cmd_regroup(ctx)
     elif command == "fixcategories":
         cmd_fixcategories(ctx)
     elif command == "fixofftopic":
