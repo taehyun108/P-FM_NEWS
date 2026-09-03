@@ -1315,7 +1315,11 @@ SEED_KEYWORDS: list[tuple[str, str]] = (
      ["포스코", "포스코홀딩스", "포스코퓨처엠", "포스코DX", "포스코인터내셔널", "포스코이앤씨", "POSCO"]]
     + [("산업", k) for k in
        ["이차전지", "배터리 소재", "양극재", "음극재", "전구체", "리튬", "니켈", "흑연",
-        "전고체 배터리", "나트륨 배터리", "LFP"]]
+        "전고체 배터리", "나트륨 배터리", "LFP",
+        # 양극재·음극재·차세대 배터리 개발·연구 (포스코퓨처엠 사업 직결)
+        "전고체 전해질", "리튬메탈 배터리", "황리튬 배터리", "실리콘 음극재", "하이니켈 양극재",
+        "단결정 양극재", "건식 전극", "차세대 배터리", "배터리 소재 개발", "이차전지 신소재",
+        "배터리 연구", "양극재 신기술", "음극재 신기술"]]
     # '정책' 카테고리는 Google 검색 시 site:www.korea.kr 로 한정된다 (대한민국 정책브리핑).
     # 포스코 산업(철강·이차전지·에너지·통상·환경규제·인프라)에 영향이 있는 부처 발표를 폭넓게 수집.
     + [("정책", k) for k in
@@ -1887,6 +1891,24 @@ def is_trade_article(row: dict) -> bool:
     if TRADE_CATEGORY in jload(row.get("categories"), []):
         return True
     return is_trade_topic(row.get("title") or "", row.get("summary_text") or "")
+
+
+# 포스코퓨처엠 사업(양극재·음극재·소재)에 직결되는 차세대 배터리·소재 기술.
+# 이런 개발·연구 기사는 포스코 회사명이 없어도 수집한다. (사용자 지정)
+BATTERY_TECH_KW = [
+    "전고체", "전고체 배터리", "리튬메탈", "리튬금속 배터리", "황리튬", "황-리튬", "리튬황",
+    "나트륨이온", "나트륨 배터리", "소듐이온", "소듐 배터리",
+    "하이니켈", "단결정 양극재", "코발트프리", "망간리치", "LMFP", "LFP 양극재",
+    "실리콘 음극", "실리콘음극재", "SiOx", "리튬메탈 음극", "무음극",
+    "고체 전해질", "고분자 전해질", "건식 전극", "드라이 전극",
+    "양극재 개발", "음극재 개발", "전구체 기술", "배터리 소재 개발", "이차전지 소재 개발",
+    "차세대 배터리", "차세대 이차전지", "차세대 전지", "배터리 기술 개발",
+]
+
+
+def is_battery_tech(title: str, extra: str = "") -> bool:
+    """양극재·음극재·차세대 배터리 소재 기술(개발·연구) 기사인가."""
+    return _kw_hit_any(f"{title}\n{extra}", BATTERY_TECH_KW)
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -3080,6 +3102,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                 continue
         elif is_trade:
             pass  # 통상 신호 + 산업 키워드가 확인됨 — 포스코 미언급 허용
+        elif is_battery_tech(item.title, f"{item.snippet or ''}\n{body[:1500]}"):
+            pass  # 양극재·음극재·차세대 배터리 소재 기술 — 포스코 미언급 허용 (사용자 지정)
         elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
             # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
@@ -4038,9 +4062,11 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
             " ".join(jload(row.get("keywords"), [])),
         ])
         groups = normalize_group_list(detect_group_companies(probe))
-        # 정책브리핑·통상환경 기사는 포스코 미언급이 정상 — '포스코' 폴백을 씌우지 않는다.
+        # 정책브리핑·통상환경·배터리기술 기사는 포스코 미언급이 정상 — '포스코' 폴백 안 씌운다.
         # 일반 기사는 수집 게이트에서 포스코 관련이 확인됐으므로 최소 '포스코'.
-        if not groups and not is_policy_brief(row) and TRADE_CATEGORY not in jload(row.get("categories"), []):
+        if (not groups and not is_policy_brief(row)
+                and TRADE_CATEGORY not in jload(row.get("categories"), [])
+                and not is_battery_tech(row.get("title") or "", row.get("summary_text") or "")):
             groups = ["포스코"]
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
     return groups, categories, row.get("press_name") or ""
@@ -4617,8 +4643,9 @@ def cmd_fixofftopic(ctx: Context) -> None:
     rows = ctx.storage.list_articles(5000, 0, None, "")
     cands = []
     for r in rows:
-        if is_policy_brief(r) or is_trade_article(r):
-            continue  # 정책브리핑·통상환경 기사는 포스코 미언급이어도 유지 (사용자 지정)
+        if (is_policy_brief(r) or is_trade_article(r)
+                or is_battery_tech(r.get("title") or "", r.get("summary_text") or "")):
+            continue  # 정책·통상·배터리기술 기사는 포스코 미언급이어도 유지 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
@@ -5033,6 +5060,17 @@ def cmd_selftest() -> int:
           "글로벌 통상환경" in detect_categories("美 무역확장법 232조 철강 관세 부과"), True)
     check("detect_categories: 요약에만 조치명이면 태깅 안 함",
           "글로벌 통상환경" in detect_categories("포스코 실적 회복세", "CBAM 대응 비용이 변수"), False)
+
+    print("\n[8-2d] 배터리·소재 기술 기사 (포스코 미언급 허용)")
+    check("전고체 배터리 개발 → 수집 대상",
+          is_battery_tech("전고체 배터리 상온 구동 성공…에너지밀도 2배"), True)
+    check("황-리튬 배터리 연구 → 수집 대상",
+          is_battery_tech("황 원소 활용한 황-리튬 배터리, 2천배 빠른 충방전"), True)
+    check("실리콘 음극재 신기술 → 수집 대상",
+          is_battery_tech("실리콘 음극재 팽창 잡는 바인더 개발"), True)
+    check("일반 전기차 판매 기사 → 아님",
+          is_battery_tech("테슬라 3분기 인도량 사상 최대"), False)
+    check("배터리 화재 사고 → 아님", is_battery_tech("ESS 배터리 화재로 공장 가동 중단"), False)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),
