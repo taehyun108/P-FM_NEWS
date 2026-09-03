@@ -466,6 +466,10 @@ class Storage(ABC):
     def press_by_domain(self, domain: str) -> dict | None: ...
 
     @abstractmethod
+    def press_tier_by_id(self, press_id: str | None) -> int:
+        """언론사 tier(1=주요지 … 3=기타). id 가 없거나 못 찾으면 3."""
+
+    @abstractmethod
     def all_press(self) -> list[dict]:
         """press_outlets 전체 행. fixpress 의 도메인 표기 복원에 쓴다."""
 
@@ -651,7 +655,7 @@ class SqliteStorage(Storage):
     def recent_articles_for_dedup(self, since: datetime) -> list[dict]:
         return self._rows(
             "select id, title, published_at, dedup_group_id, is_representative, title_embedding,"
-            " press_name, content_hash from articles"
+            " press_id, press_name, content_hash from articles"
             " where published_at >= ? and status='active'",
             (iso(since),),
         )
@@ -855,6 +859,12 @@ class SqliteStorage(Storage):
     def press_by_domain(self, domain: str) -> dict | None:
         return self._one("select * from press_outlets where domain=?", (domain,))
 
+    def press_tier_by_id(self, press_id: str | None) -> int:
+        if not press_id:
+            return 3
+        row = self._one("select tier from press_outlets where id=?", (press_id,))
+        return int(row["tier"]) if row and row["tier"] is not None else 3
+
     def all_press(self) -> list[dict]:
         return self._rows("select * from press_outlets")
 
@@ -1016,7 +1026,7 @@ class SupabaseStorage(Storage):
 
     def recent_articles_for_dedup(self, since: datetime) -> list[dict]:
         return (self._t("articles")
-                .select("id,title,published_at,dedup_group_id,is_representative,title_embedding,press_name,content_hash")
+                .select("id,title,published_at,dedup_group_id,is_representative,title_embedding,press_id,press_name,content_hash")
                 .gte("published_at", iso(since)).eq("status", "active").execute().data)
 
     def upsert_ledger(self, url_source: str, reason: str) -> None:
@@ -1185,6 +1195,12 @@ class SupabaseStorage(Storage):
     def press_by_domain(self, domain: str) -> dict | None:
         rows = self._t("press_outlets").select("*").eq("domain", domain).execute().data
         return rows[0] if rows else None
+
+    def press_tier_by_id(self, press_id: str | None) -> int:
+        if not press_id:
+            return 3
+        rows = self._t("press_outlets").select("tier").eq("id", press_id).execute().data
+        return int(rows[0]["tier"]) if rows and rows[0].get("tier") is not None else 3
 
     def all_press(self) -> list[dict]:
         return self._t("press_outlets").select("*").execute().data or []
@@ -2853,6 +2869,24 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             storage.append_alias(existing["id"], item.url_source)
             ctx.seen_cache.add(item.url_source)
             dup_count += 1
+            # 더 상위 언론사에서 온 중복이면 카드의 표시 정보(제목·링크·언론사·
+            # 기자·썸네일)를 그쪽으로 승격한다. 요약·SWOT·키워드 등 분석 결과는
+            # 같은 사건이라 그대로 두고, 재정렬을 피하려 발행시각도 유지한다.
+            if press_tier < storage.press_tier_by_id(existing.get("press_id")):
+                promo = {
+                    "title": item.title,
+                    "url_canonical": canonical,
+                    "url_original": item.url_original,
+                    "press_id": press_id,
+                    "press_name": press_name,
+                    "author": author,
+                }
+                new_thumb = extract_thumbnail(html)
+                if new_thumb:
+                    promo["thumbnail_url"] = new_thumb
+                storage.update_article(existing["id"], promo)
+                log.info("대표 승격: %s → %s (%s)", existing.get("press_name") or "?",
+                         press_name, item.title[:40])
             continue
 
         rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
@@ -4706,6 +4740,21 @@ def cmd_selftest() -> int:
     check("직교 벡터", cosine([1, 0], [0, 1]), 0.0)
     check("길이 불일치 방어", cosine([1, 2], [1, 2, 3]), 0.0)
     check("None 방어", cosine(None, [1]), 0.0)
+
+    print("\n[11-1] 대표 승격 — 언론사 tier 조회 (일시 DB)")
+    import shutil
+    import tempfile
+    _dbdir = tempfile.mkdtemp()
+    _tmp = SqliteStorage(os.path.join(_dbdir, "selftest.db"))
+    _tmp.init_schema()
+    _tmp.upsert_press("major.co.kr", "주요지", 1, "approved")
+    _pid = (_tmp.press_by_domain("major.co.kr") or {}).get("id")
+    check("등록된 언론사 tier", _tmp.press_tier_by_id(_pid), 1)
+    check("id 없으면 기타(3)", _tmp.press_tier_by_id(None), 3)
+    check("모르는 id 는 기타(3)", _tmp.press_tier_by_id("nope"), 3)
+    check("상위 tier 로만 승격", 1 < _tmp.press_tier_by_id(None), True)   # tier1 < 3
+    check("동급이면 승격 안 함", 3 < _tmp.press_tier_by_id(None), False)  # tier3 !< 3
+    shutil.rmtree(_dbdir, ignore_errors=True)
 
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")
