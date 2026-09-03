@@ -439,6 +439,7 @@ async function loadMasterSettings() {
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
     $('alwaysGroup').textContent = d.always_group;
+    $('webPwNow').textContent = d.web_password || '(미설정)';
     masterKeywords = d.keywords || [];
     renderKwList();
   } catch (e) {
@@ -542,8 +543,11 @@ function initMaster() {
         method: 'POST',
         body: JSON.stringify({ target: 'web', new_password: $('pwWebNew').value }),
       })).json();
-      if (d.ok) { masterMsg('ok', '웹페이지 비밀번호를 저장했습니다.'); e.target.reset(); }
-      else masterMsg('err', d.error || '변경 실패');
+      if (d.ok) {
+        masterMsg('ok', '웹페이지 비밀번호를 저장했습니다.');
+        e.target.reset();
+        loadMasterSettings();       // 현재 비밀번호 표시 갱신
+      } else masterMsg('err', d.error || '변경 실패');
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '변경 실패'); }
   });
 }
@@ -841,6 +845,11 @@ function init() {
 
   $('favTab').addEventListener('click', toggleFavView);
   initMaster();
+
+  // 헤더 Telegram 버튼 — 봇 대화방 주소를 받아 링크를 채운다(실패하면 숨김).
+  getJSON('/api/telegram-link').then((d) => {
+    if (d.ok && d.url) { $('tgLink').href = d.url; $('tgLink').hidden = false; }
+  }).catch(() => { /* 텔레그램 미설정 — 버튼은 숨긴 채로 둔다 */ });
 
   $('urlAddForm').addEventListener('submit', submitUrl);
 

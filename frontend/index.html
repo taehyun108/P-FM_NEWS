@@ -23,6 +23,7 @@
     </div>
     <div class="header-right">
       <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
+      <a class="fav-tab" id="tgLink" href="#" target="_blank" rel="noopener noreferrer" hidden>✈ Telegram</a>
       <button type="button" class="fav-tab" id="masterBtn">🔒 마스터</button>
     </div>
   </div>
@@ -72,6 +73,8 @@
           <input type="password" id="pwMasterNew" class="url-add-input" placeholder="새 마스터 비밀번호 (4자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">마스터 비밀번호 변경</button>
         </form>
+        <p class="master-current">현재 웹페이지 비밀번호: <b id="webPwNow">—</b>
+          <small>아직 웹 접속 잠금은 적용되지 않습니다(값만 보관).</small></p>
         <form class="master-pwform" id="pwWebForm">
           <input type="password" id="pwWebNew" class="url-add-input" placeholder="새 웹페이지 비밀번호 (4자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">웹페이지 비밀번호 변경</button>

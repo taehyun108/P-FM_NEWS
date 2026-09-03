@@ -393,3 +393,10 @@ body {
   font-size: 14px; line-height: 1; padding: 0 2px;
 }
 .master-pwform { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.master-current {
+  margin: 12px 0 0; font-size: 12.5px; color: var(--ink-mid);
+  background: var(--navy-soft); border-radius: 8px; padding: 8px 11px;
+}
+.master-current b { color: var(--navy); font-family: ui-monospace, Consolas, monospace; }
+.master-current small { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 11px; }
+a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }

@@ -575,6 +575,7 @@ class SqliteStorage(Storage):
             "alter table run_state add column always_notify_keywords TEXT default '[]'",
             "alter table run_state add column master_pw_hash TEXT",
             "alter table run_state add column web_pw_hash TEXT",
+            "alter table run_state add column web_password TEXT",
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
         ]
@@ -3982,6 +3983,28 @@ def create_app(ctx: Context):
             return JSONResponse({"ok": True})
         return JSONResponse({"ok": False, "error": err or "발송에 실패했습니다."}, status_code=502)
 
+    _tg_link_cache: dict[str, str] = {}
+
+    @app.get("/api/telegram-link")
+    def api_telegram_link():
+        """헤더 Telegram 버튼용 — 봇 대화방 주소(t.me/<봇아이디>)를 돌려준다."""
+        if not ctx.cfg.telegram_enabled:
+            return JSONResponse({"ok": False, "error": "텔레그램이 설정되지 않았습니다."})
+        url = _tg_link_cache.get("url")
+        if not url:
+            try:
+                resp = ctx.http.get(
+                    f"https://api.telegram.org/bot{ctx.cfg.telegram_bot_token}/getMe", timeout=8)
+                uname = ((resp.json() or {}).get("result") or {}).get("username")
+                if uname:
+                    url = f"https://t.me/{uname}"
+                    _tg_link_cache["url"] = url
+            except Exception as exc:
+                log.debug("텔레그램 봇 주소 조회 실패: %s", exc)
+        if not url:
+            return JSONResponse({"ok": False, "error": "봇 주소를 확인하지 못했습니다."})
+        return JSONResponse({"ok": True, "url": url})
+
     # ── 마스터 패널 (PRD 추가) ──────────────────────────────────────
     def _master_guard(token: str) -> JSONResponse | None:
         if not _valid_master_token(token or ""):
@@ -4008,6 +4031,7 @@ def create_app(ctx: Context):
             "recommended_min": RECOMMENDED_MIN_SCORE,
             "keywords": jload(st.get("always_notify_keywords"), []),
             "always_group": ALWAYS_NOTIFY_GROUP,
+            "web_password": st.get("web_password") or "",
         })
 
     @app.post("/api/master/settings")
@@ -4051,7 +4075,10 @@ def create_app(ctx: Context):
                                     status_code=401)
             ctx.storage.set_run_state({"master_pw_hash": hash_password(new_pw)})
         else:
-            ctx.storage.set_run_state({"web_pw_hash": hash_password(new_pw)})
+            # 웹페이지 비밀번호는 마스터가 팀에 공유하는 값이라 확인이 가능해야 한다.
+            # 해시와 평문을 함께 보관하고, 평문은 마스터 인증 뒤에서만 노출한다.
+            ctx.storage.set_run_state({"web_pw_hash": hash_password(new_pw),
+                                       "web_password": new_pw})
         return JSONResponse({"ok": True})
 
     @app.post("/api/analyze-url")
