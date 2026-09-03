@@ -383,6 +383,8 @@ async function shareToTelegram(articleId, btn) {
 let masterKeywords = [];
 let policyKeywords = [];
 let policyRequired = [];
+let tradeKeywords = [];
+let tradeRequired = [];
 let thTimer;
 
 function masterAuth() {
@@ -447,12 +449,17 @@ async function loadMasterSettings() {
     $('thRec').textContent = d.recommended_min;
     $('webPwNow').textContent = d.web_password || '(미설정)';
     $('notifyPolicy').checked = !!d.notify_policy;
+    $('notifyTrade').checked = !!d.notify_trade;
     masterKeywords = d.keywords || [];
     policyKeywords = d.policy_keywords || [];
     policyRequired = d.policy_required || [];
+    tradeKeywords = d.trade_keywords || [];
+    tradeRequired = d.trade_required || [];
     renderKwList();
     renderPolicyKwList();
     renderPolicyReqList();
+    renderTradeKwList();
+    renderTradeReqList();
   } catch (e) {
     if (e.message !== 'unauthorized') masterMsg('err', '설정을 불러오지 못했습니다.');
   }
@@ -473,6 +480,8 @@ function renderChipEditor(container, arr, save) {
 function renderKwList() { renderChipEditor('kwList', masterKeywords, (next) => { masterKeywords = next; renderKwList(); saveKw('keywords', masterKeywords); }); }
 function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords, (next) => { policyKeywords = next; renderPolicyKwList(); saveKw('policy_keywords', policyKeywords); }); }
 function renderPolicyReqList() { renderChipEditor('policyReqList', policyRequired, (next) => { policyRequired = next; renderPolicyReqList(); saveKw('policy_required', policyRequired); }); }
+function renderTradeKwList() { renderChipEditor('tradeKwList', tradeKeywords, (next) => { tradeKeywords = next; renderTradeKwList(); saveKw('trade_keywords', tradeKeywords); }); }
+function renderTradeReqList() { renderChipEditor('tradeReqList', tradeRequired, (next) => { tradeRequired = next; renderTradeReqList(); saveKw('trade_required', tradeRequired); }); }
 
 async function saveKw(field, arr) {
   try {
@@ -521,13 +530,15 @@ function initMaster() {
     }, 400);
   });
 
-  $('notifyPolicy').addEventListener('change', async (e) => {
+  const wireToggle = (id, field, label) => $(id).addEventListener('change', async (e) => {
     try {
       await masterFetch('/api/master/settings',
-        { method: 'POST', body: JSON.stringify({ notify_policy: e.target.checked }) });
-      masterMsg('ok', e.target.checked ? '정책브리핑 기사 알림 켬' : '정책브리핑 기사 알림 끔');
+        { method: 'POST', body: JSON.stringify({ [field]: e.target.checked }) });
+      masterMsg('ok', `${label} 알림 ${e.target.checked ? '켬' : '끔'}`);
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
+  wireToggle('notifyPolicy', 'notify_policy', '정책브리핑 기사');
+  wireToggle('notifyTrade', 'notify_trade', '글로벌 통상환경 기사');
 
   const wireKwAdd = (btnId, inputId, arrGetter, arrSetter, render, field) => {
     const add = () => {
@@ -545,6 +556,8 @@ function initMaster() {
   wireKwAdd('kwAdd', 'kwNew', () => masterKeywords, (a) => { masterKeywords = a; }, renderKwList, 'keywords');
   wireKwAdd('policyKwAdd', 'policyKwNew', () => policyKeywords, (a) => { policyKeywords = a; }, renderPolicyKwList, 'policy_keywords');
   wireKwAdd('policyReqAdd', 'policyReqNew', () => policyRequired, (a) => { policyRequired = a; }, renderPolicyReqList, 'policy_required');
+  wireKwAdd('tradeKwAdd', 'tradeKwNew', () => tradeKeywords, (a) => { tradeKeywords = a; }, renderTradeKwList, 'trade_keywords');
+  wireKwAdd('tradeReqAdd', 'tradeReqNew', () => tradeRequired, (a) => { tradeRequired = a; }, renderTradeReqList, 'trade_required');
 
   $('pwMasterForm').addEventListener('submit', async (e) => {
     e.preventDefault();

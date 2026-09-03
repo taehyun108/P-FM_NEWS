@@ -575,6 +575,9 @@ class SqliteStorage(Storage):
             "alter table run_state add column notify_policy INTEGER not null default 0",
             "alter table run_state add column policy_notify_keywords TEXT default '[]'",
             "alter table run_state add column policy_required_keywords TEXT default '[]'",
+            "alter table run_state add column notify_trade INTEGER not null default 0",
+            "alter table run_state add column trade_notify_keywords TEXT default '[]'",
+            "alter table run_state add column trade_required_keywords TEXT default '[]'",
             "alter table articles add column categories TEXT default '[]'",
             "alter table notifications add column priority INTEGER not null default 0",
         ]
@@ -1308,6 +1311,14 @@ SEED_KEYWORDS: list[tuple[str, str]] = (
         "산업통상자원부", "기후에너지환경부", "환경부", "기획재정부",
         "국토교통부", "고용노동부", "과학기술정보통신부", "중소벤처기업부",
         "기획재정부 예산", "국회 예산", "예산결산특별위원회", "국정감사"]]
+    # '통상' — 미국·유럽·중국·베트남·일본 등 주요국의 포스코 관련 산업(배터리·철강) 통상 조치.
+    + [("통상", k) for k in
+       ["IRA 배터리", "FEOC 배터리", "OBBBA 배터리", "미국 배터리 보조금", "미국 IRA 세부지침",
+        "CBAM 철강", "EU 탄소국경조정 철강", "EU 핵심원자재법", "EU 배터리 규정",
+        "중국 흑연 수출통제", "중국 배터리 소재 수출", "중국 요소 수출제한", "중국 갈륨 게르마늄",
+        "미국 철강 관세", "무역확장법 232조 철강", "철강 세이프가드", "US 상호관세 철강",
+        "철강 반덤핑", "베트남 철강 반덤핑", "일본 소재 수출규제", "일본 철강 통상",
+        "이차전지 공급망 재편", "배터리 디리스킹", "철강 통상마찰", "글로벌 관세 전쟁"]]
 )
 
 # 수집 소스 시드 — (source_type, name, url, enabled)
@@ -1549,6 +1560,16 @@ CATEGORY_RULES: dict[str, list[str]] = {
                   "정부 지원", "정책 지원", "육성 방안"],
     "법령": ["법안", "법률안", "개정안", "시행령", "시행규칙", "특별법", "입법", "규제",
              "인허가", "과징금", "행정처분", "제재", "고시", "조례"],
+    # 미국·유럽·중국 등 주요국 통상 조치. 정의는 TRADE_SIGNAL_KW 와 맞춘다.
+    "글로벌 통상환경": [
+        "IRA", "인플레이션감축법", "OBBBA", "FEOC", "해외우려기관", "무역확장법", "232조", "301조",
+        "세이프가드", "상호관세", "보편관세", "관세 폭탄",
+        "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금",
+        "EU 배터리규정", "공급망실사지침",
+        "흑연 수출통제", "갈륨", "게르마늄", "안티모니", "화이트리스트", "요소 수출제한",
+        "반덤핑", "상계관세", "무역장벽", "통상마찰", "무역분쟁", "무역전쟁",
+        "디리스킹", "프렌드쇼어링", "니어쇼어링", "탈중국", "USMCA",
+    ],
     "시장/주가": ["주가", "증권", "코스피", "코스닥", "목표주가", "시황", "상한가", "하한가",
                   "거래량", "거래대금", "시가총액", "PER", "PBR", "공매도", "외국인 순매수",
                   "기관 순매수", "배당"],
@@ -1807,12 +1828,56 @@ POLICY_RELEVANCE_KW = [
 
 POLICY_BRIEF_PRESS = "대한민국 정책브리핑"
 
+TRADE_CATEGORY = "글로벌 통상환경"
+# 통상 신호어 — 미국·유럽·중국 등 주요국의 통상 조치·규제.
+TRADE_SIGNAL_KW = [
+    # 미국
+    "IRA", "인플레이션감축법", "OBBBA", "FEOC", "해외우려기관", "리쇼어링",
+    "무역확장법", "232조", "301조", "슈퍼301", "세이프가드", "상호관세", "보편관세", "관세 폭탄",
+    # 유럽
+    "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금",
+    "EU 배터리규정", "배터리 여권", "공급망실사지침", "CSDDD",
+    # 중국
+    "흑연 수출통제", "갈륨", "게르마늄", "안티모니", "희토류 수출", "화이트리스트",
+    "요소 수출제한", "반도체 수출통제",
+    # 일반
+    "반덤핑", "상계관세", "덤핑관세", "무역장벽", "통상마찰", "무역분쟁", "무역전쟁",
+    "공급망 재편", "디리스킹", "프렌드쇼어링", "니어쇼어링", "탈중국", "수출규제", "수입규제",
+    "쿼터", "자유무역협정", "FTA", "USMCA", "무역합의",
+]
+# 통상 기사가 '포스코 관련 산업'인지 판정.
+TRADE_INDUSTRY_KW = [
+    "배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
+    "흑연", "전기차", "ESS", "핵심광물",
+    "철강", "제철", "후판", "열연", "냉연", "선재", "강판", "스테인리스", "합금철", "봉형강",
+    "포스코",
+]
+
+
+def is_trade_topic(text: str) -> bool:
+    """글로벌 통상환경 기사인가 — 통상 신호어 + 포스코 관련 산업어가 함께 있어야 한다."""
+    return _kw_hit_any(text, TRADE_SIGNAL_KW) and _kw_hit_any(text, TRADE_INDUSTRY_KW)
+
+
+def _kw_hit_any(text: str, keywords: Sequence[str]) -> bool:
+    """_kw_hit 과 달리 빈 목록이면 False (조건이 반드시 있어야 하는 경우)."""
+    return any(k in text for k in keywords)
+
 
 def is_policy_brief(row: dict) -> bool:
     """정책브리핑(korea.kr) 기사인지. press_name 또는 URL 로 판정한다."""
     if (row.get("press_name") or "") == POLICY_BRIEF_PRESS:
         return True
     return bool(KOREA_KR_NEWS_RE.search(row.get("url_canonical") or row.get("url_original") or ""))
+
+
+def is_trade_article(row: dict) -> bool:
+    """저장된 기사가 통상환경 기사인지 — 카테고리 태그 또는 제목·요약·키워드로 판정."""
+    if TRADE_CATEGORY in jload(row.get("categories"), []):
+        return True
+    probe = " ".join([row.get("title") or "", row.get("summary_text") or "",
+                      " ".join(jload(row.get("keywords"), []))])
+    return is_trade_topic(probe)
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -2927,13 +2992,16 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
     new_count = 0
     dup_count = 0
-    # (article_id, score, is_backfill, published_at, is_priority, is_policy, policy_ok)
-    saved_for_notify: list[tuple[str, int, bool, datetime, bool, bool, bool]] = []
+    # 알림 판정에 필요한 항목만 담는다. {id, score, is_backfill, published_at, priority,
+    #  policy: (해당여부, 키워드통과), trade: (해당여부, 키워드통과)}
+    saved_for_notify: list[dict] = []
     # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
-    # 정책 알림 키워드 (OR: 하나라도) / 필수 공통 키워드 (AND: 반드시). 둘 다 비면 모든 정책 기사.
+    # 특수 주제 알림 키워드 (OR: 하나라도) / 필수 공통 키워드 (AND: 반드시). 둘 다 비면 전부.
     policy_notify_kws = [k for k in jload(state.get("policy_notify_keywords"), []) if k]
     policy_required_kws = [k for k in jload(state.get("policy_required_keywords"), []) if k]
+    trade_notify_kws = [k for k in jload(state.get("trade_notify_keywords"), []) if k]
+    trade_required_kws = [k for k in jload(state.get("trade_required_keywords"), []) if k]
 
     # ── G3: 리다이렉트 해제 + HTML 확보 (병렬) ───────────────────────
     prefetched = prefetch_articles(http, [item.url_original for item, _ in fresh])
@@ -2988,12 +3056,17 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
         rule_groups = detect_group_companies(f"{item.title}\n{body[:2000]}")
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
+        # 글로벌 통상환경 기사: 통상 신호어 + 포스코 관련 산업어가 함께 있으면
+        # 포스코 미언급이어도 수집한다. (사용자 지정)
+        is_trade = is_trade_topic(relevance_probe)
         if is_policy:
-            # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집. (사용자 지정)
+            # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집.
             if not matches_keywords(relevance_probe, POLICY_RELEVANCE_KW):
                 storage.upsert_ledger(item.url_source, "off_topic")
                 ctx.seen_cache.add(item.url_source)
                 continue
+        elif is_trade:
+            pass  # 통상 신호 + 산업 키워드가 확인됨 — 포스코 미언급 허용
         elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
             # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
@@ -3003,6 +3076,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         categories = detect_categories(item.title, item.snippet or "")
         if is_policy and "정부/정책" not in categories:
             categories = ["정부/정책"] + categories
+        if is_trade and "글로벌 통상환경" not in categories:
+            categories = ["글로벌 통상환경"] + categories
         score = score_article(item.title, body, rule_groups, press_tier)
 
         article_id = new_id()
@@ -3060,10 +3135,15 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 우선 알림: 마스터의 '항상 발송 키워드'가 본문에 있으면 중요도 게이트를 우회한다.
         # (포스코퓨처엠 특례는 폐지 — 원하면 키워드로 추가한다. 사용자 지정)
         is_priority = _kw_hit(probe, always_kws)
-        # 정책 기사 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
-        policy_ok = _kw_hit(probe, policy_notify_kws) and _kw_hit(probe, policy_required_kws)
-        saved_for_notify.append(
-            (article_id, score, is_backfill, item.published_at, is_priority, is_policy, policy_ok))
+        # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
+        saved_for_notify.append({
+            "id": article_id, "score": score, "is_backfill": is_backfill,
+            "published_at": item.published_at, "priority": is_priority,
+            "policy": (is_policy,
+                       _kw_hit(probe, policy_notify_kws) and _kw_hit(probe, policy_required_kws)),
+            "trade": (is_trade,
+                      _kw_hit(probe, trade_notify_kws) and _kw_hit(probe, trade_required_kws)),
+        })
 
     # ── 분석 백로그 드레인 ───────────────────────────────────────────
     # 이전 실행에서 저장만 되고 분석이 밀린 기사를 예산 안에서 처리한다.
@@ -3090,24 +3170,29 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
     notify_threshold = effective_threshold(ctx)
-    # 정책브리핑 기사는 기본적으로 웹에만 노출. 마스터가 켜야 알림한다. (사용자 지정)
-    notify_policy = str(state.get("notify_policy") or "0") not in ("0", "False", "false", "")
-    for article_id, score, is_backfill, published_at, is_priority, is_policy, policy_ok in saved_for_notify:
+    # 특수 주제 기사(정책브리핑·글로벌 통상환경)는 기본적으로 웹에만. 마스터가 켜야 알림. (사용자 지정)
+    _on = lambda v: str(v or "0") not in ("0", "False", "false", "")
+    notify_policy, notify_trade = _on(state.get("notify_policy")), _on(state.get("notify_trade"))
+
+    def _topic_ok(pair: tuple[bool, bool], enabled: bool) -> bool:
+        is_topic, kw_ok = pair
+        return (not is_topic) or (enabled and kw_ok)
+
+    for it in saved_for_notify:
         if not cfg.telegram_enabled:
             break
-        # is_priority: 포스코퓨처엠 언급 또는 마스터 지정 키워드 → 중요도 게이트 우회
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
-            and (not is_backfill)                  # 6시간 넘은 기사는 웹에만
-            # 정책 기사: 마스터가 알림을 켜고, (키워드 미설정이거나) 키워드에 닿을 때만
-            and (not is_policy or (notify_policy and policy_ok))
-            and (score >= notify_threshold or is_priority)  # 중요도 게이트(우선 기사는 우회)
-            and published_at is not None
-            and published_at >= bootstrap_at       # 파이프라인 가동 이전 기사는 절대 알림 안 함
+            and (not it["is_backfill"])            # 6시간 넘은 기사는 웹에만
+            and _topic_ok(it["policy"], notify_policy)
+            and _topic_ok(it["trade"], notify_trade)
+            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선 기사는 우회)
+            and it["published_at"] is not None
+            and it["published_at"] >= bootstrap_at  # 파이프라인 가동 이전 기사는 절대 알림 안 함
         )
         status = "queued" if should_send else "skipped"
-        if storage.queue_notification(article_id, cfg.telegram_chat_id, status,
-                                      1 if is_priority else 0):
+        if storage.queue_notification(it["id"], cfg.telegram_chat_id, status,
+                                      1 if it["priority"] else 0):
             queued += 1 if should_send else 0
 
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -3182,6 +3267,9 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     categories = detect_categories(row["title"], f"{analysis.summary_text}\n{' '.join(keywords)}")
     if is_policy_brief(row) and "정부/정책" not in categories:
         categories = ["정부/정책"] + categories
+    _probe = f"{row['title']}\n{analysis.summary_text}\n{' '.join(keywords)}"
+    if is_trade_topic(_probe) and TRADE_CATEGORY not in categories:
+        categories = categories + [TRADE_CATEGORY]
 
     ctx.storage.update_article(article_id, {
         "sentiment": analysis.sentiment,
@@ -3923,9 +4011,9 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
             " ".join(jload(row.get("keywords"), [])),
         ])
         groups = normalize_group_list(detect_group_companies(probe))
-        # 정책브리핑 기사는 포스코 미언급이 정상 — '포스코' 폴백을 씌우지 않는다.
+        # 정책브리핑·통상환경 기사는 포스코 미언급이 정상 — '포스코' 폴백을 씌우지 않는다.
         # 일반 기사는 수집 게이트에서 포스코 관련이 확인됐으므로 최소 '포스코'.
-        if not groups and not is_policy_brief(row):
+        if not groups and not is_policy_brief(row) and TRADE_CATEGORY not in jload(row.get("categories"), []):
             groups = ["포스코"]
     categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
     return groups, categories, row.get("press_name") or ""
@@ -4053,7 +4141,8 @@ def create_app(ctx: Context):
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
     GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
-    CATEGORY_ORDER = ["양극재", "음극재", "배터리·이차전지", "산업", "시장/주가", "정부/정책", "법령"]
+    CATEGORY_ORDER = ["양극재", "음극재", "배터리·이차전지", "산업", "시장/주가",
+                      "정부/정책", "법령", "글로벌 통상환경"]
 
     def _ordered(values: list[str], priority: list[str]) -> list[str]:
         uniq = dedupe_chips(values)
@@ -4197,6 +4286,9 @@ def create_app(ctx: Context):
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
             "policy_keywords": jload(st.get("policy_notify_keywords"), []),
             "policy_required": jload(st.get("policy_required_keywords"), []),
+            "notify_trade": str(st.get("notify_trade") or "0") not in ("0", "False", "false", ""),
+            "trade_keywords": jload(st.get("trade_notify_keywords"), []),
+            "trade_required": jload(st.get("trade_required_keywords"), []),
         })
 
     @app.post("/api/master/settings")
@@ -4210,10 +4302,12 @@ def create_app(ctx: Context):
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
                                     status_code=400)
-        # 키워드 목록 필드 3종 — 같은 방식으로 정리(중복 제거, 30개 상한)
+        # 키워드 목록 필드 — 같은 방식으로 정리(중복 제거, 30개 상한)
         for field, col in (("keywords", "always_notify_keywords"),
                            ("policy_keywords", "policy_notify_keywords"),
-                           ("policy_required", "policy_required_keywords")):
+                           ("policy_required", "policy_required_keywords"),
+                           ("trade_keywords", "trade_notify_keywords"),
+                           ("trade_required", "trade_required_keywords")):
             if field in (payload or {}):
                 kws = payload[field]
                 if not isinstance(kws, list):
@@ -4221,8 +4315,9 @@ def create_app(ctx: Context):
                                         status_code=400)
                 patch[col] = jdump(dedupe_chips(
                     str(k).strip() for k in kws if str(k).strip())[:30])
-        if "notify_policy" in (payload or {}):
-            patch["notify_policy"] = 1 if payload["notify_policy"] else 0
+        for field, col in (("notify_policy", "notify_policy"), ("notify_trade", "notify_trade")):
+            if field in (payload or {}):
+                patch[col] = 1 if payload[field] else 0
         if patch:
             ctx.storage.set_run_state(patch)
         return JSONResponse({"ok": True})
@@ -4403,6 +4498,8 @@ def cmd_fixcategories(ctx: Context) -> None:
         new = detect_categories(r.get("title") or "", probe)
         if is_policy_brief(r) and "정부/정책" not in new:
             new = ["정부/정책"] + new
+        if is_trade_topic(f"{r.get('title') or ''}\n{probe}") and TRADE_CATEGORY not in new:
+            new = new + [TRADE_CATEGORY]
         if new != cur:
             ctx.storage.update_article(r["id"], {"categories": jdump(new)})
             fixed += 1
@@ -4474,8 +4571,8 @@ def cmd_fixofftopic(ctx: Context) -> None:
     rows = ctx.storage.list_articles(5000, 0, None, "")
     cands = []
     for r in rows:
-        if is_policy_brief(r):
-            continue  # 정책브리핑 기사는 포스코 미언급이어도 유지한다 (사용자 지정)
+        if is_policy_brief(r) or is_trade_article(r):
+            continue  # 정책브리핑·통상환경 기사는 포스코 미언급이어도 유지 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
@@ -4872,6 +4969,21 @@ def cmd_selftest() -> int:
           any(k in "전기요금 개편안 발표" for k in _pk), True)
     check("정책 키워드 불일치 시 제외",
           any(k in "쌀값 안정 대책" for k in _pk), False)
+
+    print("\n[8-2c] 글로벌 통상환경 수집")
+    check("통상 신호 + 산업어 → 통상환경",
+          is_trade_topic("美 IRA 세부지침…배터리 FEOC 규정 강화"), True)
+    check("CBAM + 철강 → 통상환경", is_trade_topic("EU CBAM 시행에 철강업계 비상"), True)
+    check("중국 흑연 수출통제 + 이차전지 → 통상환경",
+          is_trade_topic("중국 흑연 수출통제 확대…이차전지 타격"), True)
+    check("통상 신호만 있고 산업어 없으면 아님",
+          is_trade_topic("한미 FTA 개정 협상 재개"), False)
+    check("산업어만 있고 통상 신호 없으면 아님",
+          is_trade_topic("포스코 철강 신제품 출시"), False)
+    check("통상환경 카테고리 태그로 판정",
+          is_trade_article({"categories": ["글로벌 통상환경"]}), True)
+    check("detect_categories 가 통상 신호어를 잡음",
+          "글로벌 통상환경" in detect_categories("美 232조 철강 관세 부과"), True)
 
     print("\n[8-3] 그룹사 균형 인터리브 (포스코퓨처엠 독점 방지)")
     _ri = lambda t: (RawItem(url_source=t, url_original=t, title=t, published_at=now_utc(),

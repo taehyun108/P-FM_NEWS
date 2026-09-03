@@ -81,6 +81,30 @@
       </section>
 
       <section class="master-section">
+        <h3>글로벌 통상환경 기사 알림</h3>
+        <label class="master-toggle">
+          <input type="checkbox" id="notifyTrade">
+          <span>미국·유럽·중국 등 주요국 통상 조치(IRA·CBAM·수출통제 등) 기사도 텔레그램으로 발송</span>
+        </label>
+        <small>끄면 웹에만 표시됩니다. 켜면 아래 조건을 모두 만족하는 기사만 발송합니다.</small>
+
+        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b> 본문에 있어야 함 (비우면 조건 없음)</span></p>
+        <div class="kw-input">
+          <input type="text" id="tradeKwNew" class="url-add-input" placeholder="예: IRA, CBAM, 반덤핑, 화이트리스트">
+          <button type="button" class="url-add-btn" id="tradeKwAdd">추가</button>
+        </div>
+        <div class="kw-list" id="tradeKwList"></div>
+
+        <p class="kw-label">② 필수 공통 키워드 <span>— 이 중 <b>하나라도</b> 함께 있어야 함 (AND 조건, 비우면 조건 없음)</span></p>
+        <div class="kw-input">
+          <input type="text" id="tradeReqNew" class="url-add-input" placeholder="예: 배터리, 철강, 이차전지">
+          <button type="button" class="url-add-btn" id="tradeReqAdd">추가</button>
+        </div>
+        <div class="kw-list" id="tradeReqList"></div>
+        <small>수집 대상: 미국(IRA·OBBBA·232조), 유럽(CBAM·핵심원자재법), 중국(흑연·요소 수출통제·화이트리스트), 일본·베트남 등 — 포스코 관련 산업(배터리·철강)이 함께 언급된 기사</small>
+      </section>
+
+      <section class="master-section">
         <h3>항상 발송 키워드</h3>
         <small>기사 <b>본문</b>에 이 단어가 있으면 관련도 점수·야간 모드와 무관하게 발송합니다. (예전 '포스코퓨처엠 자동 포함' 특례는 폐지 — 필요하면 여기에 <b>포스코퓨처엠</b>을 추가하세요)</small>
         <div class="kw-input">

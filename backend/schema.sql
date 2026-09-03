@@ -71,6 +71,9 @@ create table if not exists run_state (
   notify_policy   boolean not null default false, -- 정책브리핑 기사도 텔레그램 알림 (마스터 설정)
   policy_notify_keywords text default '[]', -- 정책 알림 키워드 (마스터 설정, 비면 모든 정책기사)
   policy_required_keywords text default '[]', -- 정책 알림 필수 공통 키워드 (마스터 설정, AND 조건)
+  notify_trade    boolean not null default false, -- 글로벌 통상환경 기사도 텔레그램 알림 (마스터)
+  trade_notify_keywords text default '[]', -- 통상 알림 관심 키워드 (OR)
+  trade_required_keywords text default '[]', -- 통상 알림 필수 공통 키워드 (AND)
   updated_at      timestamptz default now()
 );
 
