@@ -97,7 +97,7 @@ a.brand:hover .brand-mark { background: rgba(255, 255, 255, .28); }
 .ticker-empty { opacity: .6; }
 
 /* ── 통계 바 ──────────────────────────────────────────────────────── */
-.stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 22px 0 16px; }
+.stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 24px; }
 .stat {
   flex: 1 1 150px; background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 13px 16px;

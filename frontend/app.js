@@ -752,6 +752,7 @@ function toggleWeeklyView() {
   $('grid').hidden = weeklyView;
   document.querySelector('.more-wrap').hidden = weeklyView;
   document.querySelector('.url-add').hidden = weeklyView;
+  $('stats').hidden = weeklyView;
   if (weeklyView) {
     window.scrollTo({ top: 0, behavior: 'smooth' });
     if (!weeklyLoaded) { weeklyLoaded = true; loadWeekly(); loadWeeklyHistory(); }
