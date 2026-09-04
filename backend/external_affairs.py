@@ -172,13 +172,19 @@ class EaDB:
         return cur
 
     # ── 부처 ──
-    def seed_agencies(self, rows: Iterable[tuple[str, str]]) -> int:
+    def seed_agencies(self, rows: Iterable[tuple[str, str, str]]) -> int:
+        """(이름, 약칭, 구분) 을 넣는다. 구분(kind)은 'ministry' | 'committee'.
+
+        이미 있는 행도 kind 는 갱신한다 — 컬럼을 뒤늦게 추가했기 때문이다.
+        """
         n = 0
-        for name, short in rows:
+        for name, short, kind in rows:
             cur = self.exec(
-                "insert or ignore into ea_agencies (id, name, short_name, enabled)"
-                " values (?,?,?,1)", (new_id(), name, short))
+                "insert or ignore into ea_agencies (id, name, short_name, kind, enabled)"
+                " values (?,?,?,?,1)", (new_id(), name, short, kind))
             n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            self.exec("update ea_agencies set kind=? where name=? and ifnull(kind,'')<>?",
+                      (kind, name, kind))
         return n
 
     def agencies(self, enabled_only: bool = True) -> list[dict]:
@@ -235,13 +241,30 @@ class EaDB:
             (url_source, reason, iso(now_utc())))
 
     # ── 항목 ──
+    # ── 실행 상태 (수집 시각 등. 대외협력 전용 테이블) ──
+    def get_run_state(self, key: str) -> str:
+        row = self.one("select value from ea_run_state where key=?", (key,))
+        return (row or {}).get("value") or ""
+
+    def set_run_state(self, key: str, value: str) -> None:
+        self.exec("insert into ea_run_state (key, value) values (?,?)"
+                  " on conflict(key) do update set value=excluded.value", (key, value))
+
     def _ensure_cols(self) -> None:
-        have = {r["name"] for r in self.rows("pragma table_info(ea_policy_items)")}
-        if "agency_raw" not in have:
-            try:
-                self.exec("alter table ea_policy_items add column agency_raw TEXT")
-            except sqlite3.OperationalError:
-                pass
+        """스키마에 뒤늦게 추가한 컬럼·테이블을 보강한다(기존 DB 도 그대로 쓸 수 있게)."""
+        self.exec("create table if not exists ea_run_state ("
+                  " key TEXT primary key, value TEXT)")
+        for table, col, ddl in (
+            ("ea_policy_items", "agency_raw", "TEXT"),
+            ("ea_policy_items", "group_companies", "TEXT"),   # JSON 배열. 규칙 기반 판정 결과
+            ("ea_agencies", "kind", "TEXT"),                  # 'ministry' | 'committee'
+        ):
+            have = {r["name"] for r in self.rows(f"pragma table_info({table})")}
+            if col not in have:
+                try:
+                    self.exec(f"alter table {table} add column {col} {ddl}")
+                except sqlite3.OperationalError:
+                    pass
 
     def insert_item(self, row: dict) -> bool:
         cols = ",".join(row)
@@ -284,43 +307,43 @@ class EaDB:
 
 # ── 관심 부처 시드 ───────────────────────────────────────────────────
 # 정부조직 개편으로 이름이 자주 바뀐다. 옛 이름도 함께 넣어 과거 공고를 놓치지 않는다.
-SEED_AGENCIES: list[tuple[str, str]] = [
-    ("산업통상자원부", "산업부"),
-    ("산업통상부", "산업부"),            # 2025 개편 후 명칭
-    ("기후에너지환경부", "기후부"),
-    ("환경부", "환경부"),
-    ("기획재정부", "기재부"),
-    ("재정경제부", "재경부"),            # 2025 개편(기재부 분리) 후 명칭
-    ("기획예산처", "기예처"),
-    ("행정안전부", "행안부"),
-    ("국토교통부", "국토부"),
-    ("고용노동부", "고용부"),
-    ("과학기술정보통신부", "과기정통부"),
-    ("중소벤처기업부", "중기부"),
-    ("공정거래위원회", "공정위"),
-    ("금융위원회", "금융위"),
-    ("원자력안전위원회", "원안위"),
-    ("관세청", "관세청"),
-    ("무역위원회", "무역위"),
-    ("소방청", "소방청"),
-    ("산림청", "산림청"),
-    ("농촌진흥청", "농진청"),
-    ("조달청", "조달청"),
-    ("특허청", "특허청"),
-    ("국회", "국회"),
-    ("법제처", "법제처"),
-    ("국무조정실", "국조실"),
+SEED_AGENCIES: list[tuple[str, str, str]] = [
+    ("산업통상자원부", "산업부", "ministry"),
+    ("산업통상부", "산업부", "ministry"),            # 2025 개편 후 명칭
+    ("기후에너지환경부", "기후부", "ministry"),
+    ("환경부", "환경부", "ministry"),
+    ("기획재정부", "기재부", "ministry"),
+    ("재정경제부", "재경부", "ministry"),            # 2025 개편(기재부 분리) 후 명칭
+    ("기획예산처", "기예처", "ministry"),
+    ("행정안전부", "행안부", "ministry"),
+    ("국토교통부", "국토부", "ministry"),
+    ("고용노동부", "고용부", "ministry"),
+    ("과학기술정보통신부", "과기정통부", "ministry"),
+    ("중소벤처기업부", "중기부", "ministry"),
+    ("공정거래위원회", "공정위", "ministry"),
+    ("금융위원회", "금융위", "ministry"),
+    ("원자력안전위원회", "원안위", "ministry"),
+    ("관세청", "관세청", "ministry"),
+    ("무역위원회", "무역위", "ministry"),
+    ("소방청", "소방청", "ministry"),
+    ("산림청", "산림청", "ministry"),
+    ("농촌진흥청", "농진청", "ministry"),
+    ("조달청", "조달청", "ministry"),
+    ("특허청", "특허청", "ministry"),
+    ("국회", "국회", "committee"),     # 소관 상임위를 못 읽은 의안의 폴백
+    ("법제처", "법제처", "ministry"),
+    ("국무조정실", "국조실", "ministry"),
     # 국회 상임위원회 (국회 입법예고 항목의 소관)
-    ("산업통상자원중소벤처기업위원회", "산자위"),
-    ("기후에너지환경노동위원회", "기환노위"),
-    ("국토교통위원회", "국토위"),
-    ("기획재정위원회", "기재위"),
-    ("재정경제기획위원회", "재경위"),
-    ("과학기술정보방송통신위원회", "과방위"),
-    ("정무위원회", "정무위"),
-    ("농림축산식품해양수산위원회", "농해수위"),
-    ("보건복지위원회", "복지위"),
-    ("행정안전위원회", "행안위"),
+    ("산업통상자원중소벤처기업위원회", "산자위", "committee"),
+    ("기후에너지환경노동위원회", "기환노위", "committee"),
+    ("국토교통위원회", "국토위", "committee"),
+    ("기획재정위원회", "기재위", "committee"),
+    ("재정경제기획위원회", "재경위", "committee"),
+    ("과학기술정보방송통신위원회", "과방위", "committee"),
+    ("정무위원회", "정무위", "committee"),
+    ("농림축산식품해양수산위원회", "농해수위", "committee"),
+    ("보건복지위원회", "복지위", "committee"),
+    ("행정안전위원회", "행안위", "committee"),
 ]
 
 # ── G2.5 관련성 키워드 ───────────────────────────────────────────────
@@ -734,6 +757,54 @@ def detect_category(title: str, law_name: str = "") -> str:
     return "기타"
 
 
+# ── 포스코 그룹사 판정 ───────────────────────────────────────────────
+# 규칙 기반이 1순위라는 기존 원칙(PRD F4.2)을 그대로 따른다. 입법·행정예고에는
+# 회사명이 등장하지 않으므로 '규제 대상 사업'으로 판정한다. LLM 은 쓰지 않는다
+# — 회사명이 본문에 없는데 LLM 에 맡기면 근거 없는 태깅이 대량으로 나온다.
+EA_GROUP_RULES: list[tuple[str, list[str]]] = [
+    ("포스코", ["철강", "제철", "제련", "합금", "고로", "전기로", "탄소중립", "온실가스",
+                "배출권", "산업안전", "중대재해", "대기환경", "물환경", "화학물질",
+                "유해화학", "화평법", "화관법", "폐기물", "자원순환", "위험물", "토양환경"]),
+    ("포스코퓨처엠", ["이차전지", "2차전지", "배터리", "양극재", "음극재", "전구체", "리튬",
+                      "니켈", "코발트", "흑연", "전해액", "분리막", "핵심광물", "희토류",
+                      "소부장", "소재부품장비", "국가첨단전략산업"]),
+    ("포스코이앤씨", ["건설산업", "주택법", "도시정비", "건축법", "국토계획", "산업단지",
+                      "특화단지", "집적화단지", "이격거리", "시공", "건설"]),
+    ("포스코인터내셔널", ["통상", "관세", "수출입", "무역구제", "반덤핑", "상계관세", "원산지",
+                          "FTA", "공급망", "수출통제", "전략물자", "전기사업", "발전사업",
+                          "재생에너지", "신재생", "수소", "전력계통", "전력시장", "전기요금",
+                          "전력수급", "송전", "배전", "원자력"]),
+    ("포스코DX", ["스마트팩토리", "산업용 로봇", "정보통신", "인공지능", "디지털전환",
+                  "데이터산업"]),
+]
+# 화면 필터 칩 순서 — 기존 뉴스 탭의 GROUP_ORDER 와 같은 감각으로 맞춘다.
+EA_GROUP_ORDER = [g for g, _ in EA_GROUP_RULES]
+
+
+def detect_ea_groups(title: str, law_name: str = "", category: str = "") -> list[str]:
+    """제목·법령명·분류에서 규제 대상 사업을 읽어 관련 그룹사를 고른다."""
+    probe = f"{title or ''}\n{law_name or ''}\n{category or ''}"
+    return [name for name, words in EA_GROUP_RULES if _kw_in(probe, words)]
+
+
+def backfill_groups(db: EaDB) -> int:
+    """group_companies 가 비어 있는 항목을 규칙으로 채운다(컬럼을 뒤늦게 추가했다).
+
+    규칙만 쓰므로 LLM 비용이 없고, 규칙을 고치면 다시 돌려 소급 반영할 수 있다.
+    """
+    rows = db.rows("select id, title, law_name, category from ea_policy_items"
+                   " where group_companies is null or group_companies in ('', '[]')")
+    n = 0
+    for r in rows:
+        groups = detect_ea_groups(r.get("title") or "", r.get("law_name") or "",
+                                  r.get("category") or "")
+        if groups:
+            db.exec("update ea_policy_items set group_companies=? where id=?",
+                    (jdump(groups), r["id"]))
+            n += 1
+    return n
+
+
 # ── 수집 1회 ────────────────────────────────────────────────────────
 def collect_once(ctx: Any, db: EaDB) -> dict:
     """스레드 C 가 하루 2회 부르는 진입점. 기존 수집 루프와 완전히 분리돼 있다."""
@@ -743,6 +814,9 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
     relinked = db.relink_agencies()
     if relinked:
         log.info("대외협력: 부처 재연결 %d건", relinked)
+    filled = backfill_groups(db)
+    if filled:
+        log.info("대외협력: 그룹사 소급 판정 %d건", filled)
 
     raw: list[dict] = []
     active_sources: list[str] = []
@@ -825,6 +899,9 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
             gates.counts["off_topic"] += 1
             gates.seen.add(it["url_source"])
             continue
+        # 관련 그룹사 — 제목·법령명·분류가 최종 확정된 뒤에 판정한다(규칙만, LLM 0)
+        row["group_companies"] = jdump(
+            detect_ea_groups(row["title"], row.get("law_name") or "", row.get("category") or ""))
         if db.insert_item(row):
             saved += 1
             fresh.append((row, body))
@@ -842,6 +919,10 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
     except Exception as exc:
         log.warning("대외협력 분석 단계 실패(수집분은 유지): %s", exc)
 
+    # 저장 건수와 무관하게 '실행했다'를 남긴다 — 이게 없으면 새 항목이 0건일 때
+    # 재시작마다 같은 슬롯을 다시 크롤한다. (_last_collect_at 주석 참고)
+    db.set_run_state("last_collect_at", iso(now_utc()))
+
     took = time.monotonic() - started
     result = {**gates.counts, "saved": saved, "analyzed": analyzed, "overflow": overflow,
               "sources": active_sources, "duration_sec": round(took, 1)}
@@ -856,6 +937,16 @@ EA_MIN_GAP_HOURS = 1   # 재시작 폭주 방지 백스톱. 같은 시각 중복
 
 
 def _last_collect_at(db: EaDB) -> datetime | None:
+    """마지막으로 수집을 **실행한** 시각.
+
+    저장된 항목의 collected_at 으로 판단하면 안 된다 — 크롤은 돌았는데 새 항목이
+    0건이면 값이 안 움직여, 서버를 재시작할 때마다 같은 슬롯을 다시 크롤한다
+    (회당 약 100 HTTP + LLM 예산 위험). 그래서 실행 자체를 ea_run_state 에 남긴다.
+    저장된 마커가 없는 기존 설치는 예전 방식으로 폴백한다.
+    """
+    marked = parse_dt(db.get_run_state("last_collect_at"))
+    if marked:
+        return marked
     row = db.one("select max(collected_at) as t from ea_policy_items")
     return parse_dt(row.get("t")) if row and row.get("t") else None
 
@@ -1148,6 +1239,7 @@ def _item_view(row: dict) -> dict:
         "impact_rationale": row.get("impact_rationale") or "",
         "affected_areas": jload(row.get("affected_areas"), []),
         "suggested_action": row.get("suggested_action") or "",
+        "group_companies": jload(row.get("group_companies"), []),
     }
 
 
@@ -1181,9 +1273,16 @@ _EA_ORDER_SQL = {
 
 
 def query_items(db: EaDB, *, item_type: str = "", agency: str = "", impact: str = "",
-                status: str = "", due: str = "", q: str = "", sort: str = "deadline") -> list[dict]:
+                status: str = "", due: str = "", q: str = "", group: str = "",
+                sort: str = "deadline") -> list[dict]:
     """정렬은 sort 파라미터로 고른다. 기본은 마감일 오름차순. (§8.4)"""
     sql, args = _ITEM_SELECT + " where 1=1", []
+    if group:
+        # group_companies 는 JSON 배열 문자열이다. 회사명은 서로 포함관계가 없어
+        # ("포스코"는 "포스코퓨처엠"의 접두사지만 따옴표로 감싸면 구분된다) LIKE 로 충분하다.
+        parts = group.split(",")
+        sql += " and (" + " or ".join(["p.group_companies like ?"] * len(parts)) + ")"
+        args += [f'%"{g}"%' for g in parts]
     if item_type:
         marks = ",".join("?" * len(item_type.split(",")))
         sql += f" and p.item_type in ({marks})"; args += item_type.split(",")
@@ -1220,22 +1319,23 @@ def register_api(app: Any, ctx: Any) -> None:
     from fastapi.responses import JSONResponse
 
     db = EaDB(ctx.cfg.sqlite_path)
-    # 시드에 뒤늦게 추가된 부처명으로 기존 항목을 다시 잇는다(서버 기동 시 1회).
+    # 뒤늦게 추가한 컬럼·시드를 서버 기동 시 1회 보강한다(부처 재연결 + 그룹사 소급).
     try:
         db._ensure_cols()
         db.seed_agencies(SEED_AGENCIES)
         db.relink_agencies()
+        backfill_groups(db)
     except sqlite3.Error as exc:   # pragma: no cover — 실패해도 API 는 떠야 한다
-        log.warning("대외협력 부처 재연결 스킵: %s", exc)
+        log.warning("대외협력 부처·그룹사 보강 스킵: %s", exc)
 
     @app.get("/api/ea/items")
     def ea_items(item_type: str = "", agency: str = "", impact: str = "", status: str = "",
-                 due: str = "", q: str = "", sort: str = "deadline",
+                 due: str = "", q: str = "", group: str = "", sort: str = "deadline",
                  page: int = 1, size: int = EA_PAGE_SIZE):
         page = max(1, page)
         size = max(1, min(size, 100))
         rows = query_items(db, item_type=item_type, agency=agency, impact=impact,
-                           status=status, due=due, q=q, sort=sort)
+                           status=status, due=due, q=q, group=group, sort=sort)
         start = (page - 1) * size
         return JSONResponse({"total": len(rows), "page": page, "size": size,
                              "items": [_item_view(r) for r in rows[start:start + size]]})
@@ -1254,16 +1354,47 @@ def register_api(app: Any, ctx: Any) -> None:
                              "urgent": urgent[:5], "urgent_total": len(urgent)})
 
     @app.get("/api/ea/filters")
-    def ea_filters():
-        def col(sql: str) -> list[str]:
-            return [r["v"] for r in db.rows(sql) if r["v"]]
+    def ea_filters(item_type: str = ""):
+        """item_type 을 주면 그 서브탭 기준으로 부처 목록·건수를 맞춘다.
+
+        부처 드롭다운은 '수집된 것만'이 아니라 **관심 부처 전체**를 건수와 함께 보여준다.
+        비어 있으면 (0) 으로 뜨므로 '왜 산업부가 없지?' 같은 혼선이 없고, 국회 의안 탭에
+        정부 부처가 섞여 뜨지도 않는다(의안의 소관은 상임위다).
+        """
+        def col(sql: str, args: Sequence[Any] = ()) -> list[str]:
+            return [r["v"] for r in db.rows(sql, args) if r["v"]]
+
+        types = [t for t in item_type.split(",") if t]
+        # 서브탭 성격: 국회 의안만 보고 있으면 상임위, 그 밖에는 정부 부처.
+        want_kind = "committee" if types and set(types) <= {"bill"} else "ministry"
+
+        where, args = "", []
+        if types:
+            where = f" where p.item_type in ({','.join('?' * len(types))})"
+            args = list(types)
+        counts = {r["v"]: r["n"] for r in db.rows(
+            "select coalesce(g.name, p.agency_raw) as v, count(*) as n"
+            " from ea_policy_items p left join ea_agencies g on g.id=p.agency_id"
+            + where + " group by v", args) if r["v"]}
+
+        # 시드된 관심 부처(해당 구분) ∪ 실제로 수집된 소관 — 건수 많은 순 → 이름 순
+        seeded = col("select name as v from ea_agencies where enabled=1 and ifnull(kind,'')=?",
+                     (want_kind,))
+        names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
+        agencies = [{"key": n, "label": f"{n} ({counts.get(n, 0)})", "count": counts.get(n, 0)}
+                    for n in names]
+
+        gcounts: dict[str, int] = {}
+        for r in db.rows("select group_companies as v from ea_policy_items p" + where, args):
+            for g in jload(r.get("v"), []):
+                gcounts[g] = gcounts.get(g, 0) + 1
+        groups = [{"key": g, "label": f"{g} ({gcounts.get(g, 0)})", "count": gcounts.get(g, 0)}
+                  for g in EA_GROUP_ORDER]
+
         return JSONResponse({
-            # 매핑된 이름이 없으면 크롤 원문(agency_raw)을 그대로 필터 값으로 쓴다.
-            # (INNER JOIN 이면 agency_id 매핑 실패한 부처가 통째로 빠졌다)
-            "agencies": col("select distinct coalesce(g.name, p.agency_raw) as v"
-                            " from ea_policy_items p"
-                            " left join ea_agencies g on g.id=p.agency_id"
-                            " order by v"),
+            "agencies": agencies,
+            "agency_kind": want_kind,
+            "groups": groups,
             "item_types": [{"key": "legislation", "label": "입법예고"},
                            {"key": "admin_notice", "label": "행정예고"},
                            {"key": "bill", "label": "국회 의안"}],

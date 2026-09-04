@@ -91,6 +91,8 @@
   background: #eef1f6; color: var(--ink-mid);
 }
 .ea-tag.is-cat { background: var(--navy-soft); color: var(--navy-dark); }
+/* 관련 그룹사 — 뉴스 탭의 그룹사 칩과 같은 강조색을 쓴다 */
+.ea-tag.is-group { background: var(--navy); color: #fff; font-weight: 700; }
 .ea-impact-high   { background: #fdeceb; color: #b3261e; }
 .ea-impact-medium { background: #fdf3e6; color: #a35a08; }
 .ea-impact-low    { background: #eef1f6; color: var(--ink-mid); }

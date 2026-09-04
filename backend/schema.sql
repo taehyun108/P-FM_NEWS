@@ -226,6 +226,7 @@ create table if not exists ea_agencies (
   id         uuid primary key default gen_random_uuid(),
   name       text not null unique,
   short_name text,
+  kind       text,                       -- 'ministry'(정부 부처) | 'committee'(국회 상임위)
   enabled    boolean default true
 );
 
@@ -245,7 +246,16 @@ create table if not exists ea_policy_items (
   opinion_url     text,
   attachment_urls jsonb default '[]',
   published_at    timestamptz,
-  collected_at    timestamptz default now()
+  collected_at    timestamptz default now(),
+  agency_raw      text,                      -- 크롤 원문 부처명(시드에 없는 신설 부처 대비)
+  group_companies jsonb default '[]'         -- 규칙으로 판정한 관련 포스코 그룹사
+);
+
+-- 대외협력 수집 실행 상태. 저장 0건이어도 '실행했다'를 남겨야
+-- 재시작 때 같은 슬롯을 다시 크롤하지 않는다.
+create table if not exists ea_run_state (
+  key   text primary key,
+  value text
 );
 
 -- LLM 영향 분석. SWOT 은 만들지 않는다(뉴스 파이프라인과 무관).
@@ -278,4 +288,5 @@ alter table ea_policy_items enable row level security;
 alter table ea_analyses     enable row level security;
 alter table ea_agencies     enable row level security;
 alter table ea_url_ledger   enable row level security;
+alter table ea_run_state    enable row level security;
 -- 대외협력 데이터는 사내 대관 업무용이라 공개 정책을 두지 않는다 (service role 로만 접근).

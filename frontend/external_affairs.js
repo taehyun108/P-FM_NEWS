@@ -16,7 +16,7 @@
 
   var eaState = {
     open: false, loaded: false, sub: 'notice',
-    agency: '', impact: '', status: '', due: '', q: '',
+    agency: '', impact: '', status: '', due: '', q: '', group: '',
     sort: 'deadline',   // deadline(마감임박순, 기본) | recent(최신순) | impact(영향도순)
     page: 1, loading: false
   };
@@ -48,13 +48,14 @@
   }
 
   /* ── URL 동기화 (ea_ 접두사 — 기존 파라미터와 충돌 없음) ── */
-  var EA_KEYS = ['ea_sub', 'ea_agency', 'ea_impact', 'ea_status', 'ea_due', 'ea_q',
-    'ea_sort', 'ea_page'];
+  var EA_KEYS = ['ea_sub', 'ea_agency', 'ea_group', 'ea_impact', 'ea_status', 'ea_due',
+    'ea_q', 'ea_sort', 'ea_page'];
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
     eaState.sub = p.get('ea_sub') || 'notice';
     eaState.agency = p.get('ea_agency') || '';
+    eaState.group = p.get('ea_group') || '';
     eaState.impact = p.get('ea_impact') || '';
     eaState.status = p.get('ea_status') || '';
     eaState.due = p.get('ea_due') || '';
@@ -69,6 +70,7 @@
     if (eaState.open) {
       if (eaState.sub !== 'notice') { p.set('ea_sub', eaState.sub); }
       if (eaState.agency) { p.set('ea_agency', eaState.agency); }
+      if (eaState.group) { p.set('ea_group', eaState.group); }
       if (eaState.impact) { p.set('ea_impact', eaState.impact); }
       if (eaState.status) { p.set('ea_status', eaState.status); }
       if (eaState.due) { p.set('ea_due', eaState.due); }
@@ -137,6 +139,10 @@
     body.append(el('p', 'ea-card-sub', bits.join(' · ')));
 
     var tags = el('div', 'ea-tags');
+    // 규제 대상 사업으로 판정한 관련 그룹사 — 회사명이 원문에 없어도 붙는다.
+    (it.group_companies || []).forEach(function (g) {
+      tags.append(el('span', 'ea-tag is-group', g));
+    });
     if (it.category) { tags.append(el('span', 'ea-tag is-cat', it.category)); }
     if (it.impact_level) {
       tags.append(el('span', 'ea-tag ea-impact-' + it.impact_level,
@@ -210,7 +216,8 @@
         eaState.page = 1;
         renderSubtabs();
         $('eaFilters').hidden = !!t.news;   // 뉴스 재사용 탭은 전용 필터를 쓰지 않는다
-        load();
+        // 부처 목록은 탭마다 다르다(정부 부처 ↔ 국회 상임위) — 다시 받아서 채운다.
+        if (t.news) { load(); } else { loadFilters().then(load); }
       });
       return b;
     }));
@@ -233,14 +240,22 @@
   }
 
   function loadFilters() {
-    return getJSON('/api/ea/filters').then(function (d) {
+    // 서브탭을 함께 넘긴다 — 부처 목록·건수를 그 탭 기준으로 받기 위해서다.
+    // (국회 의안 탭에는 상임위, 입법·행정예고 탭에는 정부 부처가 온다)
+    var sub = currentSub();
+    var qs = sub.types ? '?item_type=' + encodeURIComponent(sub.types) : '';
+    return getJSON('/api/ea/filters' + qs).then(function (d) {
       fillSelect($('eaSort'), d.sorts || [
         { key: 'deadline', label: '마감 임박순' }, { key: 'recent', label: '최신순' },
         { key: 'impact', label: '영향도순' }
       ], eaState.sort || 'deadline', null);
-      fillSelect($('eaAgency'), (d.agencies || []).map(function (a) {
-        return { key: a, label: a };
-      }), eaState.agency, '부처 전체');
+      var agencies = d.agencies || [];
+      // 탭이 바뀌어 지금 고른 부처가 목록에 없으면 해제한다(0건만 나오는 것을 막는다).
+      if (eaState.agency && !agencies.some(function (a) { return a.key === eaState.agency; })) {
+        eaState.agency = '';
+      }
+      fillSelect($('eaAgency'), agencies, eaState.agency, '부처 전체');
+      fillSelect($('eaGroup'), d.groups || [], eaState.group, '그룹사 전체');
       fillSelect($('eaImpact'), d.impacts || [], eaState.impact, '영향도 전체');
       fillSelect($('eaStatus'), (d.statuses || []).map(function (s) {
         return { key: s, label: s };
@@ -322,6 +337,7 @@
     var p = new URLSearchParams();
     p.set('item_type', sub.types);
     if (eaState.agency) { p.set('agency', eaState.agency); }
+    if (eaState.group) { p.set('group', eaState.group); }
     if (eaState.impact) { p.set('impact', eaState.impact); }
     if (eaState.status) { p.set('status', eaState.status); }
     if (eaState.due) { p.set('due', eaState.due); }
@@ -405,8 +421,8 @@
     readUrl();
     $('eaTab').addEventListener('click', toggle);
 
-    [['eaSort', 'sort'], ['eaAgency', 'agency'], ['eaImpact', 'impact'],
-     ['eaStatus', 'status'], ['eaDue', 'due']].forEach(function (pair) {
+    [['eaSort', 'sort'], ['eaAgency', 'agency'], ['eaGroup', 'group'],
+     ['eaImpact', 'impact'], ['eaStatus', 'status'], ['eaDue', 'due']].forEach(function (pair) {
       $(pair[0]).addEventListener('change', function (e) {
         eaState[pair[1]] = e.target.value;
         eaState.page = 1;

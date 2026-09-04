@@ -199,6 +199,7 @@ create table if not exists ea_agencies (
   id         TEXT primary key,
   name       TEXT not null unique,
   short_name TEXT,
+  kind       TEXT,                    -- 'ministry'(정부 부처) | 'committee'(국회 상임위)
   enabled    INTEGER default 1
 );
 
@@ -218,7 +219,16 @@ create table if not exists ea_policy_items (
   opinion_url     TEXT,
   attachment_urls TEXT,                   -- JSON 배열 문자열
   published_at    TEXT,
-  collected_at    TEXT default CURRENT_TIMESTAMP
+  collected_at    TEXT default CURRENT_TIMESTAMP,
+  agency_raw      TEXT,                   -- 크롤 원문 부처명(시드에 없는 신설 부처 대비)
+  group_companies TEXT default '[]'       -- 규칙으로 판정한 관련 포스코 그룹사 (JSON 배열)
+);
+
+-- 대외협력 수집 실행 상태. 저장 0건이어도 '실행했다'를 남겨야
+-- 재시작 때 같은 슬롯을 다시 크롤하지 않는다.
+create table if not exists ea_run_state (
+  key   TEXT primary key,
+  value TEXT
 );
 
 -- LLM 영향 분석. SWOT 은 만들지 않는다(뉴스 파이프라인과 무관).
