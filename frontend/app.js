@@ -1116,6 +1116,7 @@ function init() {
   const goHome = () => {
     if (weeklyView) toggleWeeklyView();     // 주간동향 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
+    if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 전체 목록으로
     state.group.clear(); state.cat.clear(); state.press.clear();
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
