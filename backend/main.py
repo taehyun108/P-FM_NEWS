@@ -5641,7 +5641,7 @@ def cmd_selftest() -> int:
     check("thebell click 파라미터 제거",
           normalize_url("http://thebell.co.kr/front/newsview.asp?click=F&key=202609021458518280106019&page=1"), _tb)
     check("규칙 없는 사이트는 경로 유지",
-          normalize_url("https://www.yna.co.kr/view/AKR20260904067500083?section=x"),
+          normalize_url("https://www.yna.co.kr/view/AKR20260904067500083?utm_source=x"),
           "https://www.yna.co.kr/view/AKR20260904067500083")
 
     print("\n[2] 도메인 접기 (PRD F2.3)")
