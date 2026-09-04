@@ -226,6 +226,14 @@ class EaDB:
             (url_source, reason, iso(now_utc())))
 
     # ── 항목 ──
+    def _ensure_cols(self) -> None:
+        have = {r["name"] for r in self.rows("pragma table_info(ea_policy_items)")}
+        if "agency_raw" not in have:
+            try:
+                self.exec("alter table ea_policy_items add column agency_raw TEXT")
+            except sqlite3.OperationalError:
+                pass
+
     def insert_item(self, row: dict) -> bool:
         cols = ",".join(row)
         marks = ",".join("?" * len(row))
@@ -744,6 +752,7 @@ def detect_category(title: str, law_name: str = "") -> str:
 def collect_once(ctx: Any, db: EaDB) -> dict:
     """스레드 C 가 하루 2회 부르는 진입점. 기존 수집 루프와 완전히 분리돼 있다."""
     started = time.monotonic()
+    db._ensure_cols()
     db.seed_agencies(SEED_AGENCIES)
 
     raw: list[dict] = []
@@ -796,6 +805,7 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
             "category": detect_category(it.get("title", ""), it.get("law_name", "")),
             "title": it.get("title") or "(제목 없음)",
             "agency_id": db.agency_id_by_name(it.get("agency", "")),
+            "agency_raw": (it.get("agency") or "").strip() or None,
             "law_name": it.get("law_name") or None,
             "notice_start": parse_date(it.get("notice_start")),
             "notice_end": parse_date(it.get("notice_end")),
@@ -853,24 +863,47 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
 
 
 # ── 스레드 C — 하루 2회 ─────────────────────────────────────────────
+EA_MIN_GAP_HOURS = 4   # 마지막 수집 후 이 시간 안에는 재수집하지 않는다(재시작 폭주 방지)
+
+
+def _last_collect_at(db: EaDB) -> datetime | None:
+    row = db.one("select max(collected_at) as t from ea_policy_items")
+    return parse_dt(row.get("t")) if row and row.get("t") else None
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
-    """기존 수집 루프(300초)에 얹지 않는다. 지정 시각이 지나면 그 시각당 1회만 돈다."""
+    """기존 수집 루프(300초)에 얹지 않는다. 지정 시각이 지나면 그 시각당 1회만 돈다.
+
+    마지막 수집 시각을 DB(ea_policy_items.collected_at)에서 읽어 판단하므로,
+    서버를 자주 재시작해도 EA_MIN_GAP_HOURS 안에는 다시 크롤·분석하지 않는다.
+    """
     db = EaDB(ctx.cfg.sqlite_path)
-    done: set[str] = set()   # 'YYYY-MM-DD:H' — 같은 시각 중복 실행 방지
     log.info("대외협력 수집 스레드 시작 (매일 %s시)",
              "·".join(str(h) for h in schedule_hours()))
     while not stop.is_set():
         try:
             if ea_enabled():
                 now = datetime.now()
-                for hour in schedule_hours():
-                    mark = f"{now.date().isoformat()}:{hour}"
-                    if now.hour >= hour and mark not in done:
-                        done.add(mark)
-                        collect_once(ctx, db)
-                        if len(done) > 8:
-                            done = set(sorted(done)[-4:])
-                        break
+                last = _last_collect_at(db)
+                gap_ok = last is None or (now_utc() - last) >= timedelta(hours=EA_MIN_GAP_HOURS)
+                due = any(now.hour >= h for h in schedule_hours())
+                # 오늘 예정 시각 중 가장 최근 것을 지난 시점에, 아직 그 이후 수집이 없으면 실행
+                today_slots = [now.replace(hour=h, minute=0, second=0, microsecond=0)
+                               for h in schedule_hours() if now.hour >= h]
+                slot_missed = today_slots and (last is None or
+                    last.astimezone() < max(today_slots).astimezone())
+                if due and gap_ok and slot_missed:
+                    collect_once(ctx, db)
         except Exception as exc:
             log.exception("대외협력 수집 중 오류: %s", exc)
         stop.wait(300)
@@ -1111,7 +1144,7 @@ def _item_view(row: dict) -> dict:
         "item_type": row.get("item_type") or "",
         "category": row.get("category") or "",
         "law_name": row.get("law_name") or "",
-        "agency": row.get("agency_name") or "",
+        "agency": row.get("agency_name") or row.get("agency_raw") or "",
         "notice_start": row.get("notice_start"),
         "notice_end": row.get("notice_end"),
         "d_day": d_day(row.get("notice_end")),
