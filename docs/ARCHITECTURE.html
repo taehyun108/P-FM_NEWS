@@ -273,7 +273,7 @@
         <h2><span class="tag">01 — 구성</span>무엇이 어디서 돌고 있나</h2>
 
         <p>
-          파이썬 파일 <code>backend/main.py</code> 하나(약 6,100줄)가 API 서버·수집 루프·
+          파이썬 파일 <code>backend/main.py</code> 하나(약 6,240줄)가 API 서버·수집 루프·
           텔레그램 봇·주간 레포트를 모두 담고 있다. 프런트엔드는 프레임워크 없는 바닐라 JS
           3파일이고, 데이터는 로컬 SQLite 파일 하나에 들어간다.
         </p>
@@ -374,7 +374,7 @@
           <tbody>
             <tr><td><code>index.html</code></td><td class="num">298</td><td>뼈대 마크업, 마스터 패널 모달, 주간동향 패널</td></tr>
             <tr><td><code>app.js</code></td><td class="num">1,160</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
-            <tr><td><code>style.css</code></td><td class="num">465</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
+            <tr><td><code>style.css</code></td><td class="num">460</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
           </tbody>
         </table></div>
 
@@ -396,13 +396,16 @@
           등록을 막는다.
         </p>
 
-        <h3>백엔드 — 약 6,100줄</h3>
+        <h3>백엔드 — 약 6,240줄</h3>
         <p>
           설정 → 저장소 계층 → 시드 → URL 정규화 → HTTP → 수집 → 본문추출 → 분류·중요도 →
           LLM → 중복판정 → 파이프라인 → 시세 → 텔레그램 봇 → 주간 레포트 → API → CLI 순으로
           배치돼 있다. 저장소는 <code>Storage</code> 추상 클래스 아래
           <code>SqliteStorage</code>와 <code>SupabaseStorage</code> 두 구현이 있어,
           <code>.env</code>의 <code>DB_BACKEND</code> 한 줄로 전환된다.
+          대외협력은 <code>backend/external_affairs.py</code>(1,311줄)와
+          <code>backend/ea_crawl.py</code>(360줄)로 분리돼 있고, main.py 는
+          <b>가드 import 로만</b> 연결한다 — 모듈이 없거나 깨져도 기존 수집·API 는 그대로 뜬다.
         </p>
       </section>
 
@@ -924,11 +927,25 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 211개 검사</dd>
-          <dt>미사용 코드</dt><dd>백엔드·프런트 각 0개</dd>
-          <dt>API 계약</dt><dd>프런트가 호출하는 라우트 전부 백엔드에 존재</dd>
-          <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 3종. 공유 캐시는 수집 스레드 전용</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>219개</b> 검사</dd>
+          <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
+          <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
+          <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
+          <dt>Storage 정합</dt><dd>ABC 45개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0, 호출부 없는 메서드 0</dd>
+          <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 3종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
         </div>
+
+        <h3>필터 규칙을 한 벌로 합친 이유</h3>
+        <p>
+          <code>/api/articles</code>는 성능 때문에 <b>사전계산된 태그 키</b>(<code>gk/ck/pk</code>)로
+          필터하고, <code>apply_filters</code>는 행에서 매번 <code>card_tags</code>를 계산했다.
+          규칙은 같은데 구현이 둘이라, <b>selftest 는 화면이 쓰지 않는 쪽만 검증</b>하고 있었다 —
+          한쪽만 고치면 조용히 갈라지는 구조였다. 지금은 <code>tag_row</code>(행 → 태그)와
+          <code>filter_tagged</code>(태그 → 필터) 둘로 쪼개고, 목록 API 는 캐시된 태그에
+          <code>filter_tagged</code>를, <code>apply_filters</code>는 <code>tag_row</code>를 거쳐
+          같은 <code>filter_tagged</code>를 부른다. 15초 스캔 캐시의 이점은 그대로 두면서
+          규칙은 한 곳에만 남는다.
+        </p>
       </section>
 
       <!-- ═══════════ 7. 운영 ═══════════ -->

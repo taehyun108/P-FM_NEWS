@@ -518,10 +518,6 @@ class Storage(ABC):
         """언론사 tier(1=주요지 … 3=기타). id 가 없거나 못 찾으면 3."""
 
     @abstractmethod
-    def all_press(self) -> list[dict]:
-        """press_outlets 전체 행. fixpress 의 도메인 표기 복원에 쓴다."""
-
-    @abstractmethod
     def upsert_press(self, domain: str, name: str, tier: int, status: str) -> dict: ...
 
     @abstractmethod
@@ -993,9 +989,6 @@ class SqliteStorage(Storage):
         row = self._one("select tier from press_outlets where id=?", (press_id,))
         return int(row["tier"]) if row and row["tier"] is not None else 3
 
-    def all_press(self) -> list[dict]:
-        return self._rows("select * from press_outlets")
-
     def upsert_press(self, domain: str, name: str, tier: int, status: str) -> dict:
         existing = self.press_by_domain(domain)
         if existing:
@@ -1375,9 +1368,6 @@ class SupabaseStorage(Storage):
             return 3
         rows = self._t("press_outlets").select("tier").eq("id", press_id).execute().data
         return int(rows[0]["tier"]) if rows and rows[0].get("tier") is not None else 3
-
-    def all_press(self) -> list[dict]:
-        return self._t("press_outlets").select("*").execute().data or []
 
     def upsert_press(self, domain: str, name: str, tier: int, status: str) -> dict:
         existing = self.press_by_domain(domain)
@@ -4714,27 +4704,42 @@ def _split_multi(value: str) -> list[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
 
-def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses: list[str]) -> list[dict]:
-    """행 목록을 필터한다. 같은 그룹 안은 OR, 다른 그룹 사이는 AND. (PRD F6.1a)
+def tag_row(row: dict) -> dict:
+    """행 + 사전계산된 필터 태그(표시용 g/c/p, 정규화 키 gk/ck/pk).
 
-    카드로 변환하지 않고 card_tags 만 계산해 필터한다 — 전체 스캔 비용을 줄인다.
+    카드로 변환하지 않고 card_tags 만 계산한다 — 전체 스캔 비용을 줄인다.
+    /api/articles 의 스캔 캐시와 apply_filters 가 같은 모양을 쓴다.
     """
-    g_keys = {normalize_chip(x) for x in groups}
-    c_keys = {normalize_chip(x) for x in cats}
-    p_keys = {normalize_chip(x) for x in presses}
-    if not (g_keys or c_keys or p_keys):
-        return list(rows)
+    g, c, pname = card_tags(row)
+    return {
+        "row": row, "g": g, "c": c, "p": pname,
+        "gk": {normalize_chip(x) for x in g},
+        "ck": {normalize_chip(x) for x in c},
+        "pk": normalize_chip(pname) if pname else "",
+    }
 
-    def matches(row: dict) -> bool:
-        rg, rc, rp = card_tags(row)
-        if g_keys and not (g_keys & {normalize_chip(x) for x in rg}):
-            return False
-        if c_keys and not (c_keys & {normalize_chip(x) for x in rc}):
-            return False
-        if p_keys and normalize_chip(rp) not in p_keys:
-            return False
-        return True
-    return [r for r in rows if matches(r)]
+
+def filter_tagged(tagged: list[dict], g_keys: set[str], c_keys: set[str],
+                  p_keys: set[str]) -> list[dict]:
+    """같은 그룹 안은 OR, 다른 그룹 사이는 AND. (PRD F6.1a)
+
+    필터 규칙의 **유일한 구현**이다. /api/articles 도 apply_filters 도 이것만 부른다
+    — 두 벌로 두면 한쪽만 고쳤을 때 화면과 테스트가 조용히 갈라진다.
+    """
+    if not (g_keys or c_keys or p_keys):
+        return list(tagged)
+    return [t for t in tagged
+            if (not g_keys or (g_keys & t["gk"]))
+            and (not c_keys or (c_keys & t["ck"]))
+            and (not p_keys or t["pk"] in p_keys)]
+
+
+def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses: list[str]) -> list[dict]:
+    """행 목록을 필터해 행 목록으로 돌려준다. 규칙은 filter_tagged 하나만 쓴다."""
+    def keys(values: Sequence[str]) -> set[str]:
+        return {normalize_chip(x) for x in values}
+    tagged = filter_tagged([tag_row(r) for r in rows], keys(groups), keys(cats), keys(presses))
+    return [t["row"] for t in tagged]
 
 
 def create_app(ctx: Context):
@@ -4785,15 +4790,7 @@ def create_app(ctx: Context):
         ent = _scan_cache.get(key)
         if ent and now - ent["at"] < SCAN_TTL_SEC:
             return ent["data"]
-        data = []
-        for row in _scan_rows(period, query):
-            g, c, pname = card_tags(row)
-            data.append({
-                "row": row, "g": g, "c": c, "p": pname,
-                "gk": {normalize_chip(x) for x in g},
-                "ck": {normalize_chip(x) for x in c},
-                "pk": normalize_chip(pname) if pname else "",
-            })
+        data = [tag_row(row) for row in _scan_rows(period, query)]
         _scan_cache[key] = {"at": now, "data": data}
         # 검색어별 항목이 무한히 쌓이지 않게 오래된 것부터 정리한다.
         if len(_scan_cache) > 24:
@@ -4813,17 +4810,11 @@ def create_app(ctx: Context):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
-        gk = {normalize_chip(x) for x in _split_multi(group)}
-        ck = {normalize_chip(x) for x in _split_multi(cat)}
-        pk = {normalize_chip(x) for x in _split_multi(press)}
-        if gk or ck or pk:
-            # 같은 그룹 안 OR, 다른 그룹 사이 AND. (PRD F6.1a)
-            matched = [t for t in tagged
-                       if (not gk or (gk & t["gk"]))
-                       and (not ck or (ck & t["ck"]))
-                       and (not pk or t["pk"] in pk)]
-        else:
-            matched = tagged
+        # 같은 그룹 안 OR, 다른 그룹 사이 AND. (PRD F6.1a — filter_tagged 가 유일한 구현)
+        matched = filter_tagged(tagged,
+                                {normalize_chip(x) for x in _split_multi(group)},
+                                {normalize_chip(x) for x in _split_multi(cat)},
+                                {normalize_chip(x) for x in _split_multi(press)})
         # 정렬 — 기본(recent)은 SQL 이 이미 발행일 최신순으로 준 순서를 그대로 쓴다.
         # 'score' 는 사용자가 직접 등록한 기사·중요도 높은 기사를 위로 올린다.
         if sort == "score":

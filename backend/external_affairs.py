@@ -78,10 +78,6 @@ def assembly_key() -> str:
     return _env("EA_ASSEMBLY_KEY")
 
 
-def data_go_kr_key() -> str:
-    return _env("EA_DATA_GO_KR_KEY")
-
-
 EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 50, 0)   # noqa: E731
 ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E731
 
@@ -699,34 +695,8 @@ def fetch_admin_notices(max_rows: int = 400) -> list[dict]:
     return out
 
 
-def fetch_lawmaking_detail(item: dict) -> str:
-    """G3·G4 — 입법·행정예고 상세를 REST 로 받아 제안이유·주요내용 텍스트를 뽑는다.
-
-    상세 REST:  입법예고 /rest/ogLmPp/{seq}//NN.xml    행정예고 /rest/ptcpAdmPp/{seq}.xml
-    필드명이 문서에 없어, 텍스트가 담긴 모든 요소를 이어 붙인다(LLM 이 정리한다).
-    실패하면 웹 상세 페이지(opinion_url) HTML 스크래핑으로 폴백한다.
-    """
-    oc = lawmaking_oc()
-    url = item.get("url_source") or ""
-    seq = url.rsplit("/", 1)[-1] if "/gcom/" in url else ""
-    if oc and seq.isdigit():
-        endpoint = (f"{LAWMAKING_BASE}/ogLmPp/{seq}//NN.xml"
-                    if item.get("item_type") == "legislation"
-                    else f"{LAWMAKING_BASE}/ptcpAdmPp/{seq}.xml")
-        try:
-            with _http_lock:
-                root = _get_xml(endpoint, {"OC": oc})
-            ret = root.findtext(".//retMsg") or ""
-            if not ret or ret in ("00", "success"):
-                parts = [t.strip() for t in root.itertext() if t and t.strip()
-                         and not t.strip().isdigit() and len(t.strip()) > 4]
-                text = chr(10).join(dict.fromkeys(parts))   # 순서 유지 중복 제거
-                if len(text) > 120:
-                    return text
-        except Exception as exc:
-            log.debug("입법예고 상세 REST 실패 %s: %s", seq, exc)
-    return fetch_detail_text(item.get("opinion_url") or item.get("url_canonical") or url)
-
+# 상세 본문은 ea_crawl.fetch_detail 이 담당한다 — 정부 사이트 상세 REST 는 필드명이
+# 공개돼 있지 않아 본문 품질이 크롤보다 낮았다. (analyze_item 이 fetch_detail_text 로 폴백)
 
 SOURCES = [
     ("S1 입법예고", fetch_legislation_notices),
@@ -1060,6 +1030,9 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     if item.get("agency_id"):
         row = db.one("select name from ea_agencies where id=?", (item["agency_id"],))
         agency = (row or {}).get("name", "")
+    # 매핑된 부처명이 없으면 크롤 원문을 쓴다 — 화면(_item_view)과 같은 폴백이어야
+    # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
+    agency = agency or (item.get("agency_raw") or "")
 
     prompt = EA_PROMPT.format(
         title=item.get("title") or "", law_name=item.get("law_name") or "(없음)",
