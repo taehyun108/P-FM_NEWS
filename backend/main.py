@@ -6137,6 +6137,34 @@ def cmd_selftest() -> int:
     check("주간 HTML 헤더는 .wr-head 로 감싼다", 'class="wr-head"' in _html, True)
 
     print()
+    if ea_mod is not None:
+        print("\n[16] 대외협력 — 관련성·영향도 판정 규칙")
+        # 부처명만으로는 통과시키지 않는다 (관심 부처의 일반 행정·조세 개정안 차단)
+        check("산업 키워드 있으면 통과",
+              ea_mod.is_relevant("이차전지 특화단지 지정 고시", ""), True)
+        check("부처명만 있으면 탈락",
+              ea_mod.is_relevant("국토교통부와 그 소속기관 직제 일부개정령안",
+                                 "국토교통부와 그 소속기관 직제"), False)
+        # 부처명이 차단되는 것은 keyword_sets 를 빌려 쓸 때뿐이다.
+        # 호출자가 extra_terms 로 직접 지정하면 그 의도는 존중한다.
+        check("extra_terms 로 명시하면 그 단어는 통과",
+              ea_mod.is_relevant("국토교통부와 그 소속기관 직제 일부개정령안", "",
+                                 extra_terms=["국토교통부"]), True)
+        # medium 이상은 조문 인용 또는 원문 직접 인용이 있어야 한다
+        check("조문 번호 인용 인정", bool(ea_mod._EA_CITE.search("안 제6조의2 신설")), True)
+        check("항·호 인용 인정", bool(ea_mod._EA_CITE.search("제2항을 삭제한다")), True)
+        check("원문 직접 인용 인정",
+              bool(ea_mod._EA_CITE.search('원문은 "종합건설업체가 자본력과 수주 우위"로 적었다')), True)
+        check("근거 없는 문장은 불인정",
+              bool(ea_mod._EA_CITE.search("전반적으로 부담이 커질 수 있다")), False)
+        check("빈 근거는 불인정", bool(ea_mod._EA_CITE.search("")), False)
+        # 그룹사는 규칙으로만 판정한다 (LLM 미사용)
+        check("철강 → 포스코", ea_mod.detect_ea_groups("탄소중립 설비 고시"), ["포스코"])
+        check("건설 → 포스코이앤씨",
+              ea_mod.detect_ea_groups("건설산업기본법 일부개정법률안"), ["포스코이앤씨"])
+        check("무관 제목은 그룹사 없음",
+              ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
+
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))
         return 1

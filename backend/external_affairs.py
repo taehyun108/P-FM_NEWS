@@ -369,13 +369,25 @@ EA_RELEVANCE_KW: list[str] = [
 
 
 def _keyword_sets_terms(db: EaDB) -> list[str]:
-    """기존 keyword_sets(산업·정책·통상)를 읽기 전용으로 빌려 쓴다. 쓰기는 하지 않는다."""
+    """기존 keyword_sets(산업·정책·통상)를 읽기 전용으로 빌려 쓴다. 쓰기는 하지 않는다.
+
+    단, **부처·기관명은 뺀다.** keyword_sets 는 뉴스 검색어라 '국토교통부' 같은
+    부처명이 들어 있는데, 그대로 쓰면 is_relevant 가 부처명만으로 통과시켜
+    '관심 부처라는 이유만으로는 통과시키지 않는다'는 규칙이 뒷문으로 무너진다
+    (실제로 '국토교통부와 그 소속기관 직제 일부개정령안'이 이 경로로 들어왔다).
+    """
     try:
-        return [r["keyword"] for r in db.rows(
+        terms = [r["keyword"] for r in db.rows(
             "select keyword from keyword_sets where enabled=1 and category in ('산업','정책','통상')")]
     except sqlite3.Error as exc:
         log.debug("keyword_sets 조회 실패(무시): %s", exc)
         return []
+    try:
+        agencies = db.agencies()
+    except sqlite3.Error:
+        return terms
+    names = {a["name"] for a in agencies} | {a["short_name"] for a in agencies if a.get("short_name")}
+    return [t for t in terms if t not in names]
 
 
 def _kw_in(text: str, terms: Sequence[str]) -> str | None:
@@ -999,6 +1011,11 @@ def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
 EA_MAX_BODY_CHARS = 6000
 EA_IMPACT_LEVELS = ("high", "medium", "low", "none")
 
+# medium 이상을 인정하는 근거 형태 — 조문 번호(제3조·안 제6조의2·제2항·제1호)
+# 또는 원문을 10자 이상 그대로 따온 직접 인용. 둘 다 없으면 '느낌'이라 보고 low 로 내린다.
+_EA_CITE = re.compile(
+    r'(?:안\s*)?제\s?\d+\s?조|제\s?\d+\s?항|제\s?\d+\s?호|["“][^"”]{10,}["”]')
+
 EA_SYSTEM = (
     "당신은 포스코 그룹 대외협력(대관) 담당자를 돕는 한국어 정책 분석 어시스턴트다. "
     "제공된 자료에 실제로 적힌 내용만 근거로 분석하고 JSON 으로만 답한다."
@@ -1148,9 +1165,10 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     if level not in EA_IMPACT_LEVELS:
         level = "none"
     rationale = str(parsed.get("impact_rationale") or "").strip()
-    # 조문 인용 없이 medium 이상을 주장하면 신뢰하지 않는다 — none 으로 내린다.
+    # 조문 인용 없이 medium 이상을 주장하면 신뢰하지 않는다 — low 로 내린다.
+    # 길이만 보면(예전 규칙) 조문도 인용도 없는 뭉뚱그린 문장이 medium 으로 통과한다.
     # (low/none 은 근거 문구가 없어도 그대로 둔다 — 요약은 이미 채워졌다)
-    if level in ("high", "medium") and (not rationale or len(rationale) < 15):
+    if level in ("high", "medium") and not _EA_CITE.search(rationale):
         level = "low"
         rationale = rationale or "포스코 그룹 사업과의 연결이 원문에서 확인되지 않음 — 추가 검토 필요"
     if not rationale:
