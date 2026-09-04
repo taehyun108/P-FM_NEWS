@@ -214,3 +214,68 @@ create policy "public read swot"      on swot_analyses for select using (true);
 create policy "public read quotes"    on market_quotes for select using (true);
 create policy "public read press"     on press_outlets for select using (status = 'approved');
 -- 주간 레포트는 마스터 전용 데이터라 공개 정책을 두지 않는다 (service role 로만 접근).
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 대외협력(대관) — 접두사 ea_. 기존 테이블과 독립적이며 조인하지 않는다.
+-- 입법·행정예고와 국회 의안은 뉴스(articles)와 성격이 달라(마감일 중심) 별도 보관한다.
+-- schema_sqlite.sql 의 ea_* 와 같은 논리 스키마다. 한쪽만 고치지 말 것.
+-- ═══════════════════════════════════════════════════════════════════
+
+-- 관심 부처. 정부조직 개편으로 이름이 자주 바뀌므로 테이블로 관리한다.
+create table if not exists ea_agencies (
+  id         uuid primary key default gen_random_uuid(),
+  name       text not null unique,
+  short_name text,
+  enabled    boolean default true
+);
+
+-- 입법예고 · 행정예고 · 국회 의안 항목
+create table if not exists ea_policy_items (
+  id              uuid primary key default gen_random_uuid(),
+  url_source      text not null unique,      -- 게이트(G2) 판정 키
+  url_canonical   text not null,
+  item_type       text not null,             -- 'legislation' | 'admin_notice' | 'bill'
+  category        text,                      -- 향후 선택 발송용 분류 (지금은 값만 채운다)
+  title           text not null,
+  agency_id       uuid references ea_agencies(id),
+  law_name        text,
+  notice_start    date,
+  notice_end      date,                      -- 의견제출 마감일 — 기본 정렬 키
+  status          text,                      -- '예고중' | '종료' | '국회심의' | '공포'
+  opinion_url     text,
+  attachment_urls jsonb default '[]',
+  published_at    timestamptz,
+  collected_at    timestamptz default now()
+);
+
+-- LLM 영향 분석. SWOT 은 만들지 않는다(뉴스 파이프라인과 무관).
+create table if not exists ea_analyses (
+  id               uuid primary key default gen_random_uuid(),
+  policy_item_id   uuid not null references ea_policy_items(id) on delete cascade,
+  summary          text not null,            -- 3~5줄
+  impact_level     text not null,            -- 'high' | 'medium' | 'low' | 'none'
+  impact_rationale text,                     -- 근거 조문 인용 (없으면 impact_level='none')
+  affected_areas   jsonb default '[]',
+  suggested_action text,                     -- 초안
+  model            text not null,
+  reviewed_by      text,
+  reviewed_at      timestamptz,
+  created_at       timestamptz default now()
+);
+
+-- 대외협력 전용 제외 원장. 기존 url_ledger 는 읽기만 하고 여기에만 쓴다.
+create table if not exists ea_url_ledger (
+  url_source text primary key,
+  reason     text not null,                  -- 'off_topic' | 'stale' | 'extract_failed'
+  first_seen timestamptz default now(),
+  hit_count  integer default 1
+);
+
+create index if not exists idx_ea_notice_end on ea_policy_items (notice_end);
+create index if not exists idx_ea_type_pub   on ea_policy_items (item_type, published_at);
+
+alter table ea_policy_items enable row level security;
+alter table ea_analyses     enable row level security;
+alter table ea_agencies     enable row level security;
+alter table ea_url_ledger   enable row level security;
+-- 대외협력 데이터는 사내 대관 업무용이라 공개 정책을 두지 않는다 (service role 로만 접근).
