@@ -286,6 +286,70 @@ def enrich_assembly_period(item: dict) -> dict:
     return item
 
 
+# ── 상세 본문 (개정이유·주요내용) ──────────────────────────────────
+_TITLE_QUOTED = re.compile(r"[「『]([^」』]{4,80})[」』]")
+_BILL_TITLE = re.compile(r"\[(\d{6,8})\]\s*([^(\n]{4,80})")
+# 본문 앞 상용 문구를 잘라낼 지점 — '1. 개정이유' 또는 '제안이유 및 주요내용' 헤더
+_REASON_HEAD = re.compile(
+    r"(?:\d+\s*\.\s*)?(?:개정이유|제정이유|제안이유|개정 이유|제안 이유)"
+    r"(?:\s*및\s*주요\s*내용)?")
+_NOISE = re.compile(
+    r"(메인페이지|화면크기|로그아웃|로그인|"
+    r"바로가기|누리집|의견목록|의견등록|인쇄하기|"
+    r"카카오|페이스북|네이버 블로그|URL 복사|창닫기|HOME|"
+    r"첨부파일이 없습니다|목록 보기|본문 보기)")
+
+
+def fetch_detail(item: dict) -> dict:
+    """G3·G4 — 예고 상세에서 개정이유·주요내용 텍스트와 정식 제명을 뽑는다.
+
+    반환 {"body": str, "title": str|None}. 세 사이트 모두 상세가 서버렌더다
+    (입법·행정예고 .detailContent / 국회 .desc).
+    """
+    url = item.get("opinion_url") or item.get("url_canonical") or item.get("url_source") or ""
+    if not url:
+        return {"body": "", "title": None}
+    try:
+        html = _get(url)
+    except Exception as exc:
+        log.debug("예고 상세 실패 %s: %s", url, exc)
+        return {"body": "", "title": None}
+    soup = _soup(html)
+    kind = item.get("item_type")
+    title = None
+
+    if kind == "bill":
+        # 국회 의안 — pal.assembly.go.kr : .desc 에 제안이유·주요내용
+        cand = [e for e in soup.find_all(class_=re.compile(r"desc|card-wrap|item"))
+                if "제안이유" in e.get_text()]
+        node = min(cand, key=lambda e: len(e.get_text()), default=None)
+        body = _clean(node.get_text(" ")) if node else ""
+        full = soup.get_text(" ", strip=True)
+        tm = _BILL_TITLE.search(full)
+        if tm:
+            title = _clean(tm.group(2))
+    else:
+        info = soup.find(class_="detailInfo")
+        cont = soup.find(class_="detailContent") or soup.find(id="content") or soup.find("main")
+        parts = []
+        if info:
+            parts.append(_clean(info.get_text(" ")))
+        if cont:
+            parts.append(_clean(cont.get_text(" ")))
+        body = " ".join(parts)
+        if cont:
+            qm = _TITLE_QUOTED.search(cont.get_text(" "))
+            if qm:
+                title = _clean(qm.group(1))
+
+    body = _clean(re.sub(_NOISE, " ", body))
+    # 공고 상용문구(⊙OO부공고 제N호 …「법령명」을 개정함에 있어 …)를 개정이유 직전까지 잘라낸다
+    hm = _REASON_HEAD.search(body)
+    if hm and hm.start() > 30:
+        body = "[개정이유·주요내용] " + body[hm.end():].lstrip(" .:")
+    return {"body": body[:8000], "title": title}
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

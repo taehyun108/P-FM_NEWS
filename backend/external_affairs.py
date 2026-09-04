@@ -331,19 +331,23 @@ def _keyword_sets_terms(db: EaDB) -> list[str]:
         return []
 
 
+def _kw_in(text: str, terms: Sequence[str]) -> str | None:
+    for kw in terms:
+        if kw and kw in text:
+            return kw
+    return None
+
+
 def is_relevant(title: str, law_name: str = "", agency: str = "",
                 agency_names: set[str] | None = None, extra_terms: Sequence[str] = ()) -> bool:
-    """G2.5 — 관심 부처이거나 관련 키워드가 걸리면 통과."""
-    if agency_names and agency and any(a in agency for a in agency_names):
-        return True
+    """G2.5 — 관련 산업 키워드가 제목·법령명·(있으면)본문에 있어야 통과한다.
+
+    관심 부처라는 이유만으로는 통과시키지 않는다 — 공정위·기재부 등에서 나오는
+    소비자·조세·행정 일반 개정안이 대거 섞여 들어오기 때문이다. 부처 목록은
+    화면 필터 드롭다운에만 쓴다.
+    """
     probe = f"{title or ''}\n{law_name or ''}"
-    for kw in EA_RELEVANCE_KW:
-        if kw in probe:
-            return True
-    for kw in extra_terms:
-        if kw and kw in probe:
-            return True
-    return False
+    return bool(_kw_in(probe, EA_RELEVANCE_KW) or _kw_in(probe, extra_terms))
 
 
 # ── 게이트 G0 ~ G2.5 ────────────────────────────────────────────────
@@ -715,7 +719,9 @@ EA_CATEGORY_RULES: list[tuple[str, list[str]]] = [
     ("환경·안전",     ["화학물질", "화평법", "화관법", "유해화학", "폐기물", "자원순환",
                         "대기환경", "물환경", "토양환경", "산업안전", "중대재해", "위험물",
                         "온실가스", "배출권", "탄소중립"]),
-    ("에너지",        ["전기요금", "전력수급", "재생에너지", "수소", "원자력", "에너지"]),
+    ("에너지",        ["전기요금", "전력수급", "전기사업", "전력시장", "발전사업", "송전",
+                        "배전", "전력계통", "재생에너지", "신재생", "수소", "원자력",
+                        "원자력발전", "에너지", "집적화단지", "이격거리"]),
     ("철강·산업",     ["철강", "제철", "제련", "합금", "산업단지", "특화단지",
                         "국가첨단전략산업"]),
     ("건설·입지",     ["건설산업", "주택법", "도시정비", "건축법", "국토계획"]),
@@ -795,12 +801,29 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
             "published_at": it.get("published_at") or None,
             "collected_at": iso(now_utc()),
         }
+        # G3·G4 — 상세(개정이유·주요내용) 확보. G2.5 통과분에만 HTTP 가 발생한다.
+        body = it.get("_body") or ""
+        if not body:
+            try:
+                detail = _crawl().fetch_detail(it)
+                body = detail.get("body") or ""
+                real_title = detail.get("title")
+                if real_title and len(real_title) > len(row["title"]) - 4:
+                    row["title"] = real_title
+                    row["law_name"] = _crawl()._law_name(real_title)
+                    row["category"] = detect_category(real_title, row["law_name"] or "")
+            except Exception as exc:
+                log.debug("상세 확보 실패 %s: %s", it.get("url_source", ""), exc)
+        # 본문(개정이유·주요내용)까지 확인해 여전히 산업 키워드가 없으면 저장하지 않는다
+        if body and not is_relevant(row["title"], row.get("law_name") or "",
+                                    extra_terms=gates.extra_terms) \
+                and not is_relevant(body[:2000], extra_terms=gates.extra_terms):
+            db.upsert_ledger(it["url_source"], "off_topic")
+            gates.counts["off_topic"] += 1
+            gates.seen.add(it["url_source"])
+            continue
         if db.insert_item(row):
             saved += 1
-            # G3·G4 — 상세 본문 확보(HTTP). G2.5 통과분에만 발생한다.
-            body = it.get("_body") or ""
-            if not body and row["item_type"] in ("legislation", "admin_notice"):
-                body = fetch_lawmaking_detail(row)
             fresh.append((row, body))
         gates.seen.add(it["url_source"])
 
@@ -866,17 +889,20 @@ EA_SYSTEM = (
 
 EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSON 하나로만 답하라.
 
-[요약]
-- summary: 3~5줄. 각 줄은 (1) 무엇이 바뀌는가 (2) 언제부터 적용되는가 (3) 누구에게 적용되는가
-- 자료에 없는 시행일·수치·적용 대상을 만들어내지 않는다
-- 자료가 제목뿐이어서 요약할 수 없으면 "자료 부족 — 원문 확인 필요" 한 줄만 쓴다
+[요약 — 이 개정안의 내용]
+- summary: 원문 발췌의 **개정이유(제안이유)와 주요내용**을 3~5문장으로 정리한다
+  · 첫 문장: 왜 개정하는가(개정이유)
+  · 이후: 무엇을 어떻게 바꾸는가(주요내용), 시행일·적용대상이 원문에 있으면 포함
+- 포스코와의 관련 여부와 무관하게, 개정 내용 자체를 항상 요약한다
+- 원문에 없는 시행일·수치·대상을 만들어내지 않는다
+- 원문 발췌가 비어 있거나 상용문구뿐이면 "원문을 확보하지 못했습니다" 한 줄만 쓴다
 
-[영향도]
+[영향도 — 포스코 그룹 관점]
 - impact_level: "high" | "medium" | "low" | "none" 중 하나
 - 포스코 그룹(철강·이차전지소재·건설/인프라·에너지) 사업에 미치는 영향 기준
 - impact_rationale: 판단 근거가 된 **원문의 조문·항목을 그대로 인용**한다
-- 인용할 근거를 자료에서 찾을 수 없으면 impact_level 은 반드시 "none",
-  impact_rationale 은 "원문에 근거 조문 없음"
+- 포스코 사업과 연결되는 조문을 찾을 수 없으면 impact_level="none",
+  impact_rationale="포스코 그룹 사업과 직접 연결되는 조항 없음" (summary 는 그대로 채운다)
 - 불분명하면 추정하지 말고 "low" + "추가 검토 필요"
 
 [관련 사업 영역]
@@ -969,9 +995,10 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     """
     body = source_text.strip()
     if not body:
-        body = (fetch_lawmaking_detail(item)
-                if item.get("item_type") in ("legislation", "admin_notice")
-                else fetch_detail_text(item.get("url_canonical") or item.get("url_source") or ""))
+        try:
+            body = _crawl().fetch_detail(item).get("body") or ""
+        except Exception:
+            body = fetch_detail_text(item.get("opinion_url") or item.get("url_source") or "")
     period = " ~ ".join(x for x in (item.get("notice_start"), item.get("notice_end")) if x) or "미상"
     agency = ""
     if item.get("agency_id"):
@@ -995,15 +1022,19 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     summary = parsed.get("summary")
     if isinstance(summary, list):
         summary = " ".join(str(s).strip() for s in summary if str(s).strip())
-    summary = str(summary or "").strip() or "자료 부족 — 원문 확인 필요"
+    summary = str(summary or "").strip() or "원문을 확보하지 못했습니다 — 원문 링크로 확인하세요"
 
     level = str(parsed.get("impact_level") or "none").strip().lower()
     if level not in EA_IMPACT_LEVELS:
         level = "none"
     rationale = str(parsed.get("impact_rationale") or "").strip()
-    # 근거 없이 높은 영향도를 주장하면 신뢰할 수 없다 — none 으로 내린다
-    if not rationale or rationale == "원문에 근거 조문 없음":
-        level, rationale = "none", rationale or "원문에 근거 조문 없음"
+    # 조문 인용 없이 medium 이상을 주장하면 신뢰하지 않는다 — none 으로 내린다.
+    # (low/none 은 근거 문구가 없어도 그대로 둔다 — 요약은 이미 채워졌다)
+    if level in ("high", "medium") and (not rationale or len(rationale) < 15):
+        level = "low"
+        rationale = rationale or "포스코 그룹 사업과의 연결이 원문에서 확인되지 않음 — 추가 검토 필요"
+    if not rationale:
+        rationale = "포스코 그룹 사업과 직접 연결되는 조항 없음"
 
     areas = parsed.get("affected_areas")
     areas = [str(a).strip() for a in areas if str(a).strip()] if isinstance(areas, list) else []
