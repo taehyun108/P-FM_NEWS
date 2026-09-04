@@ -1,0 +1,136 @@
+/* ── 대외협력(대관) 패널 ─────────────────────────────────────────────
+   모든 클래스는 .ea- 접두사. style.css 는 0줄 수정하고 변수만 참조한다.
+   ------------------------------------------------------------------ */
+.ea-panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 20px 22px; margin: 22px 0 16px;
+}
+.ea-panel[hidden] { display: none; }
+
+.ea-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 14px; flex-wrap: wrap; padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.ea-head h2 { margin: 0; font-size: 17px; color: var(--navy); }
+.ea-meta { margin: 4px 0 0; font-size: 12px; color: var(--ink-soft); }
+
+/* 마감 임박 배너 — D-7 이내 '예고중'이 있을 때만 */
+.ea-alert {
+  margin: 14px 0 0; padding: 12px 14px; border-radius: 10px;
+  background: #fdeceb; border: 1px solid #f3c2bd; color: #8c2f26; font-size: 13px;
+}
+.ea-alert[hidden] { display: none; }
+.ea-alert b { color: #b3261e; }
+.ea-alert ul { margin: 8px 0 0; padding-left: 18px; }
+.ea-alert li { margin-bottom: 3px; }
+.ea-alert a { color: #8c2f26; }
+
+/* 서브탭 */
+.ea-subtabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 4px; }
+.ea-subtab {
+  border: 1px solid var(--line); background: #fff; color: var(--ink-mid);
+  border-radius: 999px; padding: 6px 14px; font-family: inherit;
+  font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.ea-subtab:hover { border-color: var(--navy); color: var(--navy); }
+.ea-subtab[aria-selected="true"] {
+  background: var(--navy); border-color: var(--navy); color: #fff;
+}
+
+/* 필터 */
+.ea-filters {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin: 14px 0 6px; padding: 12px 0; border-top: 1px solid var(--line);
+}
+.ea-filters select, .ea-filters input {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px;
+  font-family: inherit; font-size: 12.5px; color: var(--ink-mid); background: #fff;
+}
+.ea-filters input { min-width: 190px; }
+.ea-count { margin-left: auto; font-size: 12.5px; color: var(--ink-mid); }
+
+/* 항목 카드 — 기존 포토카드와 별개 컴포넌트(썸네일보다 정보 밀도 우선) */
+.ea-list { display: grid; gap: 10px; margin: 12px 0 0; }
+.ea-card {
+  display: grid; grid-template-columns: 74px 1fr; gap: 14px;
+  border: 1px solid var(--line); border-radius: 11px; padding: 14px 16px;
+  background: var(--surface);
+}
+.ea-card:hover { border-color: var(--navy-line); }
+
+.ea-dday {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  border-radius: 9px; padding: 8px 4px; text-align: center;
+  font-variant-numeric: tabular-nums; align-self: start;
+}
+.ea-dday b { font-size: 17px; font-weight: 700; line-height: 1.15; }
+.ea-dday span { font-size: 10.5px; margin-top: 2px; }
+.ea-dday.is-urgent { background: #fdeceb; color: #b3261e; }        /* D-3 이내 */
+.ea-dday.is-soon   { background: #fdf3e6; color: #a35a08; }        /* D-7 이내 */
+.ea-dday.is-open   { background: var(--navy-soft); color: var(--navy); }
+.ea-dday.is-closed { background: #f1f3f7; color: var(--ink-soft); }
+
+.ea-card-title { margin: 0 0 4px; font-size: 14.5px; font-weight: 700; line-height: 1.45; }
+.ea-card-title a { color: var(--ink); text-decoration: none; }
+.ea-card-title a:hover { color: var(--navy); }
+.ea-card-sub { margin: 0 0 8px; font-size: 12px; color: var(--ink-soft); }
+.ea-card-sub b { color: var(--ink-mid); font-weight: 600; }
+.ea-summary { margin: 0 0 8px; font-size: 13px; color: var(--ink-mid); line-height: 1.65; }
+.ea-rationale {
+  margin: 0 0 8px; padding: 8px 11px; border-radius: 7px;
+  background: var(--navy-soft); color: var(--ink-mid);
+  font-size: 12px; line-height: 1.6; border-left: 3px solid var(--navy);
+}
+.ea-rationale b { color: var(--navy); }
+
+.ea-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+.ea-tag {
+  border-radius: 999px; padding: 2.5px 9px; font-size: 11.5px; font-weight: 600;
+  background: #eef1f6; color: var(--ink-mid);
+}
+.ea-tag.is-cat { background: var(--navy-soft); color: var(--navy-dark); }
+.ea-impact-high   { background: #fdeceb; color: #b3261e; }
+.ea-impact-medium { background: #fdf3e6; color: #a35a08; }
+.ea-impact-low    { background: #eef1f6; color: var(--ink-mid); }
+.ea-impact-none   { background: #f4f6fa; color: var(--ink-soft); font-weight: 400; }
+
+.ea-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ea-actions a {
+  border: 1px solid var(--line); border-radius: 7px; padding: 4px 11px;
+  font-size: 12px; color: var(--ink-mid); text-decoration: none;
+}
+.ea-actions a:hover { border-color: var(--navy); color: var(--navy); }
+.ea-actions a.is-primary { background: var(--navy); border-color: var(--navy); color: #fff; }
+
+/* 상태 */
+.ea-state { padding: 34px 0; text-align: center; color: var(--ink-soft); font-size: 13.5px; }
+.ea-state.is-error { color: var(--neg); }
+.ea-skeleton { height: 96px; border-radius: 11px; background: #eef1f6; }
+
+/* 페이지네이션 — 기존 .pager 와 같은 톤이지만 별도 클래스 */
+.ea-pager { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; margin-top: 16px; }
+.ea-pager[hidden] { display: none; }
+.ea-pager button {
+  min-width: 34px; height: 34px; padding: 0 10px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink-mid);
+  border-radius: 9px; font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; font-variant-numeric: tabular-nums;
+}
+.ea-pager button:hover:not(:disabled) { border-color: var(--navy); color: var(--navy); }
+.ea-pager button.is-current {
+  background: var(--navy); border-color: var(--navy); color: #fff; cursor: default;
+}
+.ea-pager button:disabled:not(.is-current) { opacity: .35; cursor: default; }
+
+/* 법적 고지 — 상시 표시 */
+.ea-disclaimer {
+  margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line);
+  font-size: 11.5px; color: var(--ink-soft); line-height: 1.6;
+}
+
+@media (max-width: 660px) {
+  .ea-card { grid-template-columns: 1fr; }
+  .ea-dday { flex-direction: row; gap: 6px; justify-self: start; padding: 5px 12px; }
+}

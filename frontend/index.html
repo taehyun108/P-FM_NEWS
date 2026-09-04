@@ -23,6 +23,7 @@
     </a>
     <div class="header-right">
       <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
+      <button type="button" class="fav-tab" id="eaTab" aria-pressed="false">🏛 대외협력</button>
       <button type="button" class="fav-tab" id="weeklyTab" aria-pressed="false">📈 주간동향</button>
       <a class="fav-tab" id="tgLink" href="#" target="_blank" rel="noopener noreferrer" hidden>✈ Telegram</a>
       <button type="button" class="fav-tab" id="masterBtn">🔒 마스터</button>
@@ -156,6 +157,33 @@
 </section>
 
 <main class="wrap">
+
+  <!-- 대외협력(대관) — 로직은 external_affairs.js/css 에 있다 -->
+  <section class="ea-panel" id="eaPanel" aria-label="대외협력" hidden>
+    <div class="ea-head">
+      <div>
+        <h2>🏛 대외협력 · 입법·행정예고와 국회 의안</h2>
+        <p class="ea-meta" id="eaMeta">불러오는 중…</p>
+      </div>
+    </div>
+    <div class="ea-alert" id="eaAlert" hidden></div>
+    <div class="ea-subtabs" id="eaSubtabs" role="tablist"></div>
+    <div class="ea-filters" id="eaFilters">
+      <select id="eaAgency" aria-label="소관 부처"></select>
+      <select id="eaImpact" aria-label="영향도"></select>
+      <select id="eaStatus" aria-label="상태"></select>
+      <select id="eaDue" aria-label="마감 임박"></select>
+      <input type="search" id="eaSearch" placeholder="제목·법령명·요약 검색" autocomplete="off">
+      <span class="ea-count" id="eaCount"></span>
+    </div>
+    <div class="ea-list" id="eaList"></div>
+    <nav class="ea-pager" id="eaPager" aria-label="페이지" hidden></nav>
+    <p class="ea-disclaimer">
+      이 화면은 정부 공개자료의 <b>요약과 원문 링크</b>만 제공하며 본문 전문을 게시하지 않습니다.
+      영향도·대응 제안은 <b>AI가 생성한 분석 초안</b>이며 법률 자문이 아닙니다.
+      의견 제출 전 반드시 원문을 확인하세요.
+    </p>
+  </section>
 
   <!-- 주간동향 (월요일 아침 이메일 레포트와 동일) -->
   <section class="weekly-panel" id="weeklyPanel" aria-label="주간동향" hidden>

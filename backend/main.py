@@ -5143,22 +5143,27 @@ def create_app(ctx: Context):
                              "sent_to": to_list if ok else []},
                             status_code=200 if ok else 400)
 
+    if ea_mod is not None:
+        ea_mod.register_api(app, ctx)
+
     if os.path.isdir(FRONTEND_DIR):
         from fastapi.responses import HTMLResponse
 
         _index_cache: dict[str, Any] = {"sig": None, "html": ""}
         _index_files = [os.path.join(FRONTEND_DIR, n)
-                        for n in ("index.html", "style.css", "app.js")]
+                        for n in ("index.html", "style.css", "app.js",
+                                  "external_affairs.css", "external_affairs.js")]
 
         def _render_index() -> str:
             # JS·CSS 를 HTML 에 인라인해서 내보낸다. 별도 정적 요청이 없으므로
             # 쿼리스트링을 무시하는 프록시가 있어도 옛 파일을 내줄 수 없다.
-            html, css, js = (open(p, "r", encoding="utf-8").read() for p in _index_files)
+            html, css, js, ea_css, ea_js = (
+                open(p, "r", encoding="utf-8").read() for p in _index_files)
             # 리터럴 치환만 한다(re.sub 은 repl 의 \s 등을 이스케이프로 해석해 깨진다).
             html = html.replace('<link rel="stylesheet" href="./style.css">',
-                                f"<style>\n{css}\n</style>")
+                                f"<style>\n{css}\n{ea_css}\n</style>")
             return html.replace('<script src="./app.js"></script>',
-                                f"<script>\n{js}\n</script>")
+                                f"<script>\n{js}\n</script>\n<script>\n{ea_js}\n</script>")
 
         @app.get("/")
         def index():

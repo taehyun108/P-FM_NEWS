@@ -862,3 +862,153 @@ def analyze_backlog(ctx: Any, db: EaDB) -> int:
     if done:
         log.info("대외협력 분석 %d건 (전용 상한 %d 중 %d 사용)", done, ea_limit, ea_used + done)
     return done
+
+
+# ═════════════════════════════════════════════════════════════════════
+# API — 전부 /api/ea/ 아래. 기존 라우트와 겹치지 않고,
+#       /api/articles 쿼리에 ea_* 조인을 끼워 넣지 않는다.
+# ═════════════════════════════════════════════════════════════════════
+
+EA_PAGE_SIZE = 9          # 기존 포토카드와 같은 페이지당 건수
+EA_DUE_SOON_DAYS = 7      # 마감 임박 배너 기준
+
+
+def _item_view(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "title": row.get("title") or "",
+        "url": row.get("url_canonical") or row.get("url_source") or "",
+        "item_type": row.get("item_type") or "",
+        "category": row.get("category") or "",
+        "law_name": row.get("law_name") or "",
+        "agency": row.get("agency_name") or "",
+        "notice_start": row.get("notice_start"),
+        "notice_end": row.get("notice_end"),
+        "d_day": d_day(row.get("notice_end")),
+        "status": row.get("status") or "",
+        "opinion_url": row.get("opinion_url") or "",
+        "attachment_urls": jload(row.get("attachment_urls"), []),
+        "impact_level": row.get("impact_level") or "",
+        "summary": row.get("summary") or "",
+        "impact_rationale": row.get("impact_rationale") or "",
+        "affected_areas": jload(row.get("affected_areas"), []),
+        "suggested_action": row.get("suggested_action") or "",
+    }
+
+
+_ITEM_SELECT = (
+    "select p.*, g.name as agency_name,"
+    " a.impact_level, a.summary, a.impact_rationale, a.affected_areas, a.suggested_action"
+    " from ea_policy_items p"
+    " left join ea_agencies g on g.id = p.agency_id"
+    " left join ea_analyses a on a.policy_item_id = p.id"
+)
+
+
+def query_items(db: EaDB, *, item_type: str = "", agency: str = "", impact: str = "",
+                status: str = "", due: str = "", q: str = "") -> list[dict]:
+    """마감일 오름차순, 마감일 없는 항목은 뒤로. (§8.4 기본 정렬)"""
+    sql, args = _ITEM_SELECT + " where 1=1", []
+    if item_type:
+        marks = ",".join("?" * len(item_type.split(",")))
+        sql += f" and p.item_type in ({marks})"; args += item_type.split(",")
+    if agency:
+        marks = ",".join("?" * len(agency.split(",")))
+        sql += f" and g.name in ({marks})"; args += agency.split(",")
+    if impact:
+        marks = ",".join("?" * len(impact.split(",")))
+        sql += f" and ifnull(a.impact_level,'') in ({marks})"; args += impact.split(",")
+    if status:
+        marks = ",".join("?" * len(status.split(",")))
+        sql += f" and ifnull(p.status,'') in ({marks})"; args += status.split(",")
+    if due in ("7", "14", "30"):
+        today = datetime.now(KST).date()
+        sql += " and p.notice_end is not null and p.notice_end >= ? and p.notice_end <= ?"
+        args += [today.isoformat(), (today + timedelta(days=int(due))).isoformat()]
+    if q:
+        sql += (" and (p.title like ? or ifnull(p.law_name,'') like ?"
+                " or ifnull(a.summary,'') like ?)")
+        args += [f"%{q}%"] * 3
+    sql += " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc"
+    return db.rows(sql, args)
+
+
+def register_api(app: Any, ctx: Any) -> None:
+    """main.create_app 에서 한 줄로 호출된다. 기존 라우트는 건드리지 않는다."""
+    from fastapi.responses import JSONResponse
+
+    db = EaDB(ctx.cfg.sqlite_path)
+
+    @app.get("/api/ea/items")
+    def ea_items(item_type: str = "", agency: str = "", impact: str = "", status: str = "",
+                 due: str = "", q: str = "", page: int = 1, size: int = EA_PAGE_SIZE):
+        page = max(1, page)
+        size = max(1, min(size, 100))
+        rows = query_items(db, item_type=item_type, agency=agency, impact=impact,
+                           status=status, due=due, q=q)
+        start = (page - 1) * size
+        return JSONResponse({"total": len(rows), "page": page, "size": size,
+                             "items": [_item_view(r) for r in rows[start:start + size]]})
+
+    @app.get("/api/ea/stats")
+    def ea_stats():
+        urgent = [_item_view(r) for r in query_items(db, due=str(EA_DUE_SOON_DAYS))
+                  if (r.get("status") or "") != "종료"]
+        return JSONResponse({**db.stats(), "enabled": ea_enabled(),
+                             "sources_active": {"S1": bool(data_go_kr_key()),
+                                                "S2": bool(data_go_kr_key()),
+                                                "S3": bool(assembly_key())},
+                             "due_soon_days": EA_DUE_SOON_DAYS,
+                             "urgent": urgent[:5], "urgent_total": len(urgent)})
+
+    @app.get("/api/ea/filters")
+    def ea_filters():
+        def col(sql: str) -> list[str]:
+            return [r["v"] for r in db.rows(sql) if r["v"]]
+        return JSONResponse({
+            "agencies": col("select distinct g.name as v from ea_policy_items p"
+                            " join ea_agencies g on g.id=p.agency_id order by v"),
+            "item_types": [{"key": "legislation", "label": "입법예고"},
+                           {"key": "admin_notice", "label": "행정예고"},
+                           {"key": "bill", "label": "국회 의안"}],
+            "impacts": [{"key": "high", "label": "높음"}, {"key": "medium", "label": "보통"},
+                        {"key": "low", "label": "낮음"}, {"key": "none", "label": "해당없음"}],
+            "statuses": col("select distinct status as v from ea_policy_items order by v"),
+            "dues": [{"key": "7", "label": "D-7"}, {"key": "14", "label": "D-14"},
+                     {"key": "30", "label": "D-30"}],
+        })
+
+    @app.get("/api/ea/items/{item_id}")
+    def ea_item(item_id: str):
+        row = db.one(_ITEM_SELECT + " where p.id=?", (item_id,))
+        if row is None:
+            return JSONResponse({"ok": False, "error": "항목을 찾을 수 없습니다."}, status_code=404)
+        return JSONResponse({"ok": True, "item": _item_view(row)})
+
+    # ── S4·S5 — 기존 수집 결과 재사용 (읽기 전용). 새로 수집하지 않는다. ──
+    def _news(category: str, limit: int) -> list[dict]:
+        rows = ctx.storage.list_articles(400, 0, now_utc() - timedelta(days=30), "")
+        out = []
+        for r in rows:
+            if category in jload(r.get("categories"), []):
+                out.append({
+                    "id": r.get("id"), "title": r.get("title") or "",
+                    "url": r.get("url_canonical") or r.get("url_original") or "",
+                    "press": r.get("press_name") or "",
+                    "published_at": r.get("published_at") or "",
+                    "score": int(r.get("importance_score") or 0),
+                    "summary": r.get("summary_text") or "",
+                })
+            if len(out) >= limit:
+                break
+        return out
+
+    @app.get("/api/ea/policy-news")
+    def ea_policy_news(limit: int = 30):
+        return JSONResponse({"items": _news("정부/정책", max(1, min(limit, 100)))})
+
+    @app.get("/api/ea/trade-news")
+    def ea_trade_news(limit: int = 30):
+        return JSONResponse({"items": _news("글로벌 통상환경", max(1, min(limit, 100)))})
+
+    log.info("대외협력 API 등록 (/api/ea/*)")

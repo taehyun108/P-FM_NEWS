@@ -710,6 +710,7 @@ let favView = false;
 
 function toggleFavView() {
   if (weeklyView && !favView) toggleWeeklyView();   // 주간동향 화면이면 먼저 닫는다
+  if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 먼저 닫는다
   favView = !favView;
   $('favTab').setAttribute('aria-pressed', String(favView));
   $('favTab').textContent = favView ? '← 전체 기사' : '★ 즐겨찾기';
@@ -744,6 +745,7 @@ let weeklyRecipients = [];  // 마스터 패널 수신자 목록 (참고 표시�
 
 function toggleWeeklyView() {
   if (favView) toggleFavView();            // 즐겨찾기 화면이면 먼저 닫는다
+  if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 먼저 닫는다
   weeklyView = !weeklyView;
   $('weeklyTab').setAttribute('aria-pressed', String(weeklyView));
   $('weeklyTab').textContent = weeklyView ? '← 전체 기사' : '📈 주간동향';
@@ -1095,6 +1097,8 @@ function init() {
 
   $('favTab').addEventListener('click', toggleFavView);
   $('weeklyTab').addEventListener('click', toggleWeeklyView);
+  window.pfmCloseOtherViews = () => { if (favView) toggleFavView(); if (weeklyView) toggleWeeklyView(); };
+  window.pfmRefreshList = () => refresh(true);
   $('weeklyGenBtn').addEventListener('click', generateWeekly);
   $('weeklyMailBtn').addEventListener('click', sendWeeklyMail);
   initMaster();
