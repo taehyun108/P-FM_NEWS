@@ -205,6 +205,17 @@ a.brand:hover .brand-mark { background: rgba(255, 255, 255, .28); }
   background: var(--navy); color: #fff; border-radius: 999px;
   padding: 3px 10px; font-size: 11px; font-weight: 700; white-space: nowrap;
 }
+/* 사용자가 URL 로 직접 등록한 기사 배지 */
+.manual-badge {
+  background: #f4b740; color: var(--navy-dark); border-radius: 999px;
+  padding: 3px 10px; font-size: 11px; font-weight: 700; white-space: nowrap;
+}
+/* URL 등록 미리보기 — "이 기사가 맞습니까?" 확인줄 */
+.url-add-check {
+  margin: 8px 0 0; padding: 9px 12px; border-radius: 9px;
+  background: #fff7e4; border: 1px solid #f4b740;
+  color: var(--navy-dark); font-size: 13px; font-weight: 600; line-height: 1.5;
+}
 .icon-btn {
   border: none; background: none; cursor: pointer; padding: 2px 4px;
   font-size: 13px; color: var(--ink-soft); line-height: 1; font-family: inherit;

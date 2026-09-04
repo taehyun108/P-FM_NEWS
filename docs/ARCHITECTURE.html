@@ -372,9 +372,9 @@
         <div class="tw"><table>
           <thead><tr><th>파일</th><th class="num">줄</th><th>역할</th></tr></thead>
           <tbody>
-            <tr><td><code>index.html</code></td><td class="num">264</td><td>뼈대 마크업, 마스터 패널 모달, 주간동향 패널</td></tr>
-            <tr><td><code>app.js</code></td><td class="num">1,125</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
-            <tr><td><code>style.css</code></td><td class="num">454</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
+            <tr><td><code>index.html</code></td><td class="num">298</td><td>뼈대 마크업, 마스터 패널 모달, 주간동향 패널</td></tr>
+            <tr><td><code>app.js</code></td><td class="num">1,160</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
+            <tr><td><code>style.css</code></td><td class="num">465</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
           </tbody>
         </table></div>
 
@@ -385,6 +385,15 @@
           스크롤 아님). 브라우저 저장소는 <code>localStorage</code>만 쓴다 — 즐겨찾기 목록,
           마스터 토큰, 필터 접힘 상태. 서버로는 가지 않는다. 헤더의 탭은 <b>전체 기사 ·
           즐겨찾기 · 주간동향</b> 셋이 서로 배타적으로 전환된다.
+        </p>
+        <p>
+          목록 <b>정렬</b>은 <code>최신순</code>(기본, 발행일 내림차순)과 <code>중요도순</code>
+          (<code>?sort=score</code>) 중 하나를 필터 영역에서 고른다. 중요도순은
+          <b>사용자가 URL로 직접 등록한 기사</b>(<code>source_type='manual'</code>)를 먼저
+          올리고, 그다음 중요도 점수·발행일 순이다 — 직접 고른 기사가 최신 자동수집분에
+          묻히지 않게 한다. 직접 등록한 기사 카드에는 <b>「✍ 직접 등록」 배지</b>가 붙고,
+          URL 등록 미리보기에는 <b>“이 기사가 맞습니까?”</b> 제목 확인줄을 띄워 엉뚱한 링크
+          등록을 막는다.
         </p>
 
         <h3>백엔드 — 약 6,100줄</h3>
@@ -881,7 +890,7 @@
           <thead><tr><th>엔드포인트</th><th class="num">응답</th><th>비고</th></tr></thead>
           <tbody>
             <tr><td><code>GET /</code></td><td class="num">5 ms</td><td>HTML+JS+CSS 조립 결과를 파일 수정시각으로 캐시</td></tr>
-            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 15초 캐시(웜, 미스 시 약 20 ms). 필터·페이지네이션은 매 요청 신선</td></tr>
+            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 15초 캐시(웜, 미스 시 약 20 ms). 필터·정렬(<code>sort=recent|score</code>)·페이지네이션은 매 요청 신선</td></tr>
             <tr><td><code>GET /api/filters</code></td><td class="num">2 ms</td><td>20초 캐시 + <code>/api/articles</code>와 스캔·태그 캐시 공유</td></tr>
             <tr><td><code>GET /api/stats</code></td><td class="num">21 ms</td><td>집계 쿼리</td></tr>
             <tr><td><code>GET /api/weekly</code></td><td class="num">4 ms</td><td>저장된 최신 레포트 반환 (생성은 별도)</td></tr>

@@ -228,6 +228,11 @@
       </div>
 
       <div class="filter-row">
+        <span class="filter-label">정렬 <em>단일 선택</em></span>
+        <div class="chips" id="sortChips" data-single="true"></div>
+      </div>
+
+      <div class="filter-row">
         <span class="filter-label">그룹사 <em>중복 선택</em></span>
         <div class="chips" id="groupChips"></div>
       </div>
@@ -262,6 +267,7 @@
       <button type="submit" class="url-add-btn" id="urlAddBtn">분석</button>
     </form>
     <p class="url-add-msg" id="urlAddMsg" hidden></p>
+    <p class="url-add-check" id="urlAddCheck" hidden></p>
     <div class="url-add-confirm" id="urlAddConfirm" hidden>
       <span>이 기사를 목록에 등록할까요?</span>
       <button type="button" class="url-add-btn" id="urlConfirmBtn">등록</button>

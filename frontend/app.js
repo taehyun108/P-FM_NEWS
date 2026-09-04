@@ -17,11 +17,18 @@ const state = {
   cat: new Set(),
   press: new Set(),
   period: 'all',
+  sort: 'recent',   // 'recent'(발행일 최신순, 기본) | 'score'(직접 등록·중요도순)
   q: '',
   page: 1,
   total: 0,
   loading: false,
 };
+
+/* 정렬 옵션 — 백엔드 /api/articles?sort= 값과 라벨. */
+const SORT_OPTIONS = [
+  { key: 'recent', label: '최신순' },
+  { key: 'score', label: '중요도순' },
+];
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -93,6 +100,7 @@ function readStateFromURL() {
   load('cat', state.cat);
   load('press', state.press);
   state.period = p.get('period') || 'all';
+  state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
   state.q = p.get('q') || '';
   state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
 }
@@ -103,6 +111,7 @@ function writeStateToURL() {
   if (state.cat.size) p.set('cat', [...state.cat].join(','));
   if (state.press.size) p.set('press', [...state.press].join(','));
   if (state.period !== 'all') p.set('period', state.period);
+  if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
   if (state.page > 1) p.set('page', String(state.page));
   const qs = p.toString();
@@ -199,6 +208,12 @@ async function loadFilters() {
     refresh(true);
   }, true);
 
+  renderChipGroup($('sortChips'), SORT_OPTIONS, state.sort, (key) => {
+    // 정렬은 최신순/중요도순 중 하나만 — 단일 선택.
+    state.sort = key;
+    refresh(true);
+  }, true);
+
   const multi = [
     ['groupChips', data.groups, state.group],
     ['catChips', data.categories, state.cat],
@@ -229,6 +244,10 @@ function syncChipStates() {
   [...$('periodChips').children].forEach((btn, i) => {
     btn.setAttribute('aria-pressed', String(periodKeys[i] === state.period));
   });
+  // 정렬 칩도 인덱스로 맞춘다 (key ≠ label).
+  [...$('sortChips').children].forEach((btn, i) => {
+    btn.setAttribute('aria-pressed', String((SORT_OPTIONS[i] || {}).key === state.sort));
+  });
 }
 
 /* ── 카드 렌더링 (F6.2) ─────────────────────────────────────────── */
@@ -241,6 +260,12 @@ function buildCard(item) {
   top.append(el('span', 'card-date', formatDate(item.published_at)));
 
   const right = el('div', 'card-top-right');
+  // 사용자가 URL 로 직접 등록한 기사임을 표시한다 (자동 수집분과 구분).
+  if (item.manual) {
+    const badge = el('span', 'manual-badge', '✍ 직접 등록');
+    badge.title = '내가 URL 로 직접 등록한 기사입니다';
+    right.append(badge);
+  }
   if (item.swot) right.append(buildSwotBadge(item.swot));
   if (item.press_name) right.append(el('span', 'press-badge', item.press_name));
 
@@ -867,6 +892,7 @@ function buildQuery() {
   if (state.cat.size) p.set('cat', [...state.cat].join(','));
   if (state.press.size) p.set('press', [...state.press].join(','));
   if (state.period !== 'all') p.set('period', state.period);
+  if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
   p.set('page', String(state.page));
   p.set('size', String(PAGE_SIZE));
@@ -998,6 +1024,7 @@ let pendingDraft = null;   // 미리보기 중인 draft 기사 {id, card}
 function clearUrlPreview() {
   pendingDraft = null;
   $('urlAddConfirm').hidden = true;
+  $('urlAddCheck').hidden = true;
   $('urlAddResult').replaceChildren();
 }
 
@@ -1023,6 +1050,10 @@ async function submitUrl(e) {
     if (!data.ok) { urlMsg('err', data.error || '분석에 실패했습니다.'); return; }
 
     $('urlAddResult').replaceChildren(buildCard(data.card));
+    // 붙여넣은 URL 이 의도한 기사가 맞는지 제목으로 재확인시킨다 (엉뚱한 링크 등록 방지).
+    const chk = $('urlAddCheck');
+    chk.textContent = `📄 이 기사가 맞습니까? — 「${data.card.title || '제목 없음'}」 · ${data.card.press_name || '언론사 미상'}`;
+    chk.hidden = false;
     if (data.already) {
       urlMsg('info', '이미 등록된 기사입니다. 아래 카드를 확인하세요.');
     } else if (data.draft_id) {

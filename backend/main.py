@@ -4705,6 +4705,7 @@ def build_card(row: dict) -> dict:
         "group_companies": groups,
         "categories": categories,
         "is_backfill": bool(row.get("is_backfill")),
+        "manual": (row.get("source_type") == "manual"),   # 사용자가 URL 로 직접 등록한 기사
         "swot": swot,
     }
 
@@ -4807,7 +4808,8 @@ def create_app(ctx: Context):
 
     @app.get("/api/articles")
     def api_articles(group: str = "", cat: str = "", press: str = "",
-                     period: str = "all", q: str = "", page: int = 1, size: int = 20):
+                     period: str = "all", q: str = "", page: int = 1, size: int = 20,
+                     sort: str = "recent"):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
@@ -4822,6 +4824,14 @@ def create_app(ctx: Context):
                        and (not pk or t["pk"] in pk)]
         else:
             matched = tagged
+        # 정렬 — 기본(recent)은 SQL 이 이미 발행일 최신순으로 준 순서를 그대로 쓴다.
+        # 'score' 는 사용자가 직접 등록한 기사·중요도 높은 기사를 위로 올린다.
+        if sort == "score":
+            matched = sorted(matched, key=lambda t: (
+                1 if t["row"].get("source_type") == "manual" else 0,
+                int(t["row"].get("importance_score") or 0),
+                t["row"].get("published_at") or "",
+            ), reverse=True)
         start = (page - 1) * size
         # 필터를 통과한 행만 세고, 화면에 보일 페이지 분량만 카드로 만든다.
         return JSONResponse({
@@ -5989,6 +5999,25 @@ def cmd_selftest() -> int:
     check("두 번째 호출은 대상 없음 → 0건", _tmp.purge_stale_embeddings(48), 0)
 
     shutil.rmtree(_dbdir, ignore_errors=True)
+
+    print("\n[11-3] build_card 직접 등록(manual) 플래그 + 중요도순 정렬")
+    check("manual 등록 → manual=True",
+          build_card({"source_type": "manual", "importance_score": 0})["manual"], True)
+    check("자동 수집 → manual=False",
+          build_card({"source_type": "naver_api", "importance_score": 0})["manual"], False)
+    check("source_type 없음 → manual=False", build_card({})["manual"], False)
+    # 중요도순 정렬 키 — 직접 등록 우선, 그다음 점수, 그다음 발행일
+    _sk = lambda r: (1 if r.get("source_type") == "manual" else 0,
+                     int(r.get("importance_score") or 0), r.get("published_at") or "")
+    _rows_sorted = sorted([
+        {"source_type": "rss", "importance_score": 90, "published_at": "2026-09-01"},
+        {"source_type": "manual", "importance_score": 10, "published_at": "2026-09-02"},
+        {"source_type": "rss", "importance_score": 95, "published_at": "2026-09-03"},
+    ], key=_sk, reverse=True)
+    check("중요도순: 직접 등록 기사가 최상단",
+          _rows_sorted[0]["source_type"], "manual")
+    check("중요도순: 나머지는 점수 내림차순",
+          [r["importance_score"] for r in _rows_sorted[1:]], [95, 90])
 
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")
