@@ -1150,9 +1150,11 @@ def register_api(app: Any, ctx: Any) -> None:
         urgent = [_item_view(r) for r in query_items(db, due=str(EA_DUE_SOON_DAYS))
                   if (r.get("status") or "") != "종료"]
         return JSONResponse({**db.stats(), "enabled": ea_enabled(),
-                             "sources_active": {"S1": bool(lawmaking_oc()),
-                                                "S2": bool(lawmaking_oc()),
-                                                "S3": bool(assembly_key())},
+                             # 크롤링이 있어 소스는 키 없이도 동작한다. rest 는 키가 있을 때만.
+                             "sources_active": {"S1": True, "S2": True, "S3": True},
+                             "sources_rest": {"S1": bool(lawmaking_oc()),
+                                              "S2": bool(lawmaking_oc()),
+                                              "S3": bool(assembly_key())},
                              "due_soon_days": EA_DUE_SOON_DAYS,
                              "urgent": urgent[:5], "urgent_total": len(urgent)})
 

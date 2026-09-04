@@ -337,11 +337,10 @@
   function loadStats() {
     return getJSON('/api/ea/stats').then(function (s) {
       renderAlert(s);
-      var off = [];
-      if (!s.sources_active.S3) { off.push('국회'); }
-      if (!s.sources_active.S1) { off.push('입법·행정예고'); }
       var msg = '수집 ' + s.total + '건 · 예고중 ' + s.open + '건 · 분석 ' + s.analyzed + '건';
-      if (off.length) { msg += ' · 미설정 소스: ' + off.join(', '); }
+      var rest = s.sources_rest || {};
+      var api = Object.keys(rest).filter(function (k) { return rest[k]; });
+      msg += api.length ? ' · API: ' + api.join(',') : ' · 수집: 크롤링';
       $('eaMeta').textContent = msg;
     }).catch(function () {
       $('eaMeta').textContent = '현황을 불러오지 못했습니다.';
