@@ -562,7 +562,7 @@ def detect_category(title: str, law_name: str = "") -> str:
 
 
 # ── 수집 1회 ────────────────────────────────────────────────────────
-def collect_once(db: EaDB) -> dict:
+def collect_once(ctx: Any, db: EaDB) -> dict:
     """스레드 C 가 하루 2회 부르는 진입점. 기존 수집 루프와 완전히 분리돼 있다."""
     started = time.monotonic()
     db.seed_agencies(SEED_AGENCIES)
@@ -588,6 +588,7 @@ def collect_once(db: EaDB) -> dict:
     kept = kept[:EA_MAX_PROCESS_PER_RUN]
 
     saved = 0
+    fresh: list[tuple[dict, str]] = []   # (저장된 행, API 본문) — 본문은 메모리에만 둔다
     for it in kept:
         row = {
             "id": new_id(),
@@ -608,10 +609,23 @@ def collect_once(db: EaDB) -> dict:
         }
         if db.insert_item(row):
             saved += 1
+            fresh.append((row, it.get("_body") or ""))
         gates.seen.add(it["url_source"])
 
+    # G6 — 분석은 전용 일일 상한 안에서만. 실패해도 수집 결과는 남는다.
+    # 방금 수집한 건은 API 본문이 메모리에 있으므로 그걸 그대로 넘긴다.
+    analyzed = 0
+    try:
+        budget = analysis_budget(ctx, db)
+        for row, body in fresh[:budget]:
+            if analyze_item(ctx, db, row, body):
+                analyzed += 1
+        analyzed += analyze_backlog(ctx, db)   # 이전 회차에 밀린 건 (HTML 재확보)
+    except Exception as exc:
+        log.warning("대외협력 분석 단계 실패(수집분은 유지): %s", exc)
+
     took = time.monotonic() - started
-    result = {**gates.counts, "saved": saved, "overflow": overflow,
+    result = {**gates.counts, "saved": saved, "analyzed": analyzed, "overflow": overflow,
               "sources": active_sources, "duration_sec": round(took, 1)}
     log.info("대외협력 수집: 소스 %s · 수집 %d → G2.5 통과 %d(무관 %d) · 저장 %d · %.1f초",
              ", ".join(active_sources) or "없음", result["fetched"], result["g2_5"],
@@ -634,10 +648,217 @@ def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
                     mark = f"{now.date().isoformat()}:{hour}"
                     if now.hour >= hour and mark not in done:
                         done.add(mark)
-                        collect_once(db)
+                        collect_once(ctx, db)
                         if len(done) > 8:
                             done = set(sorted(done)[-4:])
                         break
         except Exception as exc:
             log.exception("대외협력 수집 중 오류: %s", exc)
         stop.wait(300)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# LLM 영향 분석 (G6 — 과금 지점)
+#   · 뉴스 예산을 잠식하지 않도록 전용 일일 하위 상한을 둔다.
+#   · SWOT 은 만들지 않는다. 기존 SWOT 파이프라인과 무관하다.
+#   · 본문에서 읽어낼 근거가 없으면 impact_level='none' 이 정답이다.
+# ═════════════════════════════════════════════════════════════════════
+
+EA_MAX_BODY_CHARS = 6000
+EA_IMPACT_LEVELS = ("high", "medium", "low", "none")
+
+EA_SYSTEM = (
+    "당신은 포스코 그룹 대외협력(대관) 담당자를 돕는 한국어 정책 분석 어시스턴트다. "
+    "제공된 자료에 실제로 적힌 내용만 근거로 분석하고 JSON 으로만 답한다."
+)
+
+EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSON 하나로만 답하라.
+
+[요약]
+- summary: 3~5줄. 각 줄은 (1) 무엇이 바뀌는가 (2) 언제부터 적용되는가 (3) 누구에게 적용되는가
+- 자료에 없는 시행일·수치·적용 대상을 만들어내지 않는다
+- 자료가 제목뿐이어서 요약할 수 없으면 "자료 부족 — 원문 확인 필요" 한 줄만 쓴다
+
+[영향도]
+- impact_level: "high" | "medium" | "low" | "none" 중 하나
+- 포스코 그룹(철강·이차전지소재·건설/인프라·에너지) 사업에 미치는 영향 기준
+- impact_rationale: 판단 근거가 된 **원문의 조문·항목을 그대로 인용**한다
+- 인용할 근거를 자료에서 찾을 수 없으면 impact_level 은 반드시 "none",
+  impact_rationale 은 "원문에 근거 조문 없음"
+- 불분명하면 추정하지 말고 "low" + "추가 검토 필요"
+
+[관련 사업 영역]
+- affected_areas: 해당하는 것만 배열로. 없으면 빈 배열
+  ["철강", "이차전지소재", "건설·인프라", "에너지", "환경·안전", "통상", "노무"]
+
+[대응 제안]
+- suggested_action: 대관 담당자가 검토할 사항 1~2문장. 반드시 초안 성격으로 쓴다
+- 법률 자문으로 읽힐 표현("~해야 한다", "위법이다")을 쓰지 않는다
+- 당사에 유리한 방향으로 해석하지 않는다
+
+[출력 형식 — 이 구조를 정확히 지킨다]
+{{"summary":["문장1","문장2","문장3"],"impact_level":"none",
+"impact_rationale":"...","affected_areas":[],"suggested_action":"..."}}
+
+제목: {title}
+대상 법령: {law_name}
+소관: {agency}
+예고기간: {period}
+상태: {status}
+원문 발췌:
+{body}
+"""
+
+
+def fetch_detail_text(url: str) -> str:
+    """G3·G4 — 원문 페이지에서 텍스트만 뽑는다. 실패하면 빈 문자열(분석은 근거없음 처리)."""
+    if not url:
+        return ""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        with _http_lock:
+            resp = requests.get(url, timeout=EA_HTTP_TIMEOUT,
+                                headers={"User-Agent": "P-FM-NEWS/EA (+internal)"})
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding or resp.encoding
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
+            tag.decompose()
+        return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+    except Exception as exc:
+        log.debug("대외협력 원문 확보 실패 %s: %s", url, exc)
+        return ""
+
+
+def _ea_chat(ctx: Any, system: str, user: str) -> str:
+    """LangSmith 에 external_affairs 태그를 붙여 호출한다. 비용을 따로 보기 위해서다.
+
+    태그 전달이 안 되는 환경이면 태그 없이 그대로 호출한다(기능 우선).
+    """
+    client = ctx.llm.client
+    kwargs: dict[str, Any] = {
+        "model": ctx.cfg.llm_model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        resp = client.chat.completions.create(
+            **kwargs, langsmith_extra={"name": "ea_impact_analysis",
+                                       "tags": ["external_affairs"]})
+    except TypeError:
+        resp = client.chat.completions.create(**kwargs)
+    return resp.choices[0].message.content or ""
+
+
+def _parse_json_object(content: str) -> dict | None:
+    text = (content or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    for candidate in (text, text[text.find("{"):text.rfind("}") + 1] if "{" in text else ""):
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
+    """항목 1건 분석 후 ea_analyses 에 저장. 성공하면 True.
+
+    source_text: 수집 시 API 응답에 들어 있던 제안이유·주요내용. 이게 있으면
+    HTML 스크래핑보다 정확하므로 우선 쓴다(정부 사이트는 JS 렌더링이 많다).
+    본문은 저장하지 않는다 — 기존 §7-3 최소 보관 원칙을 그대로 따른다.
+    """
+    body = source_text.strip() or fetch_detail_text(
+        item.get("url_canonical") or item.get("url_source") or "")
+    period = " ~ ".join(x for x in (item.get("notice_start"), item.get("notice_end")) if x) or "미상"
+    agency = ""
+    if item.get("agency_id"):
+        row = db.one("select name from ea_agencies where id=?", (item["agency_id"],))
+        agency = (row or {}).get("name", "")
+
+    prompt = EA_PROMPT.format(
+        title=item.get("title") or "", law_name=item.get("law_name") or "(없음)",
+        agency=agency or "(미상)", period=period, status=item.get("status") or "(미상)",
+        body=(body[:EA_MAX_BODY_CHARS] or "(원문을 확보하지 못했습니다)"))
+
+    try:
+        parsed = _parse_json_object(_ea_chat(ctx, EA_SYSTEM, prompt))
+    except Exception as exc:
+        log.warning("대외협력 분석 실패 (%s): %s", (item.get("title") or "")[:30], exc)
+        return False
+    if not parsed:
+        log.warning("대외협력 분석 JSON 파싱 실패: %s", (item.get("title") or "")[:30])
+        return False
+
+    summary = parsed.get("summary")
+    if isinstance(summary, list):
+        summary = " ".join(str(s).strip() for s in summary if str(s).strip())
+    summary = str(summary or "").strip() or "자료 부족 — 원문 확인 필요"
+
+    level = str(parsed.get("impact_level") or "none").strip().lower()
+    if level not in EA_IMPACT_LEVELS:
+        level = "none"
+    rationale = str(parsed.get("impact_rationale") or "").strip()
+    # 근거 없이 높은 영향도를 주장하면 신뢰할 수 없다 — none 으로 내린다
+    if not rationale or rationale == "원문에 근거 조문 없음":
+        level, rationale = "none", rationale or "원문에 근거 조문 없음"
+
+    areas = parsed.get("affected_areas")
+    areas = [str(a).strip() for a in areas if str(a).strip()] if isinstance(areas, list) else []
+
+    db.save_analysis({
+        "id": new_id(),
+        "policy_item_id": item["id"],
+        "summary": summary,
+        "impact_level": level,
+        "impact_rationale": rationale,
+        "affected_areas": jdump(areas),
+        "suggested_action": str(parsed.get("suggested_action") or "").strip() or None,
+        "model": ctx.cfg.llm_model,
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "created_at": iso(now_utc()),
+    })
+    return True
+
+
+def analysis_budget(ctx: Any, db: EaDB) -> int:
+    """이번에 분석할 수 있는 건수. 전용 상한과 전체 상한 중 작은 쪽."""
+    ea_limit = EA_LLM_DAILY_LIMIT()
+    if ea_limit <= 0:
+        return 0
+    budget = max(0, ea_limit - db.analyses_today())
+    if budget == 0:
+        log.info("대외협력 LLM 일일 상한(%d) 도달 — 분석 건너뜀 (뉴스 분석은 계속)", ea_limit)
+        return 0
+    # 전체 일일 상한은 뉴스와 공유한다. 초과 시 대외협력만 멈춘다.
+    try:
+        budget = max(0, min(budget, ctx.cfg.llm_daily_limit - ctx.storage.llm_calls_today()))
+    except Exception as exc:
+        log.debug("전체 LLM 카운터 조회 실패(대외협력 상한만 적용): %s", exc)
+    if budget == 0:
+        log.info("전체 LLM 일일 상한 도달 — 대외협력 분석 건너뜀")
+    return budget
+
+
+def analyze_backlog(ctx: Any, db: EaDB) -> int:
+    """미분석 항목을 전용 상한 안에서 처리한다. 마감 임박(notice_end 오름차순) 우선."""
+    budget = analysis_budget(ctx, db)
+    if budget == 0:
+        return 0
+    ea_used = db.analyses_today()
+    ea_limit = EA_LLM_DAILY_LIMIT()
+    done = 0
+    for item in db.unanalyzed_items(budget):
+        if analyze_item(ctx, db, item):
+            done += 1
+    if done:
+        log.info("대외협력 분석 %d건 (전용 상한 %d 중 %d 사용)", done, ea_limit, ea_used + done)
+    return done
