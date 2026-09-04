@@ -879,8 +879,8 @@
           <thead><tr><th>엔드포인트</th><th class="num">응답</th><th>비고</th></tr></thead>
           <tbody>
             <tr><td><code>GET /</code></td><td class="num">5 ms</td><td>HTML+JS+CSS 조립 결과를 파일 수정시각으로 캐시</td></tr>
-            <tr><td><code>GET /api/articles</code></td><td class="num">36 ms</td><td>필터는 원본 행에서, 카드는 보이는 9건만 생성</td></tr>
-            <tr><td><code>GET /api/filters</code></td><td class="num">3 ms</td><td>20초 캐시</td></tr>
+            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 15초 캐시(웜, 미스 시 약 20 ms). 필터·페이지네이션은 매 요청 신선</td></tr>
+            <tr><td><code>GET /api/filters</code></td><td class="num">2 ms</td><td>20초 캐시 + <code>/api/articles</code>와 스캔·태그 캐시 공유</td></tr>
             <tr><td><code>GET /api/stats</code></td><td class="num">21 ms</td><td>집계 쿼리</td></tr>
             <tr><td><code>GET /api/weekly</code></td><td class="num">4 ms</td><td>저장된 최신 레포트 반환 (생성은 별도)</td></tr>
             <tr><td>수집 1회</td><td class="num">3–73 초</td><td>신규 건수에 비례. 목표 20초, 초과 시 경고 로그</td></tr>
@@ -891,7 +891,24 @@
         <p>
           목록 API는 원래 527 ms였다. <code>list_articles</code>가 <code>a.*</code>로
           <code>title_embedding</code>(행당 약 31 KB, 합계 5.8 MB)까지 읽고 있었는데, 카드에는
-          쓰이지도 않는 값이었다. 필요한 컬럼만 고르도록 바꿔 <b>15배</b> 빨라졌다.
+          쓰이지도 않는 값이었다. 필요한 컬럼만 고르도록 바꿔 <b>15배</b> 빨라졌다(36 ms).
+        </p>
+        <p>
+          그 뒤로도 <code>/api/articles</code>는 캐시가 없어 필터 클릭·페이지 이동마다
+          3,000행 조인 조회 + 행마다 <code>card_tags</code>(그룹사 규칙 매칭·정규화)를 다시 돌았다.
+          데이터는 수집 주기(기본 300초)에 한 번만 바뀌므로 <b>(기간, 검색어)별 스캔·태그 결과를
+          15초 캐시</b>하고, 필터링·페이지네이션·카드 생성만 매 요청 수행하도록 바꿨다.
+          <code>/api/filters</code>도 같은 캐시를 공유한다. 웜 응답 기준 다시 <b>7배</b>(36 → 5 ms).
+          수동 등록·draft 확정 시에는 캐시를 즉시 비운다.
+        </p>
+        <p>
+          SQLite 커넥션은 <code>synchronous=NORMAL</code>(WAL에서 앱 크래시에 안전) ·
+          <code>busy_timeout=5000</code> · <code>temp_store=MEMORY</code> ·
+          <code>cache_size≈16 MB</code>로 연다. 파이프라인이 문장마다 커밋하므로 fsync 부담이
+          컸는데, 커밋 지연과 WAL 비대화가 함께 줄었다.
+          그룹사 별칭·정책/시황/카테고리 키워드의 소문자 변환은 모듈 로드 시 1회만 하도록
+          사전계산했다(<code>detect_group_companies</code>·<code>score_article</code>·<code>detect_categories</code>가
+          호출마다 리스트를 다시 만들던 것을 제거 — 파이프라인·API 공통 경로).
         </p>
 
         <h3>검증</h3>

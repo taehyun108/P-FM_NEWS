@@ -567,6 +567,13 @@ class SqliteStorage(Storage):
             conn.row_factory = sqlite3.Row
             conn.execute("pragma journal_mode = wal")
             conn.execute("pragma foreign_keys = on")
+            # WAL 모드에서 synchronous=normal 은 앱 크래시에 안전하다(OS·전원 장애 시
+            # 마지막 트랜잭션만 위험). 파이프라인이 문장마다 커밋하므로 fsync 부담이 큰데,
+            # 이 설정으로 커밋 지연이 크게 줄고 WAL 비대화도 완화된다.
+            conn.execute("pragma synchronous = normal")
+            conn.execute("pragma busy_timeout = 5000")   # 쓰기 경합 시 즉시 실패 대신 5초 대기
+            conn.execute("pragma temp_store = memory")    # 정렬·임시 인덱스를 메모리에
+            conn.execute("pragma cache_size = -16000")    # 페이지 캐시 약 16MB (기본 2MB)
             self._local.conn = conn
         return conn
 
@@ -1698,6 +1705,12 @@ GROUP_COMPANIES: dict[str, list[str]] = {
     "포스코": ["포스코", "POSCO"],
 }
 
+# 별칭 소문자 사전계산 — detect_group_companies·score_article 이 호출마다
+# `[a.lower() for a in aliases]` 를 다시 만들던 것을 제거한다(파이프라인·API 공통 경로).
+_GROUP_ALIASES_LOWER: dict[str, list[str]] = {
+    canonical: [a.lower() for a in aliases] for canonical, aliases in GROUP_COMPANIES.items()
+}
+
 # 그룹사 판정에 쓰는 본문 길이. 기사의 '주체'는 제목과 리드 문단에 드러난다.
 #
 # 본문 전체를 스캔하면 말미의 스치는 언급이 주체를 가로챈다. 실제 사례:
@@ -1782,6 +1795,12 @@ POLICY_CATEGORY = "정부/정책"
 # 부차 주제라, 넣으면 필터가 변별력을 잃는다(통상·정책 모두 실제로 그랬다).
 TITLE_ANCHORED_CATEGORIES = (TRADE_CATEGORY, POLICY_CATEGORY)
 
+# 카테고리 규칙 소문자 사전계산 — detect_categories 가 호출마다 각 단어를
+# 소문자로 바꾸던 것을 제거한다(API 필터 스캔에서 행 수 × 카테고리 수만큼 반복됐다).
+_CATEGORY_RULES_LOWER: dict[str, list[str]] = {
+    name: [w.lower() for w in words] for name, words in CATEGORY_RULES.items()
+}
+
 # 중요도 가중치 (PRD F3.2)
 SCORE_FUTUREM_TITLE = 50
 SCORE_FUTUREM_BODY = 40
@@ -1793,6 +1812,9 @@ SCORE_MARKET_PENALTY = -15
 POLICY_KEYWORDS = ["정책", "규제", "법안", "수사", "사고", "화재", "제재", "과징금",
                    "국회", "산업부", "환경부", "보조금", "특화단지", "인허가", "감사", "고발"]
 MARKET_ONLY_KEYWORDS = ["목표주가", "투자의견", "코스피", "시황", "주가 전망", "증권가"]
+# score_article 이 호출마다 소문자 변환하던 것을 사전계산한다.
+_POLICY_KEYWORDS_LOWER = [w.lower() for w in POLICY_KEYWORDS]
+_MARKET_ONLY_KEYWORDS_LOWER = [w.lower() for w in MARKET_ONLY_KEYWORDS]
 
 
 # =====================================================================
@@ -2573,12 +2595,12 @@ def detect_group_companies(text: str) -> list[str]:
     """
     lowered = (text or "").lower()
     found: list[str] = []
-    for canonical, aliases in GROUP_COMPANIES.items():
+    for canonical, aliases in _GROUP_ALIASES_LOWER.items():
         if canonical == "포스코":
             continue  # 마지막에 따로 판단
-        if any(alias.lower() in lowered for alias in aliases):
+        if any(alias in lowered for alias in aliases):
             found.append(canonical)
-    if not found and any(alias.lower() in lowered for alias in GROUP_COMPANIES["포스코"]):
+    if not found and any(alias in lowered for alias in _GROUP_ALIASES_LOWER["포스코"]):
         found.append("포스코")
     return found
 
@@ -2603,12 +2625,11 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     """
     lowered = f"{title or ''}\n{summary or ''}".lower()
     title_l = (title or "").lower()
-    found = [name for name, words in CATEGORY_RULES.items()
-             if any(w.lower() in lowered for w in words)]
+    found = [name for name, words in _CATEGORY_RULES_LOWER.items()
+             if any(w in lowered for w in words)]
     # 제목 고정 카테고리(글로벌 통상환경·정부/정책): 핵심어가 제목에 없으면 부차 주제라 뺀다.
     for cat in TITLE_ANCHORED_CATEGORIES:
-        if cat in found and not _kw_hit_any(
-                title_l, [w.lower() for w in CATEGORY_RULES[cat]]):
+        if cat in found and not _kw_hit_any(title_l, _CATEGORY_RULES_LOWER[cat]):
             found.remove(cat)
     # '그룹사'는 별도의 그룹사 필터가 담당하므로 카테고리에는 넣지 않는다.
     return dedupe_chips(found)
@@ -2620,7 +2641,7 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
     full_l = f"{title} {body}".lower()
     score = 0
 
-    futurem = [a.lower() for a in GROUP_COMPANIES["포스코퓨처엠"]]
+    futurem = _GROUP_ALIASES_LOWER["포스코퓨처엠"]
     if any(a in title_l for a in futurem):
         score += SCORE_FUTUREM_TITLE
     elif any(a in full_l for a in futurem):
@@ -2629,13 +2650,13 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
     if any(g != "포스코퓨처엠" for g in group_companies):
         score += SCORE_GROUP
 
-    if any(w.lower() in full_l for w in POLICY_KEYWORDS):
+    if any(w in full_l for w in _POLICY_KEYWORDS_LOWER):
         score += SCORE_POLICY
     if press_tier <= 1:
         score += SCORE_MAJOR_PRESS
 
     # 단순 시황·주가 기사는 알림 피로를 유발하므로 감점한다.
-    if any(w.lower() in title_l for w in MARKET_ONLY_KEYWORDS):
+    if any(w in title_l for w in _MARKET_ONLY_KEYWORDS_LOWER):
         score += SCORE_MARKET_PENALTY
 
     return int(clamp(score, 0, 100))
@@ -4724,20 +4745,67 @@ def create_app(ctx: Context):
         since = now_utc() - timedelta(hours=hours) if hours else None
         return ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
 
+    # ── 스캔 + 태그 캐시 ────────────────────────────────────────────
+    # /api/articles·/api/filters 는 매 요청 list_articles(최대 3000행) 조인 조회 +
+    # 행마다 card_tags(그룹사 규칙 매칭·정규화)를 반복한다. 데이터는 수집 주기
+    # (기본 300초)에 한 번만 바뀌므로 (기간, 검색어) 조합을 짧게 캐시한다.
+    _scan_cache: dict[str, dict] = {}
+    _filters_cache: dict[str, Any] = {"at": 0.0, "data": None}
+    SCAN_TTL_SEC = 15
+    FILTERS_TTL_SEC = 20
+
+    def _scan_tagged(period: str, query: str) -> list[dict]:
+        """행 + 사전계산된 필터 태그(표시용 리스트 g/c/p, 정규화 키 gk/ck/pk)."""
+        key = f"{period}\x00{query}"
+        now = time.monotonic()
+        ent = _scan_cache.get(key)
+        if ent and now - ent["at"] < SCAN_TTL_SEC:
+            return ent["data"]
+        data = []
+        for row in _scan_rows(period, query):
+            g, c, pname = card_tags(row)
+            data.append({
+                "row": row, "g": g, "c": c, "p": pname,
+                "gk": {normalize_chip(x) for x in g},
+                "ck": {normalize_chip(x) for x in c},
+                "pk": normalize_chip(pname) if pname else "",
+            })
+        _scan_cache[key] = {"at": now, "data": data}
+        # 검색어별 항목이 무한히 쌓이지 않게 오래된 것부터 정리한다.
+        if len(_scan_cache) > 24:
+            for k in sorted(_scan_cache, key=lambda k: _scan_cache[k]["at"])[:12]:
+                _scan_cache.pop(k, None)
+        return data
+
+    def _bust_scan_cache() -> None:
+        """수동 등록·draft 확정 등 즉시 반영이 필요한 쓰기 후 캐시를 비운다."""
+        _scan_cache.clear()
+        _filters_cache.update(at=0.0, data=None)
+
     @app.get("/api/articles")
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
-        matched = apply_filters(_scan_rows(period, q),
-                                _split_multi(group), _split_multi(cat), _split_multi(press))
+        tagged = _scan_tagged(period, q)
+        gk = {normalize_chip(x) for x in _split_multi(group)}
+        ck = {normalize_chip(x) for x in _split_multi(cat)}
+        pk = {normalize_chip(x) for x in _split_multi(press)}
+        if gk or ck or pk:
+            # 같은 그룹 안 OR, 다른 그룹 사이 AND. (PRD F6.1a)
+            matched = [t for t in tagged
+                       if (not gk or (gk & t["gk"]))
+                       and (not ck or (ck & t["ck"]))
+                       and (not pk or t["pk"] in pk)]
+        else:
+            matched = tagged
         start = (page - 1) * size
         # 필터를 통과한 행만 세고, 화면에 보일 페이지 분량만 카드로 만든다.
         return JSONResponse({
             "total": len(matched),
             "page": page,
             "size": size,
-            "items": [build_card(r) for r in matched[start:start + size]],
+            "items": [build_card(t["row"]) for t in matched[start:start + size]],
         })
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
@@ -4749,11 +4817,6 @@ def create_app(ctx: Context):
         uniq = dedupe_chips(values)
         return [p for p in priority if p in uniq] + [v for v in uniq if v not in priority]
 
-    # 필터 목록은 전체 스캔이 필요한데 수집 주기(60초)에 한 번만 바뀐다.
-    # 페이지를 열 때마다 /api/articles 와 같은 스캔을 두 번 하지 않도록 짧게 캐시한다.
-    _filters_cache: dict[str, Any] = {"at": 0.0, "data": None}
-    FILTERS_TTL_SEC = 20
-
     @app.get("/api/filters")
     def api_filters():
         """현재 데이터에 실제로 존재하는 필터 값만 돌려준다."""
@@ -4764,12 +4827,11 @@ def create_app(ctx: Context):
         groups: list[str] = []
         cats: list[str] = []
         presses: list[str] = []
-        for row in _scan_rows("all", ""):
-            g, c, pname = card_tags(row)
-            groups += g
-            cats += c
-            if pname:
-                presses.append(pname)
+        for t in _scan_tagged("all", ""):   # /api/articles 와 스캔·태그 캐시를 공유한다
+            groups += t["g"]
+            cats += t["c"]
+            if t["p"]:
+                presses.append(t["p"])
         data = {
             "groups": _ordered(groups, GROUP_ORDER),
             "categories": _ordered(cats, CATEGORY_ORDER),
@@ -4990,6 +5052,7 @@ def create_app(ctx: Context):
             return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
         if row.get("status") == "draft":
             ctx.storage.update_article(article_id, {"status": "active"})
+            _bust_scan_cache()
         return JSONResponse({"ok": True})
 
     @app.post("/api/articles/{article_id}/discard")
