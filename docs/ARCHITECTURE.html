@@ -1073,24 +1073,27 @@
         <div class="tw"><table>
           <thead><tr><th>#</th><th>소스</th><th>방식</th><th>상태</th></tr></thead>
           <tbody>
-            <tr><td>S1</td><td>법제처 입법예고</td><td>공공데이터포털(LINK형)</td>
-                <td><b>비활성</b> — 활용가이드 문서 대기</td></tr>
-            <tr><td>S2</td><td>행정예고</td><td>동일 계열</td>
-                <td><b>비활성</b> — 동일</td></tr>
+            <tr><td>S1</td><td>입법예고</td>
+                <td><code>opinion.lawmaking.go.kr/rest/ogLmPp.xml</code></td>
+                <td>구현 완료 · <code>EA_LAWMAKING_OC</code> 대기</td></tr>
+            <tr><td>S2</td><td>행정예고</td>
+                <td><code>opinion.lawmaking.go.kr/rest/ptcpAdmPp.xml</code></td>
+                <td>구현 완료 · 동일 키</td></tr>
             <tr><td>S3</td><td>국회 발의법률안</td>
                 <td><code>open.assembly.go.kr</code> <code>nzmimeepazxkubdpn</code></td>
-                <td>스펙 확인 완료 · 키 대기</td></tr>
+                <td>구현 완료 · <code>EA_ASSEMBLY_KEY</code> 대기</td></tr>
             <tr><td>S4</td><td>정책 동향</td><td>기존 <code>정부/정책</code> 기사 재사용</td>
                 <td><b>동작 중</b></td></tr>
             <tr><td>S5</td><td>통상 환경</td><td>기존 <code>글로벌 통상환경</code> 기사 재사용</td>
                 <td><b>동작 중</b></td></tr>
           </tbody>
         </table></div>
-        <div class="note warn">
-          <b>추측 하드코딩을 하지 않았다.</b> 법제처 DRF 에 입법예고 target 이 있는지
-          <code>lsPop</code>·<code>lawmaking</code> 등 5종을 실제로 호출해 봤고 전부 빈 응답이었다
-          (대조군 <code>target=law</code> 는 정상 응답). 공식 활용가이드를 받기 전까지 S1·S2 는
-          비활성으로 두고, 크롤링으로 우회하지 않는다.
+        <div class="note">
+          <b>스펙은 검증된 오픈소스에서 가져왔다.</b> <code>github.com/hollobit/assembly-api-mcp</code>
+          의 <code>src/api/lawmaking.ts</code> 에서 엔드포인트·필드명을 확인하고,
+          <code>OC=test</code> 로 실호출해 응답 형식(<code>&lt;result&gt;&lt;retMsg&gt;</code>)까지
+          맞춰 두었다. 유효한 <code>OC</code> 키만 넣으면 다음 수집 주기(09·15시)에 동작한다.
+          XML 파싱은 표준 라이브러리(<code>xml.etree</code>)만 쓴다.
         </div>
 
         <h3>게이트와 분석</h3>
