@@ -504,27 +504,166 @@ def _unwrap_assembly(data: Any) -> tuple[list[dict], str]:
     return [], ""
 
 
-# ── S1 · S2 — 활용가이드 확보 전까지 비활성 ──────────────────────────
-def fetch_legislation_notices() -> list[dict]:
-    """S1 법제처 입법예고. data.go.kr 활용신청 후 받는 활용가이드에만 호출주소가 있다.
+# ── S1 · S2 · 국민참여입법센터 (opinion.lawmaking.go.kr/rest) ────────
+# 스펙 출처: github.com/hollobit/assembly-api-mcp (src/api/lawmaking.ts)
+#   입법예고 GET /rest/ogLmPp.xml   행정예고 GET /rest/ptcpAdmPp.xml
+#   인증: OC (opinion.lawmaking.go.kr 정보공개 서비스 신청 ID)
+#   www.lawmaking.go.kr 는 opinion. 으로 301 리다이렉트된다.
+#   OC=test 로 실호출 시 <result><retMsg>401</retMsg></result> — 형식 확인됨.
+LAWMAKING_BASE = "https://opinion.lawmaking.go.kr/rest"
+# 국민참여입법센터 웹 상세/의견제출 화면
+LAWMAKING_WEB = "https://opinion.lawmaking.go.kr/gcom"
 
-    open.law.go.kr 활용가이드 목록에 입법예고가 없고(확인함), DRF target 추측은
-    전부 빈 응답이었다(대조군 target=law 는 정상). 추측 하드코딩은 하지 않는다.
+
+def lawmaking_oc() -> str:
+    return _env("EA_LAWMAKING_OC")
+
+
+def _get_xml(url: str, params: dict) -> Any:
+    """XML 응답을 ElementTree 로 파싱한다. 표준 라이브러리만 쓴다."""
+    import requests
+    import xml.etree.ElementTree as ET
+    resp = requests.get(url, params=params, timeout=EA_HTTP_TIMEOUT,
+                        headers={"User-Agent": "P-FM-NEWS/EA (+internal)"})
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or resp.encoding
+    try:
+        return ET.fromstring(resp.text)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"XML 파싱 실패 (HTTP {resp.status_code}): {resp.text[:200]}") from exc
+
+
+def _xml_rows(root: Any, marker_tag: str) -> tuple[list[dict], str]:
+    """marker_tag(예: 'lsNm') 를 자식으로 가진 요소를 행으로 본다. 중첩 깊이 무관.
+
+    <result><retMsg>401</retMsg></result> 같은 오류 응답은 (빈 목록, 메시지) 로 돌려준다.
     """
-    if not data_go_kr_key():
-        log.info("S1 입법예고: EA_DATA_GO_KR_KEY 미설정 — 비활성")
-        return []
-    log.warning("S1 입법예고: 인증키는 있으나 활용가이드(호출주소·파라미터) 미확보 — 비활성 유지")
-    return []
+    ret = root.findtext(".//retMsg") or root.findtext(".//resultMsg") or ""
+    if ret and ret not in ("00", "success", "정상", "OK"):
+        return [], str(ret)
+    rows: list[dict] = []
+    for el in root.iter():
+        if el.find(marker_tag) is not None:
+            rows.append({c.tag: (c.text or "").strip() for c in el})
+    return rows, ""
 
 
-def fetch_admin_notices() -> list[dict]:
-    """S2 행정예고. S1 과 같은 계열이라 같은 가이드가 필요하다."""
-    if not data_go_kr_key():
-        log.info("S2 행정예고: EA_DATA_GO_KR_KEY 미설정 — 비활성")
+def _clean_law_name(name: str) -> str:
+    return re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*(입법예고|행정예고)?\s*$",
+                  "", (name or "").strip()) or (name or "").strip()
+
+
+def fetch_legislation_notices(max_rows: int = 400) -> list[dict]:
+    """S1 입법예고 (ogLmPp). 키(OC) 없으면 비활성. 크롤링 우회 안 함."""
+    oc = lawmaking_oc()
+    if not oc:
+        log.info("S1 입법예고: EA_LAWMAKING_OC 미설정 — 비활성")
         return []
-    log.warning("S2 행정예고: 활용가이드 미확보 — 비활성 유지")
-    return []
+    try:
+        with _http_lock:
+            root = _get_xml(f"{LAWMAKING_BASE}/ogLmPp.xml", {"OC": oc})
+    except Exception as exc:
+        log.warning("S1 입법예고 조회 실패: %s", exc)
+        return []
+    rows, msg = _xml_rows(root, "lsNm")
+    if msg:
+        log.warning("S1 입법예고 응답 코드: %s (OC 확인 필요)", msg)
+        return []
+
+    out: list[dict] = []
+    for r in rows[:max_rows]:
+        seq = r.get("ogLmPpSeq") or r.get("pntcNo") or ""
+        if not seq:
+            continue
+        detail = f"{LAWMAKING_WEB}/ogLmPp/{seq}"
+        out.append({
+            "url_source": detail,
+            "url_canonical": detail,
+            "item_type": "legislation",
+            "title": r.get("lsNm") or "",
+            "law_name": _clean_law_name(r.get("lsNm") or ""),
+            "agency": r.get("asndOfiNm") or "",
+            "notice_start": parse_date(r.get("stYd") or r.get("pntcDt")),
+            "notice_end": parse_date(r.get("edYd")),
+            "status": "예고중" if not r.get("edYd") or (d_day(parse_date(r.get("edYd"))) or 0) >= 0
+                      else "종료",
+            "opinion_url": detail,
+            "attachment_urls": [r["FileDownLink"]] if r.get("FileDownLink") else [],
+            "published_at": parse_date(r.get("pntcDt")),
+        })
+    log.info("S1 입법예고 수집 %d건", len(out))
+    return out
+
+
+def fetch_admin_notices(max_rows: int = 400) -> list[dict]:
+    """S2 행정예고 (ptcpAdmPp). 키(OC) 없으면 비활성."""
+    oc = lawmaking_oc()
+    if not oc:
+        log.info("S2 행정예고: EA_LAWMAKING_OC 미설정 — 비활성")
+        return []
+    try:
+        with _http_lock:
+            root = _get_xml(f"{LAWMAKING_BASE}/ptcpAdmPp.xml", {"OC": oc})
+    except Exception as exc:
+        log.warning("S2 행정예고 조회 실패: %s", exc)
+        return []
+    rows, msg = _xml_rows(root, "admRulNm")
+    if msg:
+        log.warning("S2 행정예고 응답 코드: %s (OC 확인 필요)", msg)
+        return []
+
+    out: list[dict] = []
+    for r in rows[:max_rows]:
+        seq = r.get("ogAdmPpSeq") or r.get("pntcNo") or ""
+        if not seq:
+            continue
+        detail = f"{LAWMAKING_WEB}/ptcpAdmPp/{seq}"
+        out.append({
+            "url_source": detail,
+            "url_canonical": detail,
+            "item_type": "admin_notice",
+            "title": r.get("admRulNm") or "",
+            "law_name": _clean_law_name(r.get("admRulNm") or ""),
+            "agency": r.get("asndOfiNm") or "",
+            "notice_start": parse_date(r.get("stYd") or r.get("pntcDt")),
+            "notice_end": parse_date(r.get("edYd")),
+            "status": "예고중" if not r.get("edYd") or (d_day(parse_date(r.get("edYd"))) or 0) >= 0
+                      else "종료",
+            "opinion_url": detail,
+            "attachment_urls": [r["FileDownLink"]] if r.get("FileDownLink") else [],
+            "published_at": parse_date(r.get("pntcDt")),
+        })
+    log.info("S2 행정예고 수집 %d건", len(out))
+    return out
+
+
+def fetch_lawmaking_detail(item: dict) -> str:
+    """G3·G4 — 입법·행정예고 상세를 REST 로 받아 제안이유·주요내용 텍스트를 뽑는다.
+
+    상세 REST:  입법예고 /rest/ogLmPp/{seq}//NN.xml    행정예고 /rest/ptcpAdmPp/{seq}.xml
+    필드명이 문서에 없어, 텍스트가 담긴 모든 요소를 이어 붙인다(LLM 이 정리한다).
+    실패하면 웹 상세 페이지(opinion_url) HTML 스크래핑으로 폴백한다.
+    """
+    oc = lawmaking_oc()
+    url = item.get("url_source") or ""
+    seq = url.rsplit("/", 1)[-1] if "/gcom/" in url else ""
+    if oc and seq.isdigit():
+        endpoint = (f"{LAWMAKING_BASE}/ogLmPp/{seq}//NN.xml"
+                    if item.get("item_type") == "legislation"
+                    else f"{LAWMAKING_BASE}/ptcpAdmPp/{seq}.xml")
+        try:
+            with _http_lock:
+                root = _get_xml(endpoint, {"OC": oc})
+            ret = root.findtext(".//retMsg") or ""
+            if not ret or ret in ("00", "success"):
+                parts = [t.strip() for t in root.itertext() if t and t.strip()
+                         and not t.strip().isdigit() and len(t.strip()) > 4]
+                text = chr(10).join(dict.fromkeys(parts))   # 순서 유지 중복 제거
+                if len(text) > 120:
+                    return text
+        except Exception as exc:
+            log.debug("입법예고 상세 REST 실패 %s: %s", seq, exc)
+    return fetch_detail_text(item.get("opinion_url") or item.get("url_canonical") or url)
 
 
 SOURCES = [
@@ -609,7 +748,11 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
         }
         if db.insert_item(row):
             saved += 1
-            fresh.append((row, it.get("_body") or ""))
+            # G3·G4 — 상세 본문 확보(HTTP). G2.5 통과분에만 발생한다.
+            body = it.get("_body") or ""
+            if not body and row["item_type"] in ("legislation", "admin_notice"):
+                body = fetch_lawmaking_detail(row)
+            fresh.append((row, body))
         gates.seen.add(it["url_source"])
 
     # G6 — 분석은 전용 일일 상한 안에서만. 실패해도 수집 결과는 남는다.
@@ -775,8 +918,11 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     HTML 스크래핑보다 정확하므로 우선 쓴다(정부 사이트는 JS 렌더링이 많다).
     본문은 저장하지 않는다 — 기존 §7-3 최소 보관 원칙을 그대로 따른다.
     """
-    body = source_text.strip() or fetch_detail_text(
-        item.get("url_canonical") or item.get("url_source") or "")
+    body = source_text.strip()
+    if not body:
+        body = (fetch_lawmaking_detail(item)
+                if item.get("item_type") in ("legislation", "admin_notice")
+                else fetch_detail_text(item.get("url_canonical") or item.get("url_source") or ""))
     period = " ~ ".join(x for x in (item.get("notice_start"), item.get("notice_end")) if x) or "미상"
     agency = ""
     if item.get("agency_id"):
@@ -955,8 +1101,8 @@ def register_api(app: Any, ctx: Any) -> None:
         urgent = [_item_view(r) for r in query_items(db, due=str(EA_DUE_SOON_DAYS))
                   if (r.get("status") or "") != "종료"]
         return JSONResponse({**db.stats(), "enabled": ea_enabled(),
-                             "sources_active": {"S1": bool(data_go_kr_key()),
-                                                "S2": bool(data_go_kr_key()),
+                             "sources_active": {"S1": bool(lawmaking_oc()),
+                                                "S2": bool(lawmaking_oc()),
                                                 "S3": bool(assembly_key())},
                              "due_soon_days": EA_DUE_SOON_DAYS,
                              "urgent": urgent[:5], "urgent_total": len(urgent)})
