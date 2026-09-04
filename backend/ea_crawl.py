@@ -82,12 +82,15 @@ def _clean(s: str) -> str:
 
 
 _STATUS_PREFIX = re.compile(r"^(진행|마감|예정|종료|접수중|D-\d+)\s+")
+# 목록에서 잘려 들어온 꼬리('… 행', '… 입법예', '… 행정예고')를 정리
+_STATUS_TAIL = re.compile(r"\s*(입법예고|행정예고|입법예|행정예|입법|행정|입|행)\s*$")
 
 
 def _strip_status(title: str) -> str:
     t = _clean(title)
     for _ in range(2):
         t = _STATUS_PREFIX.sub("", t)
+    t = _STATUS_TAIL.sub("", t).strip()
     return t
 
 
