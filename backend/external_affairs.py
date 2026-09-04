@@ -863,7 +863,7 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
 
 
 # ── 스레드 C — 하루 2회 ─────────────────────────────────────────────
-EA_MIN_GAP_HOURS = 4   # 마지막 수집 후 이 시간 안에는 재수집하지 않는다(재시작 폭주 방지)
+EA_MIN_GAP_HOURS = 1   # 재시작 폭주 방지 백스톱. 같은 시각 중복은 아래 slot_missed 가 막는다
 
 
 def _last_collect_at(db: EaDB) -> datetime | None:
