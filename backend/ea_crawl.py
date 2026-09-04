@@ -129,7 +129,7 @@ def _rows_from_table(soup, link_pat: re.Pattern) -> list[tuple[str, str, list[st
 _OGLMPP_LINK = re.compile(r"/gcom/ogLmPp/(\d+)")
 
 
-def crawl_legislation_notices(max_pages: int = 3) -> list[dict]:
+def crawl_legislation_notices(max_pages: int = 2) -> list[dict]:
     items: list[dict] = []
     for page in range(1, max_pages + 1):
         try:
@@ -167,7 +167,7 @@ def crawl_legislation_notices(max_pages: int = 3) -> list[dict]:
 _ADMPP_LINK = re.compile(r"/gcom/admpp/(\d+)")
 
 
-def crawl_admin_notices(max_pages: int = 3) -> list[dict]:
+def crawl_admin_notices(max_pages: int = 2) -> list[dict]:
     items: list[dict] = []
     for page in range(1, max_pages + 1):
         try:
@@ -205,7 +205,7 @@ def crawl_admin_notices(max_pages: int = 3) -> list[dict]:
 _NAPAL_LINK = re.compile(r"lgsltPaId=([A-Za-z0-9_]+)")
 
 
-def crawl_assembly_notices(max_pages: int = 3) -> list[dict]:
+def crawl_assembly_notices(max_pages: int = 2) -> list[dict]:
     items: list[dict] = []
     for page in range(1, max_pages + 1):
         try:

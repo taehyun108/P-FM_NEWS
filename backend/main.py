@@ -6117,6 +6117,7 @@ USAGE = """사용법: python backend/main.py <명령>
   notify     대기 중인 텔레그램 알림만 발송
   chatid     텔레그램 chat_id 확인 (봇에게 메시지를 한 번 보낸 뒤 실행)
   sendtest   텔레그램 시험 메시지 1건 발송 (연결 확인용)
+  ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
   weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
   selftest   내장 검증 (DB · 네트워크 · API 키 불필요)
 """
@@ -6176,6 +6177,10 @@ def main(argv: Sequence[str]) -> int:
             log.info("주간 레포트 생성·저장 완료 (id=%s, 발송 안 함)", rep["id"])
         elif rep.get("send_error"):
             raise SystemExit(f"발송 실패: {rep['send_error']}")
+    elif command == "ea-collect":
+        if ea_mod is None:
+            raise SystemExit("external_affairs 모듈을 불러오지 못했습니다.")
+        ea_mod.collect_once(ctx, ea_mod.EaDB(ctx.cfg.sqlite_path))
     elif command == "serve":
         cmd_serve(ctx, with_pipeline=False)
     elif command == "run":
