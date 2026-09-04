@@ -42,6 +42,11 @@ from difflib import SequenceMatcher
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
+    import external_affairs as ea_mod
+except Exception:   # pragma: no cover
+    ea_mod = None
+
 # ─────────────────────────────────────────────────────────────────────
 # 로깅 — 키 값은 절대 출력하지 않는다. (env-secret-guard §1-5)
 #
@@ -5573,6 +5578,8 @@ def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
         log.info("수집 루프 시작 (%d초 주기) · 시세 갱신 %d초", ctx.cfg.poll_interval_sec, QUOTE_REFRESH_SEC)
         if ctx.cfg.telegram_enabled:
             threads.append(threading.Thread(target=telegram_bot_loop, args=(ctx, stop), daemon=True))
+        if ea_mod is not None and ea_mod.ea_enabled():
+            threads.append(threading.Thread(target=ea_mod.scheduler_loop, args=(ctx, stop), daemon=True))
     for t in threads:
         t.start()
     log.info("서버: http://%s:%d", ctx.cfg.api_host, ctx.cfg.api_port)

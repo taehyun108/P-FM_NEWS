@@ -1,0 +1,643 @@
+"""대외협력(대관) 모듈 — 입법예고·행정예고·국회 의안.
+
+설계 원칙 (기존 파이프라인 무영향이 1순위)
+  · main.py 를 import 하지 않는다. 순환 참조를 만들지 않기 위해서다.
+    공통 유틸(now_utc·iso·new_id·jload)은 3~5줄짜리라 여기에 복제한다 —
+    기존 파일을 고치는 위험보다 코드 중복이 낫다.
+  · DB 는 스레드 전용 커넥션을 새로 연다. Storage 클래스에 손대지 않는다.
+  · 기존 수집 루프(300초)에 얹지 않는다. 독립 스레드 C 가 하루 2회만 돈다.
+  · 텔레그램·notifications 는 읽지도 쓰지도 않는다. category 값만 채워 둔다.
+  · 기존 url_ledger 는 읽기만 하고, 쓰기는 ea_url_ledger 에만 한다.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable, Sequence
+
+log = logging.getLogger("pfm.ea")
+
+# ── 설정 (.env) ──────────────────────────────────────────────────────
+KST = timezone(timedelta(hours=9))
+
+
+def _env(name: str, default: str = "") -> str:
+    """main.load_dotenv_file 이 이미 os.environ 에 넣어 둔 값을 읽는다."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    # 인라인 주석 제거 (기존 .env 표기 규약과 동일)
+    text = raw.strip()
+    if text and not text.startswith(('"', "'")):
+        text = text.split("#", 1)[0].strip()
+    return text or default
+
+
+def _env_int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    try:
+        val = int(_env(name, str(default)))
+    except ValueError:
+        return default
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
+
+def _env_on(name: str, default: bool) -> bool:
+    raw = _env(name, "").lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# 수집 시각(서버 로컬시간 기준 시). 기본 09시·15시 — 하루 2회.
+def schedule_hours() -> list[int]:
+    raw = _env("EA_SCHEDULE_HOURS", "9,15")
+    out: list[int] = []
+    for part in raw.replace(" ", "").split(","):
+        if part.isdigit() and 0 <= int(part) <= 23:
+            out.append(int(part))
+    return sorted(set(out)) or [9, 15]
+
+
+def ea_enabled() -> bool:
+    return _env_on("EA_ENABLED", True)
+
+
+def assembly_key() -> str:
+    return _env("EA_ASSEMBLY_KEY")
+
+
+def data_go_kr_key() -> str:
+    return _env("EA_DATA_GO_KR_KEY")
+
+
+EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 50, 0)   # noqa: E731
+ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E731
+
+# 1회 수집에서 상세 조회(HTTP)·분석까지 갈 최대 건수. 기존 파이프라인의
+# MAX_PROCESS_PER_RUN(12) 과 같은 취지 — 실행 시간을 예측 가능하게 묶는다.
+EA_MAX_PROCESS_PER_RUN = 30
+EA_HTTP_TIMEOUT = 20
+EA_SEEN_CACHE_HOURS = 72
+
+
+# ── 복제 유틸 (main.py 와 동일 동작. import 하지 않으려고 복제했다) ──
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def new_id() -> str:
+    return str(uuid.uuid4())
+
+
+def jdump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def jload(value: Any, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def parse_date(value: Any) -> str | None:
+    """'2026-09-04' · '20260904' · '2026.09.04' 를 ISO date 문자열로."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace(".", "-").replace("/", "-")
+    m = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})", text)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except ValueError:
+        return None
+
+
+def d_day(notice_end: str | None, today: date | None = None) -> int | None:
+    """마감까지 남은 일수. 지났으면 음수, 마감일 없으면 None."""
+    parsed = parse_date(notice_end)
+    if not parsed:
+        return None
+    return (date.fromisoformat(parsed) - (today or datetime.now(KST).date())).days
+
+
+# ── 전용 DB 접근 ─────────────────────────────────────────────────────
+# Storage 클래스에 메서드를 추가하지 않는다. 여기서 스레드 전용 커넥션을
+# 새로 열고 ea_* 테이블만 만진다. 기존 테이블은 읽기 전용으로만 조회한다.
+class EaDB:
+    def __init__(self, sqlite_path: str) -> None:
+        self.path = sqlite_path
+        self._local = threading.local()
+
+    def conn(self) -> sqlite3.Connection:
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = sqlite3.connect(self.path, timeout=30.0)
+            c.row_factory = sqlite3.Row
+            c.execute("pragma journal_mode = wal")
+            c.execute("pragma busy_timeout = 5000")
+            c.execute("pragma foreign_keys = on")
+            self._local.conn = c
+        return c
+
+    def rows(self, sql: str, args: Sequence[Any] = ()) -> list[dict]:
+        return [dict(r) for r in self.conn().execute(sql, tuple(args)).fetchall()]
+
+    def one(self, sql: str, args: Sequence[Any] = ()) -> dict | None:
+        got = self.rows(sql, args)
+        return got[0] if got else None
+
+    def exec(self, sql: str, args: Sequence[Any] = ()) -> sqlite3.Cursor:
+        c = self.conn()
+        cur = c.execute(sql, tuple(args))
+        c.commit()
+        return cur
+
+    # ── 부처 ──
+    def seed_agencies(self, rows: Iterable[tuple[str, str]]) -> int:
+        n = 0
+        for name, short in rows:
+            cur = self.exec(
+                "insert or ignore into ea_agencies (id, name, short_name, enabled)"
+                " values (?,?,?,1)", (new_id(), name, short))
+            n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return n
+
+    def agencies(self, enabled_only: bool = True) -> list[dict]:
+        sql = "select * from ea_agencies"
+        if enabled_only:
+            sql += " where enabled=1"
+        return self.rows(sql + " order by name")
+
+    def agency_id_by_name(self, name: str) -> str | None:
+        if not name:
+            return None
+        row = self.one("select id from ea_agencies where name=? or short_name=?", (name, name))
+        return row["id"] if row else None
+
+    # ── 게이트용 조회 ──
+    def known_url_sources(self, candidates: Sequence[str]) -> set[str]:
+        """G2 — ea_policy_items + ea_url_ledger 를 한 번에 대조한다."""
+        if not candidates:
+            return set()
+        found: set[str] = set()
+        chunk = 400
+        for i in range(0, len(candidates), chunk):
+            part = list(candidates[i:i + chunk])
+            marks = ",".join("?" * len(part))
+            for sql in (f"select url_source from ea_policy_items where url_source in ({marks})",
+                        f"select url_source from ea_url_ledger where url_source in ({marks})"):
+                found.update(r["url_source"] for r in self.rows(sql, part))
+        return found
+
+    def recent_url_sources(self, hours: int) -> set[str]:
+        """G1 캐시 로드 — 최근 수집분. 성능 계층일 뿐 정확성에 관여하지 않는다."""
+        cutoff = iso(now_utc() - timedelta(hours=hours))
+        return {r["url_source"] for r in self.rows(
+            "select url_source from ea_policy_items where collected_at >= ?", (cutoff,))}
+
+    def upsert_ledger(self, url_source: str, reason: str) -> None:
+        self.exec(
+            "insert into ea_url_ledger (url_source, reason, first_seen, hit_count)"
+            " values (?,?,?,1)"
+            " on conflict(url_source) do update set hit_count = hit_count + 1",
+            (url_source, reason, iso(now_utc())))
+
+    # ── 항목 ──
+    def insert_item(self, row: dict) -> bool:
+        cols = ",".join(row)
+        marks = ",".join("?" * len(row))
+        try:
+            self.exec(f"insert into ea_policy_items ({cols}) values ({marks})", list(row.values()))
+            return True
+        except sqlite3.IntegrityError:
+            return False   # url_source UNIQUE — 경합 시 최종 방어선
+
+    def unanalyzed_items(self, limit: int) -> list[dict]:
+        return self.rows(
+            "select p.* from ea_policy_items p"
+            " left join ea_analyses a on a.policy_item_id = p.id"
+            " where a.id is null"
+            " order by (p.notice_end is null), p.notice_end asc limit ?", (limit,))
+
+    def save_analysis(self, row: dict) -> None:
+        cols = ",".join(row)
+        marks = ",".join("?" * len(row))
+        self.exec(f"insert into ea_analyses ({cols}) values ({marks})", list(row.values()))
+
+    def analyses_today(self) -> int:
+        return int((self.one(
+            "select count(*) as n from ea_analyses where created_at >= ?",
+            (iso(now_utc().replace(hour=0, minute=0, second=0, microsecond=0)),)) or {"n": 0})["n"])
+
+    def stats(self) -> dict:
+        def n(sql: str, args: Sequence[Any] = ()) -> int:
+            return int((self.one(sql, args) or {"n": 0})["n"])
+        today = datetime.now(KST).date().isoformat()
+        return {
+            "total": n("select count(*) as n from ea_policy_items"),
+            "open": n("select count(*) as n from ea_policy_items"
+                      " where notice_end is not null and notice_end >= ?", (today,)),
+            "analyzed": n("select count(*) as n from ea_analyses"),
+            "excluded": n("select count(*) as n from ea_url_ledger"),
+        }
+
+
+# ── 관심 부처 시드 ───────────────────────────────────────────────────
+# 정부조직 개편으로 이름이 자주 바뀐다. 옛 이름도 함께 넣어 과거 공고를 놓치지 않는다.
+SEED_AGENCIES: list[tuple[str, str]] = [
+    ("산업통상자원부", "산업부"),
+    ("기후에너지환경부", "기후부"),
+    ("환경부", "환경부"),
+    ("기획재정부", "기재부"),
+    ("기획예산처", "기예처"),
+    ("국토교통부", "국토부"),
+    ("고용노동부", "고용부"),
+    ("과학기술정보통신부", "과기정통부"),
+    ("중소벤처기업부", "중기부"),
+    ("공정거래위원회", "공정위"),
+    ("금융위원회", "금융위"),
+    ("원자력안전위원회", "원안위"),
+    ("관세청", "관세청"),
+    ("조달청", "조달청"),
+    ("특허청", "특허청"),
+    ("국회", "국회"),
+    ("법제처", "법제처"),
+    ("국무조정실", "국조실"),
+]
+
+# ── G2.5 관련성 키워드 ───────────────────────────────────────────────
+# 법제처 입법예고에는 전 부처의 모든 법령이 올라온다. 대부분 무관하다.
+# 여기 걸리지 않으면 HTTP 를 쓰기 전에 ea_url_ledger 로 보낸다.
+EA_RELEVANCE_KW: list[str] = [
+    # 이차전지·소재
+    "이차전지", "2차전지", "배터리", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
+    "흑연", "전해액", "분리막", "핵심광물", "희토류", "소재부품장비", "소부장",
+    # 철강·산업
+    "철강", "제철", "제련", "합금", "산업단지", "특화단지", "국가첨단전략산업",
+    "탄소중립", "온실가스", "배출권", "수소", "재생에너지", "전기요금", "전력수급",
+    # 화학·환경·안전
+    "화학물질", "화평법", "화관법", "유해화학", "폐기물", "자원순환", "대기환경",
+    "물환경", "토양환경", "산업안전", "중대재해", "위험물",
+    # 통상·무역
+    "통상", "관세", "수출입", "무역구제", "반덤핑", "상계관세", "원산지", "FTA",
+    "공급망", "수출통제", "전략물자",
+    # 입지·건설 (포스코이앤씨)
+    "건설산업", "주택법", "도시정비", "건축법", "국토계획",
+]
+
+
+def _keyword_sets_terms(db: EaDB) -> list[str]:
+    """기존 keyword_sets(산업·정책·통상)를 읽기 전용으로 빌려 쓴다. 쓰기는 하지 않는다."""
+    try:
+        return [r["keyword"] for r in db.rows(
+            "select keyword from keyword_sets where enabled=1 and category in ('산업','정책','통상')")]
+    except sqlite3.Error as exc:
+        log.debug("keyword_sets 조회 실패(무시): %s", exc)
+        return []
+
+
+def is_relevant(title: str, law_name: str = "", agency: str = "",
+                agency_names: set[str] | None = None, extra_terms: Sequence[str] = ()) -> bool:
+    """G2.5 — 관심 부처이거나 관련 키워드가 걸리면 통과."""
+    if agency_names and agency and any(a in agency for a in agency_names):
+        return True
+    probe = f"{title or ''}\n{law_name or ''}"
+    for kw in EA_RELEVANCE_KW:
+        if kw in probe:
+            return True
+    for kw in extra_terms:
+        if kw and kw in probe:
+            return True
+    return False
+
+
+# ── 게이트 G0 ~ G2.5 ────────────────────────────────────────────────
+class Gates:
+    """기존 파이프라인과 같은 순서로 거른다. HTTP·LLM 은 G2.5 통과분에만 쓴다."""
+
+    def __init__(self, db: EaDB) -> None:
+        self.db = db
+        self.seen: set[str] = db.recent_url_sources(EA_SEEN_CACHE_HOURS)
+        self.agency_names = {a["name"] for a in db.agencies()} | {
+            a["short_name"] for a in db.agencies() if a.get("short_name")}
+        self.extra_terms = _keyword_sets_terms(db)
+        self.counts = {"fetched": 0, "g0": 0, "g1": 0, "g2": 0, "g2_5": 0, "off_topic": 0}
+
+    def filter(self, items: list[dict]) -> list[dict]:
+        """items = [{url_source, title, law_name, agency, ...}] — 비용 0 구간 전체."""
+        self.counts["fetched"] += len(items)
+
+        # G0 실행 내 중복 URL
+        seen_run: set[str] = set()
+        g0: list[dict] = []
+        for it in items:
+            u = it.get("url_source") or ""
+            if not u or u in seen_run:
+                continue
+            seen_run.add(u)
+            g0.append(it)
+        self.counts["g0"] += len(g0)
+
+        # G1 메모리 seen-cache
+        g1 = [it for it in g0 if it["url_source"] not in self.seen]
+        self.counts["g1"] += len(g1)
+
+        # G2 DB 전체기간 대조 (ea_policy_items + ea_url_ledger)
+        known = self.db.known_url_sources([it["url_source"] for it in g1])
+        g2 = [it for it in g1 if it["url_source"] not in known]
+        self.counts["g2"] += len(g2)
+
+        # G2.5 관련성 — 걸리지 않으면 제외 원장에 기록해 다음 주기에 HTTP 를 안 쓴다
+        kept: list[dict] = []
+        for it in g2:
+            if is_relevant(it.get("title", ""), it.get("law_name", ""), it.get("agency", ""),
+                           self.agency_names, self.extra_terms):
+                kept.append(it)
+            else:
+                self.db.upsert_ledger(it["url_source"], "off_topic")
+                self.seen.add(it["url_source"])
+                self.counts["off_topic"] += 1
+        self.counts["g2_5"] += len(kept)
+        return kept
+
+
+# ── HTTP (기존 HttpClient·카운터 락에 개입하지 않는다) ────────────────
+_http_lock = threading.Lock()   # 대외협력 전용. 기존 락 3종과 무관하다.
+
+
+def _get_json(url: str, params: dict) -> Any:
+    import requests
+    resp = requests.get(url, params=params, timeout=EA_HTTP_TIMEOUT,
+                        headers={"User-Agent": "P-FM-NEWS/EA (+internal)"})
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except ValueError:
+        raise RuntimeError(f"JSON 아님 (HTTP {resp.status_code}): {resp.text[:200]}")
+
+
+# ── S3 · 열린국회정보 — 국회의원 발의법률안 ──────────────────────────
+ASSEMBLY_URL = "https://open.assembly.go.kr/portal/openapi/nzmimeepazxkubdpn"
+
+# 실제 응답 필드명이 문서(로그인 필요)에만 있어, 흔히 쓰이는 이름을 후보로 두고
+# 첫 성공 응답의 키를 로그로 남긴다. 확인되면 후보를 정리한다.
+_BILL_FIELDS = {
+    "bill_id":   ("BILL_ID", "billId"),
+    "bill_no":   ("BILL_NO", "billNo"),
+    "title":     ("BILL_NAME", "BILL_NM", "billName"),
+    "proposer":  ("PROPOSER", "RST_PROPOSER", "proposer"),
+    "propose_dt": ("PROPOSE_DT", "PROPOSE_DATE", "proposeDt"),
+    "committee": ("COMMITTEE", "COMMITTEE_NM", "committee"),
+    "result":    ("PROC_RESULT", "PROC_RESULT_CD", "procResult"),
+    "link":      ("DETAIL_LINK", "LINK_URL", "detailLink"),
+}
+_logged_bill_keys = False
+
+
+def _pick(row: dict, names: Sequence[str]) -> str:
+    for n in names:
+        v = row.get(n)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def fetch_assembly_bills(page_size: int = 100, max_pages: int = 3) -> list[dict]:
+    """S3 수집. 키가 없으면 빈 목록(비활성). 크롤링 우회는 하지 않는다."""
+    global _logged_bill_keys
+    key = assembly_key()
+    if not key:
+        log.info("S3 국회 의안: EA_ASSEMBLY_KEY 미설정 — 비활성")
+        return []
+
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        params = {"KEY": key, "Type": "json", "pIndex": page,
+                  "pSize": page_size, "AGE": ASSEMBLY_AGE()}
+        try:
+            with _http_lock:
+                data = _get_json(ASSEMBLY_URL, params)
+        except Exception as exc:
+            log.warning("S3 국회 의안 조회 실패 (page=%d): %s", page, exc)
+            break
+
+        rows, message = _unwrap_assembly(data)
+        if message:
+            log.warning("S3 응답 메시지: %s", message)
+        if not rows:
+            break
+        if not _logged_bill_keys:
+            log.info("S3 응답 필드명(첫 행): %s", sorted(rows[0].keys()))
+            _logged_bill_keys = True
+
+        for r in rows:
+            link = _pick(r, _BILL_FIELDS["link"])
+            bill_id = _pick(r, _BILL_FIELDS["bill_id"])
+            if not link and bill_id:
+                link = ("https://likms.assembly.go.kr/bill/billDetail.do?billId=" + bill_id)
+            if not link:
+                continue
+            out.append({
+                "url_source": link,
+                "url_canonical": link,
+                "item_type": "bill",
+                "title": _pick(r, _BILL_FIELDS["title"]),
+                "law_name": "",
+                "agency": _pick(r, _BILL_FIELDS["committee"]) or "국회",
+                "notice_start": parse_date(_pick(r, _BILL_FIELDS["propose_dt"])),
+                "notice_end": None,           # 의안은 의견제출 마감일 개념이 없다
+                "status": _pick(r, _BILL_FIELDS["result"]) or "국회심의",
+                "opinion_url": "",
+                "attachment_urls": [],
+                "published_at": parse_date(_pick(r, _BILL_FIELDS["propose_dt"])),
+                "_proposer": _pick(r, _BILL_FIELDS["proposer"]),
+            })
+        if len(rows) < page_size:
+            break
+    log.info("S3 국회 의안 수집 %d건", len(out))
+    return out
+
+
+def _unwrap_assembly(data: Any) -> tuple[list[dict], str]:
+    """열린국회정보 공통 응답 껍질을 벗긴다. {서비스명: [{head:[...]}, {row:[...]}]}"""
+    if isinstance(data, dict):
+        if "RESULT" in data:      # 오류 응답
+            res = data.get("RESULT") or {}
+            return [], f'{res.get("CODE", "")} {res.get("MESSAGE", "")}'.strip()
+        for value in data.values():
+            if isinstance(value, list):
+                rows: list[dict] = []
+                message = ""
+                for chunk in value:
+                    if not isinstance(chunk, dict):
+                        continue
+                    if isinstance(chunk.get("row"), list):
+                        rows.extend(x for x in chunk["row"] if isinstance(x, dict))
+                    for hd in chunk.get("head", []) or []:
+                        res = (hd or {}).get("RESULT") if isinstance(hd, dict) else None
+                        if res and str(res.get("CODE", "")).startswith(("INFO-2", "ERROR")):
+                            message = f'{res.get("CODE")} {res.get("MESSAGE", "")}'
+                return rows, message
+    return [], ""
+
+
+# ── S1 · S2 — 활용가이드 확보 전까지 비활성 ──────────────────────────
+def fetch_legislation_notices() -> list[dict]:
+    """S1 법제처 입법예고. data.go.kr 활용신청 후 받는 활용가이드에만 호출주소가 있다.
+
+    open.law.go.kr 활용가이드 목록에 입법예고가 없고(확인함), DRF target 추측은
+    전부 빈 응답이었다(대조군 target=law 는 정상). 추측 하드코딩은 하지 않는다.
+    """
+    if not data_go_kr_key():
+        log.info("S1 입법예고: EA_DATA_GO_KR_KEY 미설정 — 비활성")
+        return []
+    log.warning("S1 입법예고: 인증키는 있으나 활용가이드(호출주소·파라미터) 미확보 — 비활성 유지")
+    return []
+
+
+def fetch_admin_notices() -> list[dict]:
+    """S2 행정예고. S1 과 같은 계열이라 같은 가이드가 필요하다."""
+    if not data_go_kr_key():
+        log.info("S2 행정예고: EA_DATA_GO_KR_KEY 미설정 — 비활성")
+        return []
+    log.warning("S2 행정예고: 활용가이드 미확보 — 비활성 유지")
+    return []
+
+
+SOURCES = [
+    ("S1 입법예고", fetch_legislation_notices),
+    ("S2 행정예고", fetch_admin_notices),
+    ("S3 국회 의안", fetch_assembly_bills),
+]
+
+
+# ── 분류 (category) ─────────────────────────────────────────────────
+# 값만 채워 둔다. 선택 발송 기능은 이번 범위가 아니다 — 나중에 마스터 패널의
+# '정책브리핑 알림'·'글로벌 통상환경 알림' 토글과 같은 방식으로 붙이면 된다.
+EA_CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    ("이차전지·소재", ["이차전지", "2차전지", "배터리", "양극재", "음극재", "전구체",
+                        "리튬", "니켈", "코발트", "흑연", "전해액", "분리막",
+                        "핵심광물", "희토류", "소부장", "소재부품장비"]),
+    ("통상",          ["통상", "관세", "수출입", "무역구제", "반덤핑", "상계관세",
+                        "원산지", "FTA", "공급망", "수출통제", "전략물자"]),
+    ("환경·안전",     ["화학물질", "화평법", "화관법", "유해화학", "폐기물", "자원순환",
+                        "대기환경", "물환경", "토양환경", "산업안전", "중대재해", "위험물",
+                        "온실가스", "배출권", "탄소중립"]),
+    ("에너지",        ["전기요금", "전력수급", "재생에너지", "수소", "원자력", "에너지"]),
+    ("철강·산업",     ["철강", "제철", "제련", "합금", "산업단지", "특화단지",
+                        "국가첨단전략산업"]),
+    ("건설·입지",     ["건설산업", "주택법", "도시정비", "건축법", "국토계획"]),
+]
+
+
+def detect_category(title: str, law_name: str = "") -> str:
+    probe = f"{title or ''}\n{law_name or ''}"
+    for name, words in EA_CATEGORY_RULES:
+        if any(w in probe for w in words):
+            return name
+    return "기타"
+
+
+# ── 수집 1회 ────────────────────────────────────────────────────────
+def collect_once(db: EaDB) -> dict:
+    """스레드 C 가 하루 2회 부르는 진입점. 기존 수집 루프와 완전히 분리돼 있다."""
+    started = time.monotonic()
+    db.seed_agencies(SEED_AGENCIES)
+
+    raw: list[dict] = []
+    active_sources: list[str] = []
+    for label, fn in SOURCES:
+        try:
+            got = fn()
+        except Exception as exc:
+            log.warning("%s 수집 실패: %s", label, exc)
+            continue
+        if got:
+            active_sources.append(label)
+            raw.extend(got)
+
+    gates = Gates(db)
+    kept = gates.filter(raw)
+
+    # 처리 상한 — 실행 시간을 예측 가능하게 묶는다. 넘친 항목은 아직
+    # ea_policy_items 에 없으므로 다음 주기에 다시 후보가 된다.
+    overflow = max(0, len(kept) - EA_MAX_PROCESS_PER_RUN)
+    kept = kept[:EA_MAX_PROCESS_PER_RUN]
+
+    saved = 0
+    for it in kept:
+        row = {
+            "id": new_id(),
+            "url_source": it["url_source"],
+            "url_canonical": it.get("url_canonical") or it["url_source"],
+            "item_type": it.get("item_type") or "legislation",
+            "category": detect_category(it.get("title", ""), it.get("law_name", "")),
+            "title": it.get("title") or "(제목 없음)",
+            "agency_id": db.agency_id_by_name(it.get("agency", "")),
+            "law_name": it.get("law_name") or None,
+            "notice_start": parse_date(it.get("notice_start")),
+            "notice_end": parse_date(it.get("notice_end")),
+            "status": it.get("status") or None,
+            "opinion_url": it.get("opinion_url") or None,
+            "attachment_urls": jdump(it.get("attachment_urls") or []),
+            "published_at": it.get("published_at") or None,
+            "collected_at": iso(now_utc()),
+        }
+        if db.insert_item(row):
+            saved += 1
+        gates.seen.add(it["url_source"])
+
+    took = time.monotonic() - started
+    result = {**gates.counts, "saved": saved, "overflow": overflow,
+              "sources": active_sources, "duration_sec": round(took, 1)}
+    log.info("대외협력 수집: 소스 %s · 수집 %d → G2.5 통과 %d(무관 %d) · 저장 %d · %.1f초",
+             ", ".join(active_sources) or "없음", result["fetched"], result["g2_5"],
+             result["off_topic"], saved, took)
+    return result
+
+
+# ── 스레드 C — 하루 2회 ─────────────────────────────────────────────
+def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
+    """기존 수집 루프(300초)에 얹지 않는다. 지정 시각이 지나면 그 시각당 1회만 돈다."""
+    db = EaDB(ctx.cfg.sqlite_path)
+    done: set[str] = set()   # 'YYYY-MM-DD:H' — 같은 시각 중복 실행 방지
+    log.info("대외협력 수집 스레드 시작 (매일 %s시)",
+             "·".join(str(h) for h in schedule_hours()))
+    while not stop.is_set():
+        try:
+            if ea_enabled():
+                now = datetime.now()
+                for hour in schedule_hours():
+                    mark = f"{now.date().isoformat()}:{hour}"
+                    if now.hour >= hour and mark not in done:
+                        done.add(mark)
+                        collect_once(db)
+                        if len(done) > 8:
+                            done = set(sorted(done)[-4:])
+                        break
+        except Exception as exc:
+            log.exception("대외협력 수집 중 오류: %s", exc)
+        stop.wait(300)
