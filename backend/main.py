@@ -1830,6 +1830,13 @@ _MARKET_ONLY_KEYWORDS_LOWER = [w.lower() for w in MARKET_ONLY_KEYWORDS]
 TRACKING_PREFIXES = ("utm_",)
 TRACKING_KEYS = {"fbclid", "gclid", "igshid", "spm", "ref", "from", "cid", "sid", "oid", "aid"}
 
+# 같은 기사를 여러 경로로 서비스하는 사이트 — 기사 ID 파라미터 하나로 접는다.
+# (도메인: (표준 경로, ID 파라미터)).  예) thebell 은 /free/content/ArticleView.asp
+# (로그인/유료 안내 페이지)와 /front/newsview.asp(실제 기사)를 같은 key 로 서비스한다.
+SITE_CANONICAL: dict[str, tuple[str, str]] = {
+    "thebell.co.kr": ("/front/newsview.asp", "key"),
+}
+
 
 def normalize_url(raw: str) -> str:
     """네트워크 없이 가능한 정규화만 수행한다. **리다이렉트를 풀지 않는다.**
@@ -1848,6 +1855,17 @@ def normalize_url(raw: str) -> str:
         if not k.lower().startswith(TRACKING_PREFIXES) and k.lower() not in TRACKING_KEYS
     ]
     path = u.path.rstrip("/") or "/"
+
+    # 사이트별 표준화 — 같은 기사 ID 면 경로·나머지 쿼리와 무관하게 한 URL 로 접는다
+    rule = SITE_CANONICAL.get(domain_of(f"{scheme}://{host}"))
+    if rule:
+        canon_path, id_key = rule
+        id_val = next((v for k, v in query if k.lower() == id_key.lower()), "")
+        if id_val:
+            reg = domain_of(f"{scheme}://{host}")
+            return urlunsplit(("https", f"www.{reg}", canon_path,
+                               urlencode([(id_key, id_val)]), ""))
+
     return urlunsplit((scheme, host + port, path, urlencode(sorted(query)), ""))
 
 
@@ -5616,6 +5634,15 @@ def cmd_selftest() -> int:
           normalize_url("HTTPS://Example.com:443/path/"), "https://example.com/path")
     check("프래그먼트 제거", normalize_url("https://a.com/b#top"), "https://a.com/b")
     check("빈 입력", normalize_url(""), "")
+    # 같은 기사의 여러 경로를 기사 ID 로 접는다 (thebell: 유료안내 vs 실제 기사)
+    _tb = "https://www.thebell.co.kr/front/newsview.asp?key=202609021458518280106019"
+    check("thebell 유료안내 경로 → 표준 경로",
+          normalize_url("https://www.thebell.co.kr/free/content/ArticleView.asp?key=202609021458518280106019"), _tb)
+    check("thebell click 파라미터 제거",
+          normalize_url("http://thebell.co.kr/front/newsview.asp?click=F&key=202609021458518280106019&page=1"), _tb)
+    check("규칙 없는 사이트는 경로 유지",
+          normalize_url("https://www.yna.co.kr/view/AKR20260904067500083?section=x"),
+          "https://www.yna.co.kr/view/AKR20260904067500083")
 
     print("\n[2] 도메인 접기 (PRD F2.3)")
     check("서브도메인", domain_of("https://news.chosun.com/a"), "chosun.com")
