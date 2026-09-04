@@ -87,7 +87,7 @@ ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E73
 
 # 1회 수집에서 상세 조회(HTTP)·분석까지 갈 최대 건수. 기존 파이프라인의
 # MAX_PROCESS_PER_RUN(12) 과 같은 취지 — 실행 시간을 예측 가능하게 묶는다.
-EA_MAX_PROCESS_PER_RUN = 30
+EA_MAX_PROCESS_PER_RUN = 40
 EA_HTTP_TIMEOUT = 20
 EA_SEEN_CACHE_HOURS = 72
 
@@ -297,7 +297,8 @@ EA_RELEVANCE_KW: list[str] = [
     "흑연", "전해액", "분리막", "핵심광물", "희토류", "소재부품장비", "소부장",
     # 철강·산업
     "철강", "제철", "제련", "합금", "산업단지", "특화단지", "국가첨단전략산업",
-    "탄소중립", "온실가스", "배출권", "수소", "재생에너지", "전기요금", "전력수급",
+    "탄소중립", "온실가스", "배출권", "수소", "재생에너지", "신재생", "전기요금",
+    "전력수급", "전기사업", "전력시장", "발전사업", "송전", "배전", "계통",
     # 화학·환경·안전
     "화학물질", "화평법", "화관법", "유해화학", "폐기물", "자원순환", "대기환경",
     "물환경", "토양환경", "산업안전", "중대재해", "위험물",
@@ -430,8 +431,11 @@ def fetch_assembly_bills(page_size: int = 100, max_pages: int = 3) -> list[dict]
     global _logged_bill_keys
     key = assembly_key()
     if not key:
-        log.info("S3 국회 의안: EA_ASSEMBLY_KEY 미설정 — 비활성")
-        return []
+        try:
+            return _crawl().crawl_assembly_notices()   # 기한 보강은 G2.5 통과 후
+        except Exception as exc:
+            log.warning("S3 국회 입법예고 크롤링 실패: %s", exc)
+            return []
 
     out: list[dict] = []
     for page in range(1, max_pages + 1):
@@ -553,12 +557,24 @@ def _clean_law_name(name: str) -> str:
                   "", (name or "").strip()) or (name or "").strip()
 
 
+def _crawl():
+    import ea_crawl
+    return ea_crawl
+
+
 def fetch_legislation_notices(max_rows: int = 400) -> list[dict]:
-    """S1 입법예고 (ogLmPp). 키(OC) 없으면 비활성. 크롤링 우회 안 함."""
+    """S1 입법예고 (ogLmPp). OC 키가 있으면 REST, 없으면 크롤링(사용자 지정).
+
+    두 사이트 모두 robots.txt = 'Allow: /' 이고 게시물은 공공누리(KOGL) 자료다.
+    크롤링은 요청 간 1초 간격·페이지 상한을 지킨다(ea_crawl 참고).
+    """
     oc = lawmaking_oc()
     if not oc:
-        log.info("S1 입법예고: EA_LAWMAKING_OC 미설정 — 비활성")
-        return []
+        try:
+            return _crawl().crawl_legislation_notices()
+        except Exception as exc:
+            log.warning("S1 입법예고 크롤링 실패: %s", exc)
+            return []
     try:
         with _http_lock:
             root = _get_xml(f"{LAWMAKING_BASE}/ogLmPp.xml", {"OC": oc})
@@ -596,11 +612,14 @@ def fetch_legislation_notices(max_rows: int = 400) -> list[dict]:
 
 
 def fetch_admin_notices(max_rows: int = 400) -> list[dict]:
-    """S2 행정예고 (ptcpAdmPp). 키(OC) 없으면 비활성."""
+    """S2 행정예고. OC 키가 있으면 REST, 없으면 크롤링(사용자 지정)."""
     oc = lawmaking_oc()
     if not oc:
-        log.info("S2 행정예고: EA_LAWMAKING_OC 미설정 — 비활성")
-        return []
+        try:
+            return _crawl().crawl_admin_notices()
+        except Exception as exc:
+            log.warning("S2 행정예고 크롤링 실패: %s", exc)
+            return []
     try:
         with _http_lock:
             root = _get_xml(f"{LAWMAKING_BASE}/ptcpAdmPp.xml", {"OC": oc})
@@ -723,8 +742,27 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
 
     # 처리 상한 — 실행 시간을 예측 가능하게 묶는다. 넘친 항목은 아직
     # ea_policy_items 에 없으므로 다음 주기에 다시 후보가 된다.
-    overflow = max(0, len(kept) - EA_MAX_PROCESS_PER_RUN)
-    kept = kept[:EA_MAX_PROCESS_PER_RUN]
+    # 유형(입법·행정·국회)을 번갈아 담아, 앞 소스가 상한을 독식하지 않게 한다.
+    by_type: dict[str, list[dict]] = {}
+    for it in kept:
+        by_type.setdefault(it.get("item_type") or "legislation", []).append(it)
+    interleaved: list[dict] = []
+    queues = list(by_type.values())
+    while queues and len(interleaved) < len(kept):
+        for q in queues:
+            if q:
+                interleaved.append(q.pop(0))
+        queues = [q for q in queues if q]
+    overflow = max(0, len(interleaved) - EA_MAX_PROCESS_PER_RUN)
+    kept = interleaved[:EA_MAX_PROCESS_PER_RUN]
+
+    # G2.5 통과분 중 국회 입법예고는 예고기간이 목록에 없다 — 상세에서 보강(HTTP)
+    for it in kept:
+        if it.get("_need_detail_period"):
+            try:
+                _crawl().enrich_assembly_period(it)
+            except Exception as exc:
+                log.debug("국회 입법예고 기한 보강 실패: %s", exc)
 
     saved = 0
     fresh: list[tuple[dict, str]] = []   # (저장된 행, API 본문) — 본문은 메모리에만 둔다
