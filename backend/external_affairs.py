@@ -197,6 +197,19 @@ class EaDB:
         row = self.one("select id from ea_agencies where name=? or short_name=?", (name, name))
         return row["id"] if row else None
 
+    def relink_agencies(self) -> int:
+        """agency_id 가 비어 있는 항목을 agency_raw ↔ ea_agencies.name 으로 다시 잇는다.
+
+        정부조직 개편으로 부처명이 바뀌어 시드에 뒤늦게 추가된 경우, 이미 저장된
+        과거 항목의 agency_id 를 채워 화면 필터·집계와 어긋나지 않게 한다.
+        """
+        return self.exec(
+            "update ea_policy_items set agency_id = ("
+            "  select id from ea_agencies where name = ea_policy_items.agency_raw)"
+            " where agency_id is null and agency_raw is not null"
+            "   and exists (select 1 from ea_agencies where name = ea_policy_items.agency_raw)"
+        ).rowcount or 0
+
     # ── 게이트용 조회 ──
     def known_url_sources(self, candidates: Sequence[str]) -> set[str]:
         """G2 — ea_policy_items + ea_url_ledger 를 한 번에 대조한다."""
@@ -277,10 +290,13 @@ class EaDB:
 # 정부조직 개편으로 이름이 자주 바뀐다. 옛 이름도 함께 넣어 과거 공고를 놓치지 않는다.
 SEED_AGENCIES: list[tuple[str, str]] = [
     ("산업통상자원부", "산업부"),
+    ("산업통상부", "산업부"),            # 2025 개편 후 명칭
     ("기후에너지환경부", "기후부"),
     ("환경부", "환경부"),
     ("기획재정부", "기재부"),
+    ("재정경제부", "재경부"),            # 2025 개편(기재부 분리) 후 명칭
     ("기획예산처", "기예처"),
+    ("행정안전부", "행안부"),
     ("국토교통부", "국토부"),
     ("고용노동부", "고용부"),
     ("과학기술정보통신부", "과기정통부"),
@@ -754,6 +770,9 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
     started = time.monotonic()
     db._ensure_cols()
     db.seed_agencies(SEED_AGENCIES)
+    relinked = db.relink_agencies()
+    if relinked:
+        log.info("대외협력: 부처 재연결 %d건", relinked)
 
     raw: list[dict] = []
     active_sources: list[str] = []
@@ -1168,16 +1187,38 @@ _ITEM_SELECT = (
 )
 
 
+# 정렬 옵션 — 화면 드롭다운(§8.4). deadline 이 기본(마감일이 1순위 지표).
+EA_SORTS = [
+    {"key": "deadline", "label": "마감 임박순"},
+    {"key": "recent", "label": "최신순"},
+    {"key": "impact", "label": "영향도순"},
+]
+# 영향도 정렬 순위 — 큰 값이 위로. 미분석(빈 문자열)은 맨 아래.
+_IMPACT_RANK = {"high": 4, "medium": 3, "low": 2, "none": 1, "": 0}
+
+_EA_ORDER_SQL = {
+    # 마감일 오름차순, 마감일 없는 항목은 뒤로 (기존 동작 그대로)
+    "deadline": " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc",
+    # 공고 시작일이 최신인 순 → 없으면 수집 시각
+    "recent": " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc,"
+              " p.collected_at desc",
+    # 영향도는 파이썬에서 정렬한다(_IMPACT_RANK). SQL 은 2차 키만 준비.
+    "impact": " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc",
+}
+
+
 def query_items(db: EaDB, *, item_type: str = "", agency: str = "", impact: str = "",
-                status: str = "", due: str = "", q: str = "") -> list[dict]:
-    """마감일 오름차순, 마감일 없는 항목은 뒤로. (§8.4 기본 정렬)"""
+                status: str = "", due: str = "", q: str = "", sort: str = "deadline") -> list[dict]:
+    """정렬은 sort 파라미터로 고른다. 기본은 마감일 오름차순. (§8.4)"""
     sql, args = _ITEM_SELECT + " where 1=1", []
     if item_type:
         marks = ",".join("?" * len(item_type.split(",")))
         sql += f" and p.item_type in ({marks})"; args += item_type.split(",")
     if agency:
-        marks = ",".join("?" * len(agency.split(",")))
-        sql += f" and g.name in ({marks})"; args += agency.split(",")
+        # 부처명은 매핑된 이름(g.name)이 없으면 크롤 원문(p.agency_raw)으로 맞춘다.
+        parts = agency.split(",")
+        marks = ",".join("?" * len(parts))
+        sql += f" and coalesce(g.name, p.agency_raw) in ({marks})"; args += parts
     if impact:
         marks = ",".join("?" * len(impact.split(",")))
         sql += f" and ifnull(a.impact_level,'') in ({marks})"; args += impact.split(",")
@@ -1192,8 +1233,13 @@ def query_items(db: EaDB, *, item_type: str = "", agency: str = "", impact: str 
         sql += (" and (p.title like ? or ifnull(p.law_name,'') like ?"
                 " or ifnull(a.summary,'') like ?)")
         args += [f"%{q}%"] * 3
-    sql += " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc"
-    return db.rows(sql, args)
+    sort = sort if sort in _EA_ORDER_SQL else "deadline"
+    sql += _EA_ORDER_SQL[sort]
+    rows = db.rows(sql, args)
+    if sort == "impact":
+        # 영향도 높은 순 → 같은 등급 안에서는 SQL 이 준 마감임박순 유지(안정 정렬).
+        rows.sort(key=lambda r: _IMPACT_RANK.get(r.get("impact_level") or "", 0), reverse=True)
+    return rows
 
 
 def register_api(app: Any, ctx: Any) -> None:
@@ -1201,14 +1247,22 @@ def register_api(app: Any, ctx: Any) -> None:
     from fastapi.responses import JSONResponse
 
     db = EaDB(ctx.cfg.sqlite_path)
+    # 시드에 뒤늦게 추가된 부처명으로 기존 항목을 다시 잇는다(서버 기동 시 1회).
+    try:
+        db._ensure_cols()
+        db.seed_agencies(SEED_AGENCIES)
+        db.relink_agencies()
+    except sqlite3.Error as exc:   # pragma: no cover — 실패해도 API 는 떠야 한다
+        log.warning("대외협력 부처 재연결 스킵: %s", exc)
 
     @app.get("/api/ea/items")
     def ea_items(item_type: str = "", agency: str = "", impact: str = "", status: str = "",
-                 due: str = "", q: str = "", page: int = 1, size: int = EA_PAGE_SIZE):
+                 due: str = "", q: str = "", sort: str = "deadline",
+                 page: int = 1, size: int = EA_PAGE_SIZE):
         page = max(1, page)
         size = max(1, min(size, 100))
         rows = query_items(db, item_type=item_type, agency=agency, impact=impact,
-                           status=status, due=due, q=q)
+                           status=status, due=due, q=q, sort=sort)
         start = (page - 1) * size
         return JSONResponse({"total": len(rows), "page": page, "size": size,
                              "items": [_item_view(r) for r in rows[start:start + size]]})
@@ -1231,8 +1285,12 @@ def register_api(app: Any, ctx: Any) -> None:
         def col(sql: str) -> list[str]:
             return [r["v"] for r in db.rows(sql) if r["v"]]
         return JSONResponse({
-            "agencies": col("select distinct g.name as v from ea_policy_items p"
-                            " join ea_agencies g on g.id=p.agency_id order by v"),
+            # 매핑된 이름이 없으면 크롤 원문(agency_raw)을 그대로 필터 값으로 쓴다.
+            # (INNER JOIN 이면 agency_id 매핑 실패한 부처가 통째로 빠졌다)
+            "agencies": col("select distinct coalesce(g.name, p.agency_raw) as v"
+                            " from ea_policy_items p"
+                            " left join ea_agencies g on g.id=p.agency_id"
+                            " order by v"),
             "item_types": [{"key": "legislation", "label": "입법예고"},
                            {"key": "admin_notice", "label": "행정예고"},
                            {"key": "bill", "label": "국회 의안"}],
@@ -1241,6 +1299,7 @@ def register_api(app: Any, ctx: Any) -> None:
             "statuses": col("select distinct status as v from ea_policy_items order by v"),
             "dues": [{"key": "7", "label": "D-7"}, {"key": "14", "label": "D-14"},
                      {"key": "30", "label": "D-30"}],
+            "sorts": EA_SORTS,
         })
 
     @app.get("/api/ea/items/{item_id}")

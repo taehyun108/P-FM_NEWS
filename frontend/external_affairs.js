@@ -16,7 +16,9 @@
 
   var eaState = {
     open: false, loaded: false, sub: 'notice',
-    agency: '', impact: '', status: '', due: '', q: '', page: 1, loading: false
+    agency: '', impact: '', status: '', due: '', q: '',
+    sort: 'deadline',   // deadline(마감임박순, 기본) | recent(최신순) | impact(영향도순)
+    page: 1, loading: false
   };
 
   function $(id) { return document.getElementById(id); }
@@ -46,7 +48,8 @@
   }
 
   /* ── URL 동기화 (ea_ 접두사 — 기존 파라미터와 충돌 없음) ── */
-  var EA_KEYS = ['ea_sub', 'ea_agency', 'ea_impact', 'ea_status', 'ea_due', 'ea_q', 'ea_page'];
+  var EA_KEYS = ['ea_sub', 'ea_agency', 'ea_impact', 'ea_status', 'ea_due', 'ea_q',
+    'ea_sort', 'ea_page'];
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
@@ -56,6 +59,7 @@
     eaState.status = p.get('ea_status') || '';
     eaState.due = p.get('ea_due') || '';
     eaState.q = p.get('ea_q') || '';
+    eaState.sort = p.get('ea_sort') || 'deadline';
     eaState.page = Math.max(1, parseInt(p.get('ea_page') || '1', 10) || 1);
   }
 
@@ -69,6 +73,7 @@
       if (eaState.status) { p.set('ea_status', eaState.status); }
       if (eaState.due) { p.set('ea_due', eaState.due); }
       if (eaState.q) { p.set('ea_q', eaState.q); }
+      if (eaState.sort && eaState.sort !== 'deadline') { p.set('ea_sort', eaState.sort); }
       if (eaState.page > 1) { p.set('ea_page', String(eaState.page)); }
     }
     var qs = p.toString();
@@ -214,9 +219,11 @@
   /* ── 필터 ── */
   function fillSelect(sel, options, value, placeholder) {
     sel.replaceChildren();
-    var o0 = el('option', null, placeholder);
-    o0.value = '';
-    sel.append(o0);
+    if (placeholder !== null) {          // null 이면 '전체' 항목 없이 항상 값이 있는 셀렉트
+      var o0 = el('option', null, placeholder);
+      o0.value = '';
+      sel.append(o0);
+    }
     options.forEach(function (o) {
       var opt = el('option', null, o.label);
       opt.value = o.key;
@@ -227,6 +234,10 @@
 
   function loadFilters() {
     return getJSON('/api/ea/filters').then(function (d) {
+      fillSelect($('eaSort'), d.sorts || [
+        { key: 'deadline', label: '마감 임박순' }, { key: 'recent', label: '최신순' },
+        { key: 'impact', label: '영향도순' }
+      ], eaState.sort || 'deadline', null);
       fillSelect($('eaAgency'), (d.agencies || []).map(function (a) {
         return { key: a, label: a };
       }), eaState.agency, '부처 전체');
@@ -315,6 +326,7 @@
     if (eaState.status) { p.set('status', eaState.status); }
     if (eaState.due) { p.set('due', eaState.due); }
     if (eaState.q) { p.set('q', eaState.q); }
+    if (eaState.sort && eaState.sort !== 'deadline') { p.set('sort', eaState.sort); }
     p.set('page', String(eaState.page));
     p.set('size', String(EA_PAGE_SIZE));
 
@@ -393,7 +405,7 @@
     readUrl();
     $('eaTab').addEventListener('click', toggle);
 
-    [['eaAgency', 'agency'], ['eaImpact', 'impact'],
+    [['eaSort', 'sort'], ['eaAgency', 'agency'], ['eaImpact', 'impact'],
      ['eaStatus', 'status'], ['eaDue', 'due']].forEach(function (pair) {
       $(pair[0]).addEventListener('change', function (e) {
         eaState[pair[1]] = e.target.value;
