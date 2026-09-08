@@ -16,3 +16,4 @@ venv/
 
 # 기타
 .DS_Store
+~$*            # Office 임시 잠금 파일
