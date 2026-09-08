@@ -3357,7 +3357,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     saved_for_notify: list[dict] = []
     # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
-    # 무조건 발송 점수 — 이 값 이상이면 우선 기사처럼 다뤄 야간·묶음을 우회한다. (0/None = 미사용)
+    # 무조건 발송 점수 — 이 값 이상이면 우선 기사처럼 다뤄 야간 게이트를 우회한다. (0/None = 미사용)
     try:
         hard_score = int(state.get("hard_notify_score") or 0)
     except (TypeError, ValueError):
@@ -3504,7 +3504,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                 score = analyzed
         probe = f"{item.title}\n{body}"
         # 우선 알림: '항상 발송 키워드' 매칭 또는 '무조건 발송 점수' 이상이면
-        # 임계값·야간·묶음 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
+        # 임계값·야간 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
         is_priority = _kw_hit(probe, always_kws) or (hard_score > 0 and score >= hard_score)
         # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
         saved_for_notify.append({
@@ -3911,8 +3911,8 @@ def refresh_quotes(ctx: Context) -> int:
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 NIGHT_START, NIGHT_END = 23, 7          # 야간 모드 23:00–07:00
 NIGHT_MIN_SCORE = 80
-DIGEST_MIN_COUNT = 3                     # 이 이상이면 다이제스트로 묶는다
 RATE_LIMIT_SLEEP = 1.1                   # 동일 채팅방 분당 20건 제한 → 초당 1건 이하
+PRIORITY_FLOOD_WARN = 10                 # 한 회차 우선 기사가 이 수 이상이면 경고 로그
 
 
 def esc(text: str) -> str:
@@ -3954,18 +3954,6 @@ def effective_threshold(ctx: Context) -> int:
     return ctx.cfg.notify_threshold
 
 
-def split_for_digest(pending: list[dict]) -> tuple[list[dict], list[dict], bool]:
-    """발송 대기 목록을 (우선 기사, 일반 기사, 일반 기사를 묶을지)로 나눈다.
-
-    우선 기사('항상 발송 키워드' 매칭)는 절대 묶지 않는다. 다이제스트는 제목 한 줄만
-    남기므로 요약·그룹사·점수가 사라지고, 키워드를 지정한 의미 자체가 없어진다.
-    묶음은 일반 기사가 DIGEST_MIN_COUNT 건 이상일 때만 적용한다. (사용자 지정)
-    """
-    priority = [p for p in pending if p.get("priority")]
-    normal = [p for p in pending if not p.get("priority")]
-    return priority, normal, len(normal) >= DIGEST_MIN_COUNT
-
-
 def send_notifications(ctx: Context, limit: int = 20) -> int:
     cfg = ctx.cfg
     if not cfg.telegram_enabled:
@@ -3990,7 +3978,7 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
     hour = datetime.now().hour
     is_night = hour >= NIGHT_START or hour < NIGHT_END
     if is_night:
-        # 야간에는 중요도 80 이상 + 포스코퓨처엠 기사만 즉시 발송, 나머지는 큐에 남긴다. (PRD F7.3)
+        # 야간에는 중요도 80 이상 또는 우선 기사만 즉시 발송, 나머지는 큐에 남긴다. (PRD F7.3)
         pending = [p for p in pending
                    if int(p.get("importance_score") or 0) >= NIGHT_MIN_SCORE or _is_priority(p)]
         if not pending:
@@ -4010,26 +3998,13 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
         time.sleep(RATE_LIMIT_SLEEP)
         return ok
 
-    priority, normal, use_digest = split_for_digest(pending)
-    if len(priority) >= 10:
+    # 모든 기사를 개별 카드로 보낸다 — 다이제스트 묶음은 쓰지 않는다. (사용자 지정)
+    # pending 은 pending_notifications 가 이미 중요도 높은 순으로 정렬해 준 상태다.
+    prio_count = sum(1 for p in pending if p.get("priority"))
+    if prio_count >= PRIORITY_FLOOD_WARN:
         log.warning("우선 기사가 한 회차에 %d건입니다. '항상 발송 키워드'가 너무 넓지 않은지"
-                    " 확인하세요(예: '포스코'는 사실상 전체 기사와 매칭됩니다).", len(priority))
-    sent = sum(1 for row in priority if _send_one(row))
-
-    if use_digest:
-        # 묶음 발송 — 일반 기사가 3건 이상이면 다이제스트 1건으로 보낸다.
-        body = [f"📰 신규 기사 {len(normal)}건", ""]
-        for row in normal:
-            link = row.get("url_canonical") or row.get("url_original") or ""
-            score = int(row.get("importance_score") or 0)
-            mark = "🔴" if score >= 80 else "🟠"
-            body.append(f'{mark} <a href="{esc(link)}">{esc(row.get("title") or "")}</a>')
-        ok, err = _telegram_send(ctx, url, "\n".join(body))
-        for row in normal:
-            ctx.storage.mark_notification(row["id"], "sent" if ok else "queued", err)
-        return sent + (len(normal) if ok else 0)
-
-    return sent + sum(1 for row in normal if _send_one(row))
+                    " 확인하세요(예: '포스코'는 사실상 전체 기사와 매칭됩니다).", prio_count)
+    return sum(1 for row in pending if _send_one(row))
 
 
 def warn_if_bad_chat_id(chat_id: str) -> None:
@@ -6139,27 +6114,15 @@ def cmd_selftest() -> int:
     check("정책: OR 매칭 but 필수 불일치 → 제외",
           _kw_hit("가정용 전기요금 인하", ["전기요금"]) and _kw_hit("가정용 전기요금 인하", ["산업"]), False)
 
-    print("\n[13-2a] 다이제스트 분리 — 우선 기사는 묶지 않는다")
-    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 0}, {"priority": 0}, {"priority": 0}])
-    check("우선 기사는 개별 발송으로 분리", len(_p), 1)
-    check("남은 일반 기사 3건 → 묶음", (len(_n), _d), (3, True))
-    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 1}, {"priority": 1}, {"priority": 0}])
-    check("우선 3건이어도 묶지 않음", (len(_p), _d), (3, False))
-    _p, _n, _d = split_for_digest([{"priority": 0}, {"priority": 0}])
-    check("일반 2건은 묶음 기준 미달 → 개별 발송", _d, False)
-    check("빈 목록 방어", split_for_digest([]), ([], [], False))
-
-    print("\n[13-2b] 무조건 발송 점수 (hard_notify_score)")
+    print("\n[13-2b] 무조건 발송 점수 (hard_notify_score) — 우선 판정")
     # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)
+    # 우선 기사는 발송 단계에서 임계값·야간 게이트를 우회한다. (다이제스트는 폐지됨)
     def _is_prio(score, hard, kw_hit=False):
         return kw_hit or (hard > 0 and score >= hard)
-    check("hard=80, 점수 85 → 우선(야간·묶음 우회)", _is_prio(85, 80), True)
+    check("hard=80, 점수 85 → 우선(야간 우회)", _is_prio(85, 80), True)
     check("hard=80, 점수 70 → 우선 아님", _is_prio(70, 80), False)
     check("hard=0(미사용) → 점수 100 이어도 우선 아님", _is_prio(100, 0), False)
     check("hard 미달이어도 키워드 매칭이면 우선", _is_prio(10, 80, kw_hit=True), True)
-    # hard 기사는 priority 로 큐잉되어 split_for_digest 에서 개별 발송된다
-    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 1}, {"priority": 0}, {"priority": 0}])
-    check("무조건점수 기사 2건 → 개별, 나머지는 별도", (len(_p), len(_n)), (2, 2))
 
     print("\n[13-3] 마스터 비밀번호 (pbkdf2)")
     _h = hash_password("s3cret!")

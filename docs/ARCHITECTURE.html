@@ -723,7 +723,7 @@
 
         <figure>
           <div class="fig-scroll">
-            <svg viewBox="0 0 800 300" role="img" aria-label="저장된 기사가 억제모드·신선도·주제토글·중요도·부트스트랩 다섯 조건을 모두 통과해야 알림 큐에 들어가고, 발송 단계에서 야간모드와 다이제스트 묶음을 거쳐 채널로 나가는 조건 체인">
+            <svg viewBox="0 0 800 300" role="img" aria-label="저장된 기사가 억제모드·신선도·주제토글·중요도·부트스트랩 다섯 조건을 모두 통과해야 알림 큐에 들어가고, 발송 단계에서 야간모드를 거쳐 전건 개별 카드로 채널에 게시되는 조건 체인">
               <defs>
                 <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                   <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
@@ -759,17 +759,14 @@
               <text class="lbl-sm" x="504" y="151" text-anchor="middle">queued</text>
 
               <!-- 발송 -->
-              <rect class="box" x="604" y="42" width="182" height="56" rx="6"/>
-              <text class="lbl-b" x="618" y="64">야간 23–07시</text>
-              <text class="lbl-sm" x="618" y="82">중요도 80 이상만</text>
+              <rect class="box" x="604" y="86" width="182" height="56" rx="6"/>
+              <text class="lbl-b" x="618" y="108">야간 23–07시</text>
+              <text class="lbl-sm" x="618" y="126">중요도 80 이상 또는 우선만</text>
 
-              <rect class="box" x="604" y="112" width="182" height="56" rx="6"/>
-              <text class="lbl-b" x="618" y="134">일반 기사 3건↑ 묶음</text>
-              <text class="lbl-sm" x="618" y="152">우선 기사는 항상 개별</text>
-
-              <rect class="box-navy" x="604" y="182" width="182" height="56" rx="6"/>
-              <text class="lbl-b" x="695" y="204" text-anchor="middle">채널 게시</text>
-              <text class="lbl-sm" x="695" y="221" text-anchor="middle">초당 1건 · 3회까지 재시도</text>
+              <rect class="box-navy" x="604" y="166" width="182" height="60" rx="6"/>
+              <text class="lbl-b" x="695" y="188" text-anchor="middle">채널 게시</text>
+              <text class="lbl-sm" x="695" y="205" text-anchor="middle">전건 개별 카드 · 초당 1건</text>
+              <text class="lbl-sm" x="695" y="219" text-anchor="middle">3회까지 재시도</text>
 
               <g color="var(--ink-3)">
                 <path class="arw" d="M130 132 L150 132 L150 47 L160 47" marker-end="url(#a4)"/>
@@ -780,19 +777,19 @@
                 <path class="arw" d="M394 101 L418 101 L418 132" />
                 <path class="arw" d="M394 162 L418 162 L418 138" />
                 <path class="arw" d="M394 230 L420 230 L420 140" />
-                <path class="arw" d="M568 128 L586 128 L586 70 L600 70" marker-end="url(#a4)"/>
-                <line class="arw" x1="568" y1="140" x2="600" y2="140" marker-end="url(#a4)"/>
-                <line class="arw" x1="695" y1="170" x2="695" y2="178" marker-end="url(#a4)"/>
+                <path class="arw" d="M568 134 L586 134 L586 114 L600 114" marker-end="url(#a4)"/>
+                <line class="arw" x1="695" y1="142" x2="695" y2="164" marker-end="url(#a4)"/>
               </g>
             </svg>
           </div>
           <figcaption>
-            <b>네 조건의 AND.</b> 하나라도 어긋나면 <code>skipped</code>로 큐에 남아 발송되지 않는다.
-            <b>우선 기사</b>('항상 발송 키워드' 적중 <b>또는</b> 중요도 ≥ <code>hard_notify_score</code>)는
-            중요도·야간 게이트를 우회하고, 발송 단계에서도 다이제스트에 묶이지 않고 요약·SWOT이
-            담긴 개별 카드로 나간다. 단 <b>발행 6시간 초과·억제 모드·주제 토글</b>은 우선 기사도
-            그대로 적용된다. 마스터의 <b>텔레그램 발송</b> 토글을 끄면(<code>notify_paused</code>)
-            큐 적재는 계속하되 발송만 멈춘다 — 다시 켜면 밀린 기사가 순서대로 나간다.
+            <b>다섯 조건의 AND.</b> 하나라도 어긋나면 <code>skipped</code>로 큐에 남아 발송되지 않는다.
+            큐에 들어간 기사는 <b>전건이 요약·포스코 관점·SWOT이 담긴 개별 카드</b>로 나간다 —
+            다이제스트 묶음은 폐지됐다. <b>우선 기사</b>('항상 발송 키워드' 적중 <b>또는</b>
+            중요도 ≥ <code>hard_notify_score</code>)는 중요도·야간 게이트를 우회하지만,
+            <b>발행 6시간 초과·억제 모드·주제 토글</b>은 우선 기사도 그대로 적용된다.
+            마스터의 <b>텔레그램 발송</b> 토글을 끄면(<code>notify_paused</code>) 큐 적재는
+            계속하되 발송만 멈춘다 — 다시 켜면 밀린 기사가 중요도 높은 순으로 나간다.
             중복 발송은 <code>(기사, 채널, 채팅방)</code> UNIQUE 제약으로 DB가 막는다.
           </figcaption>
         </figure>
@@ -803,7 +800,7 @@
           <tbody>
             <tr><td>텔레그램 발송</td><td>켜짐</td><td>끄면 발송 중지(큐는 계속 쌓임). 봇 <code>/stop</code>·<code>/start</code>와 동일</td></tr>
             <tr><td>관련도 임계값</td><td class="num">50</td><td>0–100 슬라이더. 권장 하한 40을 표시하되 자유롭게 지정</td></tr>
-            <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간·묶음 우회, 개별 카드로 즉시 발송. 0=미사용</td></tr>
+            <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간 게이트를 우회해 즉시 발송. 0=미사용</td></tr>
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td>본문에 있으면 중요도·야간 게이트를 우회</td></tr>
             <tr><td>정책브리핑 알림</td><td>꺼짐</td><td>켜면 발송. ① 관심 키워드(OR) <b>AND</b> ② 필수 공통 키워드</td></tr>
             <tr><td>글로벌 통상환경 알림</td><td>꺼짐</td><td>위와 같은 2단 필터</td></tr>
@@ -952,7 +949,7 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>243개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>237개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
