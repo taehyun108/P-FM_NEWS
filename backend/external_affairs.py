@@ -78,6 +78,11 @@ def assembly_key() -> str:
     return _env("EA_ASSEMBLY_KEY")
 
 
+def kotra_service_key() -> str:
+    """data.go.kr 에서 발급한 KOTRA 해외시장뉴스 API 서비스키. 없으면 KOTRA 소스는 꺼진다."""
+    return _env("EA_KOTRA_SERVICE_KEY")
+
+
 EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 50, 0)   # noqa: E731
 ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E731
 
@@ -445,11 +450,15 @@ class Gates:
         g2 = [it for it in g1 if it["url_source"] not in known]
         self.counts["g2"] += len(g2)
 
-        # G2.5 관련성 — 걸리지 않으면 제외 원장에 기록해 다음 주기에 HTTP 를 안 쓴다
+        # G2.5 관련성 — 걸리지 않으면 제외 원장에 기록해 다음 주기에 HTTP 를 안 쓴다.
+        # 뉴스형 소스(부처 정책뉴스·KOTRA)는 RSS 가 본문까지 줬으므로 제목이 밋밋해도
+        # 본문으로 한 번 더 본다(추가 HTTP 없음). 예고형은 종전처럼 제목·법령명만.
         kept: list[dict] = []
         for it in g2:
+            body_probe = (it.get("_body") or "")[:2000]
             if is_relevant(it.get("title", ""), it.get("law_name", ""), it.get("agency", ""),
-                           self.agency_names, self.extra_terms):
+                           self.agency_names, self.extra_terms) \
+                    or (body_probe and is_relevant(body_probe, extra_terms=self.extra_terms)):
                 kept.append(it)
             else:
                 self.db.upsert_ledger(it["url_source"], "off_topic")
@@ -733,10 +742,33 @@ def fetch_admin_notices(max_rows: int = 400) -> list[dict]:
 # 상세 본문은 ea_crawl.fetch_detail 이 담당한다 — 정부 사이트 상세 REST 는 필드명이
 # 공개돼 있지 않아 본문 품질이 크롤보다 낮았다. (analyze_item 이 fetch_detail_text 로 폴백)
 
+def fetch_ministry_news() -> list[dict]:
+    """S4 부처 정책뉴스 — 표준 정부 홈페이지 CMS 의 POST 방식 RSS(본문 포함)."""
+    try:
+        return _crawl().crawl_ministry_news()
+    except Exception as exc:
+        log.warning("S4 부처 정책뉴스 크롤링 실패: %s", exc)
+        return []
+
+
+def fetch_kotra_news() -> list[dict]:
+    """S5 KOTRA 해외시장뉴스 — data.go.kr 오픈API. 서비스키가 없으면 빈 목록."""
+    key = kotra_service_key()
+    if not key:
+        return []
+    try:
+        return _crawl().crawl_kotra_news(key)
+    except Exception as exc:
+        log.warning("S5 KOTRA 해외시장뉴스 조회 실패: %s", exc)
+        return []
+
+
 SOURCES = [
     ("S1 입법예고", fetch_legislation_notices),
     ("S2 행정예고", fetch_admin_notices),
     ("S3 국회 의안", fetch_assembly_bills),
+    ("S4 부처 정책뉴스", fetch_ministry_news),
+    ("S5 KOTRA 해외시장뉴스", fetch_kotra_news),
 ]
 
 
@@ -1061,6 +1093,40 @@ EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSO
 {body}
 """
 
+# 부처 정책뉴스·KOTRA 해외시장뉴스용 — '개정이유·조문'이 아니라 '동향·시사점' 관점.
+EA_NEWS_PROMPT = """아래 정부부처(또는 KOTRA) 발표 자료를 분석해 JSON 하나로만 답하라.
+법령 개정안이 아니라 정책·통상 동향 자료다. '개정이유'·'조문' 표현을 쓰지 마라.
+
+[요약 — 이 발표의 내용]
+- summary: 무엇을 발표·추진하는가를 3~4문장으로. 주체·시점·핵심 내용·후속 계획 순.
+- 원문에 없는 수치·일정·대상을 지어내지 않는다
+- 원문 발췌가 비어 있으면 "원문을 확보하지 못했습니다" 한 줄만 쓴다
+
+[영향도 — 포스코 그룹 관점]
+- impact_level: "high" | "medium" | "low" | "none"
+- 포스코 그룹(철강·이차전지소재·건설/인프라·에너지·통상) 사업 관련성 기준
+- impact_rationale: 판단 근거가 된 **원문의 문장을 그대로 인용**한다.
+  포스코 사업과 연결되는 대목이 없으면 impact_level="none",
+  impact_rationale="포스코 그룹 사업과 직접 연결되는 내용 없음"
+- 불분명하면 "low" + "추가 검토 필요"
+
+[관련 사업 영역]
+- affected_areas: 해당하는 것만. ["철강","이차전지소재","건설·인프라","에너지","환경·안전","통상","노무"]
+
+[대응 제안]
+- suggested_action: 대관 담당자가 검토·모니터링할 사항 1~2문장(초안 성격). 단정적 표현 금지.
+
+[출력 형식]
+{{"summary":["문장1","문장2","문장3"],"impact_level":"none",
+"impact_rationale":"...","affected_areas":[],"suggested_action":"..."}}
+
+제목: {title}
+발표 기관: {agency}
+발표일: {period}
+원문 발췌:
+{body}
+"""
+
 
 def fetch_detail_text(url: str) -> str:
     """G3·G4 — 원문 페이지에서 텍스트만 뽑는다. 실패하면 빈 문자열(분석은 근거없음 처리)."""
@@ -1142,9 +1208,13 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
     agency = agency or (item.get("agency_raw") or "")
 
-    prompt = EA_PROMPT.format(
+    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news")
+    tmpl = EA_NEWS_PROMPT if is_news else EA_PROMPT
+    news_period = item.get("published_at") or item.get("notice_start") or "(미상)"
+    prompt = tmpl.format(
         title=item.get("title") or "", law_name=item.get("law_name") or "(없음)",
-        agency=agency or "(미상)", period=period, status=item.get("status") or "(미상)",
+        agency=agency or "(미상)", period=(news_period if is_news else period),
+        status=item.get("status") or "(미상)",
         body=(body[:EA_MAX_BODY_CHARS] or "(원문을 확보하지 못했습니다)"))
 
     try:
@@ -1212,6 +1282,23 @@ def analysis_budget(ctx: Any, db: EaDB) -> int:
     return budget
 
 
+def _news_body_map(items: list[dict]) -> dict[str, str]:
+    """뉴스형(부처 정책뉴스·KOTRA) 항목은 본문을 저장하지 않는다. 백로그 분석 때
+    RSS/ API 를 한 번 더 받아 url→본문 을 맞춘다(피드에 남아 있는 최근분만 채워진다)."""
+    types = {it.get("item_type") for it in items}
+    out: dict[str, str] = {}
+    try:
+        if "ministry_news" in types:
+            for r in _crawl().crawl_ministry_news():
+                out[r["url_source"]] = r.get("_body") or ""
+        if "trade_news" in types and kotra_service_key():
+            for r in _crawl().crawl_kotra_news(kotra_service_key()):
+                out[r["url_source"]] = r.get("_body") or ""
+    except Exception as exc:   # pragma: no cover
+        log.debug("뉴스 본문 재확보 실패(무시): %s", exc)
+    return out
+
+
 def analyze_backlog(ctx: Any, db: EaDB) -> int:
     """미분석 항목을 전용 상한 안에서 처리한다. 마감 임박(notice_end 오름차순) 우선."""
     budget = analysis_budget(ctx, db)
@@ -1220,8 +1307,10 @@ def analyze_backlog(ctx: Any, db: EaDB) -> int:
     ea_used = db.analyses_today()
     ea_limit = EA_LLM_DAILY_LIMIT()
     done = 0
-    for item in db.unanalyzed_items(budget):
-        if analyze_item(ctx, db, item):
+    items = db.unanalyzed_items(budget)
+    news_bodies = _news_body_map(items)
+    for item in items:
+        if analyze_item(ctx, db, item, news_bodies.get(item.get("url_source", ""), "")):
             done += 1
     if done:
         log.info("대외협력 분석 %d건 (전용 상한 %d 중 %d 사용)", done, ea_limit, ea_used + done)
@@ -1268,6 +1357,48 @@ _ITEM_SELECT = (
     " left join ea_agencies g on g.id = p.agency_id"
     " left join ea_analyses a on a.policy_item_id = p.id"
 )
+
+
+# 화면 상단 카테고리(=탭). key 는 프런트·필터 API 가 공유한다.
+EA_CATEGORIES = [
+    {"key": "notice", "label": "입법·행정예고"},
+    {"key": "bill", "label": "국회 의안"},
+    {"key": "policy", "label": "정책 동향"},
+    {"key": "trade", "label": "통상 환경"},
+    {"key": "ministry", "label": "부처별 동향"},
+]
+# 카테고리 → ea_policy_items.item_type 목록. policy 는 기사 재사용이라 비어 있다.
+EA_CATEGORY_TYPES = {
+    "notice": ["legislation", "admin_notice"],
+    "bill": ["bill"],
+    "ministry": ["ministry_news"],
+    "trade": ["trade_news"],
+    "policy": [],
+}
+_AGENCY_TAIL_RE = re.compile(r"(부|처|청|위원회|위|실|원|단|공사|진흥원|KOTRA)$")
+# 제목 첫머리에 오는 부처 약칭 → 정식명. "산업부, …" / "국토부는 …"
+_AGENCY_HEAD_RE = re.compile(r"^\s*([가-힣]{2,7}(?:부|처|청|위))\s*[,은는이가]?\s")
+_AGENCY_ALIAS = {
+    "산업부": "산업통상부", "산업통상자원부": "산업통상부", "기재부": "기획재정부",
+    "국토부": "국토교통부", "환경부": "기후에너지환경부", "고용부": "고용노동부",
+    "과기부": "과학기술정보통신부", "과기정통부": "과학기술정보통신부", "중기부": "중소벤처기업부",
+    "복지부": "보건복지부", "행안부": "행정안전부", "농식품부": "농림축산식품부",
+    "해수부": "해양수산부", "문체부": "문화체육관광부", "공정위": "공정거래위원회",
+    "금융위": "금융위원회",
+}
+
+
+def _article_agency(row: dict) -> str:
+    """기사에서 발표 기관을 뽑는다. 정책브리핑 기사는 파이프라인이 author 에 발표
+    부처명을 넣어 둔다. 없으면 제목 첫머리의 부처 약칭을 정식명으로 바꿔 쓴다."""
+    a = (row.get("author") or "").strip()
+    if a and _AGENCY_TAIL_RE.search(a) and len(a) <= 12:
+        return _AGENCY_ALIAS.get(a, a)
+    m = _AGENCY_HEAD_RE.match(row.get("title") or "")
+    if m:
+        name = m.group(1)
+        return _AGENCY_ALIAS.get(name, name)
+    return ""
 
 
 # 정렬 옵션 — 화면 드롭다운(§8.4). deadline 이 기본(마감일이 1순위 지표).
@@ -1364,7 +1495,8 @@ def register_api(app: Any, ctx: Any) -> None:
                   if (r.get("status") or "") != "종료"]
         return JSONResponse({**db.stats(), "enabled": ea_enabled(),
                              # 크롤링이 있어 소스는 키 없이도 동작한다. rest 는 키가 있을 때만.
-                             "sources_active": {"S1": True, "S2": True, "S3": True},
+                             "sources_active": {"S1": True, "S2": True, "S3": True, "S4": True,
+                                                "S5": bool(kotra_service_key())},
                              "sources_rest": {"S1": bool(lawmaking_oc()),
                                               "S2": bool(lawmaking_oc()),
                                               "S3": bool(assembly_key())},
@@ -1372,19 +1504,21 @@ def register_api(app: Any, ctx: Any) -> None:
                              "urgent": urgent[:5], "urgent_total": len(urgent)})
 
     @app.get("/api/ea/filters")
-    def ea_filters(item_type: str = ""):
-        """item_type 을 주면 그 서브탭 기준으로 부처 목록·건수를 맞춘다.
+    def ea_filters(category: str = "notice", item_type: str = ""):
+        """카테고리별로 '기관' 드롭다운을 맞춘다.
 
-        부처 드롭다운은 '수집된 것만'이 아니라 **관심 부처 전체**를 건수와 함께 보여준다.
-        비어 있으면 (0) 으로 뜨므로 '왜 산업부가 없지?' 같은 혼선이 없고, 국회 의안 탭에
-        정부 부처가 섞여 뜨지도 않는다(의안의 소관은 상임위다).
+        기관 목록은 '수집된 것만'이 아니라 **관심 기관 전체**를 건수와 함께 보여준다
+        (비어 있으면 (0)). 카테고리마다 성격이 다르다 — 입법·행정예고=소관 부처,
+        국회 의안=소관 상임위, 부처별 동향=부처, 통상 환경=KOTRA·부처, 정책 동향=발표 부처.
         """
         def col(sql: str, args: Sequence[Any] = ()) -> list[str]:
             return [r["v"] for r in db.rows(sql, args) if r["v"]]
 
-        types = [t for t in item_type.split(",") if t]
-        # 서브탭 성격: 국회 의안만 보고 있으면 상임위, 그 밖에는 정부 부처.
-        want_kind = "committee" if types and set(types) <= {"bill"} else "ministry"
+        # item_type(구버전 파라미터)이 오면 카테고리로 역매핑
+        cat = category or {"legislation,admin_notice": "notice", "bill": "bill",
+                           "ministry_news": "ministry", "trade_news": "trade"}.get(item_type, "notice")
+        types = EA_CATEGORY_TYPES.get(cat, [])
+        want_kind = "committee" if cat == "bill" else "ministry"
 
         where, args = "", []
         if types:
@@ -1395,12 +1529,16 @@ def register_api(app: Any, ctx: Any) -> None:
             " from ea_policy_items p left join ea_agencies g on g.id=p.agency_id"
             + where + " group by v", args) if r["v"]}
 
-        # 시드된 관심 부처(해당 구분) ∪ 실제로 수집된 소관 — 건수 많은 순 → 이름 순
-        seeded = col("select name as v from ea_agencies where enabled=1 and ifnull(kind,'')=?",
-                     (want_kind,))
-        names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
-        agencies = [{"key": n, "label": f"{n} ({counts.get(n, 0)})", "count": counts.get(n, 0)}
-                    for n in names]
+        if cat in ("notice", "bill", "ministry"):
+            seeded = col("select name as v from ea_agencies where enabled=1 and ifnull(kind,'')=?",
+                         (want_kind,))
+            names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
+        elif cat == "trade":
+            names = sorted(set(["KOTRA"]) | set(counts), key=lambda n: (-counts.get(n, 0), n))
+        else:   # policy — 발표 부처는 기사에서 뽑는다(클라이언트가 목록으로 채움). 여기선 빈 목록.
+            names = []
+        agencies = [{"key": n, "label": f"{n} ({counts.get(n, 0)})" if n in counts else n,
+                     "count": counts.get(n, 0)} for n in names]
 
         gcounts: dict[str, int] = {}
         for r in db.rows("select group_companies as v from ea_policy_items p" + where, args):
@@ -1413,9 +1551,7 @@ def register_api(app: Any, ctx: Any) -> None:
             "agencies": agencies,
             "agency_kind": want_kind,
             "groups": groups,
-            "item_types": [{"key": "legislation", "label": "입법예고"},
-                           {"key": "admin_notice", "label": "행정예고"},
-                           {"key": "bill", "label": "국회 의안"}],
+            "categories": EA_CATEGORIES,
             "impacts": [{"key": "high", "label": "높음"}, {"key": "medium", "label": "보통"},
                         {"key": "low", "label": "낮음"}, {"key": "none", "label": "해당없음"}],
             "statuses": col("select distinct status as v from ea_policy_items order by v"),
@@ -1431,30 +1567,49 @@ def register_api(app: Any, ctx: Any) -> None:
             return JSONResponse({"ok": False, "error": "항목을 찾을 수 없습니다."}, status_code=404)
         return JSONResponse({"ok": True, "item": _item_view(row)})
 
-    # ── S4·S5 — 기존 수집 결과 재사용 (읽기 전용). 새로 수집하지 않는다. ──
-    def _news(category: str, limit: int) -> list[dict]:
-        rows = ctx.storage.list_articles(400, 0, now_utc() - timedelta(days=30), "")
-        out = []
-        for r in rows:
-            if category in jload(r.get("categories"), []):
+    # ── 정책 동향·통상 환경 — 기존 기사 재사용(읽기 전용) + KOTRA 항목 병합 ──
+    def _news(article_cat: str, limit: int, ea_types: Sequence[str] = (),
+              agency: str = "") -> list[dict]:
+        out: list[dict] = []
+        for r in ctx.storage.list_articles(400, 0, now_utc() - timedelta(days=45), ""):
+            if article_cat in jload(r.get("categories"), []):
                 out.append({
                     "id": r.get("id"), "title": r.get("title") or "",
                     "url": r.get("url_canonical") or r.get("url_original") or "",
                     "press": r.get("press_name") or "",
-                    "published_at": r.get("published_at") or "",
+                    "agency": _article_agency(r),
+                    "published_at": (r.get("published_at") or "")[:10],
                     "score": int(r.get("importance_score") or 0),
                     "summary": r.get("summary_text") or "",
                 })
-            if len(out) >= limit:
-                break
-        return out
+        if ea_types:
+            marks = ",".join("?" * len(ea_types))
+            for r in db.rows(
+                _ITEM_SELECT + f" where p.item_type in ({marks})"
+                " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc limit 120",
+                    list(ea_types)):
+                out.append({
+                    "id": r["id"], "title": r.get("title") or "",
+                    "url": r.get("url_canonical") or r.get("url_source") or "",
+                    "press": r.get("agency_name") or r.get("agency_raw") or "",
+                    "agency": r.get("agency_name") or r.get("agency_raw") or "",
+                    "published_at": (r.get("notice_start") or r.get("collected_at") or "")[:10],
+                    "score": _IMPACT_RANK.get(r.get("impact_level") or "", 0) * 25,
+                    "summary": r.get("summary") or "",
+                })
+        out.sort(key=lambda x: x["published_at"], reverse=True)
+        if agency:
+            picks = set(agency.split(","))
+            out = [x for x in out if x["agency"] in picks]
+        return out[:limit]
 
     @app.get("/api/ea/policy-news")
-    def ea_policy_news(limit: int = 30):
-        return JSONResponse({"items": _news("정부/정책", max(1, min(limit, 100)))})
+    def ea_policy_news(limit: int = 40, agency: str = ""):
+        return JSONResponse({"items": _news("정부/정책", max(1, min(limit, 120)), (), agency)})
 
     @app.get("/api/ea/trade-news")
-    def ea_trade_news(limit: int = 30):
-        return JSONResponse({"items": _news("글로벌 통상환경", max(1, min(limit, 100)))})
+    def ea_trade_news(limit: int = 40, agency: str = ""):
+        return JSONResponse({"items": _news("글로벌 통상환경", max(1, min(limit, 120)),
+                                            ("trade_news",), agency)})
 
     log.info("대외협력 API 등록 (/api/ea/*)")

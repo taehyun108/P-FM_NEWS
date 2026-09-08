@@ -406,8 +406,8 @@
           배치돼 있다. 저장소는 <code>Storage</code> 추상 클래스 아래
           <code>SqliteStorage</code>와 <code>SupabaseStorage</code> 두 구현이 있어,
           <code>.env</code>의 <code>DB_BACKEND</code> 한 줄로 전환된다.
-          대외협력은 <code>backend/external_affairs.py</code>(1,311줄)와
-          <code>backend/ea_crawl.py</code>(360줄)로 분리돼 있고, main.py 는
+          대외협력은 <code>backend/external_affairs.py</code>(1,614줄)와
+          <code>backend/ea_crawl.py</code>(516줄)로 분리돼 있고, main.py 는
           <b>가드 import 로만</b> 연결한다 — 모듈이 없거나 깨져도 기존 수집·API 는 그대로 뜬다.
         </p>
       </section>
@@ -966,12 +966,12 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>262개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>270개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
           <dt>Storage 정합</dt><dd>ABC 45개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0, 호출부 없는 메서드 0</dd>
-          <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 3종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
+          <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 4종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
         </div>
 
         <h3>필터 규칙을 한 벌로 합친 이유</h3>
@@ -1103,24 +1103,24 @@
 
       <!-- ═══════════ 8. 대외협력 ═══════════ -->
       <section id="ea">
-        <h2><span class="tag">09 — 대외협력</span>마감일이 1순위인 화면</h2>
+        <h2><span class="tag">09 — 대외협력</span>독립 페이지 · 5개 카테고리</h2>
 
         <p>
-          입법·행정예고 의견제출은 <b>기한이 지나면 기회 자체가 사라진다.</b> 그래서 이 탭의
-          기본 정렬은 <b>의견제출 마감일 임박순</b>이고, D-7 이내 항목은 패널 최상단에
-          배너로 따로 띄운다. 필요하면 <code>정렬</code> 드롭다운에서 <b>최신순</b>(공고 시작일)
-          이나 <b>영향도순</b>(<code>?sort=recent|impact</code>)으로 바꿀 수 있다.
-          뉴스 탭과 목적이 달라 데이터·수집기·화면을 모두 분리했다.
+          대외협력은 뉴스 앱과 목적·데이터·화면이 달라 <b>독립 주소 <code>/ea</code></b> 로 분리했다
+          (같은 SPA 를 내보내고 <code>external_affairs.js</code> 가 <code>location.pathname</code> 을
+          보고 대외협력 화면을 연다. 헤더의 "← 뉴스로" 로 되돌아간다).
+          상단 카테고리는 <b>5개</b> — <b>입법·행정예고 / 국회 의안 / 정책 동향 / 통상 환경 / 부처별 동향</b>.
+          입법·행정예고 의견제출은 기한이 지나면 기회가 사라지므로 그 탭의 기본 정렬은
+          <b>마감일 임박순</b>이고 D-7 이내는 상단 배너로 띄운다. 뉴스형 카테고리(정책·통상·부처별)는
+          <b>최신순</b>이다.
         </p>
         <p>
-          <b>부처 필터</b>는 <b>관심 부처 전체를 건수와 함께</b> 보여준다
-          (<code>산업통상부 (0)</code> · <code>기후에너지환경부 (4)</code>). 수집된 것만 보여주면
-          "왜 산업부가 없지?"라는 혼선이 생기기 때문이다. 목록은 <b>서브탭 기준</b>으로 갈린다 —
-          입법·행정예고 탭은 정부 부처(<code>kind='ministry'</code>), 국회 의안 탭은
-          국회 상임위(<code>kind='committee'</code>)만 뜬다. 의안의 소관은 부처가 아니라
-          상임위라서, 예전에는 국회 의안 탭에 재정경제부 같은 부처가 섞여 보였다.
-          부처명은 매핑된 이름이 없으면 크롤 원문(<code>agency_raw</code>)을 그대로 쓴다 —
-          2025 정부조직 개편 신 명칭(산업통상부·재정경제부·행정안전부)도 그대로 노출된다.
+          필터의 "언론사" 자리는 <b>기관</b>(정부부처·국회 상임위·KOTRA)으로 바뀐다.
+          카테고리마다 목록이 다르다 — 입법·행정예고=소관 부처(<code>kind='ministry'</code>),
+          국회 의안=소관 상임위(<code>kind='committee'</code>), 부처별 동향=부처, 통상 환경=KOTRA·부처,
+          정책 동향=기사에서 뽑은 발표 부처(제목 첫머리의 <code>산업부,</code>·<code>국토부는</code>
+          약칭을 정식명으로 환산). 관심 부처는 <b>건수 0이어도</b> 드롭다운에 남겨
+          "왜 산업부가 없지?" 혼선을 없앤다. 부처명은 매핑이 없으면 크롤 원문(<code>agency_raw</code>).
         </p>
         <p>
           건수가 0인 부처가 뜨는 것과, 그 부처의 공고가 <b>수집 자체가 안 되는 것</b>은 다르다.
@@ -1164,12 +1164,13 @@
 
         <h3>격리 설계</h3>
         <p>
-          로직은 전부 신규 3파일(<code>external_affairs.py</code> 1,014줄 ·
-          <code>external_affairs.js</code> · <code>external_affairs.css</code>)에 있고,
-          기존 파일에는 연결선만 그었다 — <code>main.py</code> 11줄,
-          <code>app.js</code> 4줄, <code>index.html</code> 2곳,
-          <code>style.css</code> <b>0줄</b>. 모든 CSS 클래스는 <code>.ea-</code> 접두사이고,
-          URL 파라미터도 <code>ea_page</code>처럼 접두사를 붙여 기존 필터 상태와 섞이지 않는다.
+          로직은 전부 신규 3파일(<code>external_affairs.py</code> ·
+          <code>ea_crawl.py</code> · <code>external_affairs.{js,css}</code>)에 있고,
+          기존 파일에는 연결선만 그었다 — <code>main.py</code> 는 가드 import + 라우터 등록 +
+          독립 주소 <code>@app.get("/ea")</code>(같은 SPA 재사용), <code>app.js</code> 4줄,
+          <code>index.html</code> 대외협력 섹션, <code>style.css</code> <b>0줄</b>.
+          모든 CSS 클래스는 <code>.ea-</code> 접두사, URL 도 경로(<code>/ea</code>) + <code>ea_</code>
+          접두사 쿼리라 기존 필터 상태와 섞이지 않는다.
         </p>
         <div class="note">
           <b><code>external_affairs.py</code>는 <code>main.py</code>를 import 하지 않는다.</b>
@@ -1184,17 +1185,24 @@
           <thead><tr><th>#</th><th>소스</th><th>방식</th><th>상태</th></tr></thead>
           <tbody>
             <tr><td>S1</td><td>입법예고</td>
-                <td><code>opinion.lawmaking.go.kr/rest/ogLmPp.xml</code></td>
-                <td>구현 완료 · <code>EA_LAWMAKING_OC</code> 대기</td></tr>
-            <tr><td>S2</td><td>행정예고</td>
-                <td><code>opinion.lawmaking.go.kr/rest/ptcpAdmPp.xml</code></td>
-                <td>구현 완료 · 동일 키</td></tr>
-            <tr><td>S3</td><td>국회 발의법률안</td>
-                <td><code>open.assembly.go.kr</code> <code>nzmimeepazxkubdpn</code></td>
-                <td>구현 완료 · <code>EA_ASSEMBLY_KEY</code> 대기</td></tr>
-            <tr><td>S4</td><td>정책 동향</td><td>기존 <code>정부/정책</code> 기사 재사용</td>
+                <td><code>opinion.lawmaking.go.kr</code> 크롤 (OC 키 있으면 REST)</td>
                 <td><b>동작 중</b></td></tr>
-            <tr><td>S5</td><td>통상 환경</td><td>기존 <code>글로벌 통상환경</code> 기사 재사용</td>
+            <tr><td>S2</td><td>행정예고</td>
+                <td><code>opinion.lawmaking.go.kr</code> 크롤 (동일 키)</td>
+                <td><b>동작 중</b></td></tr>
+            <tr><td>S3</td><td>국회 발의법률안</td>
+                <td><code>pal.assembly.go.kr</code> 크롤 (<code>EA_ASSEMBLY_KEY</code> 있으면 REST)</td>
+                <td><b>동작 중</b></td></tr>
+            <tr><td>S4</td><td>부처 정책뉴스</td>
+                <td>부처 홈페이지 정책뉴스 게시판 — POST 방식 RSS(본문 포함).
+                    산업통상부부터, <code>MINISTRY_NEWS_FEEDS</code> 로 확장</td>
+                <td><b>동작 중</b> · <code>item_type='ministry_news'</code> → 부처별 동향</td></tr>
+            <tr><td>S5</td><td>KOTRA 해외시장뉴스</td>
+                <td>data.go.kr "KOTRA 해외시장뉴스" 오픈API</td>
+                <td><code>EA_KOTRA_SERVICE_KEY</code> 대기 · <code>trade_news</code> → 통상 환경</td></tr>
+            <tr><td>S6</td><td>정책 동향</td><td>기존 <code>정부/정책</code> 기사 재사용(읽기 전용)</td>
+                <td><b>동작 중</b></td></tr>
+            <tr><td>S7</td><td>통상 환경(기사)</td><td>기존 <code>글로벌 통상환경</code> 기사 + S5 KOTRA 병합</td>
                 <td><b>동작 중</b></td></tr>
           </tbody>
         </table></div>
@@ -1232,7 +1240,10 @@
           <dt>본문</dt>
           <dd>저장하지 않는다. G2.5 통과분만 상세(REST 또는 상세 페이지 크롤)를 받아
               제안이유·주요내용을 메모리로 넘겨 그 회차에 분석하고 버린다
-              (기존 §7-3 최소 보관과 동일).</dd>
+              (기존 §7-3 최소 보관과 동일). 뉴스형(부처 정책뉴스·KOTRA)은 RSS·API 가 본문을
+              함께 주므로 상세 HTTP 가 없다. 첫 회차에 분석을 못 한 뉴스형 항목은 다음 회차에
+              피드를 한 번 더 받아 본문을 맞춘다(<code>_news_body_map</code>). 뉴스형은
+              '개정이유·조문' 프롬프트 대신 '동향·시사점' 프롬프트(<code>EA_NEWS_PROMPT</code>)를 쓴다.</dd>
           <dt>LLM 예산</dt>
           <dd>전용 일일 상한 <code>EA_LLM_DAILY_LIMIT</code>(기본 50). 전체 상한과 작은 쪽을 쓰되,
               초과 시 <b>대외협력만 멈추고 뉴스 분석은 계속</b>된다.

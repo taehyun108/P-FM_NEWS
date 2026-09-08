@@ -353,6 +353,162 @@ def fetch_detail(item: dict) -> dict:
     return {"body": body[:8000], "title": title}
 
 
+# ── S4 부처 정책뉴스 (표준 정부 홈페이지 CMS — POST 방식 RSS, 본문 포함) ──
+# 부처마다 홈페이지 CMS 가 달라 일괄 적용이 안 된다. 본문까지 서버가 주는 곳만
+# 넣는다. 새 부처는 그 부처 '정책뉴스' 게시판의 ATCL id 를 확인해 아래에 추가한다.
+#   확인법: https://<부처>/kor/article/ATCL.../ 목록 페이지에서 게시판 링크의 ATCL id
+MINISTRY_NEWS_FEEDS: list[tuple[str, str]] = [
+    ("산업통상부", "https://www.motir.go.kr/kor/article/ATCLb41cda0c5/rss"),
+]
+
+import html as _html_mod
+
+
+def _rss_items(xml: str) -> list[dict]:
+    """<item> 목록을 {title, link, pubDate, description(평문)} 로 뽑는다."""
+    out: list[dict] = []
+    for block in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        def _f(tag: str) -> str:
+            m = re.search(rf"<{tag}>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</{tag}>", block, re.S)
+            return (m.group(1).strip() if m else "")
+        desc = _html_mod.unescape(_f("description"))
+        desc = _clean(re.sub(r"<[^>]+>", " ", desc))
+        out.append({"title": _clean(_html_mod.unescape(_f("title"))),
+                    "link": _f("link"), "pubDate": _f("pubDate"), "description": desc})
+    return out
+
+
+def crawl_ministry_news(max_per_feed: int = 20) -> list[dict]:
+    """부처 정책뉴스 — POST 방식 RSS 로 제목·링크·발행일·본문을 한 번에 받는다."""
+    import requests
+    items: list[dict] = []
+    for agency, feed_url in MINISTRY_NEWS_FEEDS:
+        gap = _REQ_GAP - (time.monotonic() - _last_req[0])
+        if gap > 0:
+            time.sleep(gap)
+        try:
+            resp = requests.post(feed_url, data=b"", timeout=20,
+                                 headers={"User-Agent": _UA, "Accept-Language": "ko",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+            _last_req[0] = time.monotonic()
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or resp.encoding or "utf-8"
+            rows = _rss_items(resp.text)
+        except Exception as exc:
+            log.warning("%s 정책뉴스 RSS 실패: %s", agency, exc)
+            continue
+        for r in rows[:max_per_feed]:
+            if not r["link"] or not r["title"]:
+                continue
+            start, _ = parse_period(r["pubDate"])
+            items.append({
+                "url_source": r["link"], "url_canonical": r["link"],
+                "item_type": "ministry_news", "title": r["title"],
+                "law_name": "", "agency": agency,
+                "notice_start": start, "notice_end": None,
+                "status": "발표", "opinion_url": None,
+                "attachment_urls": [], "published_at": start,
+                "_body": r["description"],   # RSS 가 본문을 줬으므로 상세 HTTP 불필요
+            })
+    log.info("부처 정책뉴스 크롤링 %d건", len(items))
+    return items
+
+
+# ── S5 KOTRA 해외시장뉴스 (data.go.kr 오픈API — 서비스키 필요) ─────────
+# 서비스: data.go.kr "KOTRA 해외시장뉴스" (기관: 대한무역투자진흥공사).
+# 응답은 data.go.kr 표준(XML: <response><body><items><item>…). 필드명이 서비스마다
+# 조금씩 달라, 흔한 이름을 후보로 두고 첫 성공 응답의 키를 로그로 남긴다.
+KOTRA_API_URL_DEFAULT = "https://apis.data.go.kr/B410001/ovseaMrktNews/ovseaMrktNewsList"
+_kotra_keys_logged = [False]
+_KOTRA_FIELDS = {
+    "title": ("newsTitl", "cntntsSj", "titl", "title", "newsTitle"),
+    "body":  ("newsCn", "cntntsCn", "cn", "newsCntnts", "contents"),
+    "date":  ("newsWrtDt", "regDt", "frstRegistDt", "newsRegDt", "wrtDt"),
+    "url":   ("newsOrgnlUrl", "newsUrl", "orgnlUrl", "url", "newsLink"),
+    "id":    ("newsId", "cntntsId", "id", "newsSn"),
+    "nation": ("newsNatArea", "natN", "nationNm", "cntryNm", "area"),
+}
+
+
+def _kotra_pick(row: dict, key: str) -> str:
+    for n in _KOTRA_FIELDS[key]:
+        v = row.get(n)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def crawl_kotra_news(service_key: str, rows: int = 60) -> list[dict]:
+    """KOTRA 해외시장뉴스. service_key 가 없으면 빈 목록(비활성)."""
+    if not service_key:
+        return []
+    import os
+    import requests
+    from xml.etree import ElementTree as ET
+
+    url = os.environ.get("EA_KOTRA_API_URL", KOTRA_API_URL_DEFAULT).strip() or KOTRA_API_URL_DEFAULT
+    gap = _REQ_GAP - (time.monotonic() - _last_req[0])
+    if gap > 0:
+        time.sleep(gap)
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": _UA},
+                            params={"serviceKey": service_key, "numOfRows": rows,
+                                    "pageNo": 1, "type": "json"})
+        _last_req[0] = time.monotonic()
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("KOTRA 해외시장뉴스 조회 실패: %s", exc)
+        return []
+
+    records: list[dict] = []
+    text = resp.text.strip()
+    try:
+        data = resp.json()
+        # data.go.kr JSON: response.body.items.item (list 또는 dict)
+        node = data
+        for k in ("response", "body", "items"):
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+        item = node.get("item") if isinstance(node, dict) else node
+        records = item if isinstance(item, list) else ([item] if isinstance(item, dict) else [])
+    except ValueError:
+        try:
+            root = ET.fromstring(text)
+            records = [{c.tag: (c.text or "").strip() for c in it}
+                       for it in root.iter("item")]
+        except ET.ParseError:
+            log.warning("KOTRA 응답 형식 불명 (앞 200자): %s", text[:200])
+            return []
+
+    if records and not _kotra_keys_logged[0]:
+        log.info("KOTRA 응답 필드: %s", sorted(records[0].keys()))
+        _kotra_keys_logged[0] = True
+
+    out: list[dict] = []
+    for r in records:
+        title = _kotra_pick(r, "title")
+        link = _kotra_pick(r, "url") or (
+            f"https://dream.kotra.or.kr/kotranews/cms/news/actionKotraBoardDetail.do?"
+            f"pageNo=1&pRttSrchKeyword=&pNttSn={_kotra_pick(r, 'id')}" if _kotra_pick(r, "id") else "")
+        if not title or not link:
+            continue
+        start, _ = parse_period(_kotra_pick(r, "date"))
+        nation = _kotra_pick(r, "nation")
+        body = _clean(re.sub(r"<[^>]+>", " ", _html_mod.unescape(_kotra_pick(r, "body"))))
+        out.append({
+            "url_source": link, "url_canonical": link,
+            "item_type": "trade_news",
+            "title": f"[{nation}] {title}" if nation and nation not in title else title,
+            "law_name": "", "agency": "KOTRA",
+            "notice_start": start, "notice_end": None,
+            "status": "발표", "opinion_url": None,
+            "attachment_urls": [], "published_at": start,
+            "_body": body,
+        })
+    log.info("KOTRA 해외시장뉴스 크롤링 %d건", len(out))
+    return out
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

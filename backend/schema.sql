@@ -236,7 +236,7 @@ create table if not exists ea_policy_items (
   id              uuid primary key default gen_random_uuid(),
   url_source      text not null unique,      -- 게이트(G2) 판정 키
   url_canonical   text not null,
-  item_type       text not null,             -- 'legislation' | 'admin_notice' | 'bill'
+  item_type       text not null,             -- 'legislation'|'admin_notice'|'bill'|'ministry_news'|'trade_news'
   category        text,                      -- 향후 선택 발송용 분류 (지금은 값만 채운다)
   title           text not null,
   agency_id       uuid references ea_agencies(id),

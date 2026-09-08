@@ -47,6 +47,11 @@ try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 
 except Exception:   # pragma: no cover
     ea_mod = None
 
+try:
+    import ea_crawl as ea_crawl_mod
+except Exception:   # pragma: no cover
+    ea_crawl_mod = None
+
 # ─────────────────────────────────────────────────────────────────────
 # 로깅 — 키 값은 절대 출력하지 않는다. (env-secret-guard §1-5)
 #
@@ -5641,13 +5646,22 @@ def create_app(ctx: Context):
             return html.replace('<script src="./app.js"></script>',
                                 f"<script>\n{js}\n</script>\n<script>\n{ea_js}\n</script>")
 
-        @app.get("/")
-        def index():
-            # 세 파일의 수정시각이 그대로면 조립 결과를 재사용한다(매 요청 디스크 3회 읽기·치환 방지).
+        def _index_html() -> str:
             sig = tuple(os.path.getmtime(p) for p in _index_files)
             if _index_cache["sig"] != sig:
                 _index_cache.update(sig=sig, html=_render_index())
-            return HTMLResponse(_index_cache["html"])
+            return _index_cache["html"]
+
+        @app.get("/")
+        def index():
+            # 세 파일의 수정시각이 그대로면 조립 결과를 재사용한다(매 요청 디스크 3회 읽기·치환 방지).
+            return HTMLResponse(_index_html())
+
+        @app.get("/ea")
+        def ea_page():
+            # 대외협력 독립 주소. 같은 SPA 를 내보내고, external_affairs.js 가
+            # location.pathname 을 보고 대외협력 화면으로 열어 준다.
+            return HTMLResponse(_index_html())
 
         # 직접 접근(디버그)용으로 파일도 계속 서빙한다.
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
@@ -6706,6 +6720,30 @@ def cmd_selftest() -> int:
               ea_mod.detect_ea_groups("건설산업기본법 일부개정법률안"), ["포스코이앤씨"])
         check("무관 제목은 그룹사 없음",
               ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
+        # 카테고리 5개 + item_type 매핑
+        check("카테고리 5개", [c["key"] for c in ea_mod.EA_CATEGORIES],
+              ["notice", "bill", "policy", "trade", "ministry"])
+        check("부처별 동향 → ministry_news", ea_mod.EA_CATEGORY_TYPES["ministry"], ["ministry_news"])
+        check("통상 환경 → trade_news", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_news"])
+        # 발표 기관 추출 — author(정책브리핑) 우선, 없으면 제목 첫머리 약칭
+        check("author 가 부처면 기관으로", ea_mod._article_agency({"author": "산업통상부", "title": "x"}),
+              "산업통상부")
+        check("author 약칭은 정식명으로", ea_mod._article_agency({"author": "산업부", "title": "x"}),
+              "산업통상부")
+        check("제목 첫머리 부처 약칭 인식",
+              ea_mod._article_agency({"author": "김기자", "title": "국토부, 주택공급 확대 방안 발표"}),
+              "국토교통부")
+        check("기자명뿐이고 제목에도 부처 없으면 빈값",
+              ea_mod._article_agency({"author": "홍길동", "title": "포스코퓨처엠 양극재 증설"}), "")
+        # 부처 정책뉴스 RSS 파서 — <item> 에서 제목·링크·본문(태그 제거)
+        _rss = ('<rss><channel><item><title><![CDATA[제1회 협의회 개최]]></title>'
+                '<link><![CDATA[https://x/1/view]]></link><pubDate><![CDATA[2026-09-08]]></pubDate>'
+                '<description><![CDATA[<p>차관은 회의에 참석해 논의하였다.</p>]]></description>'
+                '</item></channel></rss>')
+        _parsed = ea_crawl_mod._rss_items(_rss) if ea_crawl_mod else []
+        check("RSS item 제목·본문 파싱",
+              (_parsed[0]["title"], "차관은 회의에" in _parsed[0]["description"]) if _parsed else None,
+              ("제1회 협의회 개최", True))
 
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))

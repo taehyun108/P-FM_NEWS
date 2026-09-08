@@ -209,7 +209,7 @@ create table if not exists ea_policy_items (
   id              TEXT primary key,
   url_source      TEXT not null unique,   -- 게이트(G2) 판정 키
   url_canonical   TEXT not null,
-  item_type       TEXT not null,          -- 'legislation' | 'admin_notice' | 'bill'
+  item_type       TEXT not null,          -- 'legislation'|'admin_notice'|'bill'|'ministry_news'|'trade_news'
   category        TEXT,                   -- 향후 선택 발송용 분류 (지금은 값만 채운다)
   title           TEXT not null,
   agency_id       TEXT references ea_agencies(id),
