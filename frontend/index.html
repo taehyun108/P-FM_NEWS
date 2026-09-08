@@ -346,6 +346,20 @@
 <!-- SWOT 툴팁 (PRD F6.2a) — 카드 경계를 넘어 표시되도록 body 직속으로 둔다 -->
 <div class="swot-tip" id="swotTip" role="tooltip" hidden></div>
 
+<!-- 통계 상세 (발송 실패 · 분석 대기 카드를 누르면 열린다) -->
+<div class="modal-backdrop" id="detailModal" hidden>
+  <div class="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+    <div class="modal-head">
+      <h2 id="detailTitle">상세</h2>
+      <button type="button" class="modal-close" id="detailClose" aria-label="닫기">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-desc" id="detailDesc"></p>
+      <div class="detail-list" id="detailList"></div>
+    </div>
+  </div>
+</div>
+
 <script src="./app.js"></script>
 </body>
 </html>

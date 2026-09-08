@@ -575,6 +575,12 @@ class Storage(ABC):
     @abstractmethod
     def mark_notification(self, notif_id: str, status: str, error: str | None) -> None: ...
 
+    @abstractmethod
+    def failed_notifications(self, limit: int) -> list[dict]: ...
+
+    @abstractmethod
+    def unanalyzed_articles(self, limit: int) -> list[dict]: ...
+
 
 # ── SQLite 구현 ──────────────────────────────────────────────────────
 
@@ -1118,6 +1124,36 @@ class SqliteStorage(Storage):
                 (status, error, sent_at, notif_id),
             )
 
+    def failed_notifications(self, limit: int) -> list[dict]:
+        """대시보드의 '발송 실패'를 눌렀을 때 보여 줄 목록.
+
+        status='failed' 뿐 아니라, queued 로 남았지만 재시도 한도를 넘겨
+        <다시 시도되지도 않고 실패로 세어지지도 않는> 것까지 함께 보여 준다.
+        후자는 화면 어디에도 안 나와서 조용히 사라지던 건들이다.
+        """
+        return self._rows(
+            "select n.id, n.status, n.error, n.retry_count, n.created_at, n.channel, n.chat_id,"
+            " a.id as article_id, a.title, a.press_name, a.published_at,"
+            " a.url_canonical, a.url_original, a.importance_score"
+            " from notifications n"
+            " left join articles a on a.id = n.article_id"
+            " where n.status='failed' or (n.status='queued' and n.retry_count >= 3)"
+            " order by n.created_at desc limit ?",
+            (limit,),
+        )
+
+    def unanalyzed_articles(self, limit: int) -> list[dict]:
+        """'분석 대기'를 눌렀을 때 보여 줄 목록 — 본문은 있는데 분석이 안 끝난 기사."""
+        return self._rows(
+            "select a.id as article_id, a.title, a.press_name, a.published_at, a.collected_at,"
+            " a.url_canonical, a.url_original, a.importance_score,"
+            " length(b.body) as body_len, b.fetched_at, b.summary_source"
+            " from articles a join article_bodies b on b.article_id = a.id"
+            " where a.analyzed_at is null and a.status='active'"
+            " order by a.collected_at desc limit ?",
+            (limit,),
+        )
+
 
 # ── Supabase 구현 ────────────────────────────────────────────────────
 
@@ -1519,6 +1555,45 @@ class SupabaseStorage(Storage):
             patch["status"] = status
             patch["sent_at"] = iso(now_utc()) if status == "sent" else None
         self._t("notifications").update(patch).eq("id", notif_id).execute()
+
+    def failed_notifications(self, limit: int) -> list[dict]:
+        # PostgREST 는 or() 안에서 and() 를 중첩할 수 있다.
+        rows = (self._t("notifications")
+                .select("id,status,error,retry_count,created_at,channel,chat_id,article_id")
+                .or_("status.eq.failed,and(status.eq.queued,retry_count.gte.3)")
+                .order("created_at", desc=True).limit(limit).execute().data) or []
+        ids = [r["article_id"] for r in rows if r.get("article_id")]
+        arts = {}
+        if ids:
+            for a in (self._t("articles").select(
+                    "id,title,press_name,published_at,url_canonical,url_original,importance_score")
+                    .in_("id", ids).execute().data or []):
+                arts[a["id"]] = a
+        out = []
+        for r in rows:
+            a = arts.get(r.get("article_id"), {})
+            out.append({**r, "title": a.get("title"), "press_name": a.get("press_name"),
+                        "published_at": a.get("published_at"),
+                        "url_canonical": a.get("url_canonical"),
+                        "url_original": a.get("url_original"),
+                        "importance_score": a.get("importance_score")})
+        return out
+
+    def unanalyzed_articles(self, limit: int) -> list[dict]:
+        bodies = (self._t("article_bodies").select("article_id,fetched_at,summary_source")
+                  .order("fetched_at", desc=True).limit(2000).execute().data) or []
+        by_id = {b["article_id"]: b for b in bodies}
+        if not by_id:
+            return []
+        rows = (self._t("articles").select(
+                "id,title,press_name,published_at,collected_at,url_canonical,url_original,importance_score")
+                .is_("analyzed_at", "null").eq("status", "active")
+                .in_("id", list(by_id)[:500])
+                .order("collected_at", desc=True).limit(limit).execute().data) or []
+        return [{**r, "article_id": r["id"],
+                 "fetched_at": by_id.get(r["id"], {}).get("fetched_at"),
+                 "summary_source": by_id.get(r["id"], {}).get("summary_source"),
+                 "body_len": None} for r in rows]
 
 
 def make_storage(cfg: Config) -> Storage:
@@ -4345,6 +4420,31 @@ def esc(text: str) -> str:
     return html_mod.escape(text or "", quote=False)
 
 
+def esc_attr(text: str) -> str:
+    """href="..." 안에 들어가는 값. 큰따옴표까지 이스케이프해야 태그가 안 깨진다.
+
+    esc() 는 quote=False 라 " 를 그대로 둔다. 주소에 " 가 섞이면 <a href> 가 끊겨
+    'can't parse entities' 로 영구 실패한다.
+    """
+    return html_mod.escape(text or "", quote=True)
+
+
+# 텔레그램 메시지 상한은 4096자. 넘으면 'message is too long' 으로 <재시도해도 계속>
+# 실패한다. 요약·관점이 긴 기사가 조용히 실패로 쌓이던 원인이라 보낼 때 잘라 준다.
+TELEGRAM_MAX_CHARS = 4096
+
+
+def clamp_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    tail = "\n\n…(길어서 줄였습니다)"
+    cut = text[: limit - len(tail)]
+    # 태그 한가운데서 자르면 HTML 이 깨지므로 마지막으로 닫힌 지점까지 물러난다
+    if cut.count("<") > cut.count(">"):
+        cut = cut[: cut.rfind("<")]
+    return cut + tail
+
+
 def format_message(row: dict) -> str:
     score = int(row.get("importance_score") or 0)
     emoji = "🔴" if score >= 80 else "🟠"
@@ -4364,7 +4464,7 @@ def format_message(row: dict) -> str:
         lines += ["", f"포스코 관점: {esc(perspective)}"]
     link = row.get("url_canonical") or row.get("url_original") or ""
     if link:
-        lines += ["", f'🔗 <a href="{esc(link)}">원문 보기</a>']
+        lines += ["", f'🔗 <a href="{esc_attr(link)}">원문 보기</a>']
     return "\n".join(lines)
 
 
@@ -4462,7 +4562,7 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
 
     def _send_one(row: dict) -> bool:
         """개별 카드 발송 — 요약·그룹사·점수가 다 들어간 전체 메시지."""
-        ok, err = _telegram_send(ctx, url, format_message(row))
+        ok, err = _telegram_send(ctx, url, clamp_message(format_message(row)))
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
         else:
@@ -4478,6 +4578,8 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if prio_count >= PRIORITY_FLOOD_WARN:
         log.warning("우선 기사가 한 회차에 %d건입니다. '항상 발송 키워드'가 너무 넓지 않은지"
                     " 확인하세요(예: '포스코'는 사실상 전체 기사와 매칭됩니다).", prio_count)
+    # 다이제스트 묶음은 폐지됐다 — 전건 개별 카드. 재시도 3회 초과분은 _send_one 이
+    # failed 로 넘긴다(원격 세션의 '영구 실패' 수정 반영).
     return sum(1 for row in pending if _send_one(row))
 
 
@@ -5391,6 +5493,41 @@ def create_app(ctx: Context):
     @app.get("/api/stats")
     def api_stats():
         return JSONResponse(ctx.storage.stats())
+
+    @app.get("/api/stats/notify-failed")
+    def api_stats_notify_failed(limit: int = 50):
+        """대시보드 '발송 실패' 카드를 눌렀을 때 — 어떤 기사가 왜 실패했는지."""
+        rows = ctx.storage.failed_notifications(max(1, min(limit, 200)))
+        return JSONResponse({"items": [{
+            "article_id": r.get("article_id"),
+            "title": r.get("title") or "(기사 정보 없음)",
+            "press_name": r.get("press_name"),
+            "url": r.get("url_canonical") or r.get("url_original"),
+            "importance_score": r.get("importance_score"),
+            "status": r.get("status"),
+            "error": r.get("error") or "(원인이 기록되지 않았습니다)",
+            "retry_count": r.get("retry_count"),
+            "channel": r.get("channel"),
+            "created_at": r.get("created_at"),
+            # queued 인데 재시도 한도를 넘긴 건 = 실패로 세어지지도, 재시도되지도 않던 것
+            "stuck": r.get("status") == "queued",
+        } for r in rows]})
+
+    @app.get("/api/stats/analysis-pending")
+    def api_stats_analysis_pending(limit: int = 50):
+        """대시보드 '분석 대기' 카드를 눌렀을 때 — 본문은 받았는데 분석이 안 끝난 기사."""
+        rows = ctx.storage.unanalyzed_articles(max(1, min(limit, 200)))
+        return JSONResponse({"items": [{
+            "article_id": r.get("article_id"),
+            "title": r.get("title") or "(제목 없음)",
+            "press_name": r.get("press_name"),
+            "url": r.get("url_canonical") or r.get("url_original"),
+            "importance_score": r.get("importance_score"),
+            "collected_at": r.get("collected_at"),
+            "fetched_at": r.get("fetched_at"),
+            "summary_source": r.get("summary_source"),
+            "body_len": r.get("body_len"),
+        } for r in rows]})
 
     @app.get("/api/articles/{article_id}")
     def api_article(article_id: str):
