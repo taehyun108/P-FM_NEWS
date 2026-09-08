@@ -5141,20 +5141,15 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
     groups = normalize_group_list(jload(row.get("group_companies"), []))
     cats = jload(row.get("categories"), [])
     if not groups:
+        # 제목·요약·키워드에서 계열사를 찾는다. 없으면 그룹사 태그를 붙이지 않는다 —
+        # 예전에는 '포스코' 를 폴백으로 씌웠지만, 본문에 포스코가 시황·티커 목록으로
+        # 스치듯 나온 기사(홍콩증시·충북경제 등)까지 포스코 태그를 달아 오해를 샀다.
+        # (사용자 지적 2회) 카테고리 태그로 충분하고, 로고 썸네일은 프런트가 알아서 채운다.
         probe = " ".join([
             row.get("title") or "", row.get("summary_text") or "",
             " ".join(jload(row.get("keywords"), [])),
         ])
         groups = normalize_group_list(detect_group_companies(probe))
-        # '포스코' 폴백은 **분석이 끝나 관련성이 확정된** 일반 기사에만 씌운다.
-        #  · 미분석(deferred) 기사: 수집 게이트가 네이버 snippet 만 봤을 수 있어 신뢰 못 함
-        #  · 정책브리핑·통상·배터리 생태계 기사: 포스코 미언급이 정상
-        non_posco_cat = {TRADE_CATEGORY, POLICY_CATEGORY, PEOPLE_NEWS_CATEGORY,
-                         "배터리·이차전지", "양극재", "음극재"}
-        if (not groups and row.get("analyzed_at") and not is_policy_brief(row)
-                and not (non_posco_cat & set(cats))
-                and not is_battery_scope(row.get("title") or "", row.get("summary_text") or "")):
-            groups = ["포스코"]
     categories = dedupe_chips(cats, exclude=groups)
     return groups, categories, row.get("press_name") or ""
 
@@ -6687,17 +6682,17 @@ def cmd_selftest() -> int:
           _rows_sorted[0]["source_type"], "manual")
     check("중요도순: 나머지는 점수 내림차순",
           [r["importance_score"] for r in _rows_sorted[1:]], [95, 90])
-    # card_tags '포스코' 폴백 — 분석 완료 + 관련 카테고리 아님일 때만
+    # card_tags — 제목·요약에서 실제로 계열사가 잡힐 때만 그룹사 태그. '포스코' 폴백 폐지.
     _now = iso(now_utc())
-    check("분석 완료·그룹 없음·일반 기사 → 포스코 폴백",
-          card_tags({"title": "새 공장 착공식 개최", "group_companies": "[]",
-                     "categories": "[]", "analyzed_at": _now})[0], ["포스코"])
-    check("미분석 기사에는 포스코 폴백 안 함",
-          card_tags({"title": "새 공장 착공식 개최", "group_companies": "[]",
-                     "categories": "[]", "analyzed_at": None})[0], [])
-    check("배터리·이차전지 카테고리면 포스코 폴백 안 함",
-          card_tags({"title": "글로벌 배터리 시장 재편", "group_companies": "[]",
-                     "categories": '["배터리·이차전지"]', "analyzed_at": _now})[0], [])
+    check("제목·요약에 계열사 없으면 그룹사 태그 없음",
+          card_tags({"title": "새 공장 착공식 개최", "summary_text": "회사가 착공식을 열었다.",
+                     "group_companies": "[]", "categories": "[]", "analyzed_at": _now})[0], [])
+    check("요약에 포스코 스친 언급만 있어도 태깅 안 함(시황 티커 방지)",
+          card_tags({"title": "홍콩 증시 속락", "summary_text": "지수가 하락했다.",
+                     "group_companies": "[]", "categories": "[]", "analyzed_at": _now})[0], [])
+    check("저장된 group_companies 는 그대로 존중",
+          card_tags({"title": "새 공장", "group_companies": '["포스코퓨처엠"]',
+                     "categories": "[]"})[0], ["포스코퓨처엠"])
     check("제목에 계열사 있으면 그대로 태깅",
           card_tags({"title": "포스코퓨처엠 양극재 증설", "group_companies": "[]",
                      "categories": "[]", "analyzed_at": _now})[0], ["포스코퓨처엠"])
