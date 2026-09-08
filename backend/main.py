@@ -3873,7 +3873,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         probe = f"{item.title}\n{body}"
         # 우선 알림: '항상 발송 키워드' 매칭 또는 '무조건 발송 점수' 이상이면
         # 임계값·야간 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
-        is_priority = _kw_hit(probe, always_kws) or (hard_score > 0 and score >= hard_score)
+        # '항상 발송 키워드' 는 **제목 + 판정된 주체 그룹사**로만 본다 — 본문 전체를 훑으면
+        # 포스코 그룹 기사 대부분에 '포스코홀딩스'·'포스코퓨처엠'이 스치듯 등장해
+        # 사실상 모든 그룹 기사가 야간에도 발송된다(파업 기사 오발송 사례, 2026-09-08).
+        priority_probe = f"{item.title}\n{' '.join(rule_groups)}"
+        is_priority = (_kw_hit_any(priority_probe, always_kws)
+                       or (hard_score > 0 and score >= hard_score))
         # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
         saved_for_notify.append({
             "id": article_id, "score": score, "is_backfill": is_backfill,
@@ -4376,7 +4381,8 @@ def queue_manual_notify(ctx: Context, article_id: str) -> bool:
         hard_score = int(state.get("hard_notify_score") or 0)
     except (TypeError, ValueError):
         hard_score = 0
-    probe = f"{detail.get('title', '')}\n{detail.get('summary_text', '') or ''}"
+    # '항상 발송 키워드'는 제목 + 판정된 그룹사로만 본다(요약에 스친 언급 제외 — run_once 와 동일).
+    probe = f"{detail.get('title', '')}\n{' '.join(jload(detail.get('group_companies'), []))}"
     is_priority = _kw_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
     if not (score >= effective_threshold(ctx) or is_priority):
         log.info("수동 등록 기사(점수 %d)가 임계값 미만이라 웹에만 노출: %s",
@@ -6620,6 +6626,19 @@ def cmd_selftest() -> int:
     check("제목에 계열사 있으면 그대로 태깅",
           card_tags({"title": "포스코퓨처엠 양극재 증설", "group_companies": "[]",
                      "categories": "[]", "analyzed_at": _now})[0], ["포스코퓨처엠"])
+
+    # 우선 알림('항상 발송 키워드')은 제목 + 판정 그룹사로만 본다 — 본문 스친 언급 제외
+    _akw = ["포스코홀딩스", "포스코퓨처엠"]
+    def _prio_probe(title, groups):
+        return _kw_hit_any(f"{title}\n{' '.join(groups)}", _akw)
+    check("제목에 항상발송 키워드 → 우선",
+          _prio_probe("포스코퓨처엠 3분기 실적", ["포스코퓨처엠"]), True)
+    check("판정 그룹사에 있으면 → 우선",
+          _prio_probe("퓨처엠, 광양 공장 증설", ["포스코퓨처엠"]), True)
+    check("본문에만 스친 언급(제목·그룹사에 없음) → 우선 아님",
+          _prio_probe("포스코 노조, 48시간 부분파업 D-1", ["포스코"]), False)
+    check("항상발송 키워드 비면 우선 아님 (_kw_hit_any)",
+          _kw_hit_any("포스코퓨처엠 양극재 증설", []), False)
 
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")
