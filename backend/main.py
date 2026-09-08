@@ -645,6 +645,7 @@ class SqliteStorage(Storage):
             "alter table notifications add column priority INTEGER not null default 0",
             "alter table run_state add column last_weekly_report_at TEXT",
             "alter table run_state add column weekly_report_to TEXT default '[]'",
+            "alter table run_state add column hard_notify_score INTEGER",
         ]
         for sql in migrations:
             try:
@@ -3356,6 +3357,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     saved_for_notify: list[dict] = []
     # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
+    # 무조건 발송 점수 — 이 값 이상이면 우선 기사처럼 다뤄 야간·묶음을 우회한다. (0/None = 미사용)
+    try:
+        hard_score = int(state.get("hard_notify_score") or 0)
+    except (TypeError, ValueError):
+        hard_score = 0
     # 특수 주제 알림 키워드 (OR: 하나라도) / 필수 공통 키워드 (AND: 반드시). 둘 다 비면 전부.
     policy_notify_kws = [k for k in jload(state.get("policy_notify_keywords"), []) if k]
     policy_required_kws = [k for k in jload(state.get("policy_required_keywords"), []) if k]
@@ -3497,9 +3503,9 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             if analyzed is not None:
                 score = analyzed
         probe = f"{item.title}\n{body}"
-        # 우선 알림: 마스터의 '항상 발송 키워드'가 본문에 있으면 중요도 게이트를 우회한다.
-        # (포스코퓨처엠 특례는 폐지 — 원하면 키워드로 추가한다. 사용자 지정)
-        is_priority = _kw_hit(probe, always_kws)
+        # 우선 알림: '항상 발송 키워드' 매칭 또는 '무조건 발송 점수' 이상이면
+        # 임계값·야간·묶음 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
+        is_priority = _kw_hit(probe, always_kws) or (hard_score > 0 and score >= hard_score)
         # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
         saved_for_notify.append({
             "id": article_id, "score": score, "is_backfill": is_backfill,
@@ -3560,7 +3566,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             and (not it["is_backfill"])            # 6시간 넘은 기사는 웹에만
             and _topic_ok(it["policy"], notify_policy)
             and _topic_ok(it["trade"], notify_trade)
-            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선 기사는 우회)
+            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선·무조건점수는 우회)
             and it["published_at"] is not None
             and it["published_at"] >= bootstrap_at  # 파이프라인 가동 이전 기사는 절대 알림 안 함
         )
@@ -5010,9 +5016,15 @@ def create_app(ctx: Context):
         if (err := _master_guard(x_master_token)):
             return err
         st = ctx.storage.get_run_state()
+        try:
+            hard_score = int(st.get("hard_notify_score") or 0)
+        except (TypeError, ValueError):
+            hard_score = 0
         return JSONResponse({
             "ok": True,
+            "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
             "threshold": effective_threshold(ctx),
+            "hard_notify_score": hard_score,          # 0 = 미사용
             "recommended_min": RECOMMENDED_MIN_SCORE,
             "keywords": jload(st.get("always_notify_keywords"), []),
             "web_password": st.get("web_password") or "",
@@ -5032,11 +5044,19 @@ def create_app(ctx: Context):
         if (err := _master_guard(x_master_token)):
             return err
         patch: dict[str, Any] = {}
+        if "telegram_enabled" in (payload or {}):
+            patch["notify_paused"] = 0 if payload["telegram_enabled"] else 1
         if "threshold" in (payload or {}):
             try:
                 patch["notify_threshold"] = int(clamp(int(payload["threshold"]), 0, 100))
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
+                                    status_code=400)
+        if "hard_notify_score" in (payload or {}):
+            try:
+                patch["hard_notify_score"] = int(clamp(int(payload["hard_notify_score"]), 0, 100))
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "무조건 발송 점수는 0~100 숫자여야 합니다."},
                                     status_code=400)
         # 키워드 목록 필드 — 같은 방식으로 정리(중복 제거, 30개 상한)
         for field, col in (("keywords", "always_notify_keywords"),
@@ -6128,6 +6148,18 @@ def cmd_selftest() -> int:
     _p, _n, _d = split_for_digest([{"priority": 0}, {"priority": 0}])
     check("일반 2건은 묶음 기준 미달 → 개별 발송", _d, False)
     check("빈 목록 방어", split_for_digest([]), ([], [], False))
+
+    print("\n[13-2b] 무조건 발송 점수 (hard_notify_score)")
+    # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)
+    def _is_prio(score, hard, kw_hit=False):
+        return kw_hit or (hard > 0 and score >= hard)
+    check("hard=80, 점수 85 → 우선(야간·묶음 우회)", _is_prio(85, 80), True)
+    check("hard=80, 점수 70 → 우선 아님", _is_prio(70, 80), False)
+    check("hard=0(미사용) → 점수 100 이어도 우선 아님", _is_prio(100, 0), False)
+    check("hard 미달이어도 키워드 매칭이면 우선", _is_prio(10, 80, kw_hit=True), True)
+    # hard 기사는 priority 로 큐잉되어 split_for_digest 에서 개별 발송된다
+    _p, _n, _d = split_for_digest([{"priority": 1}, {"priority": 1}, {"priority": 0}, {"priority": 0}])
+    check("무조건점수 기사 2건 → 개별, 나머지는 별도", (len(_p), len(_n)), (2, 2))
 
     print("\n[13-3] 마스터 비밀번호 (pbkdf2)")
     _h = hash_password("s3cret!")

@@ -788,9 +788,12 @@
           </div>
           <figcaption>
             <b>네 조건의 AND.</b> 하나라도 어긋나면 <code>skipped</code>로 큐에 남아 발송되지 않는다.
-            '항상 발송 키워드'가 적중한 <b>우선 기사</b>는 중요도·야간 게이트를 우회하고, 발송
-            단계에서도 다이제스트에 묶이지 않고 요약·SWOT이 담긴 개별 카드로 나간다. 중복 발송은
-            <code>(기사, 채널, 채팅방)</code> UNIQUE 제약으로 DB가 막는다.
+            <b>우선 기사</b>('항상 발송 키워드' 적중 <b>또는</b> 중요도 ≥ <code>hard_notify_score</code>)는
+            중요도·야간 게이트를 우회하고, 발송 단계에서도 다이제스트에 묶이지 않고 요약·SWOT이
+            담긴 개별 카드로 나간다. 단 <b>발행 6시간 초과·억제 모드·주제 토글</b>은 우선 기사도
+            그대로 적용된다. 마스터의 <b>텔레그램 발송</b> 토글을 끄면(<code>notify_paused</code>)
+            큐 적재는 계속하되 발송만 멈춘다 — 다시 켜면 밀린 기사가 순서대로 나간다.
+            중복 발송은 <code>(기사, 채널, 채팅방)</code> UNIQUE 제약으로 DB가 막는다.
           </figcaption>
         </figure>
 
@@ -798,7 +801,9 @@
         <div class="tw"><table>
           <thead><tr><th>설정</th><th>기본값</th><th>동작</th></tr></thead>
           <tbody>
+            <tr><td>텔레그램 발송</td><td>켜짐</td><td>끄면 발송 중지(큐는 계속 쌓임). 봇 <code>/stop</code>·<code>/start</code>와 동일</td></tr>
             <tr><td>관련도 임계값</td><td class="num">50</td><td>0–100 슬라이더. 권장 하한 40을 표시하되 자유롭게 지정</td></tr>
+            <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간·묶음 우회, 개별 카드로 즉시 발송. 0=미사용</td></tr>
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td>본문에 있으면 중요도·야간 게이트를 우회</td></tr>
             <tr><td>정책브리핑 알림</td><td>꺼짐</td><td>켜면 발송. ① 관심 키워드(OR) <b>AND</b> ② 필수 공통 키워드</td></tr>
             <tr><td>글로벌 통상환경 알림</td><td>꺼짐</td><td>위와 같은 2단 필터</td></tr>
@@ -947,7 +952,7 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>238개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>243개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>

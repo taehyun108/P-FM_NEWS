@@ -472,9 +472,14 @@ async function showMasterPanel() {
 async function loadMasterSettings() {
   try {
     const d = await (await masterFetch('/api/master/settings')).json();
+    $('telegramEnabled').checked = !!d.telegram_enabled;
     $('thRange').value = d.threshold;
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
+    const hs = Number(d.hard_notify_score || 0);
+    $('hardRange').value = hs;
+    $('hardVal').textContent = hs;
+    $('hardState').textContent = hs > 0 ? '이상' : '(사용 안 함)';
     $('webPwNow').textContent = d.web_password || '(미설정)';
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
@@ -565,6 +570,29 @@ function initMaster() {
         masterMsg('ok', `임계값 ${e.target.value} 저장`);
       } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
     }, 400);
+  });
+
+  let hardTimer;
+  $('hardRange').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('hardVal').textContent = v;
+    $('hardState').textContent = v > 0 ? '이상' : '(사용 안 함)';
+    clearTimeout(hardTimer);
+    hardTimer = setTimeout(async () => {
+      try {
+        await masterFetch('/api/master/settings',
+          { method: 'POST', body: JSON.stringify({ hard_notify_score: v }) });
+        masterMsg('ok', v > 0 ? `무조건 발송 점수 ${v} 저장` : '무조건 발송 점수 사용 안 함');
+      } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+    }, 400);
+  });
+
+  $('telegramEnabled').addEventListener('change', async (e) => {
+    try {
+      await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ telegram_enabled: e.target.checked }) });
+      masterMsg('ok', `텔레그램 발송 ${e.target.checked ? '켬' : '끔'}`);
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 
   const wireToggle = (id, field, label) => $(id).addEventListener('change', async (e) => {

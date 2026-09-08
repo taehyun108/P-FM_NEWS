@@ -64,8 +64,9 @@ create table if not exists run_state (
   last_success_at  TEXT,
   bootstrap_at     TEXT,                   -- 최초 실행 시각. 이 이전 발행 기사는 알림하지 않는다
   notify_mode      TEXT not null default 'suppressed',
-  notify_paused    INTEGER not null default 0,   -- 텔레그램 /stop 로 알림 일시중지
+  notify_paused    INTEGER not null default 0,   -- 텔레그램 발송 중지 (마스터 토글·/stop). 1=중지
   notify_threshold INTEGER,                -- /threshold 로 지정한 임계값 (null 이면 .env 값)
+  hard_notify_score INTEGER,               -- 무조건 발송 점수. 이 값 이상이면 야간·묶음 우회 (null·0=미사용)
   tg_offset        INTEGER not null default 0,   -- 텔레그램 getUpdates offset
   always_notify_keywords TEXT default '[]', -- 이 단어가 본문에 있으면 점수 무관 알림 (마스터 설정)
   master_pw_hash   TEXT,                    -- 마스터 비밀번호 (pbkdf2, null 이면 .env 값 사용)
