@@ -415,70 +415,82 @@ def crawl_ministry_news(max_per_feed: int = 20) -> list[dict]:
 
 
 # ── S5 KOTRA 해외시장뉴스 (data.go.kr 오픈API — 서비스키 필요) ─────────
-# 서비스: data.go.kr "KOTRA 해외시장뉴스" (기관: 대한무역투자진흥공사).
-# 응답은 data.go.kr 표준(XML: <response><body><items><item>…). 필드명이 서비스마다
-# 조금씩 달라, 흔한 이름을 후보로 두고 첫 성공 응답의 키를 로그로 남긴다.
-KOTRA_API_URL_DEFAULT = "https://apis.data.go.kr/B410001/ovseaMrktNews/ovseaMrktNewsList"
+# 서비스: data.go.kr/15034831 "대한무역투자진흥공사_해외시장뉴스".
+#   GET https://apis.data.go.kr/B410001/kotra_overseasMarketNews/ovseaMrktNews/ovseaMrktNews
+#        (오퍼레이션명이 base 경로 끝에 한 번 더 붙는다 — data.go.kr GW 규칙)
+#   필수 파라미터: serviceKey, pageNo, numOfRows. 응답: response.body.itemList.item (최신순).
+#   본문 필드는 없다(제목 자체가 완결된 문장이라 그것을 요약으로 쓴다).
+#   필드: newsTitl 제목 · kotraNewsUrl 링크 · othbcDt 게시일 · natn 국가 · indstCl 산업(콤마)
+#        · infoCl 분류(트렌드/경제·무역/통상·규제/…) · bbstxSn 번호 · ovrofInfo 무역관
+KOTRA_API_URL_DEFAULT = ("https://apis.data.go.kr/B410001"
+                         "/kotra_overseasMarketNews/ovseaMrktNews/ovseaMrktNews")
+# 포스코 그룹에 닿는 산업분류·정보분류만 남긴다(해외시장뉴스는 소비재·농식품이 대부분).
+_KOTRA_INDUST_KEEP = ("철강", "금속", "자동차", "수송기기", "화학", "광물", "에너지",
+                      "조선", "기계", "전자", "전기", "건설", "인프라", "플랜트",
+                      "그리드", "전력망", "환경")
+_KOTRA_INFO_KEEP = ("통상·규제", "국별 주요산업", "글로벌 공급망")
+_KOTRA_TITLE_KW = ("철강", "제철", "배터리", "이차전지", "2차전지", "양극재", "음극재",
+                   "리튬", "니켈", "코발트", "흑연", "전기차", "EV", "ESS", "수소",
+                   "핵심광물", "희토류", "공급망", "관세", "반덤핑", "상계관세",
+                   "세이프가드", "수출통제", "IRA", "CBAM", "무역장벽")
 _kotra_keys_logged = [False]
-_KOTRA_FIELDS = {
-    "title": ("newsTitl", "cntntsSj", "titl", "title", "newsTitle"),
-    "body":  ("newsCn", "cntntsCn", "cn", "newsCntnts", "contents"),
-    "date":  ("newsWrtDt", "regDt", "frstRegistDt", "newsRegDt", "wrtDt"),
-    "url":   ("newsOrgnlUrl", "newsUrl", "orgnlUrl", "url", "newsLink"),
-    "id":    ("newsId", "cntntsId", "id", "newsSn"),
-    "nation": ("newsNatArea", "natN", "nationNm", "cntryNm", "area"),
-}
 
 
-def _kotra_pick(row: dict, key: str) -> str:
-    for n in _KOTRA_FIELDS[key]:
-        v = row.get(n)
-        if v not in (None, ""):
-            return str(v).strip()
-    return ""
+def _kotra_relevant(r: dict) -> bool:
+    ind = r.get("indstCl") or ""
+    info = (r.get("infoCl") or "").strip()
+    title = _html_mod.unescape(r.get("newsTitl") or "")
+    return (any(k in ind for k in _KOTRA_INDUST_KEEP)
+            or info in _KOTRA_INFO_KEEP
+            or any(k in title for k in _KOTRA_TITLE_KW))
 
 
-def crawl_kotra_news(service_key: str, rows: int = 60) -> list[dict]:
-    """KOTRA 해외시장뉴스. service_key 가 없으면 빈 목록(비활성)."""
+def crawl_kotra_news(service_key: str, rows: int = 100, pages: int = 2) -> list[dict]:
+    """KOTRA 해외시장뉴스. service_key 가 없으면 빈 목록(비활성).
+
+    data.go.kr 서비스키는 인코딩본으로 배포되므로 unquote 후 requests 가 한 번만
+    인코딩하게 한다(그대로 넘기면 %2F→%252F 로 이중 인코딩돼 400 이 난다).
+    """
     if not service_key:
         return []
     import os
+    from urllib.parse import unquote
     import requests
-    from xml.etree import ElementTree as ET
 
-    url = os.environ.get("EA_KOTRA_API_URL", KOTRA_API_URL_DEFAULT).strip() or KOTRA_API_URL_DEFAULT
-    gap = _REQ_GAP - (time.monotonic() - _last_req[0])
-    if gap > 0:
-        time.sleep(gap)
-    try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": _UA},
-                            params={"serviceKey": service_key, "numOfRows": rows,
-                                    "pageNo": 1, "type": "json"})
-        _last_req[0] = time.monotonic()
-        resp.raise_for_status()
-    except Exception as exc:
-        log.warning("KOTRA 해외시장뉴스 조회 실패: %s", exc)
-        return []
+    url = (os.environ.get("EA_KOTRA_API_URL", "").strip() or KOTRA_API_URL_DEFAULT)
+    key = unquote(service_key)   # 이미 디코딩돼 있으면 그대로
 
     records: list[dict] = []
-    text = resp.text.strip()
-    try:
-        data = resp.json()
-        # data.go.kr JSON: response.body.items.item (list 또는 dict)
-        node = data
-        for k in ("response", "body", "items"):
-            if isinstance(node, dict) and k in node:
-                node = node[k]
-        item = node.get("item") if isinstance(node, dict) else node
-        records = item if isinstance(item, list) else ([item] if isinstance(item, dict) else [])
-    except ValueError:
+    for page in range(1, pages + 1):
+        gap = _REQ_GAP - (time.monotonic() - _last_req[0])
+        if gap > 0:
+            time.sleep(gap)
         try:
-            root = ET.fromstring(text)
-            records = [{c.tag: (c.text or "").strip() for c in it}
-                       for it in root.iter("item")]
-        except ET.ParseError:
-            log.warning("KOTRA 응답 형식 불명 (앞 200자): %s", text[:200])
-            return []
+            resp = requests.get(url, timeout=20, headers={"User-Agent": _UA},
+                                params={"serviceKey": key, "numOfRows": rows,
+                                        "pageNo": page, "returnType": "json"})
+            _last_req[0] = time.monotonic()
+            resp.raise_for_status()
+            data = resp.json()
+        except ValueError:
+            m = re.search(r"<(?:errMsg|returnReasonCode)>([^<]+)</", resp.text)
+            log.warning("KOTRA API 오류: %s (서비스키 승인·URL 확인)",
+                        m.group(1) if m else resp.text[:120])
+            break
+        except Exception as exc:
+            log.warning("KOTRA 해외시장뉴스 조회 실패: %s", exc)
+            break
+        hdr = (data.get("response") or {}).get("header") or {}
+        if str(hdr.get("resultCode")) not in ("0", "00"):
+            log.warning("KOTRA API 응답 코드 %s: %s", hdr.get("resultCode"), hdr.get("resultMsg"))
+            break
+        body = (data.get("response") or {}).get("body") or {}
+        il = body.get("itemList")
+        got = il.get("item") if isinstance(il, dict) else il
+        got = got if isinstance(got, list) else ([got] if isinstance(got, dict) else [])
+        records.extend(g for g in got if isinstance(g, dict))
+        if len(got) < rows:
+            break
 
     if records and not _kotra_keys_logged[0]:
         log.info("KOTRA 응답 필드: %s", sorted(records[0].keys()))
@@ -486,15 +498,24 @@ def crawl_kotra_news(service_key: str, rows: int = 60) -> list[dict]:
 
     out: list[dict] = []
     for r in records:
-        title = _kotra_pick(r, "title")
-        link = _kotra_pick(r, "url") or (
-            f"https://dream.kotra.or.kr/kotranews/cms/news/actionKotraBoardDetail.do?"
-            f"pageNo=1&pRttSrchKeyword=&pNttSn={_kotra_pick(r, 'id')}" if _kotra_pick(r, "id") else "")
+        if not _kotra_relevant(r):
+            continue
+        title = _clean(_html_mod.unescape(r.get("newsTitl") or ""))
+        rid = str(r.get("bbstxSn") or "").strip()
+        link = (r.get("kotraNewsUrl") or "").strip() or (
+            f"https://dream.kotra.or.kr/user/extra/kotranews/bbs/linkView/jsp/Page.do?dataIdx={rid}"
+            if rid else "")
         if not title or not link:
             continue
-        start, _ = parse_period(_kotra_pick(r, "date"))
-        nation = _kotra_pick(r, "nation")
-        body = _clean(re.sub(r"<[^>]+>", " ", _html_mod.unescape(_kotra_pick(r, "body"))))
+        nation = (r.get("natn") or "").strip()
+        ind = (r.get("indstCl") or "").strip()
+        info = (r.get("infoCl") or "").strip()
+        start, _ = parse_period(r.get("othbcDt") or "")
+        # 본문이 없으므로 제목 + 메타를 요약 재료로 넘긴다(제목이 완결된 문장이다).
+        synth = " ".join(x for x in (
+            title, f"({nation} · {ind})" if nation or ind else "",
+            f"KOTRA {r.get('ovrofInfo') or ''} · {info}".strip(" ·"),
+        ) if x)
         out.append({
             "url_source": link, "url_canonical": link,
             "item_type": "trade_news",
@@ -503,7 +524,7 @@ def crawl_kotra_news(service_key: str, rows: int = 60) -> list[dict]:
             "notice_start": start, "notice_end": None,
             "status": "발표", "opinion_url": None,
             "attachment_urls": [], "published_at": start,
-            "_body": body,
+            "_body": synth,
         })
     log.info("KOTRA 해외시장뉴스 크롤링 %d건", len(out))
     return out

@@ -951,12 +951,17 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
             fresh.append((row, body))
         gates.seen.add(it["url_source"])
 
-    # G6 — 분석은 전용 일일 상한 안에서만. 실패해도 수집 결과는 남는다.
-    # 방금 수집한 건은 API 본문이 메모리에 있으므로 그걸 그대로 넘긴다.
+    # G6 — 분석. KOTRA(trade_news)는 규칙 기반이라 LLM 상한과 무관하게 전부 처리하고,
+    # 나머지(예고·부처뉴스)만 전용 일일 상한 안에서 LLM 분석한다.
     analyzed = 0
     try:
+        kotra = [(r, b) for r, b in fresh if (r.get("item_type") or "") == "trade_news"]
+        rest = [(r, b) for r, b in fresh if (r.get("item_type") or "") != "trade_news"]
+        for row, _ in kotra:
+            if analyze_item(ctx, db, row, ""):
+                analyzed += 1
         budget = analysis_budget(ctx, db)
-        for row, body in fresh[:budget]:
+        for row, body in rest[:budget]:
             if analyze_item(ctx, db, row, body):
                 analyzed += 1
         analyzed += analyze_backlog(ctx, db)   # 이전 회차에 밀린 건 (HTML 재확보)
@@ -1186,6 +1191,40 @@ def _parse_json_object(content: str) -> dict | None:
     return None
 
 
+_TRADE_IMPACT_KW = {
+    "high": ("한국산", "대(對)한국", "한국 기업", "반덤핑관세 부과", "상계관세 부과"),
+    "medium": ("반덤핑", "상계관세", "세이프가드", "수입규제", "관세 인상", "수출통제",
+               "탄소규제", "탄소국경", "CBAM", "원산지", "인증제도", "통관 규정"),
+}
+
+
+def _kotra_rule_analysis(db: EaDB, item: dict) -> bool:
+    """KOTRA 해외시장뉴스는 본문이 없다(제목이 완결된 문장). LLM 없이 규칙으로
+    요약·영향도를 채운다 — 전용 LLM 상한(EA_LLM_DAILY_LIMIT)을 예고 분석에 남긴다."""
+    title = item.get("title") or ""
+    probe = f"{title}"
+    level = "none"
+    for lv in ("high", "medium"):
+        if any(k in probe for k in _TRADE_IMPACT_KW[lv]):
+            level = lv
+            break
+    rationale = ("제목에 한국 대상 통상 조치가 명시됨 — 원문 확인 필요"
+                 if level == "high" else
+                 "해외 통상·규제 동향 — 포스코 수출입·조달 영향 여부는 원문 확인 필요"
+                 if level == "medium" else
+                 "포스코 그룹 사업과 직접 연결되는 내용 없음")
+    db.save_analysis({
+        "id": new_id(), "policy_item_id": item["id"],
+        "summary": title,   # KOTRA 제목이 곧 요약이다
+        "impact_level": level, "impact_rationale": rationale,
+        "affected_areas": jdump([]),
+        "suggested_action": ("해당 품목·지역이 포스코 수출입에 걸리는지 확인" if level != "none" else None),
+        "model": "rule", "reviewed_by": None, "reviewed_at": None,
+        "created_at": iso(now_utc()),
+    })
+    return True
+
+
 def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     """항목 1건 분석 후 ea_analyses 에 저장. 성공하면 True.
 
@@ -1193,6 +1232,8 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     HTML 스크래핑보다 정확하므로 우선 쓴다(정부 사이트는 JS 렌더링이 많다).
     본문은 저장하지 않는다 — 기존 §7-3 최소 보관 원칙을 그대로 따른다.
     """
+    if (item.get("item_type") or "") == "trade_news":
+        return _kotra_rule_analysis(db, item)   # 본문 없음 — LLM 안 씀
     body = source_text.strip()
     if not body:
         try:
@@ -1300,21 +1341,29 @@ def _news_body_map(items: list[dict]) -> dict[str, str]:
 
 
 def analyze_backlog(ctx: Any, db: EaDB) -> int:
-    """미분석 항목을 전용 상한 안에서 처리한다. 마감 임박(notice_end 오름차순) 우선."""
+    """미분석 항목을 처리한다. KOTRA(trade_news)는 규칙 기반이라 상한 밖에서 전부,
+    나머지는 전용 LLM 상한 안에서(마감 임박 우선)."""
+    done = 0
+    # 규칙 기반 KOTRA 는 상한과 무관하게 먼저 비운다
+    for item in db.unanalyzed_items(200):
+        if (item.get("item_type") or "") == "trade_news":
+            if analyze_item(ctx, db, item, ""):
+                done += 1
     budget = analysis_budget(ctx, db)
     if budget == 0:
-        return 0
+        return done
     ea_used = db.analyses_today()
     ea_limit = EA_LLM_DAILY_LIMIT()
-    done = 0
-    items = db.unanalyzed_items(budget)
+    items = [it for it in db.unanalyzed_items(budget)
+             if (it.get("item_type") or "") != "trade_news"]
     news_bodies = _news_body_map(items)
+    llm_done = 0
     for item in items:
         if analyze_item(ctx, db, item, news_bodies.get(item.get("url_source", ""), "")):
-            done += 1
-    if done:
-        log.info("대외협력 분석 %d건 (전용 상한 %d 중 %d 사용)", done, ea_limit, ea_used + done)
-    return done
+            llm_done += 1
+    if llm_done:
+        log.info("대외협력 분석 %d건 (전용 상한 %d 중 %d 사용)", llm_done, ea_limit, ea_used + llm_done)
+    return done + llm_done
 
 
 # ═════════════════════════════════════════════════════════════════════
