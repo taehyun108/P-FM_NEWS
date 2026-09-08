@@ -161,15 +161,23 @@ async function loadQuotes() {
 async function loadStats() {
   try {
     const s = await getJSON('/api/stats');
+    // detail: 눌렀을 때 열어 볼 목록의 종류 (0건이면 볼 게 없으니 버튼으로 만들지 않는다)
     const cards = [
-      ['전체 기사', s.total.toLocaleString('ko-KR'), false],
-      ['오늘 수집', s.today.toLocaleString('ko-KR'), false],
-      ['최근 수집', s.last_collected_at ? formatDate(s.last_collected_at) : '—', true],
-      ['분석 대기', s.analysis_pending.toLocaleString('ko-KR'), false],
-      ['발송 실패', s.notify_failed.toLocaleString('ko-KR'), false],
+      ['전체 기사', s.total.toLocaleString('ko-KR'), false, null],
+      ['오늘 수집', s.today.toLocaleString('ko-KR'), false, null],
+      ['최근 수집', s.last_collected_at ? formatDate(s.last_collected_at) : '—', true, null],
+      ['분석 대기', s.analysis_pending.toLocaleString('ko-KR'), false,
+        s.analysis_pending > 0 ? 'analysis' : null],
+      ['발송 실패', s.notify_failed.toLocaleString('ko-KR'), false,
+        s.notify_failed > 0 ? 'notify' : null],
     ];
-    $('stats').replaceChildren(...cards.map(([label, value, small]) => {
-      const box = el('div', 'stat');
+    $('stats').replaceChildren(...cards.map(([label, value, small, detail]) => {
+      const box = el(detail ? 'button' : 'div', 'stat');
+      if (detail) {
+        box.type = 'button';
+        box.title = `${label} ${value}건 — 눌러서 목록 보기`;
+        box.addEventListener('click', () => openStatDetail(detail));
+      }
       box.append(el('div', 'stat-label', label));
       box.append(el('div', `stat-value${small ? ' small' : ''}`, value));
       return box;
@@ -178,6 +186,88 @@ async function loadStats() {
     console.warn('통계 조회 실패', err);
   }
 }
+
+/* ── 통계 상세 (발송 실패 · 분석 대기) ──────────────────────────────
+   숫자만 보여 주면 '무엇이 왜 그런지'를 알 수가 없다. 카드를 누르면
+   해당 기사와 실패 원인을 그대로 펼쳐 준다. */
+
+const STAT_DETAIL = {
+  notify: {
+    title: '발송 실패',
+    api: '/api/stats/notify-failed',
+    desc: '텔레그램으로 보내지 못한 기사입니다. 아래 붉은 칸이 텔레그램이 돌려준 실제 원인입니다.',
+    render: (it) => {
+      const box = el('div', 'detail-item');
+      const h = el('h4');
+      if (it.url) {
+        const a = el('a', null, it.title);
+        a.href = it.url; a.target = '_blank'; a.rel = 'noopener';
+        h.append(a);
+      } else {
+        h.textContent = it.title;
+      }
+      if (it.stuck) h.append(el('span', 'detail-tag', '재시도 중단됨'));
+      box.append(h);
+      const meta = el('div', 'detail-meta');
+      [it.press_name, it.created_at ? formatDate(it.created_at) : null,
+       `재시도 ${it.retry_count ?? 0}회`, it.channel,
+       it.importance_score != null ? `중요도 ${it.importance_score}` : null,
+      ].filter(Boolean).forEach((t) => meta.append(el('span', null, t)));
+      box.append(meta);
+      const err = el('div', 'detail-err');
+      err.append(el('b', null, '원인: '));
+      err.append(document.createTextNode(it.error));
+      box.append(err);
+      return box;
+    },
+  },
+  analysis: {
+    title: '분석 대기',
+    api: '/api/stats/analysis-pending',
+    desc: '본문은 받아 왔는데 요약·분석이 끝나지 않은 기사입니다. 다음 분석 주기에 처리됩니다.',
+    render: (it) => {
+      const box = el('div', 'detail-item');
+      const h = el('h4');
+      if (it.url) {
+        const a = el('a', null, it.title);
+        a.href = it.url; a.target = '_blank'; a.rel = 'noopener';
+        h.append(a);
+      } else {
+        h.textContent = it.title;
+      }
+      box.append(h);
+      const meta = el('div', 'detail-meta');
+      [it.press_name,
+       it.collected_at ? `수집 ${formatDate(it.collected_at)}` : null,
+       it.body_len != null ? `본문 ${it.body_len.toLocaleString('ko-KR')}자` : null,
+       it.summary_source,
+      ].filter(Boolean).forEach((t) => meta.append(el('span', null, t)));
+      box.append(meta);
+      return box;
+    },
+  },
+};
+
+async function openStatDetail(kind) {
+  const spec = STAT_DETAIL[kind];
+  if (!spec) return;
+  $('detailTitle').textContent = spec.title;
+  $('detailDesc').textContent = spec.desc;
+  $('detailList').replaceChildren(el('div', 'detail-empty', '불러오는 중…'));
+  $('detailModal').hidden = false;
+  try {
+    const data = await getJSON(spec.api);
+    const items = data.items || [];
+    $('detailList').replaceChildren(
+      ...(items.length ? items.map(spec.render)
+                       : [el('div', 'detail-empty', '해당하는 기사가 없습니다.')]));
+  } catch (err) {
+    $('detailList').replaceChildren(
+      el('div', 'detail-empty', '목록을 불러오지 못했습니다: ' + err.message));
+  }
+}
+
+function closeStatDetail() { $('detailModal').hidden = true; }
 
 /* ── 필터 UI (F6.1a) ────────────────────────────────────────────── */
 
@@ -535,6 +625,15 @@ function initMaster() {
   $('masterClose').addEventListener('click', closeMaster);
   $('masterModal').addEventListener('click', (e) => {
     if (e.target === $('masterModal')) closeMaster();
+  });
+
+  // 통계 상세 모달 — 닫기 버튼 · 바깥 클릭 · Esc
+  $('detailClose').addEventListener('click', closeStatDetail);
+  $('detailModal').addEventListener('click', (e) => {
+    if (e.target === $('detailModal')) closeStatDetail();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('detailModal').hidden) closeStatDetail();
   });
 
   $('masterLogin').addEventListener('submit', async (e) => {
