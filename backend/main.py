@@ -3179,7 +3179,8 @@ MAX_PROCESS_BURST = 60
 # 저장해 둔다(본문·LLM 없이). 못 담은 나머지는 다음 회차에 다시 후보가 된다.
 DEFER_PER_RUN = 45
 # 메타만 저장된 기사(deferred)를 회차당 이만큼 본문 확보 + 분석한다.
-DEFER_DRAIN_PER_RUN = 18
+# 이 드레인은 안전망이지 우선순위가 아니다 — 신규 분석이 예산을 먼저 쓴다.
+DEFER_DRAIN_PER_RUN = 10
 # deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
 DEFER_MAX_AGE_HOURS = 48
 # 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
@@ -3623,10 +3624,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         log.warning("일일 LLM 호출 상한(%d)에 도달했습니다. 저장만 하고 분석은 다음 날 재개합니다.",
                     cfg.llm_daily_limit)
 
-    # 메타만 저장된(deferred) 기사가 있으면 예산의 최대 1/3 을 그 드레인에 예약한다.
-    # 안 그러면 신규·본문대기 분석이 매 회차 예산을 다 써 deferred 가 영원히 안 빠진다.
+    # 메타만 저장된(deferred) 기사가 있으면 예산의 일부를 그 드레인에 예약한다(안 그러면
+    # 신규 분석이 매 회차 예산을 다 써 deferred 가 안 빠진다). 다만 예약은 작게 —
+    # 신규 기사 분석이 우선이고, 남는 예산은 아래에서 deferred 드레인이 더 쓴다.
     defer_pending = storage.deferred_count()
-    defer_budget = min(DEFER_DRAIN_PER_RUN, defer_pending, max(1, llm_budget // 2)) if defer_pending else 0
+    defer_budget = min(6, defer_pending, max(1, llm_budget // 4)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
 
     # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — LLM 을 안 쓰므로 저렴하고,
