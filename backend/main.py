@@ -3176,10 +3176,10 @@ MAX_PROCESS_PER_RUN = 24
 # 백로그(신선 후보가 상한의 3배 이상)일 때 저장 상한을 이 값까지 올려 빠르게 소진한다.
 MAX_PROCESS_BURST = 60
 # 상한을 넘어 이번 회차에 못 다룬 신선 후보 — 버리지 않고 이만큼은 메타데이터만
-# 저장해 둔다(본문·LLM 없이). _drain_deferred 가 다음 회차부터 본문을 받아 분석한다.
-DEFER_PER_RUN = 80
+# 저장해 둔다(본문·LLM 없이). 못 담은 나머지는 다음 회차에 다시 후보가 된다.
+DEFER_PER_RUN = 45
 # 메타만 저장된 기사(deferred)를 회차당 이만큼 본문 확보 + 분석한다.
-DEFER_DRAIN_PER_RUN = 12
+DEFER_DRAIN_PER_RUN = 18
 # deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
 DEFER_MAX_AGE_HOURS = 48
 # 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
@@ -3626,7 +3626,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # 메타만 저장된(deferred) 기사가 있으면 예산의 최대 1/3 을 그 드레인에 예약한다.
     # 안 그러면 신규·본문대기 분석이 매 회차 예산을 다 써 deferred 가 영원히 안 빠진다.
     defer_pending = storage.deferred_count()
-    defer_budget = min(DEFER_DRAIN_PER_RUN, defer_pending, max(1, llm_budget // 3)) if defer_pending else 0
+    defer_budget = min(DEFER_DRAIN_PER_RUN, defer_pending, max(1, llm_budget // 2)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
 
     # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — LLM 을 안 쓰므로 저렴하고,
