@@ -33,30 +33,18 @@
 .ea-alert li { margin-bottom: 3px; }
 .ea-alert a { color: #8c2f26; }
 
-/* 카테고리 탭 */
-.ea-cats { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 4px; }
-.ea-cat {
-  border: 1px solid var(--line); background: #fff; color: var(--ink-mid);
-  border-radius: 999px; padding: 6px 14px; font-family: inherit;
-  font-size: 12.5px; font-weight: 600; cursor: pointer;
-}
-.ea-cat:hover { border-color: var(--navy); color: var(--navy); }
-.ea-cat[aria-selected="true"] {
-  background: var(--navy); border-color: var(--navy); color: #fff;
-}
-.ea-filters select[hidden], .ea-filters input[hidden] { display: none; }
-
-/* 필터 */
-.ea-filters {
-  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  margin: 14px 0 6px; padding: 12px 0; border-top: 1px solid var(--line);
-}
-.ea-filters select, .ea-filters input {
+/* 대외협력 전용 필터 — 메인 .filters 구조를 그대로 재사용한다.
+   카테고리 행이 곧 예전의 탭이다(단일 선택 칩). */
+.ea-filter-panel { margin: 16px 0 4px; }
+.ea-filter-panel .filter-row[hidden] { display: none; }
+.ea-selects { display: flex; flex-wrap: wrap; gap: 8px; flex: 1; }
+.ea-selects select {
   border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px;
   font-family: inherit; font-size: 12.5px; color: var(--ink-mid); background: #fff;
 }
-.ea-filters input { min-width: 190px; }
-.ea-count { margin-left: auto; font-size: 12.5px; color: var(--ink-mid); }
+.ea-selects select[hidden] { display: none; }
+/* 카테고리 칩은 조금 더 눈에 띄게(예전 탭 역할) */
+#eaCatChips .chip[aria-pressed="true"] { font-weight: 700; }
 
 /* 항목 카드 — 기존 포토카드와 별개 컴포넌트(썸네일보다 정보 밀도 우선) */
 .ea-list { display: grid; gap: 10px; margin: 12px 0 0; }

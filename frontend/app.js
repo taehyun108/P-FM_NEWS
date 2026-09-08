@@ -767,7 +767,7 @@ function toggleFavView() {
   favView = !favView;
   $('favTab').setAttribute('aria-pressed', String(favView));
   $('favTab').textContent = favView ? '← 전체 기사' : '★ 즐겨찾기';
-  document.querySelector('.filters').hidden = favView;
+  $('mainFilters').hidden = favView;
   if (favView) renderFavorites(); else refresh(true);
 }
 
@@ -803,7 +803,7 @@ function toggleWeeklyView() {
   $('weeklyTab').setAttribute('aria-pressed', String(weeklyView));
   $('weeklyTab').textContent = weeklyView ? '← 전체 기사' : '📈 주간동향';
   $('weeklyPanel').hidden = !weeklyView;
-  document.querySelector('.filters').hidden = weeklyView;
+  $('mainFilters').hidden = weeklyView;
   $('grid').hidden = weeklyView;
   document.querySelector('.more-wrap').hidden = weeklyView;
   document.querySelector('.url-add').hidden = weeklyView;

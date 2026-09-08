@@ -1,6 +1,8 @@
-/* ── 대외협력(대관) — 독립 페이지(/ea) ───────────────────────────────
-   기존 app.js 의 state 객체를 확장하지 않는다. 전용 상태를 따로 둔다.
-   URL 은 경로(/ea)로 구분하고, 필터는 ea_ 접두사 쿼리로 붙인다.
+/* ── 대외협력(대관) — 독립 화면(/ea) ─────────────────────────────────
+   즐겨찾기 탭과 같은 방식: 버튼을 누르면 대외협력 화면으로 전환되고
+   (버튼 라벨이 '← 전체 기사'로 바뀐다), 다시 누르면 뉴스로 돌아온다.
+   필터는 메인 뉴스 필터(.filters)와 같은 접기식 칩 패널이되 대외협력 전용이다.
+   app.js 의 state 는 건드리지 않는다. URL 은 경로(/ea) + ea_ 쿼리.
    ------------------------------------------------------------------ */
 (function () {
   'use strict';
@@ -8,9 +10,8 @@
   var EA_PAGE_SIZE = 9;
   var EA_PATH = '/ea';
 
-  // 상단 카테고리(=탭). key 는 백엔드 EA_CATEGORIES 와 맞춘다.
-  //  - kind 'items' : /api/ea/items (예고·부처동향) → buildCard
-  //  - kind 'news'  : /api/ea/{news} (기사 재사용, 기관 필터는 클라이언트)
+  // 카테고리(예전의 상단 탭) — 이제 필터의 '카테고리' 칩 행이다. 단일 선택.
+  //  kind 'items' : /api/ea/items          kind 'news' : /api/ea/{news}(기사 재사용)
   var CATS = [
     { key: 'notice',   label: '입법·행정예고', kind: 'items', types: 'legislation,admin_notice',
       sort: 'deadline', hasDeadline: true },
@@ -25,10 +26,10 @@
 
   var eaState = {
     open: false, loaded: false, cat: 'notice',
-    agency: '', impact: '', status: '', due: '', q: '', group: '',
-    sort: 'deadline',
-    page: 1, loading: false,
-    newsAgencies: []   // policy·trade 탭에서 로드한 항목으로 채운 기관 목록
+    agency: new Set(), impact: new Set(), group: new Set(),   // 중복 선택 (칩)
+    status: '', due: '', sort: 'deadline', q: '',              // 단일 (드롭다운/검색)
+    page: 1, loading: false, filterCollapsed: false,
+    newsAgencies: []   // policy·trade 에서 로드한 항목으로 채운 기관 칩 목록
   };
 
   function $(id) { return document.getElementById(id); }
@@ -64,6 +65,23 @@
     return CATS[0];
   }
 
+  var csv = function (set) { return Array.from(set).join(','); };
+
+  /* ── 칩 렌더 (메인 .chip 스타일 재사용) ── */
+  function renderChips(container, options, selected, onToggle, single) {
+    if (!container) { return; }
+    container.replaceChildren.apply(container, options.map(function (o) {
+      var key = typeof o === 'string' ? o : o.key;
+      var label = typeof o === 'string' ? o : o.label;
+      var b = el('button', 'chip', label);
+      b.type = 'button';
+      b.setAttribute('aria-pressed',
+        String(single ? selected === key : selected.has(key)));
+      b.addEventListener('click', function () { onToggle(key); });
+      return b;
+    }));
+  }
+
   /* ── URL: 경로(/ea) + ea_ 접두사 쿼리 ── */
   var EA_KEYS = ['ea_cat', 'ea_agency', 'ea_group', 'ea_impact', 'ea_status', 'ea_due',
     'ea_q', 'ea_sort', 'ea_page'];
@@ -71,9 +89,9 @@
   function readUrl() {
     var p = new URLSearchParams(location.search);
     eaState.cat = p.get('ea_cat') || 'notice';
-    eaState.agency = p.get('ea_agency') || '';
-    eaState.group = p.get('ea_group') || '';
-    eaState.impact = p.get('ea_impact') || '';
+    eaState.agency = new Set((p.get('ea_agency') || '').split(',').filter(Boolean));
+    eaState.group = new Set((p.get('ea_group') || '').split(',').filter(Boolean));
+    eaState.impact = new Set((p.get('ea_impact') || '').split(',').filter(Boolean));
     eaState.status = p.get('ea_status') || '';
     eaState.due = p.get('ea_due') || '';
     eaState.q = p.get('ea_q') || '';
@@ -88,9 +106,9 @@
     if (eaState.open) {
       path = EA_PATH;
       if (eaState.cat !== 'notice') { p.set('ea_cat', eaState.cat); }
-      if (eaState.agency) { p.set('ea_agency', eaState.agency); }
-      if (eaState.group) { p.set('ea_group', eaState.group); }
-      if (eaState.impact) { p.set('ea_impact', eaState.impact); }
+      if (eaState.agency.size) { p.set('ea_agency', csv(eaState.agency)); }
+      if (eaState.group.size) { p.set('ea_group', csv(eaState.group)); }
+      if (eaState.impact.size) { p.set('ea_impact', csv(eaState.impact)); }
       if (eaState.status) { p.set('ea_status', eaState.status); }
       if (eaState.due) { p.set('ea_due', eaState.due); }
       if (eaState.q) { p.set('ea_q', eaState.q); }
@@ -103,6 +121,11 @@
     var url = path + (qs ? '?' + qs : '');
     if (push) { history.pushState({ ea: eaState.open }, '', url); }
     else { history.replaceState({ ea: eaState.open }, '', url); }
+  }
+
+  function activeFilterCount() {
+    return eaState.agency.size + eaState.impact.size + eaState.group.size
+      + (eaState.status ? 1 : 0) + (eaState.due ? 1 : 0) + (eaState.q ? 1 : 0);
   }
 
   /* ── 마감 임박 배너 (D-7 이내가 있을 때만) ── */
@@ -219,54 +242,41 @@
     return card;
   }
 
-  /* ── 카테고리 탭 ── */
-  function renderCats() {
-    var box = $('eaCats');
-    box.replaceChildren.apply(box, CATS.map(function (t) {
-      var b = el('button', 'ea-cat', t.label);
-      b.type = 'button';
-      b.setAttribute('role', 'tab');
-      b.setAttribute('aria-selected', String(t.key === eaState.cat));
-      b.addEventListener('click', function () {
-        if (eaState.cat === t.key) { return; }
-        eaState.cat = t.key;
-        eaState.page = 1;
-        eaState.agency = ''; eaState.impact = ''; eaState.status = ''; eaState.due = '';
-        eaState.sort = t.sort || 'deadline';
-        renderCats();
-        applyFilterVisibility();
-        loadFilters().then(load);
-      });
-      return b;
-    }));
+  /* ── 필터: 카테고리 칩 + 카테고리별 행 노출 ── */
+  function renderCatChips() {
+    renderChips($('eaCatChips'), CATS, eaState.cat, function (key) {
+      if (eaState.cat === key) { return; }
+      eaState.cat = key;
+      eaState.page = 1;
+      eaState.agency.clear(); eaState.impact.clear(); eaState.group.clear();
+      eaState.status = ''; eaState.due = '';
+      eaState.sort = currentCat().sort || 'deadline';
+      renderCatChips();
+      applyRowVisibility();
+      loadFilters().then(load);
+      loadStats();
+    }, true);
   }
 
-  /* ── 카테고리별로 필터를 켜고 끈다 ── */
-  function applyFilterVisibility() {
+  function applyRowVisibility() {
     var c = currentCat();
     var isNews = c.kind === 'news';
-    // 예고형만 마감/상태/정렬 전체. 부처동향·통상(KOTRA)은 최신순 고정 성격.
+    $('eaAgencyRow').hidden = false;                     // 기관은 모든 카테고리
+    $('eaImpactRow').hidden = isNews;                    // 영향도·그룹사는 예고·부처동향만
+    $('eaGroupRow').hidden = isNews;
+    $('eaMiscRow').hidden = isNews;                      // 정렬·상태·마감은 items 만
     $('eaSort').hidden = isNews;
     $('eaStatus').hidden = isNews || !c.hasDeadline;
     $('eaDue').hidden = isNews || !c.hasDeadline;
-    $('eaImpact').hidden = isNews;
-    $('eaGroup').hidden = isNews;
-    $('eaSearch').hidden = isNews;
-    $('eaFilters').hidden = false;
   }
 
-  /* ── 필터 ── */
   function fillSelect(sel, options, value, placeholder) {
     sel.replaceChildren();
     if (placeholder !== null) {
-      var o0 = el('option', null, placeholder);
-      o0.value = '';
-      sel.append(o0);
+      var o0 = el('option', null, placeholder); o0.value = ''; sel.append(o0);
     }
     options.forEach(function (o) {
-      var opt = el('option', null, o.label);
-      opt.value = o.key;
-      sel.append(opt);
+      var opt = el('option', null, o.label); opt.value = o.key; sel.append(opt);
     });
     sel.value = value || '';
   }
@@ -275,20 +285,41 @@
     var c = currentCat();
     return getJSON('/api/ea/filters?category=' + encodeURIComponent(c.key)).then(function (d) {
       fillSelect($('eaSort'), d.sorts || [], eaState.sort || c.sort || 'deadline', null);
-      var agencies = c.kind === 'news'
-        ? eaState.newsAgencies.map(function (a) { return { key: a, label: a }; })
-        : (d.agencies || []);
-      if (eaState.agency && !agencies.some(function (a) { return a.key === eaState.agency; })) {
-        eaState.agency = '';
-      }
-      fillSelect($('eaAgency'), agencies, eaState.agency, '기관 전체');
-      fillSelect($('eaGroup'), d.groups || [], eaState.group, '그룹사 전체');
-      fillSelect($('eaImpact'), d.impacts || [], eaState.impact, '영향도 전체');
       fillSelect($('eaStatus'), (d.statuses || []).map(function (s) {
         return { key: s, label: s };
       }), eaState.status, '상태 전체');
       fillSelect($('eaDue'), d.dues || [], eaState.due, '마감 전체');
+
+      var agencies = c.kind === 'news'
+        ? eaState.newsAgencies.map(function (a) { return { key: a, label: a }; })
+        : (d.agencies || []);
+      // 카테고리가 바뀌어 선택된 기관이 목록에 없으면 해제
+      Array.from(eaState.agency).forEach(function (k) {
+        if (!agencies.some(function (a) { return a.key === k; })) { eaState.agency.delete(k); }
+      });
+      renderChips($('eaAgencyChips'), agencies, eaState.agency, function (key) {
+        toggleSet(eaState.agency, key); load();
+      });
+      renderChips($('eaImpactChips'), d.impacts || [], eaState.impact, function (key) {
+        toggleSet(eaState.impact, key); load();
+      });
+      renderChips($('eaGroupChips'), d.groups || [], eaState.group, function (key) {
+        toggleSet(eaState.group, key); load();
+      });
+      syncFilterHead();
     }).catch(function () { /* 필터는 없어도 목록은 보여준다 */ });
+  }
+
+  function toggleSet(set, key) {
+    if (set.has(key)) { set.delete(key); } else { set.add(key); }
+    eaState.page = 1;
+  }
+
+  function syncFilterHead() {
+    var n = activeFilterCount();
+    var badge = $('eaActiveCount');
+    if (n) { badge.textContent = n + '개 적용'; badge.hidden = false; }
+    else { badge.hidden = true; }
   }
 
   /* ── 페이지네이션 ── */
@@ -330,13 +361,14 @@
   function showState(cls, text) {
     $('eaList').replaceChildren(el('p', 'ea-state' + (cls ? ' ' + cls : ''), text));
     $('eaPager').hidden = true;
-    $('eaCount').textContent = '';
+    $('eaCount').textContent = '—';
   }
 
   function load() {
     if (eaState.loading) { return; }
     eaState.loading = true;
     writeUrl();
+    syncFilterHead();
 
     var c = currentCat();
     $('eaList').replaceChildren.apply($('eaList'), [0, 1, 2].map(function () {
@@ -347,25 +379,21 @@
     if (c.kind === 'news') {
       var np = new URLSearchParams();
       np.set('limit', '80');
-      if (eaState.agency) { np.set('agency', eaState.agency); }
+      if (eaState.agency.size) { np.set('agency', csv(eaState.agency)); }
       getJSON(c.news + '?' + np.toString()).then(function (d) {
         var items = d.items || [];
-        // 기관 목록은 (필터 미적용) 전체에서 뽑아야 하므로 별도 호출 없이 첫 로드로 채운다
-        if (!eaState.agency) {
+        if (!eaState.agency.size) {
           var set = {};
           items.forEach(function (x) { if (x.agency) { set[x.agency] = 1; } });
           eaState.newsAgencies = Object.keys(set).sort();
-          fillSelect($('eaAgency'), eaState.newsAgencies.map(function (a) {
-            return { key: a, label: a };
-          }), eaState.agency, '기관 전체');
+          renderChips($('eaAgencyChips'),
+            eaState.newsAgencies.map(function (a) { return { key: a, label: a }; }),
+            eaState.agency, function (key) { toggleSet(eaState.agency, key); load(); });
         }
         var start = (eaState.page - 1) * EA_PAGE_SIZE;
-        $('eaCount').textContent = items.length + '건';
+        $('eaCount').textContent = items.length.toLocaleString('ko-KR') + '건';
         renderPager(items.length);
-        if (!items.length) {
-          showState('', '최근 45일 내 해당 자료가 없습니다.');
-          return;
-        }
+        if (!items.length) { showState('', '최근 45일 내 해당 자료가 없습니다.'); return; }
         $('eaList').replaceChildren.apply($('eaList'),
           items.slice(start, start + EA_PAGE_SIZE).map(buildNewsCard));
       }).catch(function () {
@@ -376,9 +404,9 @@
 
     var p = new URLSearchParams();
     p.set('item_type', c.types);
-    if (eaState.agency) { p.set('agency', eaState.agency); }
-    if (eaState.group) { p.set('group', eaState.group); }
-    if (eaState.impact) { p.set('impact', eaState.impact); }
+    if (eaState.agency.size) { p.set('agency', csv(eaState.agency)); }
+    if (eaState.group.size) { p.set('group', csv(eaState.group)); }
+    if (eaState.impact.size) { p.set('impact', csv(eaState.impact)); }
     if (eaState.status) { p.set('status', eaState.status); }
     if (eaState.due) { p.set('due', eaState.due); }
     if (eaState.q) { p.set('q', eaState.q); }
@@ -415,22 +443,32 @@
     });
   }
 
-  /* ── 페이지 열고 닫기 (기존 탭과 배타적) ── */
+  function clearAll() {
+    eaState.agency.clear(); eaState.impact.clear(); eaState.group.clear();
+    eaState.status = ''; eaState.due = ''; eaState.q = '';
+    eaState.page = 1;
+    $('eaSearch').value = '';
+    loadFilters().then(load);
+  }
+
+  /* ── 화면 열고 닫기 (즐겨찾기 탭과 동일한 방식) ── */
   function setOpen(on, opts) {
     opts = opts || {};
     eaState.open = on;
-    $('eaTab').setAttribute('aria-pressed', String(on));
+    var tab = $('eaTab');
+    tab.setAttribute('aria-pressed', String(on));
+    tab.textContent = on ? '← 전체 기사' : '🏛 대외협력';
     $('eaPanel').hidden = !on;
-    var hide = ['.filters', '#grid', '.more-wrap', '.url-add', '#stats'];
-    hide.forEach(function (sel) {
-      var n = document.querySelector(sel);
-      if (n) { n.hidden = on; }
-    });
+    ['.filters:not(.ea-filter-panel)', '#grid', '.more-wrap', '.url-add', '#stats']
+      .forEach(function (sel) {
+        var n = document.querySelector(sel);
+        if (n) { n.hidden = on; }
+      });
     if (!opts.silent) { writeUrl(opts.push); }
     if (on) {
       eaState.loaded = true;
-      renderCats();
-      applyFilterVisibility();
+      renderCatChips();
+      applyRowVisibility();
       loadFilters().then(load);
       loadStats();
     }
@@ -451,8 +489,6 @@
     if (eaState.open) { closeEa(); } else { openEa(); }
   }
 
-  /* app.js 가 다른 탭을 열거나 홈으로 갈 때 이걸 불러 대외협력을 닫는다.
-     URL 경로도 /ea → / 로 되돌린다(뒤로가기 기록은 남기지 않는다). */
   window.pfmCloseEaView = function () {
     if (eaState.open) { setOpen(false, { push: false }); }
   };
@@ -462,13 +498,15 @@
     if (!$('eaTab') || !$('eaPanel')) { return; }
     readUrl();
     $('eaTab').addEventListener('click', toggle);
-    var back = $('eaBack');
-    if (back) {
-      back.addEventListener('click', function (e) { e.preventDefault(); closeEa(); });
-    }
 
-    [['eaSort', 'sort'], ['eaAgency', 'agency'], ['eaGroup', 'group'],
-     ['eaImpact', 'impact'], ['eaStatus', 'status'], ['eaDue', 'due']].forEach(function (pair) {
+    $('eaFilterToggle').addEventListener('click', function () {
+      eaState.filterCollapsed = !eaState.filterCollapsed;
+      $('eaFilterToggle').setAttribute('aria-expanded', String(!eaState.filterCollapsed));
+      $('eaFilterBody').hidden = eaState.filterCollapsed;
+    });
+    $('eaClearAll').addEventListener('click', clearAll);
+
+    [['eaSort', 'sort'], ['eaStatus', 'status'], ['eaDue', 'due']].forEach(function (pair) {
       $(pair[0]).addEventListener('change', function (e) {
         eaState[pair[1]] = e.target.value;
         eaState.page = 1;
@@ -481,23 +519,23 @@
       clearTimeout(timer);
       var v = e.target.value.trim();
       timer = setTimeout(function () {
-        eaState.q = v;
-        eaState.page = 1;
-        load();
+        eaState.q = v; eaState.page = 1; load();
       }, 300);
     });
 
     window.addEventListener('popstate', function () {
       var wantEa = location.pathname === EA_PATH;
       if (wantEa && !eaState.open) { readUrl(); setOpen(true, { silent: true }); }
-      else if (!wantEa && eaState.open) { setOpen(false, { silent: true });
-        if (window.pfmRefreshList) { window.pfmRefreshList(); } }
+      else if (!wantEa && eaState.open) {
+        setOpen(false, { silent: true });
+        if (window.pfmRefreshList) { window.pfmRefreshList(); }
+      }
     });
 
-    // /ea 로 직접 들어왔거나 ea_* 파라미터가 있으면 대외협력을 연 상태로 시작
     var p = new URLSearchParams(location.search);
     if (location.pathname === EA_PATH || EA_KEYS.some(function (k) { return p.has(k); })) {
       if (window.pfmCloseOtherViews) { window.pfmCloseOtherViews(); }
+      $('eaSearch').value = eaState.q;
       setOpen(true, { silent: true });
     }
   }

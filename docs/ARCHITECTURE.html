@@ -1110,23 +1110,28 @@
 
       <!-- ═══════════ 8. 대외협력 ═══════════ -->
       <section id="ea">
-        <h2><span class="tag">09 — 대외협력</span>독립 페이지 · 5개 카테고리</h2>
+        <h2><span class="tag">09 — 대외협력</span>독립 화면 · 5개 카테고리</h2>
 
         <p>
-          대외협력은 뉴스 앱과 목적·데이터·화면이 달라 <b>독립 주소 <code>/ea</code></b> 로 분리했다
-          (같은 SPA 를 내보내고 <code>external_affairs.js</code> 가 <code>location.pathname</code> 을
-          보고 대외협력 화면을 연다. 헤더의 "← 뉴스로" 로 되돌아간다).
-          상단 카테고리는 <b>5개</b> — <b>입법·행정예고 / 국회 의안 / 정책 동향 / 통상 환경 / 부처별 동향</b>.
-          입법·행정예고 의견제출은 기한이 지나면 기회가 사라지므로 그 탭의 기본 정렬은
-          <b>마감일 임박순</b>이고 D-7 이내는 상단 배너로 띄운다. 뉴스형 카테고리(정책·통상·부처별)는
-          <b>최신순</b>이다.
+          대외협력은 뉴스 앱과 목적·데이터가 달라 <b>즐겨찾기 탭과 같은 방식</b>으로 분리했다 —
+          헤더의 <b>🏛 대외협력</b> 버튼을 누르면 대외협력 화면으로 바뀌고(버튼 라벨이
+          <b>← 전체 기사</b>로), 메인 뉴스 필터·그리드·URL등록·통계는 전부 숨는다. 독립 주소
+          <code>/ea</code> 도 유지해(<code>@app.get("/ea")</code>가 같은 SPA 재사용) 링크로 바로 들어올 수 있다.
         </p>
         <p>
-          필터의 "언론사" 자리는 <b>기관</b>(정부부처·국회 상임위·KOTRA)으로 바뀐다.
-          카테고리마다 목록이 다르다 — 입법·행정예고=소관 부처(<code>kind='ministry'</code>),
+          <b>필터는 메인 뉴스 필터와 같은 접기식 칩 패널</b>이되 대외협력 전용이다
+          (<code>.ea-filter-panel</code>, <code>ea_</code> 접두사 쿼리). 행 구성 —
+          <b>검색 · 카테고리(단일) · 기관(중복) · 영향도(중복) · 그룹사(중복) · 정렬·상태(드롭다운)</b>.
+          <b>카테고리 칩이 곧 예전의 상단 탭</b>이다: 입법·행정예고 / 국회 의안 / 정책 동향 /
+          통상 환경 / 부처별 동향 5개, 단일 선택. 뉴스형(정책·통상·부처별)을 고르면 영향도·그룹사·
+          정렬 행이 숨는다.
+        </p>
+        <p>
+          필터의 "언론사" 자리는 <b>기관</b>(정부부처·국회 상임위·KOTRA)이다. 카테고리마다 목록이
+          다르다 — 입법·행정예고=소관 부처(<code>kind='ministry'</code>),
           국회 의안=소관 상임위(<code>kind='committee'</code>), 부처별 동향=부처, 통상 환경=KOTRA·부처,
           정책 동향=기사에서 뽑은 발표 부처(제목 첫머리의 <code>산업부,</code>·<code>국토부는</code>
-          약칭을 정식명으로 환산). 관심 부처는 <b>건수 0이어도</b> 드롭다운에 남겨
+          약칭을 정식명으로 환산). 관심 부처는 <b>건수 0이어도</b> 칩으로 남겨
           "왜 산업부가 없지?" 혼선을 없앤다. 부처명은 매핑이 없으면 크롤 원문(<code>agency_raw</code>).
         </p>
         <p>
@@ -1174,8 +1179,11 @@
           로직은 전부 신규 3파일(<code>external_affairs.py</code> ·
           <code>ea_crawl.py</code> · <code>external_affairs.{js,css}</code>)에 있고,
           기존 파일에는 연결선만 그었다 — <code>main.py</code> 는 가드 import + 라우터 등록 +
-          독립 주소 <code>@app.get("/ea")</code>(같은 SPA 재사용), <code>app.js</code> 4줄,
-          <code>index.html</code> 대외협력 섹션, <code>style.css</code> <b>0줄</b>.
+          독립 주소 <code>@app.get("/ea")</code>(같은 SPA 재사용), <code>app.js</code> 는
+          <code>.filters</code> → <code>#mainFilters</code> 지정 2줄(대외협력 전용 필터와
+          구분하기 위함), <code>index.html</code> 대외협력 섹션, <code>style.css</code> <b>0줄</b>
+          (대외협력 필터는 <code>style.css</code> 의 <code>.filters</code>·<code>.chip</code> 클래스를
+          그대로 재사용한다).
           모든 CSS 클래스는 <code>.ea-</code> 접두사, URL 도 경로(<code>/ea</code>) + <code>ea_</code>
           접두사 쿼리라 기존 필터 상태와 섞이지 않는다.
         </p>

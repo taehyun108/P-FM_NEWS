@@ -172,27 +172,63 @@
 
 <main class="wrap">
 
-  <!-- 대외협력(대관) — 독립 페이지(/ea). 로직은 external_affairs.js/css 에 있다 -->
+  <!-- 대외협력(대관) — 독립 화면(/ea). 로직은 external_affairs.js/css 에 있다.
+       필터는 메인 뉴스 필터와 같은 구조(.filters)를 쓰되 대외협력 전용이다. -->
   <section class="ea-panel" id="eaPanel" aria-label="대외협력" hidden>
     <div class="ea-head">
       <div class="ea-head-main">
-        <a class="ea-back" id="eaBack" href="/">← 뉴스로</a>
         <h2>🏛 대외협력</h2>
         <p class="ea-meta" id="eaMeta">불러오는 중…</p>
       </div>
     </div>
     <div class="ea-alert" id="eaAlert" hidden></div>
-    <div class="ea-cats" id="eaCats" role="tablist"></div>
-    <div class="ea-filters" id="eaFilters">
-      <select id="eaSort" aria-label="정렬"></select>
-      <select id="eaGroup" aria-label="포스코 그룹사"></select>
-      <select id="eaAgency" aria-label="기관"></select>
-      <select id="eaImpact" aria-label="영향도"></select>
-      <select id="eaStatus" aria-label="상태"></select>
-      <select id="eaDue" aria-label="마감 임박"></select>
-      <input type="search" id="eaSearch" placeholder="제목·법령명·요약 검색" autocomplete="off">
-      <span class="ea-count" id="eaCount"></span>
-    </div>
+
+    <!-- 대외협력 전용 필터 (메인 .filters 와 같은 접기식 칩 패널) -->
+    <section class="filters ea-filter-panel" aria-label="대외협력 필터">
+      <div class="filter-head">
+        <button type="button" class="filter-toggle" id="eaFilterToggle"
+                aria-expanded="true" aria-controls="eaFilterBody">
+          <span class="filter-caret" aria-hidden="true">▾</span> 필터
+        </button>
+        <div class="filter-head-right">
+          <span class="result-count" id="eaCount">—</span>
+          <span class="active-filter-count" id="eaActiveCount" hidden></span>
+          <button type="button" class="btn-clear" id="eaClearAll">전체 해제</button>
+        </div>
+      </div>
+      <div class="filter-body" id="eaFilterBody">
+        <div class="filter-row">
+          <label class="filter-label" for="eaSearch">검색</label>
+          <input type="search" id="eaSearch" class="search"
+                 placeholder="제목·법령명·요약 검색" autocomplete="off">
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">카테고리 <em>단일 선택</em></span>
+          <div class="chips" id="eaCatChips" data-single="true"></div>
+        </div>
+        <div class="filter-row" id="eaAgencyRow">
+          <span class="filter-label">기관 <em>중복 선택</em></span>
+          <div class="chips" id="eaAgencyChips"></div>
+        </div>
+        <div class="filter-row" id="eaImpactRow">
+          <span class="filter-label">영향도 <em>중복 선택</em></span>
+          <div class="chips" id="eaImpactChips"></div>
+        </div>
+        <div class="filter-row" id="eaGroupRow">
+          <span class="filter-label">그룹사 <em>중복 선택</em></span>
+          <div class="chips" id="eaGroupChips"></div>
+        </div>
+        <div class="filter-row" id="eaMiscRow">
+          <span class="filter-label">정렬 · 상태</span>
+          <div class="ea-selects">
+            <select id="eaSort" aria-label="정렬"></select>
+            <select id="eaStatus" aria-label="상태"></select>
+            <select id="eaDue" aria-label="마감 임박"></select>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <div class="ea-list" id="eaList"></div>
     <nav class="ea-pager" id="eaPager" aria-label="페이지" hidden></nav>
     <p class="ea-disclaimer">
@@ -219,7 +255,7 @@
   </section>
 
   <!-- 필터 (PRD F6.1-4, F6.1a) -->
-  <section class="filters" aria-label="기사 필터">
+  <section class="filters" id="mainFilters" aria-label="기사 필터">
     <div class="filter-head">
       <button type="button" class="filter-toggle" id="filterToggle" aria-expanded="true" aria-controls="filterBody">
         <span class="filter-caret" aria-hidden="true">▾</span> 필터

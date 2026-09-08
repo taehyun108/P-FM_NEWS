@@ -1554,7 +1554,9 @@ def register_api(app: Any, ctx: Any) -> None:
             "categories": EA_CATEGORIES,
             "impacts": [{"key": "high", "label": "높음"}, {"key": "medium", "label": "보통"},
                         {"key": "low", "label": "낮음"}, {"key": "none", "label": "해당없음"}],
-            "statuses": col("select distinct status as v from ea_policy_items order by v"),
+            "statuses": (col("select distinct p.status as v from ea_policy_items p"
+                             + where + " order by v", args) if types
+                         else col("select distinct status as v from ea_policy_items order by v")),
             "dues": [{"key": "7", "label": "D-7"}, {"key": "14", "label": "D-14"},
                      {"key": "30", "label": "D-30"}],
             "sorts": EA_SORTS,
