@@ -213,6 +213,26 @@ class Config:
         return bool(self.naver_client_id and self.naver_client_secret)
 
 
+def _jwt_role(token: str) -> str:
+    """Supabase 키(JWT)의 role 클레임을 읽는다. 실패하면 빈 문자열."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role", "")
+    except Exception:
+        return ""
+
+
+def _pick_supabase_service_key(k1: str, k2: str) -> str:
+    """두 Supabase 키 중 role=service_role 인 것을 고른다(변수를 바꿔 넣어도 동작).
+    role 을 못 읽으면 첫 번째(SUPABASE_SERVICE_ROLE_KEY) 를 그대로 쓴다."""
+    for k in (k1, k2):
+        if k and _jwt_role(k) == "service_role":
+            return k
+    return k1 or k2
+
+
 def load_config() -> Config:
     """필수 키를 시작 직후 한 번에 전부 검증한다. (env-secret-guard §4)"""
     load_dotenv_file(os.path.join(ROOT_DIR, ".env"))
@@ -227,7 +247,10 @@ def load_config() -> Config:
         missing.append("OPENAI_API_KEY")
 
     supabase_url = get_env("SUPABASE_URL")
-    supabase_key = get_env("SUPABASE_SERVICE_ROLE_KEY")
+    # 서비스 롤 키를 쓴다(RLS 우회). 두 키 변수를 서로 바꿔 넣는 실수가 잦아
+    # JWT 의 role 클레임을 보고 실제 service_role 키를 고른다.
+    supabase_key = _pick_supabase_service_key(
+        get_env("SUPABASE_SERVICE_ROLE_KEY"), get_env("SUPABASE_ANON_KEY"))
     if backend == "supabase":
         if not supabase_url:
             missing.append("SUPABASE_URL")
@@ -6079,6 +6102,58 @@ def cmd_initdb(ctx: Context) -> None:
              len(SEED_KEYWORDS), len(SEED_PRESS))
 
 
+# sqlite → supabase 로 옮길 테이블(의존성 순서: 부모 먼저).
+_MIGRATE_TABLES = [
+    "press_outlets", "feed_sources", "keyword_sets", "run_state", "url_ledger",
+    "articles", "article_bodies", "summaries", "swot_analyses", "notifications",
+    "collection_logs", "market_quotes", "weekly_reports",
+    "ea_agencies", "ea_policy_items", "ea_analyses", "ea_url_ledger", "ea_run_state",
+]
+
+
+def cmd_migrate(ctx: Context) -> None:
+    """SQLite → Supabase 전체 복사 (일회성).
+
+    선행: ① Supabase SQL Editor 에서 backend/schema.sql 실행
+          ② .env  DB_BACKEND=supabase  로 전환 (그래야 ctx.storage 가 Supabase)
+    JSON 문자열('[...]'/'{...}')·불리언(0/1)은 자동 변환한다. 배치 upsert.
+    """
+    if ctx.cfg.db_backend != "supabase":
+        raise SystemExit("먼저 .env 의 DB_BACKEND=supabase 로 바꾸고 다시 실행하세요.")
+    src = sqlite3.connect(ctx.cfg.sqlite_path)
+    src.row_factory = sqlite3.Row
+    tgt = ctx.storage.db   # supabase client
+
+    def _coerce(v: Any) -> Any:
+        if isinstance(v, str) and v[:1] in ("[", "{"):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return v
+        return v
+
+    total = 0
+    for table in _MIGRATE_TABLES:
+        try:
+            rows = [dict(r) for r in src.execute(f"select * from {table}")]
+        except sqlite3.OperationalError:
+            log.info("  %s: 원본에 없음 — 건너뜀", table)
+            continue
+        if not rows:
+            log.info("  %s: 0행", table)
+            continue
+        payload = [{k: _coerce(v) for k, v in r.items()} for r in rows]
+        done = 0
+        for i in range(0, len(payload), 500):
+            chunk = payload[i:i + 500]
+            tgt.table(table).upsert(chunk).execute()
+            done += len(chunk)
+        total += done
+        log.info("  %s: %d행 이관", table, done)
+    src.close()
+    log.info("이관 완료: 총 %d행. 이제 서버를 재시작하면 Supabase 로 동작합니다.", total)
+
+
 def cmd_once(ctx: Context, max_llm: int | None) -> None:
     refresh_quotes(ctx)
     # 수동 1회 실행에서는 네이버 간격 제한을 무시한다(바로 확인하려는 것이므로).
@@ -6627,6 +6702,15 @@ def cmd_selftest() -> int:
           card_tags({"title": "포스코퓨처엠 양극재 증설", "group_companies": "[]",
                      "categories": "[]", "analyzed_at": _now})[0], ["포스코퓨처엠"])
 
+    # Supabase 키 자동 선별 — 두 키를 바꿔 넣어도 service_role 을 고른다
+    import base64 as _b64
+    _anon = ("x." + _b64.urlsafe_b64encode(b'{"role":"anon"}').decode().rstrip("=") + ".y")
+    _svc = ("x." + _b64.urlsafe_b64encode(b'{"role":"service_role"}').decode().rstrip("=") + ".y")
+    check("JWT role 파싱", (_jwt_role(_anon), _jwt_role(_svc)), ("anon", "service_role"))
+    check("키 순서 정상이면 첫 키", _pick_supabase_service_key(_svc, _anon), _svc)
+    check("키를 바꿔 넣어도 service_role 선택", _pick_supabase_service_key(_anon, _svc), _svc)
+    check("role 못 읽으면 첫 키 폴백", _pick_supabase_service_key("garbage", "also-bad"), "garbage")
+
     # 우선 알림('항상 발송 키워드')은 제목 + 판정 그룹사로만 본다 — 본문 스친 언급 제외
     _akw = ["포스코홀딩스", "포스코퓨처엠"]
     def _prio_probe(title, groups):
@@ -6863,6 +6947,7 @@ USAGE = """사용법: python backend/main.py <명령>
   chatid     텔레그램 chat_id 확인 (봇에게 메시지를 한 번 보낸 뒤 실행)
   sendtest   텔레그램 시험 메시지 1건 발송 (연결 확인용)
   ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
+  migrate    SQLite → Supabase 전체 이관 (schema.sql 배포 + DB_BACKEND=supabase 후, 일회성)
   weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
   selftest   내장 검증 (DB · 네트워크 · API 키 불필요)
 """
@@ -6926,6 +7011,8 @@ def main(argv: Sequence[str]) -> int:
         if ea_mod is None:
             raise SystemExit("external_affairs 모듈을 불러오지 못했습니다.")
         ea_mod.collect_once(ctx, ea_mod.EaDB(ctx.cfg.sqlite_path))
+    elif command == "migrate":
+        cmd_migrate(ctx)
     elif command == "serve":
         cmd_serve(ctx, with_pipeline=False)
     elif command == "run":

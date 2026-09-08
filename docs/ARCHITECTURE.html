@@ -926,12 +926,22 @@
         </table></div>
 
         <div class="note warn">
-          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(9.4 MB, 그중
-          6 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 3 MB 선에서 유지)이고
+          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(약 15 MB, 그중
+          7 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 8 MB 선에서 유지)이고
           <code>.gitignore</code>에 있어 GitHub에는 올라가지 않는다. 카드 하단의
           <code>SUPABASE</code> 글자는 하드코딩된 표시 라벨일 뿐 실제 저장소와 무관하다.
-          Supabase로 옮기려면 <code>schema.sql</code>을 실행하고 <code>.env</code> 세 줄만 바꾸면 된다.
         </div>
+        <h3>Supabase 전환 절차</h3>
+        <ol style="margin:8px 0 0 18px; font-size:13px; line-height:1.9;">
+          <li>Supabase 대시보드 &gt; SQL Editor 에서 <code>backend/schema.sql</code> 실행 (테이블 18개 생성)</li>
+          <li><code>.env</code> 에 <code>SUPABASE_URL</code>·<code>SUPABASE_SERVICE_ROLE_KEY</code>·
+              <code>SUPABASE_ANON_KEY</code> 입력. <b>두 키를 서로 바꿔 넣어도</b> 코드가 JWT
+              <code>role</code> 을 보고 <code>service_role</code> 키를 골라 쓴다(<code>_pick_supabase_service_key</code>).</li>
+          <li><code>.env DB_BACKEND=supabase</code> 로 전환</li>
+          <li><code>python backend/main.py migrate</code> — SQLite 전체를 Supabase 로 배치 upsert
+              (JSON 문자열·불리언 자동 변환). 처음이면 <code>initdb</code> 로 시드만 넣어도 된다.</li>
+          <li>서버 재시작. <code>저장소: Supabase</code> 로그 확인.</li>
+        </ol>
       </section>
 
       <!-- ═══════════ 6. 성능 ═══════════ -->
@@ -976,11 +986,11 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>286개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>290개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
-          <dt>Storage 정합</dt><dd>ABC 45개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0, 호출부 없는 메서드 0</dd>
+          <dt>Storage 정합</dt><dd>ABC 48개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 18개·컬럼 완전 동기</dd>
           <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 4종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
         </div>
 
@@ -1216,8 +1226,10 @@
                     산업통상부부터, <code>MINISTRY_NEWS_FEEDS</code> 로 확장</td>
                 <td><b>동작 중</b> · <code>item_type='ministry_news'</code> → 부처별 동향</td></tr>
             <tr><td>S5</td><td>KOTRA 해외시장뉴스</td>
-                <td>data.go.kr "KOTRA 해외시장뉴스" 오픈API</td>
-                <td><code>EA_KOTRA_SERVICE_KEY</code> 대기 · <code>trade_news</code> → 통상 환경</td></tr>
+                <td>data.go.kr/15034831 오픈API — <code>.../ovseaMrktNews/ovseaMrktNews</code>
+                    (오퍼레이션명 중복). 본문 없음 → 제목이 요약, 통상 조치어로 영향도 heuristic
+                    (LLM 안 씀). 포스코 관련 산업분류·제목어만 통과</td>
+                <td><code>EA_KOTRA_SERVICE_KEY</code> 있으면 <b>동작</b> · <code>trade_news</code> → 통상 환경</td></tr>
             <tr><td>S6</td><td>정책 동향</td><td>기존 <code>정부/정책</code> 기사 재사용(읽기 전용)</td>
                 <td><b>동작 중</b></td></tr>
             <tr><td>S7</td><td>통상 환경(기사)</td><td>기존 <code>글로벌 통상환경</code> 기사 + S5 KOTRA 병합</td>
