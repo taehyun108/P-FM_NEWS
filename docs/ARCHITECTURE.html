@@ -552,12 +552,15 @@
             </svg>
           </div>
           <figcaption>
-            <b>3,583건이 들어와 24건이 본문 확보·저장·분석까지 간다</b>.
-            앞 세 게이트가 재조회 비용을 0으로 만든다. <b>상한을 넘은 나머지</b>는 버리지 않는다 —
-            제목·스니펫 관련성만 확인해 <b>메타데이터만 저장</b>(<code>_defer_overflow</code>)하고,
-            다음 회차부터 <code>_drain_deferred</code>가 회차당 12건씩 본문을 받아 정식 분석한다.
-            '수집' 단계에서 관련 기사를 잃지 않는다. 예전에는 상한(12) 밖 항목을 그냥 버려,
-            중간 점수 기사가 큐에서 굶다 72시간 뒤 <code>stale</code>로 사라졌다.
+            <b>수집분의 대부분은 첫 관문에서 걸러진다</b>. 네이버 검색은 키워드를 느슨하게
+            매칭해 시황·정치·대학 기사를 무더기로 물어 오므로, <b>제목</b>에 관련성 신호
+            (배터리 생태계어 · 정책어 · 통상 조치어 · 포스코)가 없으면 바로 버린다
+            (<code>_naver_item_relevant</code> — 네이버 <code>description</code>은 검색어를
+            되풀이하는 블러브라 신뢰하지 않는다). 앞 세 게이트가 재조회 비용을 0으로 만든다.
+            <b>상한(24)을 넘은 나머지</b>는 버리지 않고 <b>제목</b> 관련성만 확인해 메타데이터만
+            저장(<code>_defer_overflow</code>)하고, 다음 회차부터 <code>_drain_deferred</code>가
+            회차당 16건씩 본문을 받아 관련성 재검·정식 분석한다. <b>분석이 끝나기 전에는
+            화면에 노출하지 않는다</b> — 본문으로 관련성이 확정되지 않은 기사는 오태그가 섞인다.
           </figcaption>
         </figure>
 
@@ -702,7 +705,11 @@
           <dt>그룹사</dt>
           <dd>포스코홀딩스·퓨처엠·DX·인터내셔널·이앤씨 등 51개소. <b>제목 + 본문 리드 700자</b>에
               회사명이 실제로 등장할 때만 채택한다 — 본문 말미에 스친 계열사 언급이 기사 주체를
-              가로채는 것을 막는다.</dd>
+              가로채는 것을 막는다. 회사명이 없고 정책·통상·배터리·인사 카테고리도 아닌
+              <b>일반 기사</b>에는 최소 태그로 <code>포스코</code>를 붙이는데(수집 게이트가
+              포스코 관련을 이미 확인했으므로), 이 폴백은 <b>분석이 끝난</b> 기사에만 씌운다 —
+              수집만 된 기사는 관련성 확정 전이라 잘못된 <code>포스코</code>·<code>배터리</code>
+              태그가 섞이기 때문이다.</dd>
           <dt>카테고리</dt>
           <dd>양극재 · 음극재 · 배터리·이차전지 · 산업 · 시장/주가 · 정부/정책 · 글로벌 통상환경 ·
               <b>인사·부고</b> — 8개(<b>법령은 폐지</b>). 제목+요약으로만 판정한다. <b>정부/정책·글로벌
@@ -966,7 +973,7 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>270개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>282개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
@@ -998,8 +1005,8 @@
             <tr><td>시세 갱신</td><td class="num">60초</td><td>수집과 분리된 전용 스레드</td></tr>
             <tr><td>네이버 호출 간격</td><td class="num">300초</td><td>하루 25,000회 한도 대응</td></tr>
             <tr><td>1회 저장 상한</td><td class="num">24건</td><td>초과분은 <code>_defer_overflow</code>가 메타데이터만 저장(비용 0)</td></tr>
-            <tr><td>1회 LLM 분석</td><td class="num">20건</td><td>모델 호출 1회에 2–3초. 이 중 최대 1/3 은 메타 저장분 드레인에 예약</td></tr>
-            <tr><td>메타 저장분 드레인</td><td class="num">12건/회</td><td><code>_drain_deferred</code> — 본문 확보 후 관련성 재검·분석</td></tr>
+            <tr><td>1회 LLM 분석</td><td class="num">20건</td><td>모델 호출 1회에 2–3초. 이 중 일부는 메타 저장분 드레인에 예약</td></tr>
+            <tr><td>메타 저장분 드레인</td><td class="num">16건/회</td><td><code>_drain_deferred</code> — 본문 확보 후 관련성 재검·분석. 24시간 못 받으면 보관</td></tr>
             <tr><td>일일 LLM 상한</td><td class="num">1,500건</td><td>UTC 자정(한국 오전 9시)에 초기화</td></tr>
             <tr><td>임베딩 상한</td><td class="num">30회/실행</td><td>유사 제목 대량 유입 시 폭주 방어</td></tr>
             <tr><td>임베딩 정리</td><td class="num">48시간</td><td>중복 판정 창 밖이면 <code>title_embedding</code> 비움 — 용량 회수</td></tr>

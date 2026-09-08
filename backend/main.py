@@ -2283,16 +2283,40 @@ def extract_ministry(html: str, body: str) -> str:
     return "정책브리핑"
 
 
-def _naver_item_relevant(title: str, category: str) -> bool:
-    """네이버가 느슨하게 매칭한 무관 기사를 거른다.
+# is_battery_scope / is_trade_topic 가 놓치는 흔한 제목어. 검색 카테고리가 이미
+# 배터리·통상이라 이 단어가 제목에 있으면 관련 기사로 본다(범용 명사는 넣지 않는다).
+_NAVER_BATTERY_TITLE_KW = ["배터리", "이차전지", "2차전지", "전기차", "EV", "충전소", "배터리팩"]
+_NAVER_TRADE_TITLE_KW = ["관세", "반덤핑", "상계관세", "세이프가드", "수출규제", "수출통제",
+                         "무역장벽", "무역분쟁", "무역전쟁", "통상", "FTA", "덤핑", "무역확장법"]
 
-    '그룹사' 키워드(포스코DX 등) 검색 결과에는 **제목에** '포스코'가 있는 기사만 통과시킨다.
-    네이버 description 은 검색어를 그대로 되풀이하므로 본문·요약으로는 걸러지지 않는다.
-    이 필터가 없으면 '영진전문대 수시모집' 같은 기사가 포스코DX 태그로 들어온다.
+
+def _naver_item_relevant(title: str, category: str, keyword: str = "") -> bool:
+    """네이버가 느슨하게 매칭한 무관 기사를 거른다. **제목** 기준으로만 판정한다.
+
+    네이버 description 은 검색어를 그대로 되풀이하는 블러브(기사 요약 아님)라
+    본문·요약으로는 걸러지지 않는다. 그래서 관련성 신호가 **제목**에 있어야 통과시킨다.
+    이 필터가 없으면 "니켈" 검색의 원자재 시황, "국정감사" 검색의 정치 기사,
+    "SK온" 검색의 SK 시황이 배터리·포스코 태그를 달고 대거 유입된다.
+
+    · 포스코·계열사가 제목에 있으면 카테고리 불문 통과
+    · '그룹사' 검색은 포스코가 제목에 없으면 탈락
+    · 검색어가 제목에 그대로 들어 있으면 통과(정밀 매칭)
+    · 그 밖에는 카테고리별 신호(배터리 생태계 / 정책어 / 통상 조치어)가 제목에 있어야 통과
     """
+    t = title or ""
+    if POSCO_MENTION_RE.search(t) or detect_group_companies(t):
+        return True
     if category == "그룹사":
-        return bool(POSCO_MENTION_RE.search(title or ""))
-    return True
+        return False
+    if keyword and keyword in t:
+        return True
+    if category == "정책":
+        return _kw_hit_any(t, POLICY_RELEVANCE_KW)
+    if category == "통상":
+        return (is_trade_topic(t, "") or _kw_hit_any(t, TRADE_MEASURE_KW)
+                or _kw_hit_any(t, _NAVER_TRADE_TITLE_KW))
+    # '산업'·기타 — 배터리 생태계 신호가 제목에 있어야 한다
+    return is_battery_scope(t, "") or _kw_hit_any(t, _NAVER_BATTERY_TITLE_KW)
 
 
 def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -> list[RawItem]:
@@ -2346,7 +2370,7 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
                 continue
             title = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("title", ""))).strip()
             snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("description", ""))).strip()
-            if not _naver_item_relevant(title, category):
+            if not _naver_item_relevant(title, category, keyword):
                 dropped += 1
                 continue
             published = parse_feed_datetime(entry.get("pubDate"))
@@ -2359,7 +2383,7 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
                 snippet=snippet,
             ))
     if dropped:
-        log.info("네이버 무관 기사 %d건 제외 (그룹사 키워드 결과 중 포스코 미언급)", dropped)
+        log.info("네이버 무관 기사 %d건 제외 (제목에 관련성 신호 없음)", dropped)
     return items
 
 
@@ -3185,12 +3209,13 @@ def find_duplicate(
 MAX_PROCESS_PER_RUN = 24
 # 상한을 넘어 이번 회차에 못 다룬 신선 후보 — 버리지 않고 이만큼은 메타데이터만
 # 저장해 둔다(본문·LLM 없이). 못 담은 나머지는 다음 회차에 다시 후보가 된다.
-DEFER_PER_RUN = 60
+DEFER_PER_RUN = 40
 # 메타만 저장된 기사(deferred)를 회차당 이만큼 본문 확보 + 분석한다.
 # 이 드레인은 안전망이지 우선순위가 아니다 — 신규 분석이 예산을 먼저 쓴다.
-DEFER_DRAIN_PER_RUN = 10
+# deferred 는 이제 화면에 안 뜨므로(분석 완료분만 노출) 조금 더 공격적으로 빼도 된다.
+DEFER_DRAIN_PER_RUN = 16
 # deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
-DEFER_MAX_AGE_HOURS = 48
+DEFER_MAX_AGE_HOURS = 24
 # 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
 PEOPLE_PER_RUN = 30
 # 인사·부고는 '기록·레퍼런스' 성격이라 일반 신선도 컷오프(72h)로 버리면 안 된다.
@@ -3234,14 +3259,19 @@ def interleave_by_group(fresh: list[tuple[RawItem, bool]], cap: int) -> list[tup
 
 
 def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
-    """본문 없이 제목·스니펫만으로 관련성을 저비용 판정한다. (keep, groups) 반환."""
+    """본문 없이 관련성을 저비용 판정한다. (keep, groups) 반환.
+
+    스니펫(특히 네이버 description)은 검색어를 되풀이하는 블러브라 신뢰도가 낮다.
+    그래서 배터리·통상 신호는 **제목**에서만 인정하고, 그룹사·포스코 언급은
+    스니펫도 함께 본다(회사명은 블러브에 우연히 나오기 어렵다). 최종 관련성은
+    _drain_deferred 가 본문으로 다시 판정하므로 여기서 조금 놓쳐도 복구된다."""
     probe = f"{title}\n{snippet or ''}"
     groups = normalize_group_list(detect_group_companies(probe))
     keep = bool(
         groups
         or POSCO_MENTION_RE.search(probe)
-        or is_battery_scope(title, snippet or "")
-        or is_trade_topic(title, snippet or "")
+        or is_battery_scope(title, "")
+        or is_trade_topic(title, "")
         or people_news_kind("", title)
     )
     return keep, groups
@@ -3251,9 +3281,9 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
                     dedup_candidates: list[dict]) -> int:
     """상한을 넘어 이번 회차에 못 다룬 신선 후보를 메타데이터만 저장한다.
 
-    본문·HTTP·LLM 을 쓰지 않으므로 비용이 0이다. 관련성은 제목·스니펫만으로
-    거칠게 거르고(본문 재검증은 _drain_deferred 가 한다), 통과분만
-    analyzed_at=NULL 로 넣어 둔다. 화면에는 '분석 대기' 칩으로 바로 보인다.
+    본문·HTTP·LLM 을 쓰지 않으므로 비용이 0이다. 관련성·카테고리·점수는 **제목** 기준으로만
+    임시 판정하고(스니펫 블러브 오염 방지), 본문 재검증·최종 태깅은 _drain_deferred 가 한다.
+    통과분은 analyzed_at=NULL 로 넣어 두되 화면에는 노출하지 않는다(분석 완료분만 노출).
     """
     storage = ctx.storage
     known = {c.get("url_canonical") or c.get("url_source") for c in dedup_candidates}
@@ -3265,7 +3295,7 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
         if not keep:
             continue   # 원장에 넣지 않는다 — 다음 회차 상한이 커지면 정식 처리될 수 있다
         pk = people_news_kind(item.url_source, item.title)
-        cats = [PEOPLE_NEWS_CATEGORY] if pk else detect_categories(item.title, item.snippet or "")
+        cats = [PEOPLE_NEWS_CATEGORY] if pk else detect_categories(item.title, "")
         aid = new_id()
         row = {
             "id": aid, "url_source": item.url_source, "url_source_aliases": [],
@@ -3276,7 +3306,7 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
             "source_type": item.source_type, "thumbnail_url": "",
             "content_hash": "", "dedup_group_id": aid, "is_representative": True,
             "is_backfill": is_backfill,
-            "importance_score": SCORE_PEOPLE_NEWS if pk else score_article(item.title, item.snippet or "", groups, 3),
+            "importance_score": SCORE_PEOPLE_NEWS if pk else score_article(item.title, "", groups, 3),
             "sentiment": None, "keywords": [], "group_companies": groups,
             "categories": cats,
             "title_embedding": None, "analyzed_at": None, "status": "active",
@@ -5080,19 +5110,23 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
     목록·필터 응답에서 전체 행을 build_card 하지 않고 필터만 걸 때 쓴다.
     """
     groups = normalize_group_list(jload(row.get("group_companies"), []))
+    cats = jload(row.get("categories"), [])
     if not groups:
         probe = " ".join([
             row.get("title") or "", row.get("summary_text") or "",
             " ".join(jload(row.get("keywords"), [])),
         ])
         groups = normalize_group_list(detect_group_companies(probe))
-        # 정책브리핑·통상환경·배터리기술 기사는 포스코 미언급이 정상 — '포스코' 폴백 안 씌운다.
-        # 일반 기사는 수집 게이트에서 포스코 관련이 확인됐으므로 최소 '포스코'.
-        if (not groups and not is_policy_brief(row)
-                and TRADE_CATEGORY not in jload(row.get("categories"), [])
+        # '포스코' 폴백은 **분석이 끝나 관련성이 확정된** 일반 기사에만 씌운다.
+        #  · 미분석(deferred) 기사: 수집 게이트가 네이버 snippet 만 봤을 수 있어 신뢰 못 함
+        #  · 정책브리핑·통상·배터리 생태계 기사: 포스코 미언급이 정상
+        non_posco_cat = {TRADE_CATEGORY, POLICY_CATEGORY, PEOPLE_NEWS_CATEGORY,
+                         "배터리·이차전지", "양극재", "음극재"}
+        if (not groups and row.get("analyzed_at") and not is_policy_brief(row)
+                and not (non_posco_cat & set(cats))
                 and not is_battery_scope(row.get("title") or "", row.get("summary_text") or "")):
             groups = ["포스코"]
-    categories = dedupe_chips(jload(row.get("categories"), []), exclude=groups)
+    categories = dedupe_chips(cats, exclude=groups)
     return groups, categories, row.get("press_name") or ""
 
 
@@ -5214,7 +5248,10 @@ def create_app(ctx: Context):
     def _scan_rows(period: str, query: str) -> list[dict]:
         hours = PERIOD_HOURS.get(period, 0)
         since = now_utc() - timedelta(hours=hours) if hours else None
-        return ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
+        # 분석이 끝난 기사만 노출한다. 수집만 된(deferred) 기사는 관련성이 본문으로
+        # 아직 확정되지 않아 오태그(잘못된 포스코·배터리 태그)가 섞인다. (사용자 지정 2026-09-08)
+        return [r for r in ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
+                if r.get("analyzed_at")]
 
     # ── 스캔 + 태그 캐시 ────────────────────────────────────────────
     # /api/articles·/api/filters 는 매 요청 list_articles(최대 3000행) 조인 조회 +
@@ -5891,16 +5928,20 @@ def cmd_fixofftopic(ctx: Context) -> None:
     제목·요약·키워드로 먼저 거르고, 남은 후보만 원문을 병렬로 다시 받아
     본문에 포스코 언급이 있으면 유지한다. 확인 불가(요청 실패)면 유지한다.
     """
+    # 이 카테고리가 붙은 기사는 포스코 미언급이 정상 — 보관 대상에서 제외한다.
+    _KEEP_CATS = {TRADE_CATEGORY, POLICY_CATEGORY, PEOPLE_NEWS_CATEGORY,
+                  "배터리·이차전지", "양극재", "음극재"}
     rows = ctx.storage.list_articles(5000, 0, None, "")
     cands = []
     for r in rows:
-        if (is_policy_brief(r) or is_trade_article(r)
+        cats = set(jload(r.get("categories"), []))
+        if (is_policy_brief(r) or is_trade_article(r) or (cats & _KEEP_CATS)
+                or jload(r.get("group_companies"), [])
                 or is_battery_scope(r.get("title") or "", r.get("summary_text") or "")):
-            continue  # 정책·통상·배터리기술 기사는 포스코 미언급이어도 유지 (사용자 지정)
+            continue  # 정책·통상·배터리·인사·부고·그룹사 확정 기사는 유지 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
-            " ".join(jload(r.get("group_companies"), [])),
         ])
         if not (detect_group_companies(text) or POSCO_MENTION_RE.search(text)):
             cands.append(r)
@@ -6351,7 +6392,7 @@ def cmd_selftest() -> int:
     check("본문 언급은 카테고리에 안 잡힌다(제목·요약만 스캔)",
           detect_categories("장인화 회장 호주 방문", "핵심광물 공급망 협력을 제안했다"), [])
 
-    print("\n[8-2] 네이버 관련성 필터 (제목 기준, 그룹사 쏠림 방지)")
+    print("\n[8-2] 네이버 관련성 필터 (제목 기준 — 모든 카테고리)")
     check("포스코 무관 기사(수집 게이트)",
           bool(detect_group_companies("해병대 포병대대 포항 소외계층 무료급식 봉사")
                or POSCO_MENTION_RE.search("해병대 포병대대 포항 소외계층 무료급식 봉사")), False)
@@ -6360,11 +6401,27 @@ def cmd_selftest() -> int:
     check("계열사만 언급된 기사(수집 게이트)",
           bool(detect_group_companies("삼척블루파워 석탄화력 준공")), True)
     check("그룹사 키워드: 제목에 포스코 없음 → 제외",
-          _naver_item_relevant("영진전문대 수시모집 2309명 선발", "그룹사"), False)
+          _naver_item_relevant("영진전문대 수시모집 2309명 선발", "그룹사", "포스코DX"), False)
     check("그룹사 키워드: 제목에 포스코DX 있음 → 통과",
-          _naver_item_relevant("대덕SW고 학생, 포스코DX AI 유스챌린지 대상", "그룹사"), True)
-    check("산업 키워드는 필터 안 함",
-          _naver_item_relevant("LG엔솔 리튬 계약", "산업"), True)
+          _naver_item_relevant("대덕SW고 학생, 포스코DX AI 유스챌린지 대상", "그룹사", "포스코DX"), True)
+    check("산업: 제목에 배터리 신호 있으면 통과",
+          _naver_item_relevant("SK온, 美 ESS 1.5조 수주", "산업", "SK온"), True)
+    check("산업: 제목에 신호 없는 시황 기사 → 제외",
+          _naver_item_relevant("삼성전기, 3%대 약세…140만원선 사수하나?", "산업", "삼성SDI"), False)
+    check("산업: 검색어가 제목에 그대로 있으면 통과",
+          _naver_item_relevant("니켈 가격 3개월래 최고", "산업", "니켈 가격"), True)
+    check("정책: 제목에 정책어 없으면 제외",
+          _naver_item_relevant("내일 서울대 총장후보 4명 압축", "정책", "국정감사"), False)
+    check("정책: 제목에 정책어 있으면 통과",
+          _naver_item_relevant("전기차 보조금 확대 국정감사 쟁점", "정책", "국정감사"), True)
+    check("통상: 제목에 통상 조치어 없으면 제외",
+          _naver_item_relevant("코스피 7100선 돌파", "통상", "관세"), False)
+    check("통상: '관세'가 제목에 있으면 통과",
+          _naver_item_relevant("트럼프 관세에 車업계 초비상", "통상", "글로벌 관세 전쟁"), True)
+    check("산업: '배터리'가 제목에 있으면 통과(스코프어 아니어도)",
+          _naver_item_relevant("K-배터리 소재 국산화 시동…정부 2조 투입", "산업", "양극재"), True)
+    check("포스코가 제목에 있으면 카테고리 불문 통과",
+          _naver_item_relevant("포스코홀딩스 주가 강세", "통상", "관세"), True)
 
     print("\n[8-2b] 정책브리핑(korea.kr) 수집")
     check("정책브리핑 URL 판정",
@@ -6549,6 +6606,20 @@ def cmd_selftest() -> int:
           _rows_sorted[0]["source_type"], "manual")
     check("중요도순: 나머지는 점수 내림차순",
           [r["importance_score"] for r in _rows_sorted[1:]], [95, 90])
+    # card_tags '포스코' 폴백 — 분석 완료 + 관련 카테고리 아님일 때만
+    _now = iso(now_utc())
+    check("분석 완료·그룹 없음·일반 기사 → 포스코 폴백",
+          card_tags({"title": "새 공장 착공식 개최", "group_companies": "[]",
+                     "categories": "[]", "analyzed_at": _now})[0], ["포스코"])
+    check("미분석 기사에는 포스코 폴백 안 함",
+          card_tags({"title": "새 공장 착공식 개최", "group_companies": "[]",
+                     "categories": "[]", "analyzed_at": None})[0], [])
+    check("배터리·이차전지 카테고리면 포스코 폴백 안 함",
+          card_tags({"title": "글로벌 배터리 시장 재편", "group_companies": "[]",
+                     "categories": '["배터리·이차전지"]', "analyzed_at": _now})[0], [])
+    check("제목에 계열사 있으면 그대로 태깅",
+          card_tags({"title": "포스코퓨처엠 양극재 증설", "group_companies": "[]",
+                     "categories": "[]", "analyzed_at": _now})[0], ["포스코퓨처엠"])
 
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")
