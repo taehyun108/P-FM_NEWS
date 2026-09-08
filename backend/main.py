@@ -262,7 +262,7 @@ def load_config() -> Config:
         llm_daily_limit=get_env_int("LLM_DAILY_LIMIT", 1500, 0),
         # 1회 실행에서 분석할 최대 건수. 나머지는 analyzed_at=null 로 남아 다음 실행에 처리된다.
         # 60초 주기를 지키려면 작게 유지한다(모델 1회 호출이 5~10초).
-        llm_per_run=get_env_int("LLM_PER_RUN", 6, 1),
+        llm_per_run=get_env_int("LLM_PER_RUN", 20, 1),
         api_host=get_env("API_HOST", "127.0.0.1"),
         api_port=get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
@@ -438,6 +438,13 @@ class Storage(ABC):
 
     @abstractmethod
     def unanalyzed_count(self) -> int: ...
+
+    @abstractmethod
+    def deferred_articles(self, limit: int) -> list[dict]:
+        """메타만 저장돼(본문 없음) 아직 분석 안 된 기사. 발행 오래된 순."""
+
+    @abstractmethod
+    def deferred_count(self) -> int: ...
 
     @abstractmethod
     def delete_body(self, article_id: str) -> None: ...
@@ -774,6 +781,25 @@ class SqliteStorage(Storage):
         row = self._one(
             "select count(*) as n from articles a join article_bodies b on b.article_id = a.id"
             " where a.analyzed_at is null and a.status='active'"
+        )
+        return int(row["n"]) if row else 0
+
+    def deferred_articles(self, limit: int) -> list[dict]:
+        return self._rows(
+            "select a.id, a.title, a.url_source, a.url_canonical, a.url_original,"
+            " a.press_name, a.published_at, a.collected_at, a.group_companies"
+            " from articles a"
+            " where a.analyzed_at is null and a.status='active'"
+            " and not exists (select 1 from article_bodies b where b.article_id = a.id)"
+            " order by a.published_at asc limit ?",
+            (limit,),
+        )
+
+    def deferred_count(self) -> int:
+        row = self._one(
+            "select count(*) as n from articles a"
+            " where a.analyzed_at is null and a.status='active'"
+            " and not exists (select 1 from article_bodies b where b.article_id = a.id)"
         )
         return int(row["n"]) if row else 0
 
@@ -1203,6 +1229,24 @@ class SupabaseStorage(Storage):
                .select("article_id,articles!inner(analyzed_at,status)", count="exact")
                .is_("articles.analyzed_at", "null").eq("articles.status", "active").execute())
         return res.count or 0
+
+    def deferred_articles(self, limit: int) -> list[dict]:
+        # 본문이 없는 미분석 활성 기사 — article_bodies 에 있는 id 를 빼고 조회한다.
+        bodies = {r["article_id"] for r in
+                  self._t("article_bodies").select("article_id").execute().data or []}
+        rows = (self._t("articles")
+                .select("id,title,url_source,url_canonical,url_original,press_name,"
+                        "published_at,collected_at,group_companies")
+                .is_("analyzed_at", "null").eq("status", "active")
+                .order("published_at", desc=False).limit(limit + len(bodies)).execute()).data or []
+        return [r for r in rows if r["id"] not in bodies][:limit]
+
+    def deferred_count(self) -> int:
+        bodies = {r["article_id"] for r in
+                  self._t("article_bodies").select("article_id").execute().data or []}
+        rows = (self._t("articles").select("id")
+                .is_("analyzed_at", "null").eq("status", "active").execute()).data or []
+        return sum(1 for r in rows if r["id"] not in bodies)
 
     def delete_body(self, article_id: str) -> None:
         self._t("article_bodies").delete().eq("article_id", article_id).execute()
@@ -3063,10 +3107,18 @@ def find_duplicate(
 # 12. 파이프라인 (PRD F1.1 게이트)
 # =====================================================================
 
-# 1회 실행에서 G3(HTTP) 이후로 보낼 최대 건수.
-# PRD §6 의 "1회 실행 20초 이내" 를 지키기 위한 상한이다. 넘친 항목은 버리는 것이
-# 아니라 다음 실행에서 다시 후보가 된다(아직 articles 에 없으므로 G2 를 통과한다).
-MAX_PROCESS_PER_RUN = 12
+# 1회 실행에서 본문 확보(G3/G4)·중복판정·저장까지 갈 최대 건수. 이 안에 든 것은
+# 즉시 저장되고, 예산이 남으면 바로 분석된다.
+MAX_PROCESS_PER_RUN = 24
+# 백로그(신선 후보가 상한의 3배 이상)일 때 저장 상한을 이 값까지 올려 빠르게 소진한다.
+MAX_PROCESS_BURST = 60
+# 상한을 넘어 이번 회차에 못 다룬 신선 후보 — 버리지 않고 이만큼은 메타데이터만
+# 저장해 둔다(본문·LLM 없이). _drain_deferred 가 다음 회차부터 본문을 받아 분석한다.
+DEFER_PER_RUN = 80
+# 메타만 저장된 기사(deferred)를 회차당 이만큼 본문 확보 + 분석한다.
+DEFER_DRAIN_PER_RUN = 12
+# deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
+DEFER_MAX_AGE_HOURS = 48
 
 
 def matches_keywords(text: str, keywords: Sequence[str]) -> bool:
@@ -3098,6 +3150,124 @@ def interleave_by_group(fresh: list[tuple[RawItem, bool]], cap: int) -> list[tup
                 if len(picked) >= cap:
                     break
     return picked
+
+
+def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
+    """본문 없이 제목·스니펫만으로 관련성을 저비용 판정한다. (groups, keep) 반환용."""
+    probe = f"{title}\n{snippet or ''}"
+    groups = normalize_group_list(detect_group_companies(probe))
+    keep = bool(
+        groups
+        or POSCO_MENTION_RE.search(probe)
+        or is_battery_scope(title, snippet or "")
+        or is_trade_topic(title, snippet or "")
+    )
+    return keep, groups
+
+
+def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
+                    dedup_candidates: list[dict]) -> int:
+    """상한을 넘어 이번 회차에 못 다룬 신선 후보를 메타데이터만 저장한다.
+
+    본문·HTTP·LLM 을 쓰지 않으므로 비용이 0이다. 관련성은 제목·스니펫만으로
+    거칠게 거르고(본문 재검증은 _drain_deferred 가 한다), 통과분만
+    analyzed_at=NULL 로 넣어 둔다. 화면에는 '분석 대기' 칩으로 바로 보인다.
+    """
+    storage = ctx.storage
+    known = {c.get("url_canonical") or c.get("url_source") for c in dedup_candidates}
+    saved = 0
+    for item, is_backfill in overflow[:DEFER_PER_RUN]:
+        if item.url_source in known or item.url_original in known:
+            continue
+        keep, groups = _title_snippet_relevant(item.title, item.snippet or "")
+        if not keep:
+            continue   # 원장에 넣지 않는다 — 다음 회차 상한이 커지면 정식 처리될 수 있다
+        aid = new_id()
+        row = {
+            "id": aid, "url_source": item.url_source, "url_source_aliases": [],
+            "url_canonical": item.url_source, "url_original": item.url_original,
+            "title": item.title, "press_id": None,
+            "press_name": item.press_hint or "", "author": "",
+            "published_at": iso(item.published_at), "collected_at": iso(now_utc()),
+            "source_type": item.source_type, "thumbnail_url": "",
+            "content_hash": "", "dedup_group_id": aid, "is_representative": True,
+            "is_backfill": is_backfill,
+            "importance_score": score_article(item.title, item.snippet or "", groups, 3),
+            "sentiment": None, "keywords": [], "group_companies": groups,
+            "categories": detect_categories(item.title, item.snippet or ""),
+            "title_embedding": None, "analyzed_at": None, "status": "active",
+        }
+        if storage.insert_article(row):
+            saved += 1
+            known.add(item.url_source)
+            ctx.seen_cache.add(item.url_source)
+            dedup_candidates.append({
+                "id": aid, "title": item.title, "published_at": iso(item.published_at),
+                "dedup_group_id": aid, "is_representative": True, "title_embedding": None,
+                "press_name": row["press_name"], "content_hash": "",
+                "url_canonical": item.url_source, "url_source": item.url_source,
+            })
+    return saved
+
+
+def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> int:
+    """메타만 저장된(deferred) 기사를 본문 확보 → 관련성 재검 → 분석한다.
+
+    본문을 계속 못 받으면 DEFER_MAX_AGE_HOURS 후 보관 처리한다.
+    본문 기준 관련성에서 탈락하면(제목만 그럴듯했던 경우) 역시 보관한다.
+    """
+    storage, http = ctx.storage, ctx.http
+    done = 0
+    for art in storage.deferred_articles(limit):
+        aid = art["id"]
+        target = art.get("url_original") or art.get("url_canonical") or art.get("url_source")
+        try:
+            canonical, html = resolve_canonical(http, target)
+        except Exception:
+            canonical, html = "", ""
+        body = extract_body(html) if html else ""
+        if len(body) < 200:
+            collected = parse_dt(art.get("collected_at"))
+            if collected and (now_utc() - collected) > timedelta(hours=DEFER_MAX_AGE_HOURS):
+                storage.update_article(aid, {"status": "archived"})
+            continue   # 다음 회차 재시도
+
+        rule_groups = detect_group_companies(f"{art['title']}\n{body[:GROUP_LEAD_CHARS]}")
+        probe = f"{art['title']}\n{body}"
+        if not (rule_groups or POSCO_MENTION_RE.search(probe)
+                or is_battery_scope(art["title"], body[:1500])
+                or is_trade_topic(art["title"], body[:1500])
+                or bool(KOREA_KR_NEWS_RE.search(canonical or ""))):
+            storage.update_article(aid, {"status": "archived"})
+            continue
+
+        # 본문 도착 후 중복 재판정 — 그새 정식 수집된 기사와 겹치면 흡수한다
+        content_hash = sha256(body)
+        dup = find_duplicate(storage, ctx.llm, art["title"], parse_dt(art["published_at"]),
+                             content_hash, canonical or art["url_canonical"], dedup_candidates)
+        if dup and dup["id"] != aid:
+            storage.append_alias(dup["id"], art["url_source"])
+            storage.update_article(aid, {"status": "archived"})
+            continue
+
+        press_name, press_id, press_tier = resolve_press(storage, canonical or target,
+                                                         art.get("press_name") or "", html)
+        storage.update_article(aid, {
+            "url_canonical": canonical or art["url_canonical"],
+            "press_id": press_id, "press_name": press_name,
+            "author": extract_author(html, body, press_name),
+            "content_hash": content_hash, "thumbnail_url": extract_thumbnail(html),
+            "importance_score": score_article(art["title"], body, rule_groups, press_tier),
+        })
+        row = {"id": aid, "title": art["title"], "press_id": press_id, "press_name": press_name,
+               "importance_score": score_article(art["title"], body, rule_groups, press_tier),
+               "group_companies": rule_groups}
+        if analyze_and_save(ctx, aid, row, body, "fulltext") is not None:
+            done += 1
+        else:
+            # 분석 실패(3회 재시도해도 동일) — 링크·제목 카드로 확정해 deferred 큐에서 뺀다.
+            storage.update_article(aid, {"analyzed_at": iso(now_utc())})
+    return done
 
 
 @dataclass
@@ -3327,27 +3497,29 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         log.warning("일일 LLM 호출 상한(%d)에 도달했습니다. 저장만 하고 분석은 다음 날 재개합니다.",
                     cfg.llm_daily_limit)
 
-    # 수집 속도가 분석 속도를 앞지르면 백로그가 무한히 는다. 예산에 맞춰 수집을 조인다.
-    #   예산 없음  → 수집만 계속(본문 저장), 분석은 다음 날
-    #   백로그 있음 → 예산의 절반만 신규에 쓰고 나머지는 백로그 해소
-    #   평상시     → 예산만큼만 수집
-    pending_now = storage.unanalyzed_count()
-    if llm_budget <= 0:
-        process_cap = MAX_PROCESS_PER_RUN
-    elif pending_now > llm_budget:
-        process_cap = max(1, llm_budget // 2)
-    else:
-        process_cap = min(MAX_PROCESS_PER_RUN, llm_budget)
+    # 메타만 저장된(deferred) 기사가 있으면 예산의 최대 1/3 을 그 드레인에 예약한다.
+    # 안 그러면 신규·본문대기 분석이 매 회차 예산을 다 써 deferred 가 영원히 안 빠진다.
+    defer_pending = storage.deferred_count()
+    defer_budget = min(DEFER_DRAIN_PER_RUN, defer_pending, max(1, llm_budget // 3)) if defer_pending else 0
+    llm_budget = max(0, llm_budget - defer_budget)
 
+    # 저장 상한은 LLM 예산과 분리한다. 저장(본문 확보+중복판정)은 비용이 작고,
+    # 여기서 조이면 관련 기사가 큐에서 굶어 72시간 뒤 stale 로 사라진다.
+    # 넘친 후보는 _defer_overflow 가 메타만 저장해 두므로 '수집'은 무엇도 잃지 않는다.
+    pending_now = storage.unanalyzed_count() + storage.deferred_count()
     fresh_available = len(fresh)   # 절단 전 신규 후보 수 — 안정화 판단에 쓴다
+    process_cap = MAX_PROCESS_BURST if fresh_available > MAX_PROCESS_PER_RUN * 3 else MAX_PROCESS_PER_RUN
 
     # 중요도 순 + 그룹사 균형. 중요도만 쓰면 포스코퓨처엠(제목 +50)이 큐를 독점해
     # 포스코DX·이앤씨 기사가 매 회차 뒤로 밀린다. 그룹사별로 번갈아 뽑는다. (PRD F4.6)
     fresh.sort(key=lambda pair: score_article(pair[0].title, pair[0].snippet, [], 3), reverse=True)
+    overflow: list[tuple[RawItem, bool]] = []
     if fresh_available > process_cap:
         picked = interleave_by_group(fresh, process_cap)
-        log.info("이번 실행 처리 대상을 %d건으로 제한합니다 (신규 대기 %d · 분석 대기 %d).",
-                 len(picked), fresh_available - len(picked), pending_now)
+        picked_urls = {p[0].url_source for p in picked}
+        overflow = [pair for pair in fresh if pair[0].url_source not in picked_urls]
+        log.info("이번 실행 즉시 처리 %d건 · 메타 저장 대기 %d건 · 분석 대기 %d건",
+                 len(picked), len(overflow), pending_now)
         fresh = picked
 
     new_count = 0
@@ -3516,8 +3688,16 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                       _kw_hit(probe, trade_notify_kws) and _kw_hit(probe, trade_required_kws)),
         })
 
+    # ── 넘친 신선 후보를 메타데이터만 저장한다 (본문·LLM 없음, 비용 0) ──
+    # '수집' 단계에서 관련 기사를 절대 잃지 않기 위한 장치. 아래 _drain_deferred 가
+    # 다음 회차부터 본문을 받아 정식 분석한다.
+    if overflow:
+        deferred = _defer_overflow(ctx, overflow, dedup_candidates)
+        if deferred:
+            log.info("메타데이터만 저장 %d건 (다음 회차부터 본문 확보·분석)", deferred)
+
     # ── 분석 백로그 드레인 ───────────────────────────────────────────
-    # 이전 실행에서 저장만 되고 분석이 밀린 기사를 예산 안에서 처리한다.
+    # 이전 실행에서 본문까지 저장되고 분석만 밀린 기사를 예산 안에서 처리한다.
     analyzed_backlog = 0
     if llm_budget > 0:
         for pending in storage.unanalyzed_with_body(llm_budget):
@@ -3532,6 +3712,13 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             llm_budget -= 1
     if analyzed_backlog:
         log.info("분석 백로그 %d건 처리", analyzed_backlog)
+
+    # ── 메타만 저장된(deferred) 기사 드레인 — 본문 확보 → 관련성 재검 → 분석 ──
+    # 예약해 둔 defer_budget + 앞 단계에서 남은 예산을 함께 쓴다.
+    drain_budget = defer_budget + max(0, llm_budget)
+    drained = _drain_deferred(ctx, min(drain_budget, DEFER_DRAIN_PER_RUN), dedup_candidates) if drain_budget else 0
+    if drained:
+        log.info("메타 저장분 분석 %d건 (예약 예산 %d)", drained, defer_budget)
 
     # 30일 넘은 임시 본문 정리 (§7-3 보존 기간)
     purged = storage.cleanup_bodies(30)
@@ -3588,12 +3775,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         "duration_ms": duration_ms,
     })
 
-    backlog = storage.unanalyzed_count()
+    backlog = storage.unanalyzed_count() + storage.deferred_count()
     # 부트스트랩/복구 억제는 "한 회"가 아니라 파이프라인이 안정될 때까지 유지한다. (PRD F1.1)
-    # 신규 유입과 분석 백로그가 모두 잦아들면 그때 알림을 켠다. 그러지 않으면
-    # 초기 수집 몇 시간 동안 밀린 기사가 한꺼번에 알림으로 쏟아진다.
-    # 아직 수집 못 한 신규 후보가 많으면(예: 네이버 배치가 막 들어옴) 억제를 유지한다.
-    stabilized = fresh_available < 20 and new_count < 10 and backlog < 10
+    # 신규 유입과 분석 백로그(본문 대기 + 메타만 저장분)가 모두 잦아들면 그때 알림을 켠다.
+    # 그러지 않으면 초기 수집 몇 시간 동안 밀린 기사가 한꺼번에 알림으로 쏟아진다.
+    stabilized = fresh_available < 20 and new_count < 10 and backlog < 30
     next_mode = "active" if (not suppressed or stabilized) else "suppressed"
     if suppressed and next_mode == "active":
         log.info("파이프라인이 안정되어 알림을 활성화합니다.")
@@ -5970,6 +6156,18 @@ def cmd_selftest() -> int:
     check("4건 중 3개 이상 그룹사가 대표됨", len(_titles) >= 3, True)
     check("포스코DX 포함", any("포스코DX" in p[0].title for p in _picked), True)
     check("포스코이앤씨 포함", any("포스코이앤씨" in p[0].title for p in _picked), True)
+
+    print("\n[8-4] 넘친 신선 후보 저비용 관련성 판정 (_title_snippet_relevant)")
+    check("그룹사 제목 → 저장",
+          _title_snippet_relevant("포스코퓨처엠 광양 양극재 증설", "")[0], True)
+    check("배터리 생태계(BYD) → 저장",
+          _title_snippet_relevant("BYD 전기차 판매량 급감", "테슬라는 증가")[0], True)
+    check("포스코 언급 스니펫 → 저장",
+          _title_snippet_relevant("증시 주도주 분석", "포스코홀딩스 주가 상승")[0], True)
+    check("무관 일반 경제 → 저장 안 함",
+          _title_snippet_relevant("아파트 청약 경쟁률 상승", "수도권 분양시장")[0], False)
+    check("반도체 기사 → 저장 안 함",
+          _title_snippet_relevant("삼성전자 HBM4 양산 준비", "")[0], False)
 
     print("\n[9] LLM 응답 파싱 (PRD F4)")
     check("코드펜스 제거", _parse_json_object('```json\n{"a":1}\n```'), {"a": 1})
