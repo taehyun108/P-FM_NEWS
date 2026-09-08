@@ -514,6 +514,10 @@ class Storage(ABC):
     def press_by_domain(self, domain: str) -> dict | None: ...
 
     @abstractmethod
+    def all_press(self) -> list[dict]:
+        """press_outlets 전체 행. fixpress 의 이름 재정리에 쓴다."""
+
+    @abstractmethod
     def press_tier_by_id(self, press_id: str | None) -> int:
         """언론사 tier(1=주요지 … 3=기타). id 가 없거나 못 찾으면 3."""
 
@@ -983,6 +987,9 @@ class SqliteStorage(Storage):
     def press_by_domain(self, domain: str) -> dict | None:
         return self._one("select * from press_outlets where domain=?", (domain,))
 
+    def all_press(self) -> list[dict]:
+        return self._rows("select * from press_outlets")
+
     def press_tier_by_id(self, press_id: str | None) -> int:
         if not press_id:
             return 3
@@ -1363,6 +1370,9 @@ class SupabaseStorage(Storage):
         rows = self._t("press_outlets").select("*").eq("domain", domain).execute().data
         return rows[0] if rows else None
 
+    def all_press(self) -> list[dict]:
+        return self._t("press_outlets").select("*").execute().data or []
+
     def press_tier_by_id(self, press_id: str | None) -> int:
         if not press_id:
             return 3
@@ -1632,7 +1642,19 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "sateconomy.co.kr": ("토요경제", 3), "socialvalue.kr": ("소셜밸류", 3),
     "inthenews.co.kr": ("인더뉴스", 3), "press9.kr": ("프레스나인", 3),
     "mtn.co.kr": ("머니투데이방송", 2),
+    # 사용자 확인 매체 (2026-09-08) — 도메인·부제 그대로 노출되던 것 정정
+    "wsobi.com": ("여성소비자신문", 3), "tbc.co.kr": ("TBC", 2),
+    "ppss.kr": ("ㅍㅍㅅㅅ", 3), "ktv.go.kr": ("KTV 국민방송", 2),
+    "kpinews.kr": ("KPI뉴스", 3), "kjdaily.com": ("광주매일신문", 3),
+    "kgnews.co.kr": ("경기신문", 3), "gosiweek.com": ("피앤피뉴스", 3),
+    "unn.net": ("한국대학신문", 3), "ttlnews.com": ("퍼블릭뉴스통신", 3),
+    "the-stock.kr": ("더스탁", 3), "apnews.kr": ("AP신문", 3),
 }
+
+# 다음·네이버 뉴스 래퍼 도메인 — 그 자체가 언론사가 아니다.
+# 이런 페이지의 og:site_name 은 'Daum | 뉴스1' 처럼 '래퍼 | 실제출처' 형태라
+# 마지막 구분자 뒤(실제 출처)를 매체명으로 쓴다.
+NEWS_AGGREGATORS = frozenset({"daum.net", "naver.com"})
 
 # 그룹사 정규 명칭 — LLM 이 만든 그룹사명은 이 목록에 없으면 버린다. (PRD F4.2)
 #   키 = 표시명(필터 칩·카드에 이 이름이 나온다). 값 = 본문에서 찾을 별칭(법인격 ㈜/(유) 제외).
@@ -3114,7 +3136,31 @@ def prettify_domain(domain: str) -> str:
     return (domain or "").strip()
 
 
-def site_name_from_html(html: str) -> str:
+def clean_site_name(name: str, domain: str = "") -> str:
+    """매체명에서 부제·영문 병기·래퍼 접두를 떼어낸다.
+
+    예) '경기신문 - 기본에 충실한 …'      → '경기신문'
+        'AP신문 |  온라인뉴스미디어  …'    → 'AP신문'
+        '더스탁(The Stock)'              → '더스탁'
+        'Daum | 뉴스1'   (daum.net)     → '뉴스1'   (래퍼 도메인은 뒤쪽이 실제 출처)
+    """
+    name = re.sub(r"\s+", " ", html_mod.unescape(name or "")).strip()
+    if not name:
+        return ""
+    # domain 은 domain_of 로 이미 접힌 값(v.daum.net → daum.net)이 들어온다.
+    if domain in NEWS_AGGREGATORS:
+        # '래퍼 | 실제출처' — 마지막 구분자 뒤(한글 조각)를 취한다.
+        parts = re.split(r"\s*[|\-–·]\s*", name)
+        name = next((p for p in reversed(parts) if _has_hangul(p)), parts[-1]).strip()
+    else:
+        # 첫 구분자 앞이 매체명. 뒤는 대개 슬로건·부제다.
+        name = re.split(r"\s*[|\-–]\s*", name, maxsplit=1)[0].strip()
+        # 끝에 붙은 '(English…)' 영문 병기 제거 (한글 병기 '(주간)' 등은 남긴다).
+        name = re.sub(r"\s*\([A-Za-z0-9 .,'&/\-]+\)\s*$", "", name).strip()
+    return name
+
+
+def site_name_from_html(html: str, domain: str = "") -> str:
     """HTML 의 og:site_name / <meta name=publisher> 에서 매체명을 뽑는다.
 
     SEED_PRESS 에 없는 매체도 대부분 이 태그에 한글 매체명을 넣는다.
@@ -3124,7 +3170,7 @@ def site_name_from_html(html: str) -> str:
                 r'<meta[^>]+name=["\'](?:twitter:site|publisher|source)["\'][^>]+content=["\']([^"\']+)["\']'):
         m = re.search(pat, html or "", re.I)
         if m:
-            name = html_mod.unescape(m.group(1)).strip()
+            name = clean_site_name(m.group(1), domain)
             if name and _has_hangul(name) and not _looks_like_domain(name):
                 return name
     return ""
@@ -3141,7 +3187,7 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "") -> tupl
 
     row = storage.press_by_domain(domain)
     seed = SEED_PRESS.get(domain)
-    og_name = site_name_from_html(html)
+    og_name = site_name_from_html(html, domain)
 
     if row is None:
         if seed:
@@ -5216,6 +5262,16 @@ def cmd_fixpress(ctx: Context) -> None:
             ctx.storage.update_press_name(domain, name, tier)
             renamed += 1
 
+    # 이미 저장된 이름에서 부제·영문 병기·래퍼 접두를 뒤늦게 떼어낸다.
+    # (SEED_PRESS 로 안 잡히지만 'Daum | 뉴스1' 처럼 정리 여지가 있는 것)
+    cleaned = 0
+    for row in ctx.storage.all_press():
+        cur = (row.get("name") or "").strip()
+        nxt = clean_site_name(cur, row.get("domain") or "")
+        if nxt and nxt != cur and _has_hangul(nxt) and not _looks_like_domain(nxt):
+            ctx.storage.update_press_name(row["domain"], nxt, int(row.get("tier") or 3))
+            cleaned += 1
+
     # SEED_PRESS 에 없어 도메인·조각으로 남은 매체는 대표 기사 1건을 받아
     # og:site_name 에서 한글 매체명을 시도한다. 실패하면 도메인 전체로 둔다.
     ogfix = 0
@@ -5232,7 +5288,7 @@ def cmd_fixpress(ctx: Context) -> None:
         og = ""
         try:
             _, html = resolve_canonical(ctx.http, target)
-            og = site_name_from_html(html)
+            og = site_name_from_html(html, domain)
         except Exception as exc:
             log.debug("og:site_name 조회 실패 %s: %s", target, exc)
         ctx.storage.update_press_name(domain, og or domain, 3)
@@ -5240,8 +5296,8 @@ def cmd_fixpress(ctx: Context) -> None:
             ogfix += 1
 
     synced = ctx.storage.sync_article_press_names()
-    log.info("언론사명 정리: %d개 이름 교체 · %d개 og:site_name 복원 · 기사 %d건 반영",
-             renamed, ogfix, synced)
+    log.info("언론사명 정리: %d개 SEED 교체 · %d개 부제 제거 · %d개 og:site_name 복원 · 기사 %d건 반영",
+             renamed, cleaned, ogfix, synced)
 
 
 def cmd_fixauthors(ctx: Context) -> None:
@@ -5787,6 +5843,15 @@ def cmd_selftest() -> int:
           site_name_from_html('<meta property="og:site_name" content="비즈니스포스트"/>'), "비즈니스포스트")
     check("영문 og:site_name 은 무시",
           site_name_from_html('<meta property="og:site_name" content="BusinessPost"/>'), "")
+    # 부제·영문 병기 제거 (clean_site_name)
+    check("' - 부제' 제거", clean_site_name("경기신문 - 기본에 충실한 경기·인천 지역 바른 신문"), "경기신문")
+    check("' | 부제' 제거", clean_site_name("AP신문 |  온라인뉴스미디어  에이피신문"), "AP신문")
+    check("'(English)' 병기 제거", clean_site_name("더스탁(The Stock)"), "더스탁")
+    check("한글 병기 괄호는 유지", clean_site_name("주간동아(주간)"), "주간동아(주간)")
+    check("래퍼 도메인은 뒤쪽(실제 출처)", clean_site_name("Daum | 뉴스1", "daum.net"), "뉴스1")
+    check("일반 도메인은 앞쪽(매체명)", clean_site_name("AP신문 | 부제", "apnews.kr"), "AP신문")
+    check("SEED_PRESS 신규 매핑(KPI뉴스)", SEED_PRESS.get("kpinews.kr", ("", 0))[0], "KPI뉴스")
+    check("SEED_PRESS 신규 매핑(여성소비자신문)", SEED_PRESS.get("wsobi.com", ("", 0))[0], "여성소비자신문")
 
     print("\n[8-1] 카테고리 태깅 (PRD F3.1)")
     check("'지역' 카테고리는 폐지됨", "지역" in detect_categories("포항 공장에서 사고"), False)

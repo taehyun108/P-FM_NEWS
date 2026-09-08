@@ -578,6 +578,18 @@
           정보(제목·링크·언론사·기자·썸네일)를 그쪽으로 승격한다. 요약·SWOT 등 분석 결과는
           같은 사건이므로 그대로 두고, 피드가 재정렬되지 않도록 발행시각도 유지한다.
         </p>
+        <h3>언론사명 정리</h3>
+        <p>
+          도메인 → 매체명 매핑은 <code>SEED_PRESS</code>(약 246곳)가 1순위, 없으면 본문
+          <code>og:site_name</code>, 그다음 피드 힌트다. <code>og:site_name</code>은 그대로
+          쓰지 않고 <code>clean_site_name</code>이 <b>부제·영문 병기·래퍼 접두</b>를 떼어낸다 —
+          <code>경기신문 - 기본에 충실한…</code> → <code>경기신문</code>,
+          <code>더스탁(The Stock)</code> → <code>더스탁</code>,
+          <code>Daum | 뉴스1</code>(다음·네이버 래퍼 도메인) → <code>뉴스1</code>.
+          매핑도 태그도 없으면 도메인을 그대로 두고 <code>status='pending'</code>으로 적재해
+          수집은 막지 않는다. <code>fixpress</code> 명령이 <code>SEED_PRESS</code> 최신값과
+          정리 규칙을 기존 <code>press_outlets</code>·기사에 소급 반영한다.
+        </p>
       </section>
 
       <!-- ═══════════ 3. 관련성 ═══════════ -->
@@ -869,7 +881,7 @@
             <tr><td><code>notifications</code></td><td class="num">934</td><td>발송 큐·이력 · <code>priority</code>로 우선 발송 표시</td></tr>
             <tr><td><code>weekly_reports</code></td><td class="num">5</td><td>주간동향 레포트 — payload(JSON) + html · 발송 시각</td></tr>
             <tr><td><code>url_ledger</code></td><td class="num">2,324</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
-            <tr><td><code>press_outlets</code></td><td class="num">455</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
+            <tr><td><code>press_outlets</code></td><td class="num">473</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
             <tr><td><code>keyword_sets</code></td><td class="num">118</td><td>검색 키워드 — 그룹사 7 · 산업 48 · 정책 38 · 통상 25</td></tr>
             <tr><td><code>collection_logs</code></td><td class="num">2,060</td><td>실행별 수집·중복·HTTP 횟수</td></tr>
             <tr><td><code>run_state</code></td><td class="num">1</td><td>파이프라인 상태 + 마스터 설정(임계값·키워드·수신자·비밀번호 해시)</td></tr>
@@ -935,7 +947,7 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>219개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>238개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
