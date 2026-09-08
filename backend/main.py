@@ -3171,13 +3171,12 @@ def find_duplicate(
 # =====================================================================
 
 # 1회 실행에서 본문 확보(G3/G4)·중복판정·저장까지 갈 최대 건수. 이 안에 든 것은
-# 즉시 저장되고, 예산이 남으면 바로 분석된다.
+# 즉시 저장되고, 예산이 남으면 바로 분석된다. 나머지는 _defer_overflow 가 메타만
+# 저장하므로(비용 0) 이 값을 올릴 이유가 없다 — 올리면 '본문 있는데 미분석' 큐만 커진다.
 MAX_PROCESS_PER_RUN = 24
-# 백로그(신선 후보가 상한의 3배 이상)일 때 저장 상한을 이 값까지 올려 빠르게 소진한다.
-MAX_PROCESS_BURST = 60
 # 상한을 넘어 이번 회차에 못 다룬 신선 후보 — 버리지 않고 이만큼은 메타데이터만
 # 저장해 둔다(본문·LLM 없이). 못 담은 나머지는 다음 회차에 다시 후보가 된다.
-DEFER_PER_RUN = 45
+DEFER_PER_RUN = 60
 # 메타만 저장된 기사(deferred)를 회차당 이만큼 본문 확보 + 분석한다.
 # 이 드레인은 안전망이지 우선순위가 아니다 — 신규 분석이 예산을 먼저 쓴다.
 DEFER_DRAIN_PER_RUN = 10
@@ -3642,7 +3641,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # 넘친 후보는 _defer_overflow 가 메타만 저장해 두므로 '수집'은 무엇도 잃지 않는다.
     pending_now = storage.unanalyzed_count() + storage.deferred_count()
     fresh_available = len(fresh)   # 절단 전 신규 후보 수 — 안정화 판단에 쓴다
-    process_cap = MAX_PROCESS_BURST if fresh_available > MAX_PROCESS_PER_RUN * 3 else MAX_PROCESS_PER_RUN
+    process_cap = MAX_PROCESS_PER_RUN
 
     # 중요도 순 + 그룹사 균형. 중요도만 쓰면 포스코퓨처엠(제목 +50)이 큐를 독점해
     # 포스코DX·이앤씨 기사가 매 회차 뒤로 밀린다. 그룹사별로 번갈아 뽑는다. (PRD F4.6)
