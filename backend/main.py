@@ -1567,6 +1567,8 @@ SEED_FEEDS: list[tuple[str, str, str, bool]] = [
     ("rss", "아시아경제", "https://www.asiae.co.kr/rss/stock.htm", True),
     ("rss", "뉴시스 경제", "https://newsis.com/RSS/economy.xml", True),
     ("rss", "전기신문", "https://www.electimes.com/rss/allArticle.xml", True),
+    # 인사·부고 전용 스트림 (다른 매체의 [부고]·[인사] 는 위 피드·네이버에서 제목으로 잡힌다)
+    ("rss", "연합뉴스 인물", "https://www.yna.co.kr/rss/people.xml", True),
 ]
 
 # 도메인 → (언론사명, tier). tier 1=주요지, 2=업계·경제지, 3=기타 (PRD F2.3)
@@ -1873,6 +1875,7 @@ SCORE_TRADE = 15           # 글로벌 통상환경 신호
 SCORE_POLICY = 20
 SCORE_MAJOR_PRESS = 10
 SCORE_MARKET_PENALTY = -15
+SCORE_PEOPLE_NEWS = 12     # 인사·부고 — 웹 전용(임계값 미만), 알림 안 나감
 
 POLICY_KEYWORDS = ["정책", "규제", "법안", "수사", "사고", "화재", "제재", "과징금",
                    "국회", "산업부", "환경부", "보조금", "특화단지", "인허가", "감사", "고발"]
@@ -2206,6 +2209,54 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
     이 범위면 포스코 미언급이어도 수집한다 — 전방 수요·경쟁 동향이 사업에 직결된다.
     """
     return _kw_hit_any(f"{title}\n{extra}", BATTERY_SCOPE_KW)
+
+
+# ── 인사·부고 (포스코 관점 없이 공지 원문만 요약) ───────────────────────
+PEOPLE_NEWS_CATEGORY = "인사·부고"
+_OBIT_TITLE_RE = re.compile(r"^\s*(?:\[|【)\s*(?:부고|訃告|부음)\s*(?:\]|】)")
+_OBIT_URL_RE = re.compile(r"obituary", re.I)
+_PERSONNEL_TITLE_RE = re.compile(r"^\s*(?:\[|【)\s*(?:인사|人事|승진|신임|취임|프로필)\s*(?:\]|】)")
+
+
+def people_news_kind(url: str, title: str) -> str:
+    """인사·부고 기사면 종류('obituary' | 'personnel'), 아니면 ''.
+
+    제목 말머리([부고]·[인사]·[승진]…)나 연합뉴스 부고 섹션 URL 로 판정한다.
+    '동정'(장관 활동 등)은 포함하지 않는다 — 일반 기사로 흐르게 둔다.
+    """
+    t = title or ""
+    if _OBIT_TITLE_RE.search(t) or _OBIT_URL_RE.search(url or ""):
+        return "obituary"
+    if _PERSONNEL_TITLE_RE.search(t):
+        return "personnel"
+    return ""
+
+
+_NOTICE_HEAD_RE = re.compile(
+    r"^.*?(?:구독\s*구독중\s*이전\s*다음|이미지\s*확대.*?자료사진\s*\])\s*")
+_NOTICE_TAIL_RE = re.compile(
+    r"\s*(?:\(\S+=\s*연합뉴스\)|※\s*부고\s*요청|&lt;저작권자|<저작권자|제보는\s*카카오톡"
+    r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고).*$")
+
+
+def format_people_notice(body: str, kind: str) -> str:
+    """인사·부고 공지에서 핵심 블록만 남긴다. LLM 을 쓰지 않는다.
+
+    부고:  '▲ 별세·상주 … = 빈소, 발인, 장지 ☎ 전화'
+    인사:  '◇ 부서 ▲ 직책 이름 …'
+    """
+    text = re.sub(r"\s+", " ", (body or "").strip())
+    text = _NOTICE_HEAD_RE.sub("", text, count=1)
+    text = _NOTICE_TAIL_RE.sub("", text).strip()
+    if kind == "obituary":
+        m = re.search(r"▲.*?☎[\s\d\-()]+", text) or re.search(r"▲.*", text)
+        if m:
+            text = m.group(0).strip()
+    else:
+        m = re.search(r"[◇▲■].*", text)
+        if m:
+            text = m.group(0).strip()
+    return text[:800]
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -3131,6 +3182,8 @@ DEFER_PER_RUN = 80
 DEFER_DRAIN_PER_RUN = 12
 # deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
 DEFER_MAX_AGE_HOURS = 48
+# 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
+PEOPLE_PER_RUN = 30
 
 
 def matches_keywords(text: str, keywords: Sequence[str]) -> bool:
@@ -3165,7 +3218,7 @@ def interleave_by_group(fresh: list[tuple[RawItem, bool]], cap: int) -> list[tup
 
 
 def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
-    """본문 없이 제목·스니펫만으로 관련성을 저비용 판정한다. (groups, keep) 반환용."""
+    """본문 없이 제목·스니펫만으로 관련성을 저비용 판정한다. (keep, groups) 반환."""
     probe = f"{title}\n{snippet or ''}"
     groups = normalize_group_list(detect_group_companies(probe))
     keep = bool(
@@ -3173,6 +3226,7 @@ def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
         or POSCO_MENTION_RE.search(probe)
         or is_battery_scope(title, snippet or "")
         or is_trade_topic(title, snippet or "")
+        or people_news_kind("", title)
     )
     return keep, groups
 
@@ -3194,6 +3248,8 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
         keep, groups = _title_snippet_relevant(item.title, item.snippet or "")
         if not keep:
             continue   # 원장에 넣지 않는다 — 다음 회차 상한이 커지면 정식 처리될 수 있다
+        pk = people_news_kind(item.url_source, item.title)
+        cats = [PEOPLE_NEWS_CATEGORY] if pk else detect_categories(item.title, item.snippet or "")
         aid = new_id()
         row = {
             "id": aid, "url_source": item.url_source, "url_source_aliases": [],
@@ -3204,9 +3260,9 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
             "source_type": item.source_type, "thumbnail_url": "",
             "content_hash": "", "dedup_group_id": aid, "is_representative": True,
             "is_backfill": is_backfill,
-            "importance_score": score_article(item.title, item.snippet or "", groups, 3),
+            "importance_score": SCORE_PEOPLE_NEWS if pk else score_article(item.title, item.snippet or "", groups, 3),
             "sentiment": None, "keywords": [], "group_companies": groups,
-            "categories": detect_categories(item.title, item.snippet or ""),
+            "categories": cats,
             "title_embedding": None, "analyzed_at": None, "status": "active",
         }
         if storage.insert_article(row):
@@ -3244,6 +3300,26 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> i
                 storage.update_article(aid, {"status": "archived"})
             continue   # 다음 회차 재시도
 
+        # 인사·부고면 LLM 없이 공지 원문만 확정한다
+        pk = people_news_kind(canonical or art["url_source"], art["title"])
+        if pk:
+            press_name, press_id, _ = resolve_press(storage, canonical or target,
+                                                    art.get("press_name") or "", html)
+            storage.update_article(aid, {
+                "url_canonical": canonical or art["url_canonical"],
+                "press_id": press_id, "press_name": press_name,
+                "categories": [PEOPLE_NEWS_CATEGORY], "importance_score": SCORE_PEOPLE_NEWS,
+                "analyzed_at": iso(now_utc()),
+            })
+            storage.save_summary({
+                "id": new_id(), "article_id": aid,
+                "summary_text": format_people_notice(body, pk), "perspective_text": "",
+                "summary_source": "notice", "model": "", "token_usage": None,
+                "created_at": iso(now_utc()),
+            })
+            done += 1
+            continue
+
         rule_groups = detect_group_companies(f"{art['title']}\n{body[:GROUP_LEAD_CHARS]}")
         probe = f"{art['title']}\n{body}"
         if not (rule_groups or POSCO_MENTION_RE.search(probe)
@@ -3280,6 +3356,42 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> i
             # 분석 실패(3회 재시도해도 동일) — 링크·제목 카드로 확정해 deferred 큐에서 뺀다.
             storage.update_article(aid, {"analyzed_at": iso(now_utc())})
     return done
+
+
+def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, body: str,
+                      kind: str, press_name: str, press_id: str | None,
+                      dedup_candidates: list[dict], is_backfill: bool) -> None:
+    """인사·부고 기사를 LLM 없이 저장한다. 요약은 공지 원문 블록, 포스코 관점은 없음."""
+    storage = ctx.storage
+    aid = new_id()
+    row = {
+        "id": aid, "url_source": item.url_source, "url_source_aliases": [],
+        "url_canonical": canonical or item.url_source, "url_original": item.url_original,
+        "title": item.title, "press_id": press_id, "press_name": press_name,
+        "author": extract_author(html, body, press_name),
+        "published_at": iso(item.published_at), "collected_at": iso(now_utc()),
+        "source_type": item.source_type, "thumbnail_url": extract_thumbnail(html),
+        "content_hash": sha256(body), "dedup_group_id": aid, "is_representative": True,
+        "is_backfill": is_backfill, "importance_score": SCORE_PEOPLE_NEWS,
+        "sentiment": "중립", "keywords": [], "group_companies": [],
+        "categories": [PEOPLE_NEWS_CATEGORY], "title_embedding": None,
+        "analyzed_at": iso(now_utc()), "status": "active",
+    }
+    if not storage.insert_article(row):
+        return
+    ctx.seen_cache.add(item.url_source)
+    dedup_candidates.append({
+        "id": aid, "title": item.title, "published_at": iso(item.published_at),
+        "dedup_group_id": aid, "is_representative": True, "title_embedding": None,
+        "press_name": press_name, "content_hash": row["content_hash"],
+        "url_canonical": row["url_canonical"], "url_source": item.url_source,
+    })
+    storage.save_summary({
+        "id": new_id(), "article_id": aid,
+        "summary_text": format_people_notice(body, kind), "perspective_text": "",
+        "summary_source": "notice", "model": "", "token_usage": None,
+        "created_at": iso(now_utc()),
+    })
 
 
 @dataclass
@@ -3447,9 +3559,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     if rss_feeds:
         # 언론사 RSS 는 전체 기사를 주므로 키워드로 먼저 거른다.
         # 이 필터가 없으면 무관한 기사까지 G3(HTTP)·G6(과금)까지 올라간다.
+        # [부고]·[인사]·[승진] 말머리 기사는 키워드와 무관하게 통과시킨다. (사용자 지정)
         raw += [
             item for item in collect_rss_feeds(http, rss_feeds)
             if matches_keywords(f"{item.title} {item.snippet}", keywords)
+            or people_news_kind(item.url_source, item.title)
         ]
     fetched_count = len(raw)
 
@@ -3515,6 +3629,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     defer_budget = min(DEFER_DRAIN_PER_RUN, defer_pending, max(1, llm_budget // 3)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
 
+    # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — LLM 을 안 쓰므로 저렴하고,
+    # 제목 점수가 0이라 일반 큐에 두면 영원히 상한에 밀린다. (사용자 지정)
+    people = [p for p in fresh if people_news_kind(p[0].url_source, p[0].title)][:PEOPLE_PER_RUN]
+    people_urls = {p[0].url_source for p in people}
+    fresh = [p for p in fresh if p[0].url_source not in people_urls]
+
     # 저장 상한은 LLM 예산과 분리한다. 저장(본문 확보+중복판정)은 비용이 작고,
     # 여기서 조이면 관련 기사가 큐에서 굶어 72시간 뒤 stale 로 사라진다.
     # 넘친 후보는 _defer_overflow 가 메타만 저장해 두므로 '수집'은 무엇도 잃지 않는다.
@@ -3533,6 +3653,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         log.info("이번 실행 즉시 처리 %d건 · 메타 저장 대기 %d건 · 분석 대기 %d건",
                  len(picked), len(overflow), pending_now)
         fresh = picked
+
+    # 인사·부고를 같은 처리 루프 앞에 붙인다 (본문만 받아 _save_people_news 로 확정)
+    fresh = people + fresh
+    if people:
+        log.info("인사·부고 %d건 처리", len(people))
 
     new_count = 0
     dup_count = 0
@@ -3603,6 +3728,14 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                 storage.update_article(existing["id"], promo)
                 log.info("대표 승격: %s → %s (%s)", existing.get("press_name") or "?",
                          press_name, item.title[:40])
+            continue
+
+        # ── 인사·부고 — 포스코 관점·LLM 없이 공지 원문만 담는다 (사용자 지정) ──
+        pk = people_news_kind(canonical or item.url_source, item.title)
+        if pk:
+            _save_people_news(ctx, item, canonical, html, body, pk, press_name,
+                              press_id, dedup_candidates, is_backfill)
+            new_count += 1
             continue
 
         # 그룹사는 제목+리드까지만 본다 — 본문 말미의 스치는 계열사 언급이
@@ -5060,7 +5193,7 @@ def create_app(ctx: Context):
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
     GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
     CATEGORY_ORDER = ["양극재", "음극재", "배터리·이차전지", "산업", "시장/주가",
-                      "정부/정책", "글로벌 통상환경"]
+                      "정부/정책", "글로벌 통상환경", PEOPLE_NEWS_CATEGORY]
 
     def _ordered(values: list[str], priority: list[str]) -> list[str]:
         uniq = dedupe_chips(values)
@@ -5842,6 +5975,11 @@ def quote_loop(ctx: Context, stop: threading.Event) -> None:
 
 def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
     uvicorn = _import("uvicorn", "uvicorn")
+    # 시드는 idempotent — 새로 추가된 RSS 피드·키워드를 기동 시 반영한다.
+    try:
+        ctx.storage.seed_feeds(SEED_FEEDS)
+    except Exception as exc:   # pragma: no cover
+        log.warning("피드 시드 스킵: %s", exc)
     app = create_app(ctx)
     stop = threading.Event()
     threads: list[threading.Thread] = []
@@ -6081,6 +6219,25 @@ def cmd_selftest() -> int:
     check("제목에 산업부 장관 → 정책",
           "정부/정책" in detect_categories("김정관 산업부 장관, G20 참석"), True)
     check("철강 공정어는 '산업'", "산업" in detect_categories("포스코 포항 3고로 개수 완료"), True)
+
+    print("\n[8-5] 인사·부고 (LLM 없이 공지 원문만)")
+    check("[부고] 말머리 → obituary",
+          people_news_kind("", "[부고] 홍길동(전 삼성 부사장)씨 모친상"), "obituary")
+    check("연합 부고 섹션 URL → obituary",
+          people_news_kind("https://www.yna.co.kr/view/AKR1?section=people/obituary-notice", "제목"),
+          "obituary")
+    check("[인사]·[승진] → personnel",
+          people_news_kind("", "[승진] 포스코홀딩스 임원 인사"), "personnel")
+    check("[동정]은 대상 아님", people_news_kind("", "[동정] 장관 현장방문"), "")
+    check("일반 기사는 대상 아님", people_news_kind("", "포스코퓨처엠 양극재 증설"), "")
+    _ob = ("김 기자 구독 구독중 이전 다음 ▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 "
+           "= 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678 (서울=연합뉴스) 무단 전재 금지")
+    check("부고 요약 = ▲…☎ 블록",
+          format_people_notice(_ob, "obituary"),
+          "▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 = 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678")
+    check("인사 요약 = ◇…블록",
+          format_people_notice("기자 구독 구독중 이전 다음 ◇ 편집국 ▲ 산업본부장 류준형 (서울=연합뉴스)", "personnel"),
+          "◇ 편집국 ▲ 산업본부장 류준형")
     check("'실적' 단독은 시장/주가 태그 아님",
           "시장/주가" in detect_categories("포스코 2분기 실적 발표"), False)
     check("주가 특화어는 시장/주가 태그",
