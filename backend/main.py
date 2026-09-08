@@ -5625,6 +5625,21 @@ def create_app(ctx: Context):
             "weekly_to": weekly_recipients(ctx),
             "weekly_env_to": list(ctx.cfg.weekly_to),
             "weekly_smtp_ready": ctx.cfg.smtp_configured,
+            # 중요도 점수 산정 규칙 — 마스터 패널에 그대로 표시한다(단일 출처).
+            "score_rules": {
+                "night": {"start": NIGHT_START, "end": NIGHT_END, "min_score": NIGHT_MIN_SCORE},
+                "items": [
+                    {"label": "포스코퓨처엠이 제목에", "points": SCORE_FUTUREM_TITLE},
+                    {"label": "포스코퓨처엠이 본문에만", "points": SCORE_FUTUREM_BODY},
+                    {"label": "다른 계열사(홀딩스·DX·인터내셔널·이앤씨 등)", "points": SCORE_GROUP},
+                    {"label": "배터리 생태계(소재·셀·전기차·ESS·원료)가 제목에", "points": SCORE_BATTERY_TITLE},
+                    {"label": "배터리 생태계가 본문에만", "points": SCORE_BATTERY_BODY},
+                    {"label": "해외 통상 조치(IRA·CBAM·반덤핑 등) 신호", "points": SCORE_TRADE},
+                    {"label": "정책 키워드(전기요금·배출권·특화단지 등)", "points": SCORE_POLICY},
+                    {"label": "주요 언론사(연합·전자신문·머니투데이 등)", "points": SCORE_MAJOR_PRESS},
+                    {"label": "단순 시황·주가 기사(목표주가·코스피·투자의견)", "points": SCORE_MARKET_PENALTY},
+                ],
+            },
         })
 
     @app.post("/api/master/settings")

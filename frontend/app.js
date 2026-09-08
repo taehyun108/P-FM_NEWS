@@ -591,9 +591,30 @@ async function loadMasterSettings() {
     renderTradeKwList();
     renderTradeReqList();
     renderWeeklyToList();
+    renderScoreRules(d.score_rules);
   } catch (e) {
     if (e.message !== 'unauthorized') masterMsg('err', '설정을 불러오지 못했습니다.');
   }
+}
+
+/** 중요도 점수 산정 규칙 — /api/master/settings 의 score_rules 를 그대로 표시(단일 출처). */
+function renderScoreRules(rules) {
+  const ul = $('scoreRules');
+  if (!ul || !rules) return;
+  ul.replaceChildren(...(rules.items || []).map((it) => {
+    const li = el('li');
+    li.append(el('span', 'sr-label', it.label));
+    const p = it.points;
+    const b = el('b', p < 0 ? 'sr-minus' : 'sr-plus', (p > 0 ? '+' : '') + p);
+    li.append(b);
+    return li;
+  }));
+  $('scoreEg').innerHTML =
+    '예) "<b>포스코퓨처엠</b> 양극재 3만톤 증설"(조선일보) = 50(제목) + 10(주요 언론사) = <b>60점</b>';
+  const n = rules.night || {};
+  $('scoreNight').innerHTML =
+    `야간(밤 ${n.start ?? 23}시~오전 ${n.end ?? 7}시)에는 <b>${n.min_score ?? 80}점 이상</b> 또는 ` +
+    `위 '무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다.`;
 }
 
 /** 칩 목록 렌더 — 삭제 버튼은 arr 에서 빼고 save 콜백을 부른다. */

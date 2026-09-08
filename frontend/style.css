@@ -406,6 +406,7 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   background: #fff; border-radius: 14px; width: 100%; max-width: 520px;
   box-shadow: 0 20px 60px rgba(14, 36, 86, .3);
 }
+#masterModal .modal { max-width: 600px; }
 .modal-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 20px; border-bottom: 1px solid var(--line);
@@ -453,7 +454,47 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .master-toggle input { margin-top: 2px; flex: none; }
 .kw-label { margin: 12px 0 5px; font-size: 12px; font-weight: 700; color: var(--navy); }
 .kw-label span { font-weight: 400; color: var(--ink-soft); }
-/* 통상환경/정책 마스터 섹션 — 이미 .kw-label, .master-toggle 재사용 */
+
+/* ── 마스터 패널 — 안내형 레이아웃 ─────────────────────────────── */
+.master-intro {
+  margin: 0; padding: 11px 13px; border-radius: 9px;
+  background: var(--navy-soft); color: var(--navy-dark);
+  font-size: 12px; line-height: 1.65;
+}
+.master-section h3 {
+  display: flex; align-items: center; gap: 8px;
+}
+.ms-step {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 19px; height: 19px; border-radius: 50%;
+  background: var(--navy); color: #fff; font-size: 11px; font-weight: 700; flex: none;
+}
+.ms-lead { margin-bottom: 4px !important; color: var(--ink-mid) !important; }
+
+.score-box {
+  margin-top: 12px; border: 1px solid var(--navy-line, var(--line));
+  border-radius: 10px; background: #fbfcfe; padding: 12px 13px;
+}
+.score-box-head {
+  font-size: 12px; font-weight: 700; color: var(--navy); margin-bottom: 9px;
+}
+.score-box-head span { display: block; font-weight: 400; font-size: 11px; color: var(--ink-soft); margin-top: 2px; }
+.score-rules { list-style: none; margin: 0; padding: 0; }
+.score-rules li {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 3.5px 0; font-size: 12px; color: var(--ink-mid);
+  border-bottom: 1px dashed var(--line);
+}
+.score-rules li:last-child { border-bottom: 0; }
+.sr-label { flex: 1; }
+.score-rules b { font-variant-numeric: tabular-nums; font-size: 12.5px; flex: none; }
+.sr-plus { color: var(--navy); }
+.sr-minus { color: var(--neg, #c0392b); }
+.score-eg {
+  margin: 10px 0 0; padding: 8px 10px; border-radius: 7px;
+  background: var(--navy-soft); font-size: 11.5px; color: var(--navy-dark); line-height: 1.6;
+}
+.score-note { margin: 8px 0 0; font-size: 11px; color: var(--ink-soft); line-height: 1.6; }
 .url-add-confirm {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   margin: 10px 0 4px; padding: 10px 12px; border-radius: 9px;

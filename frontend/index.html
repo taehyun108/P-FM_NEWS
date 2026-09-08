@@ -47,82 +47,105 @@
       <button type="submit" class="url-add-btn">로그인</button>
     </form>
 
-    <!-- 설정 패널 -->
+    <!-- 설정 패널 — 설정 순서대로 배열. 위에서부터 차례로 보면 됩니다. -->
     <div class="modal-body" id="masterPanel" hidden>
+      <p class="master-intro">
+        여기서 정한 값은 <b>모든 사용자에게 공통</b>으로 적용됩니다. 텔레그램 채널로 어떤 기사를,
+        언제 보낼지를 조절하는 곳입니다. 웹 화면(전체 기사·대외협력·주간동향)에는 영향을 주지 않습니다.
+      </p>
+
       <section class="master-section">
-        <h3>텔레그램 발송</h3>
+        <h3><span class="ms-step">1</span> 텔레그램 알림 사용</h3>
         <label class="master-toggle">
           <input type="checkbox" id="telegramEnabled">
           <span>텔레그램 채널로 기사 알림을 발송한다</span>
         </label>
-        <small>끄면 발송을 멈춥니다. 그동안 조건을 통과한 기사는 큐에 쌓였다가 다시 켜면 순서대로 나갑니다. (봇 <code>/stop</code>·<code>/start</code> 명령과 동일)</small>
+        <small><b>끄면</b> 채널로 아무것도 안 나갑니다. 그동안 조건을 통과한 기사는 큐에 쌓였다가
+          다시 켜면 <b>중요도 높은 순</b>으로 한꺼번에 나갑니다. (텔레그램 봇에게 <code>/stop</code>·<code>/start</code> 를 보내는 것과 같습니다)</small>
       </section>
 
       <section class="master-section">
-        <h3>텔레그램 발송 기준</h3>
+        <h3><span class="ms-step">2</span> 어떤 기사를 보낼지 — 중요도 임계값</h3>
         <label class="master-field">
-          <span>관련도 점수 임계값 <b id="thVal">50</b> 이상</span>
+          <span>중요도 <b id="thVal">50</b>점 이상인 기사만 발송</span>
           <input type="range" id="thRange" min="0" max="100" step="5">
-          <small id="thHint">권장: <b id="thRec">40</b> 이상 · 마스터는 0~100 자유롭게 지정</small>
+          <small id="thHint">값을 <b>낮추면</b> 더 많은 기사가, <b>올리면</b> 핵심 기사만 옵니다.
+            권장 <b id="thRec">40</b>점 이상 · 마스터는 0~100 자유롭게.</small>
         </label>
+
+        <div class="score-box" id="scoreBox">
+          <div class="score-box-head">중요도 점수는 이렇게 매겨집니다 <span>제목·본문·언론사를 규칙으로 채점 → 0~100</span></div>
+          <ul class="score-rules" id="scoreRules"><li>불러오는 중…</li></ul>
+          <p class="score-eg" id="scoreEg"></p>
+          <p class="score-note" id="scoreNight"></p>
+        </div>
+      </section>
+
+      <section class="master-section">
+        <h3><span class="ms-step">3</span> 꼭 받아야 하는 기사 — 예외 규칙</h3>
         <label class="master-field">
           <span>무조건 발송 점수 <b id="hardVal">0</b> <span id="hardState">(사용 안 함)</span></span>
           <input type="range" id="hardRange" min="0" max="100" step="5">
-          <small>이 점수 이상이면 <b>야간(23–07시)·묶음(다이제스트)</b>을 무시하고 개별 카드로 즉시 발송합니다. 0 이면 사용하지 않습니다. (발행 6시간 초과·억제 모드·정책/통상 토글은 그대로 적용)</small>
+          <small>이 점수 이상인 기사는 <b>야간(밤 11시~오전 7시)에도</b> 즉시 발송합니다.
+            (임계값이 50, 이 값이 80이면 → 50~79점은 낮에만, 80점 이상은 밤에도) · <b>0 = 사용 안 함</b></small>
         </label>
+
+        <p class="kw-label" style="margin-top:14px">항상 발송 키워드</p>
+        <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>점수·야간과 무관하게</b> 무조건 발송합니다.
+          예: <b>포스코퓨처엠</b>, <b>수소환원제철</b>, <b>장인화</b></small>
+        <div class="kw-input">
+          <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 Enter 또는 추가">
+          <button type="button" class="url-add-btn" id="kwAdd">추가</button>
+        </div>
+        <div class="kw-list" id="kwList"></div>
       </section>
 
       <section class="master-section">
-        <h3>정책브리핑 기사 알림</h3>
+        <h3><span class="ms-step">4</span> 추가 주제 켜기</h3>
+        <small class="ms-lead">아래 두 주제는 <b>포스코 회사명이 안 나와도</b> 수집되는 기사입니다.
+          기본은 웹에만 보이고, 켜면 텔레그램으로도 옵니다. <b>2단 키워드</b>로 원하는 것만 골라 받으세요.</small>
+
         <label class="master-toggle">
           <input type="checkbox" id="notifyPolicy">
-          <span>대한민국 정책브리핑(korea.kr) 기사도 텔레그램으로 발송</span>
+          <span><b>정책브리핑</b>(korea.kr) 기사도 텔레그램으로</span>
         </label>
-        <small>끄면 웹에만 표시됩니다. 켜면 아래 조건을 모두 만족하는 기사만 발송합니다. (관련도 점수 기준도 그대로 적용)</small>
-
-        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b> 본문에 있어야 함 (비우면 조건 없음)</span></p>
+        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b> 있으면 (비우면 전체)</span></p>
         <div class="kw-input">
-          <input type="text" id="policyKwNew" class="url-add-input" placeholder="예: 전기요금, 배출권, 탄소국경">
+          <input type="text" id="policyKwNew" class="url-add-input" placeholder="예: 전기요금, 배출권, 특화단지">
           <button type="button" class="url-add-btn" id="policyKwAdd">추가</button>
         </div>
         <div class="kw-list" id="policyKwList"></div>
-
-        <p class="kw-label">② 필수 공통 키워드 <span>— 이 중 <b>하나라도</b> 함께 있어야 함 (AND 조건, 비우면 조건 없음)</span></p>
+        <p class="kw-label">② 필수 공통 키워드 <span>— ① 과 <b>함께</b> 있어야 함 (AND, 비우면 조건 없음)</span></p>
         <div class="kw-input">
           <input type="text" id="policyReqNew" class="url-add-input" placeholder="예: 산업, 제조, 철강">
           <button type="button" class="url-add-btn" id="policyReqAdd">추가</button>
         </div>
         <div class="kw-list" id="policyReqList"></div>
-        <small>예) ① <b>전기요금</b> + ② <b>산업</b> → "산업용 전기요금" 기사는 발송, "가정용 전기요금" 기사는 제외</small>
-      </section>
+        <small>예) ① <b>전기요금</b> + ② <b>산업</b> → "산업용 전기요금" 은 발송, "가정용 전기요금" 은 제외</small>
 
-      <section class="master-section">
-        <h3>글로벌 통상환경 기사 알림</h3>
-        <label class="master-toggle">
+        <label class="master-toggle" style="margin-top:16px">
           <input type="checkbox" id="notifyTrade">
-          <span>미국·유럽·중국 등 주요국 통상 조치(IRA·CBAM·수출통제 등) 기사도 텔레그램으로 발송</span>
+          <span><b>글로벌 통상환경</b>(미국·EU·중국 통상 조치) 기사도 텔레그램으로</span>
         </label>
-        <small>끄면 웹에만 표시됩니다. 켜면 아래 조건을 모두 만족하는 기사만 발송합니다.</small>
-
-        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b> 본문에 있어야 함 (비우면 조건 없음)</span></p>
+        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b></span></p>
         <div class="kw-input">
           <input type="text" id="tradeKwNew" class="url-add-input" placeholder="예: IRA, CBAM, 반덤핑, 화이트리스트">
           <button type="button" class="url-add-btn" id="tradeKwAdd">추가</button>
         </div>
         <div class="kw-list" id="tradeKwList"></div>
-
-        <p class="kw-label">② 필수 공통 키워드 <span>— 이 중 <b>하나라도</b> 함께 있어야 함 (AND 조건, 비우면 조건 없음)</span></p>
+        <p class="kw-label">② 필수 공통 키워드 <span>— ① 과 <b>함께</b> (AND)</span></p>
         <div class="kw-input">
           <input type="text" id="tradeReqNew" class="url-add-input" placeholder="예: 배터리, 철강, 이차전지">
           <button type="button" class="url-add-btn" id="tradeReqAdd">추가</button>
         </div>
         <div class="kw-list" id="tradeReqList"></div>
-        <small>수집 대상: 미국(IRA·OBBBA·232조), 유럽(CBAM·핵심원자재법), 중국(흑연·요소 수출통제·화이트리스트), 일본·베트남 등 — 포스코 관련 산업(배터리·철강)이 함께 언급된 기사</small>
+        <small>수집 대상: 미국(IRA·OBBBA·232조), EU(CBAM·핵심원자재법), 중국(흑연·요소 수출통제) 등 —
+          철강·배터리 산업이 함께 언급된 기사</small>
       </section>
 
       <section class="master-section">
-        <h3>주간 레포트 수신자</h3>
-        <small id="weeklyToHint">월요일 아침 이 주소들로 주간동향 레포트가 발송됩니다. (비우면 .env WEEKLY_REPORT_TO 사용)</small>
+        <h3><span class="ms-step">5</span> 주간 레포트 수신자 (이메일)</h3>
+        <small id="weeklyToHint">월요일 아침, 한 주치 그룹 동향 요약이 이 주소들로 발송됩니다. (비우면 서버 기본 수신자)</small>
         <div class="kw-input">
           <input type="email" id="weeklyToNew" class="url-add-input" placeholder="이메일 주소 입력 후 추가">
           <button type="button" class="url-add-btn" id="weeklyToAdd">추가</button>
@@ -131,24 +154,14 @@
       </section>
 
       <section class="master-section">
-        <h3>항상 발송 키워드</h3>
-        <small>기사 <b>본문</b>에 이 단어가 있으면 관련도 점수·야간 모드와 무관하게 발송합니다. (예전 '포스코퓨처엠 자동 포함' 특례는 폐지 — 필요하면 여기에 <b>포스코퓨처엠</b>을 추가하세요)</small>
-        <div class="kw-input">
-          <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 추가">
-          <button type="button" class="url-add-btn" id="kwAdd">추가</button>
-        </div>
-        <div class="kw-list" id="kwList"></div>
-      </section>
-
-      <section class="master-section">
-        <h3>비밀번호 변경</h3>
+        <h3><span class="ms-step">6</span> 운영자 설정 — 비밀번호</h3>
         <form class="master-pwform" id="pwMasterForm">
           <input type="password" id="pwMasterCur" class="url-add-input" placeholder="현재 마스터 비밀번호" autocomplete="current-password">
           <input type="password" id="pwMasterNew" class="url-add-input" placeholder="새 마스터 비밀번호 (4자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">마스터 비밀번호 변경</button>
         </form>
         <p class="master-current">현재 웹페이지 비밀번호: <b id="webPwNow">—</b>
-          <small>아직 웹 접속 잠금은 적용되지 않습니다(값만 보관).</small></p>
+          <small>웹 접속 잠금은 아직 미적용(값만 보관).</small></p>
         <form class="master-pwform" id="pwWebForm">
           <input type="password" id="pwWebNew" class="url-add-input" placeholder="새 웹페이지 비밀번호 (4자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">웹페이지 비밀번호 변경</button>
