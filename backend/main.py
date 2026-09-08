@@ -1867,6 +1867,9 @@ _CATEGORY_RULES_LOWER: dict[str, list[str]] = {
 SCORE_FUTUREM_TITLE = 50
 SCORE_FUTUREM_BODY = 40
 SCORE_GROUP = 25
+SCORE_BATTERY_TITLE = 25   # 배터리 생태계(소재·셀·전기차·ESS·원료) 키워드가 제목에
+SCORE_BATTERY_BODY = 12    # 본문에만
+SCORE_TRADE = 15           # 글로벌 통상환경 신호
 SCORE_POLICY = 20
 SCORE_MAJOR_PRESS = 10
 SCORE_MARKET_PENALTY = -15
@@ -2729,6 +2732,15 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
 
     if any(g != "포스코퓨처엠" for g in group_companies):
         score += SCORE_GROUP
+
+    # 배터리 생태계 기사(포스코 미언급 허용 대상)는 그룹사 언급이 없어도
+    # 전방 수요·경쟁 동향이라 최소 중요도를 준다. 예전엔 0점이라 큐에서 굶었다.
+    if is_battery_scope(title_l, ""):
+        score += SCORE_BATTERY_TITLE
+    elif is_battery_scope("", body[:1500]):
+        score += SCORE_BATTERY_BODY
+    if is_trade_topic(title):
+        score += SCORE_TRADE
 
     if any(w in full_l for w in _POLICY_KEYWORDS_LOWER):
         score += SCORE_POLICY
@@ -5962,6 +5974,13 @@ def cmd_selftest() -> int:
           True)
     check("시황 기사 감점 반영",
           score_article("코스피 시황 목표주가", "단순 시황", [], 3) == 0, True)
+    check("배터리 생태계(그룹사 미언급)는 0점 아님",
+          score_article("BYD 전기차 판매량 급감", "", [], 3), SCORE_BATTERY_TITLE)
+    check("배터리 키워드가 본문에만 → 소폭",
+          score_article("증시 주도주 순환매", "2차전지 관련주가 반등", [], 3), SCORE_BATTERY_BODY)
+    check("통상 신호(조치명+산업어) → 가점",
+          score_article("CBAM 시행에 철강업계 비상", "", [], 3) >= SCORE_TRADE, True)
+    check("무관 기사는 여전히 0", score_article("아파트 청약 경쟁률", "분양시장", [], 3), 0)
 
     print("\n[7] SWOT 정규화 (PRD F4.4)")
     check("전부 0 → 50", swot_total({"s": {"score": 0}, "w": {"score": 0},
