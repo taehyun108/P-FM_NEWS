@@ -2216,18 +2216,22 @@ PEOPLE_NEWS_CATEGORY = "인사·부고"
 _OBIT_TITLE_RE = re.compile(r"^\s*(?:\[|【)\s*(?:부고|訃告|부음)\s*(?:\]|】)")
 _OBIT_URL_RE = re.compile(r"obituary", re.I)
 _PERSONNEL_TITLE_RE = re.compile(r"^\s*(?:\[|【)\s*(?:인사|人事|승진|신임|취임|프로필)\s*(?:\]|】)")
+# 말머리가 없는 정부부처·기관 인사 공지. '인사발령'·'보직인사'는 사실상 인사 공지에서만
+# 쓰는 표현이라 제목에 있으면 personnel 로 본다. (motir.go.kr 등 부처 사이트 대응)
+_GOV_PERSONNEL_RE = re.compile(r"인사\s*발령|보직\s*인사|전보\s*발령|승진\s*임용")
 
 
 def people_news_kind(url: str, title: str) -> str:
     """인사·부고 기사면 종류('obituary' | 'personnel'), 아니면 ''.
 
     제목 말머리([부고]·[인사]·[승진]…)나 연합뉴스 부고 섹션 URL 로 판정한다.
+    말머리가 없어도 '인사발령'·'보직인사' 같은 정부부처 인사 공지 표현이 있으면 personnel.
     '동정'(장관 활동 등)은 포함하지 않는다 — 일반 기사로 흐르게 둔다.
     """
     t = title or ""
     if _OBIT_TITLE_RE.search(t) or _OBIT_URL_RE.search(url or ""):
         return "obituary"
-    if _PERSONNEL_TITLE_RE.search(t):
+    if _PERSONNEL_TITLE_RE.search(t) or _GOV_PERSONNEL_RE.search(t):
         return "personnel"
     return ""
 
@@ -3184,6 +3188,13 @@ DEFER_DRAIN_PER_RUN = 10
 DEFER_MAX_AGE_HOURS = 48
 # 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
 PEOPLE_PER_RUN = 30
+# 인사·부고는 '기록·레퍼런스' 성격이라 일반 신선도 컷오프(72h)로 버리면 안 된다.
+# 부처 인사는 발행 후 며칠 지나 인지되는 경우가 많다. 이 창 안이면 수집한다(알림은
+# is_backfill=6h 규칙이 그대로 막으므로 오래된 인사가 텔레그램으로 가지는 않는다).
+PEOPLE_BACKFILL_CUTOFF_HOURS = 24 * 30
+# 메타만 저장분(deferred)이 이 수 미만이면 파이프라인을 '안정'으로 본다. 본문 대기 큐(30)와
+# 달리 느슨하게 둔다 — deferred 는 알림 후보가 아니라서 억제를 유지할 이유가 약하다.
+DEFER_BACKLOG_STABLE = 600
 
 
 def matches_keywords(text: str, keywords: Sequence[str]) -> bool:
@@ -3596,7 +3607,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             storage.upsert_ledger(item.url_source, "no_pubdate")
             continue
         age = now - item.published_at
-        if age > timedelta(hours=cfg.backfill_cutoff_hours):
+        # 인사·부고는 훨씬 긴 창을 쓴다 — 며칠 지나 올라온 부처 인사도 놓치지 않는다.
+        cutoff = (PEOPLE_BACKFILL_CUTOFF_HOURS
+                  if people_news_kind(item.url_source, item.title)
+                  else cfg.backfill_cutoff_hours)
+        if age > timedelta(hours=cutoff):
             storage.upsert_ledger(item.url_source, "stale")
             continue
         fresh.append((item, age > timedelta(hours=cfg.fresh_cutoff_hours)))
@@ -3921,11 +3936,16 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         "duration_ms": duration_ms,
     })
 
-    backlog = storage.unanalyzed_count() + storage.deferred_count()
+    body_backlog = storage.unanalyzed_count()      # 본문까지 확보돼 곧 분석·알림될 큐 — 폭주 위험
+    defer_backlog = storage.deferred_count()        # 메타만 저장분 — 본문·분석 없이 배경에서 천천히 드레인
+    backlog = body_backlog + defer_backlog
     # 부트스트랩/복구 억제는 "한 회"가 아니라 파이프라인이 안정될 때까지 유지한다. (PRD F1.1)
-    # 신규 유입과 분석 백로그(본문 대기 + 메타만 저장분)가 모두 잦아들면 그때 알림을 켠다.
-    # 그러지 않으면 초기 수집 몇 시간 동안 밀린 기사가 한꺼번에 알림으로 쏟아진다.
-    stabilized = fresh_available < 20 and new_count < 10 and backlog < 30
+    # 초기 수집 몇 시간 동안 밀린 기사가 한꺼번에 알림으로 쏟아지는 것을 막는 장치다.
+    # 안정화 판정은 '알림 폭주 위험'(본문 대기 큐)만 본다. 메타만 저장분(deferred)은
+    # 분석·본문이 없어 알림 후보가 아니고, 대부분 관련성 재검에서 보관 처리되며 느리게
+    # 빠지므로, 여기에 세면 배경 큐가 조금만 쌓여도 알림이 영구히 억제된다. (조사 2026-09-08)
+    stabilized = (fresh_available < 20 and new_count < 10
+                  and body_backlog < 30 and defer_backlog < DEFER_BACKLOG_STABLE)
     next_mode = "active" if (not suppressed or stabilized) else "suppressed"
     if suppressed and next_mode == "active":
         log.info("파이프라인이 안정되어 알림을 활성화합니다.")
@@ -4115,6 +4135,13 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     out = {"ok": True, "card": build_card(detail), "already": False}
     if not activate:
         out["draft_id"] = article_id      # 프런트가 '등록'/'취소' 를 호출할 때 쓴다
+    else:
+        # 바로 목록에 뜬 수동 등록(봇 DM 등) — 임계값을 넘으면 채널에도 발송한다.
+        try:
+            if queue_manual_notify(ctx, article_id):
+                out["notified"] = True
+        except Exception as exc:   # pragma: no cover
+            log.warning("수동 등록 알림 처리 실패: %s", exc)
     return out
 
 
@@ -4245,6 +4272,9 @@ NIGHT_START, NIGHT_END = 23, 7          # 야간 모드 23:00–07:00
 NIGHT_MIN_SCORE = 80
 RATE_LIMIT_SLEEP = 1.1                   # 동일 채팅방 분당 20건 제한 → 초당 1건 이하
 PRIORITY_FLOOD_WARN = 10                 # 한 회차 우선 기사가 이 수 이상이면 경고 로그
+# 파이프라인 루프와 수동 등록(API·봇)이 동시에 send_notifications 를 부르면 같은 큐 행을
+# 두 번 보낼 수 있다. 발송 구간을 직렬화해 중복을 막는다.
+_SEND_LOCK = threading.Lock()
 
 
 def esc(text: str) -> str:
@@ -4286,7 +4316,55 @@ def effective_threshold(ctx: Context) -> int:
     return ctx.cfg.notify_threshold
 
 
+def queue_manual_notify(ctx: Context, article_id: str) -> bool:
+    """수동 등록(URL) 기사를 알림 큐에 올리고 즉시 발송을 시도한다.
+
+    자동 수집과 달리 사람이 직접 고른 등록이므로 is_backfill(6시간 경과)·
+    부트스트랩 억제(suppressed)는 무시한다. 다만 점수 임계값 미만이면 보내지
+    않는다(사용자 지정 2026-09-08). telegram_enabled·봇 /stop·야간 모드는
+    send_notifications 가 그대로 적용한다(야간 저점수 기사는 큐에 남아 아침에 발송).
+    반환: 큐에 새로 적재했으면 True.
+    """
+    cfg = ctx.cfg
+    if not cfg.telegram_enabled or not cfg.telegram_chat_id:
+        return False
+    detail = ctx.storage.article_detail(article_id)
+    if not detail or detail.get("status") != "active":
+        return False
+    state = ctx.storage.get_run_state()
+    if str(state.get("notify_paused") or "0") not in ("0", "False", "false", ""):
+        return False  # 봇 /stop 으로 일시중지됨
+
+    score = int(detail.get("importance_score") or 0)
+    always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
+    try:
+        hard_score = int(state.get("hard_notify_score") or 0)
+    except (TypeError, ValueError):
+        hard_score = 0
+    probe = f"{detail.get('title', '')}\n{detail.get('summary_text', '') or ''}"
+    is_priority = _kw_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
+    if not (score >= effective_threshold(ctx) or is_priority):
+        log.info("수동 등록 기사(점수 %d)가 임계값 미만이라 웹에만 노출: %s",
+                 score, (detail.get("title") or "")[:40])
+        return False
+
+    if not ctx.storage.queue_notification(article_id, cfg.telegram_chat_id, "queued",
+                                          1 if is_priority else 0):
+        return False  # 이미 큐에 있음 — 중복 발송 방지
+    try:
+        send_notifications(ctx, limit=3)
+    except Exception as exc:   # pragma: no cover
+        log.warning("수동 등록 알림 즉시 발송 실패(큐에는 남아 다음 주기에 재시도): %s", exc)
+    return True
+
+
 def send_notifications(ctx: Context, limit: int = 20) -> int:
+    # 파이프라인 루프·수동 등록이 겹쳐도 같은 큐 행을 두 번 보내지 않도록 직렬화한다.
+    with _SEND_LOCK:
+        return _send_notifications(ctx, limit)
+
+
+def _send_notifications(ctx: Context, limit: int = 20) -> int:
     cfg = ctx.cfg
     if not cfg.telegram_enabled:
         return 0
@@ -5447,10 +5525,16 @@ def create_app(ctx: Context):
         row = ctx.storage.article_detail(article_id)
         if row is None:
             return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
+        notified = False
         if row.get("status") == "draft":
             ctx.storage.update_article(article_id, {"status": "active"})
             _bust_scan_cache()
-        return JSONResponse({"ok": True})
+            # 등록 확정 시 임계값을 넘으면 텔레그램 채널에도 발송한다. (사용자 지정 2026-09-08)
+            try:
+                notified = queue_manual_notify(ctx, article_id)
+            except Exception as exc:
+                log.warning("수동 등록 알림 처리 실패: %s", exc)
+        return JSONResponse({"ok": True, "notified": notified})
 
     @app.post("/api/articles/{article_id}/discard")
     def api_discard_draft(article_id: str):
@@ -6231,6 +6315,13 @@ def cmd_selftest() -> int:
           people_news_kind("", "[승진] 포스코홀딩스 임원 인사"), "personnel")
     check("[동정]은 대상 아님", people_news_kind("", "[동정] 장관 현장방문"), "")
     check("일반 기사는 대상 아님", people_news_kind("", "포스코퓨처엠 양극재 증설"), "")
+    # 말머리 없는 정부부처 인사 공지 (motir.go.kr 등)
+    check("'인사발령(…)' 제목 → personnel",
+          people_news_kind("https://www.motir.go.kr/kor/article/x", "인사발령(실장급 승진)"), "personnel")
+    check("'보직인사' 제목 → personnel",
+          people_news_kind("", "산업통상부 4월 정기 보직인사 단행"), "personnel")
+    check("부처명만 있고 인사 표현 없으면 대상 아님",
+          people_news_kind("", "산업통상부, 반도체 국장급 회의 소집"), "")
     _ob = ("김 기자 구독 구독중 이전 다음 ▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 "
            "= 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678 (서울=연합뉴스) 무단 전재 금지")
     check("부고 요약 = ▲…☎ 블록",
@@ -6499,6 +6590,15 @@ def cmd_selftest() -> int:
     check("hard=0(미사용) → 점수 100 이어도 우선 아님", _is_prio(100, 0), False)
     check("hard 미달이어도 키워드 매칭이면 우선", _is_prio(10, 80, kw_hit=True), True)
 
+    # 안정화 게이트: 메타만 저장분(deferred)은 억제 유지 사유가 아니다. (조사 2026-09-08)
+    def _stabilized(fresh_avail, new_cnt, body_backlog, defer_backlog):
+        return (fresh_avail < 20 and new_cnt < 10
+                and body_backlog < 30 and defer_backlog < DEFER_BACKLOG_STABLE)
+    check("본문 대기 큐만 잦아들면 deferred 200건이어도 안정",
+          _stabilized(5, 3, 10, 200), True)
+    check("본문 대기 큐가 크면 억제 유지", _stabilized(5, 3, 120, 0), False)
+    check("deferred 가 상한을 넘으면 억제 유지", _stabilized(5, 3, 10, DEFER_BACKLOG_STABLE + 1), False)
+
     print("\n[13-3] 마스터 비밀번호 (pbkdf2)")
     _h = hash_password("s3cret!")
     check("정상 비번 검증", verify_password("s3cret!", _h), True)
@@ -6527,6 +6627,13 @@ def cmd_selftest() -> int:
           repair_truncated_title("포스코퓨처엠 양극재 증설", _html_full), "포스코퓨처엠 양극재 증설")
     check("앞부분이 다르면 오교체하지 않는다",
           repair_truncated_title("전혀 다른 기사 제목입니다...", _html_full), "전혀 다른 기사 제목입니다...")
+    # 수동 등록 발송 판정: 점수 임계값 이상 또는 우선일 때만 (사용자 지정 2026-09-08).
+    # is_backfill·suppressed 는 무시하지만 임계값·야간·telegram_enabled 는 존중한다.
+    def _manual_send_ok(score, threshold, is_priority):
+        return score >= threshold or is_priority
+    check("수동 등록: 점수 70 ≥ 임계값 50 → 발송", _manual_send_ok(70, 50, False), True)
+    check("수동 등록: 점수 20 < 임계값 50, 우선 아님 → 웹에만", _manual_send_ok(20, 50, False), False)
+    check("수동 등록: 점수 낮아도 우선이면 발송", _manual_send_ok(10, 50, True), True)
 
     print("\n[15] 주간 레포트 (월요일 이메일)")
     _ws, _we = weekly_window(datetime(2026, 9, 7, 7, 0, tzinfo=timezone.utc))
