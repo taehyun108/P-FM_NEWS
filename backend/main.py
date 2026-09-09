@@ -5645,22 +5645,31 @@ def _kakao_access_token(ctx: Context) -> str | None:
     return body["access_token"]
 
 
-KAKAO_DESC_MAX = 380   # feed 템플릿 description 안전 상한 (템플릿 전체 10KB 한도 대비)
+KAKAO_TEXT_MAX = 195   # text 템플릿 200자 한도 (이모지·여유분 감안)
+
+
+def _clip(s: str, n: int) -> str:
+    """n 자로 자르고 잘렸으면 끝에 '…' 를 붙인다."""
+    s = (s or "").strip()
+    if n <= 0:
+        return ""
+    return s if len(s) <= n else s[: max(0, n - 1)].rstrip() + "…"
 
 
 def _kakao_text_template(title: str, link: str) -> dict:
-    """키·링크만 있을 때(연결 테스트·콜백)의 단순 text 템플릿. text 는 200자 한도."""
+    """키·링크만 있을 때(연결 테스트·콜백)의 단순 text 템플릿."""
     return {
         "object_type": "text",
-        "text": f"{title}\n{link}".strip()[:190],
+        "text": f"{title}\n{link}".strip()[:KAKAO_TEXT_MAX],
         "link": {"web_url": link, "mobile_web_url": link},
         "button_title": "원문 보기",
     }
 
 
-def _kakao_feed_template(row: dict, link: str) -> dict:
-    """텔레그램 카드와 같은 구성(태그·제목·요약·포스코 관점·원문 버튼)을
-    카카오 feed 템플릿으로 만든다. format_message() 의 카카오판."""
+def _kakao_text_from_row(row: dict, link: str) -> dict:
+    """텔레그램 카드와 같은 서식(태그·제목·요약·포스코 관점)을 카카오 text 템플릿에
+    담는다. text 는 200자 한도 — 링크는 본문이 아니라 link 필드·버튼으로 뺀다.
+    format_message() 의 카카오판(200자 압축)."""
     score = int(row.get("importance_score") or 0)
     emoji = "🔴" if score >= 80 else "🟠"
     groups = normalize_group_list(jload(row.get("group_companies"), []))
@@ -5668,38 +5677,37 @@ def _kakao_feed_template(row: dict, link: str) -> dict:
         probe = f"{row.get('title') or ''}\n{row.get('summary_text') or ''}"
         groups = normalize_group_list(detect_group_companies(probe))
     tag = groups[0] if groups else "포스코"
-    title = f"{emoji} [{tag}] {(row.get('title') or '').strip()}"[:110]
 
-    header = format_summary_header(row.get("press_name") or "", row.get("author") or "")
+    body = f"{emoji} [{tag}] {(row.get('title') or '').strip()}"
+    hdr = format_summary_header(row.get("press_name") or "", row.get("author") or "")
     summary = (row.get("summary_text") or "").strip()
     perspective = (row.get("perspective_text") or "").strip()
-    parts: list[str] = []
-    if summary:
-        parts.append(f"{header} {summary}".strip() if header else summary)
-    if perspective:
-        parts.append(f"[포스코 관점] {perspective}")
-    desc = "\n\n".join(parts) or "요약이 아직 없습니다."
-    if len(desc) > KAKAO_DESC_MAX:
-        desc = desc[: KAKAO_DESC_MAX - 1] + "…"
 
-    web = {"web_url": link, "mobile_web_url": link}
+    seg = f"{hdr} {summary}".strip() if (hdr and summary) else summary
+    if seg and KAKAO_TEXT_MAX - len(body) > 14:
+        body += "\n\n" + _clip(seg, KAKAO_TEXT_MAX - len(body) - 2)
+    if perspective and KAKAO_TEXT_MAX - len(body) > 20:
+        body += "\n\n포스코 관점: " + _clip(perspective, KAKAO_TEXT_MAX - len(body) - 10)
+
     return {
-        "object_type": "feed",
-        "content": {"title": title, "description": desc, "link": web},
-        "buttons": [{"title": "원문 보기", "link": web}],
+        "object_type": "text",
+        "text": body[:200],
+        "link": {"web_url": link, "mobile_web_url": link},
+        "button_title": "원문 보기",
     }
 
 
 def _kakao_send(ctx: Context, title: str, link: str,
                 article_id: str | None = None, kind: str = "카카오",
                 row: dict | None = None) -> tuple[bool, str | None]:
-    """카카오톡 '나와의 채팅'으로 기사 카드를 보낸다. telegram_log 에 같이 기록한다.
+    """카카오톡 '나와의 채팅'으로 기사를 보낸다. telegram_log 에 같이 기록한다.
 
-    row 가 있으면 텔레그램과 같은 요약·관점이 담긴 feed 카드로,
-    없으면(테스트·콜백) 제목+링크만 담은 text 로 보낸다.
+    row 가 있으면 텔레그램과 같은 서식(태그·제목·요약·포스코 관점)을 text 템플릿에
+    200자로 압축해 보낸다 — PC 카카오톡에서도 일반 메시지처럼 펼쳐 보인다.
+    없으면(테스트·콜백) 제목+링크만 담는다.
     """
-    template_obj = _kakao_feed_template(row, link) if row else _kakao_text_template(title, link)
-    log_text = f"{title}\n{link}".strip()[:190]   # 대시보드 '발송 로그' 표시용
+    template_obj = _kakao_text_from_row(row, link) if row else _kakao_text_template(title, link)
+    log_text = (template_obj.get("text") or f"{title}\n{link}").strip()[:190]   # 발송 로그 표시용
     ok, err = False, None
     try:
         with _KAKAO_LOCK:
@@ -8516,20 +8524,24 @@ def cmd_selftest() -> int:
 
     _tt = _kakao_text_template("제목", "https://x.test/a")
     check("text 템플릿 — object_type=text", _tt["object_type"], "text")
+    check("_clip — 안 넘치면 그대로", _clip("가나다", 5), "가나다")
+    check("_clip — 넘치면 … 부착", _clip("가나다라마바", 4), "가나다…")
     _fr = {"title": "포스코퓨처엠 양극재 증설", "importance_score": 85,
            "group_companies": '["포스코퓨처엠"]', "press_name": "뉴스1", "author": "김기자",
            "summary_text": "짧은 요약 문장.", "perspective_text": "관점 문장",
            "url_canonical": "https://x.test/a"}
-    _ft = _kakao_feed_template(_fr, "https://x.test/a")
-    check("feed 템플릿 — object_type=feed", _ft["object_type"], "feed")
-    check("feed 템플릿 — 점수 85 는 🔴", _ft["content"]["title"].startswith("🔴"), True)
-    check("feed 템플릿 — 태그가 제목에", "[포스코퓨처엠]" in _ft["content"]["title"], True)
-    check("feed 템플릿 — 언론사·기자 머리표", "[뉴스1, 김기자]" in _ft["content"]["description"], True)
-    check("feed 템플릿 — 포스코 관점 포함", "[포스코 관점]" in _ft["content"]["description"], True)
-    check("feed 템플릿 — 긴 요약도 상한 준수",
-          len(_kakao_feed_template({**_fr, "summary_text": "요" * 500},
-                                   "https://x.test/a")["content"]["description"]) <= KAKAO_DESC_MAX, True)
-    check("feed 템플릿 — 원문 버튼 링크", _ft["buttons"][0]["link"]["web_url"], "https://x.test/a")
+    _ft = _kakao_text_from_row(_fr, "https://x.test/a")
+    check("row text — object_type=text", _ft["object_type"], "text")
+    check("row text — 점수 85 는 🔴", _ft["text"].startswith("🔴"), True)
+    check("row text — 태그가 머리줄에", "[포스코퓨처엠]" in _ft["text"], True)
+    check("row text — 언론사·기자 머리표", "[뉴스1, 김기자]" in _ft["text"], True)
+    check("row text — 포스코 관점 포함", "포스코 관점:" in _ft["text"], True)
+    check("row text — 링크는 본문 아닌 link 필드", "http" not in _ft["text"], True)
+    check("row text — 원문 버튼", _ft["button_title"], "원문 보기")
+    check("row text — 긴 요약도 200자 이하",
+          len(_kakao_text_from_row({**_fr, "summary_text": "요" * 500,
+                                    "perspective_text": "관" * 500},
+                                   "https://x.test/a")["text"]) <= 200, True)
 
     print("\n[13-2b] 무조건 발송 점수 (hard_notify_score) — 우선 판정")
     # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)
