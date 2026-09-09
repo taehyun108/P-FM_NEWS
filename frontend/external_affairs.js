@@ -149,30 +149,36 @@
     box.hidden = false;
   }
 
-  /* ── D-day 뱃지 ── */
-  function ddayBadge(it) {
-    var box = el('div', 'ea-dday');
-    var d = it.d_day;
-    if (d === null || d === undefined) {
-      box.classList.add('is-closed');
-      box.append(el('b', null, '—'), el('span', null, it.status || '기한없음'));
-      return box;
-    }
-    if (d < 0) { box.classList.add('is-closed'); }
-    else if (d <= 3) { box.classList.add('is-urgent'); }
-    else if (d <= 7) { box.classList.add('is-soon'); }
-    else { box.classList.add('is-open'); }
-    box.append(el('b', null, d < 0 ? '마감' : 'D-' + d));
-    box.append(el('span', null, d < 0 ? fmtDate(it.notice_end) : '까지'));
-    return box;
+  /* ── 포토카드 상단 배너 (썸네일 자리) ── */
+  function eaThumb(cat, big, sub, cls) {
+    var t = el('div', 'ea-thumb ' + (cls || 'is-open'));
+    t.append(el('span', 'ea-thumb-cat', cat));
+    var m = el('div', 'ea-thumb-metric');
+    m.append(el('b', null, big));
+    if (sub) { m.append(el('span', null, sub)); }
+    t.append(m);
+    return t;
   }
 
-  /* ── 항목 카드 (예고·부처동향) ── */
+  /* 예고·부처동향 항목의 D-day → 배너 문구 */
+  function ddayThumb(it) {
+    var d = it.d_day;
+    if (d === null || d === undefined) {
+      return eaThumb(currentCat().label, '상시', it.status || '기한 없음', 'is-closed');
+    }
+    if (d < 0) { return eaThumb(currentCat().label, '마감', fmtDate(it.notice_end), 'is-closed'); }
+    var end = fmtDate(it.notice_end);
+    if (d <= 3) { return eaThumb(currentCat().label, 'D-' + d, '제출 마감 임박', 'is-urgent'); }
+    if (d <= 7) { return eaThumb(currentCat().label, 'D-' + d, end + ' 까지', 'is-soon'); }
+    return eaThumb(currentCat().label, 'D-' + d, end + ' 까지', 'is-open');
+  }
+
+  /* ── 항목 카드 (예고·부처동향) — 뉴스 포토카드와 같은 세로 카드 ── */
   function buildCard(it) {
     var card = el('article', 'ea-card');
-    card.append(ddayBadge(it));
+    card.append(ddayThumb(it));
 
-    var body = el('div');
+    var body = el('div', 'ea-card-body');
     var h = el('h3', 'ea-card-title');
     h.append(link(it.title, it.url));
     body.append(h);
@@ -187,15 +193,20 @@
     body.append(el('p', 'ea-card-sub', bits.join(' · ')));
 
     var tags = el('div', 'ea-tags');
+    var seen = {};
     (it.group_companies || []).forEach(function (g) {
-      tags.append(el('span', 'ea-tag is-group', g));
+      if (g && !seen[g]) { seen[g] = 1; tags.append(el('span', 'ea-tag is-group', g)); }
     });
-    if (it.category) { tags.append(el('span', 'ea-tag is-cat', it.category)); }
+    if (it.category && !seen[it.category]) {
+      seen[it.category] = 1; tags.append(el('span', 'ea-tag is-cat', it.category));
+    }
     if (it.impact_level) {
       tags.append(el('span', 'ea-tag ea-impact-' + it.impact_level,
         IMPACT_LABEL[it.impact_level] || it.impact_level));
     }
-    (it.affected_areas || []).forEach(function (x) { tags.append(el('span', 'ea-tag', x)); });
+    (it.affected_areas || []).forEach(function (x) {
+      if (x && !seen[x]) { seen[x] = 1; tags.append(el('span', 'ea-tag', x)); }
+    });
     if (tags.childNodes.length) { body.append(tags); }
 
     if (it.summary) { body.append(el('p', 'ea-summary', it.summary)); }
@@ -224,20 +235,35 @@
     return card;
   }
 
-  /* ── 정책/통상 뉴스 카드 ── */
+  /* ── 정책/통상 뉴스 카드 — 같은 포토카드 형식 ── */
   function buildNewsCard(n) {
     var card = el('article', 'ea-card');
-    var badge = el('div', 'ea-dday is-open');
-    badge.append(el('b', null, String(n.score)), el('span', null, '중요도'));
-    card.append(badge);
+    var s = Number(n.score) || 0;
+    var cls = s >= 66 ? 'is-urgent' : (s >= 40 ? 'is-soon' : 'is-open');
+    card.append(eaThumb(currentCat().label, String(s), '중요도', cls));
 
-    var body = el('div');
+    var body = el('div', 'ea-card-body');
     var h = el('h3', 'ea-card-title');
     h.append(link(n.title, n.url));
     body.append(h);
     body.append(el('p', 'ea-card-sub',
       [n.agency || n.press, fmtDate(n.published_at)].filter(Boolean).join(' · ')));
+
+    var tags = el('div', 'ea-tags');
+    (n.group_companies || []).forEach(function (g) {
+      tags.append(el('span', 'ea-tag is-group', g));
+    });
+    if (n.impact_level) {
+      tags.append(el('span', 'ea-tag ea-impact-' + n.impact_level,
+        IMPACT_LABEL[n.impact_level] || n.impact_level));
+    }
+    if (tags.childNodes.length) { body.append(tags); }
+
     if (n.summary) { body.append(el('p', 'ea-summary', n.summary)); }
+    var acts = el('div', 'ea-actions');
+    acts.append(link('원문', n.url));
+    body.append(acts);
+
     card.append(body);
     return card;
   }

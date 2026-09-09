@@ -28,6 +28,10 @@
 
 * { box-sizing: border-box; }
 
+/* hidden 속성은 항상 이긴다. .grid·.stats 처럼 display 를 지정한 요소도
+   hidden 이면 확실히 숨겨야 뷰 전환(대외협력·주간동향·즐겨찾기)이 깨지지 않는다. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
