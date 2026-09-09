@@ -604,6 +604,14 @@ class Storage(ABC):
     def mark_notification(self, notif_id: str, status: str, error: str | None) -> None: ...
 
     @abstractmethod
+    def touch_notification(self, notif_id: str, error: str | None) -> None:
+        """일시적 오류 — 재시도 횟수는 건드리지 않고 error 문구만 갱신한다."""
+
+    @abstractmethod
+    def requeue_failed_notifications(self) -> int:
+        """막힌 발송 실패 건(failed · 재시도 소진된 queued)을 다시 큐로 되돌린다."""
+
+    @abstractmethod
     def failed_notifications(self, limit: int) -> list[dict]: ...
 
     @abstractmethod
@@ -1222,6 +1230,15 @@ class SqliteStorage(Storage):
                 (status, error, sent_at, notif_id),
             )
 
+    def touch_notification(self, notif_id: str, error: str | None) -> None:
+        self._exec("update notifications set error=? where id=?", (error, notif_id))
+
+    def requeue_failed_notifications(self) -> int:
+        cur = self._exec(
+            "update notifications set status='queued', retry_count=0, error=null, sent_at=null"
+            " where status='failed' or (status='queued' and retry_count >= 3)")
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     def failed_notifications(self, limit: int) -> list[dict]:
         """대시보드의 '발송 실패'를 눌렀을 때 보여 줄 목록.
 
@@ -1722,6 +1739,17 @@ class SupabaseStorage(Storage):
             patch["status"] = status
             patch["sent_at"] = iso(now_utc()) if status == "sent" else None
         self._t("notifications").update(patch).eq("id", notif_id).execute()
+
+    def touch_notification(self, notif_id: str, error: str | None) -> None:
+        self._t("notifications").update({"error": error}).eq("id", notif_id).execute()
+
+    def requeue_failed_notifications(self) -> int:
+        patch = {"status": "queued", "retry_count": 0, "error": None, "sent_at": None}
+        done = (self._t("notifications").update(patch)
+                .eq("status", "failed").execute().data) or []
+        stuck = (self._t("notifications").update(patch)
+                 .eq("status", "queued").gte("retry_count", 3).execute().data) or []
+        return len(done) + len(stuck)
 
     def failed_notifications(self, limit: int) -> list[dict]:
         # PostgREST 는 or() 안에서 and() 를 중첩할 수 있다.
@@ -2418,6 +2446,14 @@ def _kw_hit_any(text: str, keywords: Sequence[str]) -> bool:
     return any(k in text for k in keywords)
 
 
+def _kw_first_hit(text: str, keywords: Sequence[str]) -> str | None:
+    """본문에 처음 걸린 키워드를 돌려준다. 없으면 None. (발송 이유 표시용)"""
+    for k in keywords:
+        if k and k in text:
+            return k
+    return None
+
+
 def is_trade_topic(title: str, extra: str = "") -> bool:
     """글로벌 통상환경 기사인가.
 
@@ -2531,6 +2567,116 @@ def format_people_notice(body: str, kind: str) -> str:
         if m:
             text = m.group(0).strip()
     return text[:800]
+
+
+# ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
+# 소스 기사(연합·뉴시스 인사 RSS)는 이름·소속만 나열한 덤프라 읽기 어렵다.
+# LLM 으로 사람별 항목(소속 국·과 / 직급 / 승진·전보 / 고시·회차 / 이력 / 업무 / 학력)을
+# 뽑되, **기사에 실제로 적힌 것만** 채운다. 외부 검색으로 보강하지 않는다.
+PEOPLE_NOTICE_SYSTEM = (
+    "당신은 정부·공공기관 인사·부고 공지를 정리하는 편집자다. "
+    "주어진 기사 본문에 실제로 적힌 사실만 사용하고, 없는 항목은 빈 값으로 둔다. "
+    "고시 회차·이력·학력 등은 기사에 없으면 절대 추측하지 않는다. JSON 으로만 답한다."
+)
+PEOPLE_NOTICE_PROMPT = """[구분] {kind}
+[제목] {title}
+[언론사] {press}
+[본문]
+{body}
+
+위 공지를 사람별로 정리해 JSON 하나로만 답하라.
+
+인사(승진·전보·임용·취임 등)이면 각 사람마다:
+  name       이름
+  org        소속 (부처 + 국/과, 기사에 있는 만큼)
+  position   직급/직위 (예: 부이사관, 국장)
+  change     인사 종류 (승진 | 전보 | 신규임용 | 취임 | 연임 | 퇴직 등)
+  exam       임용 경로 (예: "행정고시 45회", "기술고시 30회") — 없으면 ""
+  career     주요 이력 배열 (역임 보직과 기간, 예: "기재부 재정성과평가과장(23.5~25.5)") — 없으면 []
+  duty       담당·역점 업무 — 없으면 ""
+  education  출신 학교 — 없으면 ""
+→ {{"kind":"personnel","people":[{{"name":"...","org":"...","position":"...","change":"...","exam":"","career":[],"duty":"","education":""}}]}}
+
+부고면 각 대상마다:
+  subject   별세자 (직함 포함)
+  relation  부고 주체와의 관계 (예: "OOO 부장 부친상") — 없으면 ""
+  mourners  상주 — 없으면 ""
+  wake      빈소 — 없으면 ""
+  funeral   발인 일시 — 없으면 ""
+  burial    장지 — 없으면 ""
+  contact   연락처 — 없으면 ""
+→ {{"kind":"obituary","deaths":[{{"subject":"...","relation":"","mourners":"","wake":"","funeral":"","burial":"","contact":""}}]}}
+
+규칙:
+- 기사에 없는 항목은 빈 문자열/빈 배열로 둔다. 지어내지 말 것.
+- 사람이 여러 명이면 모두 담되, 최대 20명.
+- 본문이 이름 나열뿐이면 name·org·position·change 만 채우면 된다."""
+
+
+def _pp(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def format_people_llm(parsed: dict, kind: str) -> str:
+    """people_notice() 의 JSON 을 카드·텔레그램에 넣을 사람별 텍스트 블록으로 만든다."""
+    if not isinstance(parsed, dict):
+        return ""
+    blocks: list[str] = []
+    if kind == "obituary" or parsed.get("kind") == "obituary":
+        for d in (parsed.get("deaths") or [])[:20]:
+            if not isinstance(d, dict):
+                continue
+            head = _pp(d.get("subject")) or "부고"
+            rel = _pp(d.get("relation"))
+            lines = [f"ㆍ{head}" + (f" / {rel}" if rel else "")]
+            if _pp(d.get("mourners")):
+                lines.append(f"   · 상주: {_pp(d.get('mourners'))}")
+            if _pp(d.get("wake")):
+                lines.append(f"   · 빈소: {_pp(d.get('wake'))}")
+            fb = " / ".join(x for x in (
+                f"발인 {_pp(d.get('funeral'))}" if _pp(d.get("funeral")) else "",
+                f"장지 {_pp(d.get('burial'))}" if _pp(d.get("burial")) else "") if x)
+            if fb:
+                lines.append(f"   · {fb}")
+            if _pp(d.get("contact")):
+                lines.append(f"   · ☎ {_pp(d.get('contact'))}")
+            blocks.append("\n".join(lines))
+    else:
+        for p in (parsed.get("people") or [])[:20]:
+            if not isinstance(p, dict):
+                continue
+            name = _pp(p.get("name"))
+            if not name:
+                continue
+            head_bits = [_pp(p.get("org")), name,
+                         " ".join(x for x in (_pp(p.get("position")), _pp(p.get("change"))) if x)]
+            lines = ["ㆍ" + " ".join(b for b in head_bits if b).strip()]
+            if _pp(p.get("exam")):
+                lines.append(f"   · {_pp(p.get('exam'))}")
+            career = [_pp(c) for c in (p.get("career") or []) if _pp(c)]
+            if career:
+                joined = " ".join(f"{i}) {c}" for i, c in enumerate(career, 1))
+                lines.append(f"   · 이력: {joined}")
+            if _pp(p.get("duty")):
+                lines.append(f"   · 업무: {_pp(p.get('duty'))}")
+            if _pp(p.get("education")):
+                lines.append(f"   · 학력: {_pp(p.get('education'))}")
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks).strip()
+
+
+def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
+                   use_llm: bool) -> tuple[str, str, dict]:
+    """인사·부고 요약 텍스트를 만든다. 반환: (요약, 사용 모델, 토큰 usage).
+
+    use_llm 이면 구조화를 시도하고, 실패하거나 use_llm 이 아니면 규칙 기반으로 대체한다.
+    """
+    if use_llm:
+        parsed, usage = ctx.llm.people_notice(kind, title, press, body)
+        text = format_people_llm(parsed, kind) if parsed else ""
+        if text:
+            return text[:1600], ctx.llm.model, usage
+    return format_people_notice(body, kind), "", {}
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -3260,6 +3406,29 @@ class LLMClient:
         log.error("LLM 분석 최종 실패: %s", last_error)
         return Analysis(ok=False)
 
+    def people_notice(self, kind: str, title: str, press: str, body: str) -> tuple[dict | None, dict]:
+        """인사·부고 공지를 사람별 구조로 뽑는다. 실패하면 (None, {}).
+
+        기사에 실제로 적힌 내용만 채운다 — 고시·이력·학력이 없으면 빈 값이다.
+        """
+        prompt = PEOPLE_NOTICE_PROMPT.format(
+            kind=("부고" if kind == "obituary" else "인사"),
+            title=title, press=press or "미상", body=(body or "")[:MAX_BODY_CHARS])
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                content, usage = self._chat(PEOPLE_NOTICE_SYSTEM, prompt)
+                parsed = _parse_json_object(content)
+                if parsed is None:
+                    raise ValueError("JSON 파싱 실패")
+                return parsed, usage
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        log.warning("인사·부고 구조화 실패(규칙 기반으로 대체): %s", last_error)
+        return None, {}
+
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
         resp = self.client.chat.completions.create(
@@ -3481,8 +3650,11 @@ DEFER_PER_RUN = 40
 DEFER_DRAIN_PER_RUN = 16
 # deferred 상태로 이 시간을 넘기면(본문을 계속 못 받음) 보관 처리한다.
 DEFER_MAX_AGE_HOURS = 24
-# 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리, LLM 미사용)
+# 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리)
 PEOPLE_PER_RUN = 30
+# 그 중 사람별 구조 요약(LLM)에 쓸 수 있는 최대 호출 수. 나머지는 규칙 기반으로 저장되고
+# 나중에 `repeople` 로 채울 수 있다. 일일 상한(LLM_DAILY_LIMIT)도 함께 적용된다.
+PEOPLE_LLM_PER_RUN = get_env_int("PEOPLE_LLM_PER_RUN", 12, 0)
 # 인사·부고는 '기록·레퍼런스' 성격이라 일반 신선도 컷오프(72h)로 버리면 안 된다.
 # 부처 인사는 발행 후 며칠 지나 인지되는 경우가 많다. 이 창 안이면 수집한다(알림은
 # is_backfill=6h 규칙이 그대로 막으므로 오래된 인사가 텔레그램으로 가지는 않는다).
@@ -3602,11 +3774,13 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
     return saved
 
 
-def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> int:
+def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
+                    people_llm: int = 0) -> int:
     """메타만 저장된(deferred) 기사를 본문 확보 → 관련성 재검 → 분석한다.
 
     본문을 계속 못 받으면 DEFER_MAX_AGE_HOURS 후 보관 처리한다.
     본문 기준 관련성에서 탈락하면(제목만 그럴듯했던 경우) 역시 보관한다.
+    people_llm = 이 드레인에서 인사·부고 구조화에 쓸 수 있는 LLM 호출 수.
     """
     storage, http = ctx.storage, ctx.http
     done = 0
@@ -3624,7 +3798,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> i
                 storage.update_article(aid, {"status": "archived"})
             continue   # 다음 회차 재시도
 
-        # 인사·부고면 LLM 없이 공지 원문만 확정한다
+        # 인사·부고면 사람별 구조로 정리한다 (예산 남으면 LLM, 아니면 규칙 기반)
         pk = people_news_kind(canonical or art["url_source"], art["title"])
         if pk:
             press_name, press_id, _ = resolve_press(storage, canonical or target,
@@ -3635,10 +3809,14 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> i
                 "categories": [PEOPLE_NEWS_CATEGORY], "importance_score": SCORE_PEOPLE_NEWS,
                 "analyzed_at": iso(now_utc()),
             })
+            summary, model, usage = people_summary(ctx, pk, art["title"], press_name, body,
+                                                   use_llm=people_llm > 0)
+            if model:
+                people_llm -= 1
             storage.save_summary({
                 "id": new_id(), "article_id": aid,
-                "summary_text": format_people_notice(body, pk), "perspective_text": "",
-                "summary_source": "notice", "model": "", "token_usage": None,
+                "summary_text": summary, "perspective_text": "",
+                "summary_source": "notice", "model": model, "token_usage": usage or None,
                 "created_at": iso(now_utc()),
             })
             done += 1
@@ -3684,8 +3862,12 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict]) -> i
 
 def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, body: str,
                       kind: str, press_name: str, press_id: str | None,
-                      dedup_candidates: list[dict], is_backfill: bool) -> None:
-    """인사·부고 기사를 LLM 없이 저장한다. 요약은 공지 원문 블록, 포스코 관점은 없음."""
+                      dedup_candidates: list[dict], is_backfill: bool,
+                      use_llm: bool = False) -> bool:
+    """인사·부고 기사를 저장한다. 포스코 관점·SWOT 은 없다.
+
+    use_llm 이면 사람별 구조 요약을 시도한다. 반환: LLM 을 실제로 썼으면 True.
+    """
     storage = ctx.storage
     aid = new_id()
     row = {
@@ -3702,7 +3884,7 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "analyzed_at": iso(now_utc()), "status": "active",
     }
     if not storage.insert_article(row):
-        return
+        return False
     ctx.seen_cache.add(item.url_source)
     dedup_candidates.append({
         "id": aid, "title": item.title, "published_at": iso(item.published_at),
@@ -3710,12 +3892,14 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "press_name": press_name, "content_hash": row["content_hash"],
         "url_canonical": row["url_canonical"], "url_source": item.url_source,
     })
+    summary, model, usage = people_summary(ctx, kind, item.title, press_name, body, use_llm)
     storage.save_summary({
         "id": new_id(), "article_id": aid,
-        "summary_text": format_people_notice(body, kind), "perspective_text": "",
-        "summary_source": "notice", "model": "", "token_usage": None,
+        "summary_text": summary, "perspective_text": "",
+        "summary_source": "notice", "model": model, "token_usage": usage or None,
         "created_at": iso(now_utc()),
     })
+    return bool(model)
 
 
 @dataclass
@@ -3958,11 +4142,13 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     defer_budget = min(6, defer_pending, max(1, llm_budget // 4)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
 
-    # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — LLM 을 안 쓰므로 저렴하고,
-    # 제목 점수가 0이라 일반 큐에 두면 영원히 상한에 밀린다. (사용자 지정)
+    # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — 제목 점수가 0이라 일반 큐에 두면
+    # 영원히 상한에 밀린다. (사용자 지정) 사람별 구조 요약은 LLM 을 쓰되, 이번 회차·오늘
+    # 남은 예산 안에서만 한다. 예산 밖은 규칙 기반으로 저장되고 `repeople` 로 채운다.
     people = [p for p in fresh if people_news_kind(p[0].url_source, p[0].title)][:PEOPLE_PER_RUN]
     people_urls = {p[0].url_source for p in people}
     fresh = [p for p in fresh if p[0].url_source not in people_urls]
+    people_llm_left = min(PEOPLE_LLM_PER_RUN, max(0, daily_left - llm_budget - defer_budget))
 
     # 저장 상한은 LLM 예산과 분리한다. 저장(본문 확보+중복판정)은 비용이 작고,
     # 여기서 조이면 관련 기사가 큐에서 굶어 72시간 뒤 stale 로 사라진다.
@@ -4059,11 +4245,14 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                          press_name, item.title[:40])
             continue
 
-        # ── 인사·부고 — 포스코 관점·LLM 없이 공지 원문만 담는다 (사용자 지정) ──
+        # ── 인사·부고 — 포스코 관점·SWOT 없이 사람별 구조 요약만 담는다 (사용자 지정) ──
         pk = people_news_kind(canonical or item.url_source, item.title)
         if pk:
-            _save_people_news(ctx, item, canonical, html, body, pk, press_name,
-                              press_id, dedup_candidates, is_backfill)
+            used = _save_people_news(ctx, item, canonical, html, body, pk, press_name,
+                                     press_id, dedup_candidates, is_backfill,
+                                     use_llm=people_llm_left > 0)
+            if used:
+                people_llm_left -= 1
             new_count += 1
             continue
 
@@ -4195,7 +4384,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 메타만 저장된(deferred) 기사 드레인 — 본문 확보 → 관련성 재검 → 분석 ──
     # 예약해 둔 defer_budget + 앞 단계에서 남은 예산을 함께 쓴다.
     drain_budget = defer_budget + max(0, llm_budget)
-    drained = _drain_deferred(ctx, min(drain_budget, DEFER_DRAIN_PER_RUN), dedup_candidates) if drain_budget else 0
+    drained = _drain_deferred(ctx, min(drain_budget, DEFER_DRAIN_PER_RUN), dedup_candidates,
+                              people_llm=people_llm_left) if drain_budget else 0
     if drained:
         log.info("메타 저장분 분석 %d건 (예약 예산 %d)", drained, defer_budget)
 
@@ -4613,11 +4803,75 @@ def refresh_quotes(ctx: Context) -> int:
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 NIGHT_START, NIGHT_END = 23, 7          # 야간 모드 23:00–07:00
 NIGHT_MIN_SCORE = 80
-RATE_LIMIT_SLEEP = 1.1                   # 동일 채팅방 분당 20건 제한 → 초당 1건 이하
+RATE_LIMIT_SLEEP = 3.5                   # 채널 분당 ~20건 한도 → 건당 3초 이상 간격(여유 포함)
 PRIORITY_FLOOD_WARN = 10                 # 한 회차 우선 기사가 이 수 이상이면 경고 로그
+SEND_BATCH_PER_CYCLE = 12               # 파이프라인 한 회차에 발송할 최대 건수(백로그 폭주 완충)
+TG_MAX_PER_MIN = 17                      # 최근 60초 발송이 이 수에 닿으면 대기 (텔레그램 한도 아래)
+FLOOD_PAD_SEC = 3                        # 텔레그램이 준 retry_after 에 이만큼 더 얹어 기다린다
+NOTIFY_MAX_AGE_HOURS = 24               # 이보다 오래 큐에 남은 건은 일시 오류라도 failed 로 확정
 # 파이프라인 루프와 수동 등록(API·봇)이 동시에 send_notifications 를 부르면 같은 큐 행을
 # 두 번 보낼 수 있다. 발송 구간을 직렬화해 중복을 막는다.
 _SEND_LOCK = threading.Lock()
+
+# ── 텔레그램 rate limit / flood 상태 (모듈 전역) ──────────────────────
+# 429 "Too Many Requests: retry after N" 을 받으면 그 N초 동안 봇 전체가 발송 금지다.
+# 이걸 무시하고 계속 두드리면 텔레그램이 금지 시간을 오히려 늘린다(2026-09-08 사고).
+_FLOOD_UNTIL = 0.0                       # time.monotonic() 기준. 이 시각까지 발송 보류
+_FLOOD_LOCK = threading.Lock()
+_SEND_TIMES: list[float] = []            # 최근 발송 시각(monotonic). 분당 한도 계산용
+_RATE_LOCK = threading.Lock()
+
+
+def _flood_arm(retry_after: float) -> None:
+    """텔레그램이 준 대기 시간만큼(+여유) 발송을 보류하도록 설정."""
+    global _FLOOD_UNTIL
+    with _FLOOD_LOCK:
+        _FLOOD_UNTIL = max(_FLOOD_UNTIL,
+                           time.monotonic() + max(1.0, retry_after) + FLOOD_PAD_SEC)
+
+
+def _flood_remaining() -> float:
+    """flood 대기가 남았으면 남은 초, 아니면 0."""
+    with _FLOOD_LOCK:
+        return max(0.0, _FLOOD_UNTIL - time.monotonic())
+
+
+def _rate_gate() -> None:
+    """채널 분당 한도 아래로 유지한다. 한도에 닿으면 가장 오래된 발송이 빠질 때까지 잔다.
+    (락은 sleep 전에 반드시 놓아 다른 스레드를 막지 않는다.)"""
+    while True:
+        with _RATE_LOCK:
+            now = time.monotonic()
+            _SEND_TIMES[:] = [t for t in _SEND_TIMES if now - t < 60.0]
+            if len(_SEND_TIMES) < TG_MAX_PER_MIN:
+                _SEND_TIMES.append(now)
+                return
+            wait = 60.0 - (now - _SEND_TIMES[0]) + 0.3
+        log.info("텔레그램 분당 발송 한도 근접 — %.1f초 대기", wait)
+        time.sleep(min(max(wait, 0.1), 60.0))
+
+
+_TRANSIENT_TG_HINTS = (
+    "too many requests", "retry after", "429", "bad gateway", "502",
+    "503", "gateway time-out", "gateway timeout", "internal server error",
+    "timed out", "timeout", "connection", "temporarily",
+)
+
+
+def _is_transient_tg_error(err: str | None) -> bool:
+    """rate limit·서버 오류·네트워크 오류처럼 <기다리면 풀리는> 실패인가.
+    이런 실패는 재시도 횟수를 깎지 않는다(일시 장애로 영구 실패 처리 방지)."""
+    low = (err or "").lower()
+    return any(h in low for h in _TRANSIENT_TG_HINTS)
+
+
+def _notify_too_old(row: dict) -> bool:
+    """큐에 들어온 지 NOTIFY_MAX_AGE_HOURS 를 넘겼는가.
+    일시 오류라도 이 정도 오래됐으면 포기하고 failed 로 확정한다(무한 재시도 방지)."""
+    created = parse_dt(row.get("created_at"))
+    if created is None:
+        return False
+    return (now_utc() - created) > timedelta(hours=NOTIFY_MAX_AGE_HOURS)
 
 
 def esc(text: str) -> str:
@@ -4673,13 +4927,33 @@ def format_message(row: dict) -> str:
     return "\n".join(lines)
 
 
-def _notify_reason(row: dict) -> str:
-    """알림 큐에서 나가는 기사의 '발송 이유' — 대시보드 '발송 로그' 에 표시된다."""
-    if row.get("source_type") == "manual":
-        return "URL 등록"          # 사용자가 URL 로 직접 등록한 기사
-    if row.get("priority"):
-        return "우선 발송"          # '항상 발송 키워드'·무조건 점수로 게이트 우회
-    return "자동 알림"              # 파이프라인이 중요도 임계값을 넘겨 발송
+def _notify_reason(row: dict, always_kws: Sequence[str] = (),
+                   threshold: int = 0, hard_score: int = 0) -> str:
+    """알림 큐에서 나가는 기사의 '발송 이유' — 대시보드 '발송 로그' 에 표시된다.
+
+    발송 시점에 <제목 + 판정된 그룹사> 와 점수로 다시 따져, 셋 중 무엇 때문에
+    나가는지 사람이 읽을 문구로 만든다.
+      · 항상발송 키워드 '…'        — 마스터가 지정한 키워드 매칭 (임계값·야간 우회)
+      · 무조건 발송 점수 66 ≥ 65   — hard_notify_score 이상
+      · 중요도 55 ≥ 임계값 30      — 평범한 임계값 초과
+    수동 URL 등록 기사는 앞에 'URL 등록 · ' 를 붙인다.
+    always_kws/threshold 없이 불린 경우(구버전 경로·테스트)는 짧은 라벨로 폴백한다.
+    """
+    manual = row.get("source_type") == "manual"
+    prefix = "URL 등록 · " if manual else ""
+    score = int(row.get("importance_score") or 0)
+    probe = f"{row.get('title') or ''}\n{' '.join(jload(row.get('group_companies'), []))}"
+    kw = _kw_first_hit(probe, [k for k in always_kws if k])
+    if kw:
+        return f"{prefix}항상발송 키워드 '{kw}'"
+    if hard_score > 0 and score >= hard_score:
+        return f"{prefix}무조건 발송 점수 {score} ≥ {hard_score}"
+    if threshold > 0 and score >= threshold:
+        return f"{prefix}중요도 {score} ≥ 임계값 {threshold}"
+    # 판정 근거 없이 불린 경우 — 대략적 분류로만
+    if manual:
+        return "URL 등록"
+    return "우선 발송" if row.get("priority") else "자동 알림"
 
 
 def effective_threshold(ctx: Context) -> int:
@@ -4729,10 +5003,18 @@ def queue_manual_notify(ctx: Context, article_id: str) -> bool:
     if not ctx.storage.queue_notification(article_id, cfg.telegram_chat_id, "queued",
                                           1 if is_priority else 0):
         return False  # 이미 큐에 있음 — 중복 발송 방지
-    try:
-        send_notifications(ctx, limit=3)
-    except Exception as exc:   # pragma: no cover
-        log.warning("수동 등록 알림 즉시 발송 실패(큐에는 남아 다음 주기에 재시도): %s", exc)
+    # 즉시 발송은 다른 발송이 진행 중이 아닐 때만 시도한다. 락을 기다리며 API 응답을
+    # 붙잡고 있으면(발송 배치가 수십 초 걸릴 수 있음) 등록 요청이 타임아웃된다.
+    # 지금 못 보내도 큐에 남아 다음 파이프라인 주기에 나간다.
+    if _SEND_LOCK.acquire(blocking=False):
+        try:
+            _send_notifications(ctx, limit=3)
+        except Exception as exc:   # pragma: no cover
+            log.warning("수동 등록 알림 즉시 발송 실패(큐에는 남아 다음 주기에 재시도): %s", exc)
+        finally:
+            _SEND_LOCK.release()
+    else:
+        log.info("다른 발송이 진행 중 — 수동 등록 기사는 큐에 두고 다음 주기에 발송합니다.")
     return True
 
 
@@ -4749,6 +5031,14 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     state = ctx.storage.get_run_state()
     if str(state.get("notify_paused") or "0") not in ("0", "False", "false", ""):
         return 0  # /stop 으로 일시중지됨
+
+    # 텔레그램이 429 로 "N초 기다려라" 한 상태면 이번 회차는 통째로 건너뛴다.
+    # 페널티 창 안에서 계속 두드리면 금지 시간이 오히려 늘어난다(2026-09-08 사고).
+    wait = _flood_remaining()
+    if wait > 0:
+        log.warning("텔레그램 flood 대기 중 — %.0f초 후 재개 (이번 회차 발송 건너뜀)", wait)
+        return 0
+
     pending = ctx.storage.pending_notifications(limit)
     if not pending:
         return 0
@@ -4773,14 +5063,30 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
             return 0
 
     url = TELEGRAM_API.format(token=cfg.telegram_bot_token)
+    # 발송 이유(대시보드 '발송 로그') 재판정에 쓸 현재 설정값 — 한 번만 읽는다.
+    always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
+    try:
+        hard_score = int(state.get("hard_notify_score") or 0)
+    except (TypeError, ValueError):
+        hard_score = 0
 
     def _send_one(row: dict) -> bool:
         """개별 카드 발송 — 요약·그룹사·점수가 다 들어간 전체 메시지."""
+        _rate_gate()   # 채널 분당 한도 아래로 유지 (알림 큐 발송에만 적용, 봇 응답은 제외)
+        reason = _notify_reason(row, always_kws, th, hard_score)
         ok, err = _telegram_send(ctx, url, clamp_message(format_message(row)),
-                                 kind=_notify_reason(row), article_id=row.get("article_id"))
+                                 kind=reason, article_id=row.get("article_id"))
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
+        elif _notify_too_old(row):
+            # 24시간 넘게 큐에 있었다 — 원인이 무엇이든 포기하고 failed 로 확정한다.
+            ctx.storage.mark_notification(row["id"], "failed", err)
+        elif _is_transient_tg_error(err):
+            # rate limit·서버 오류·네트워크 오류 — 기다리면 풀린다. 재시도 횟수를 쓰지 않고
+            # 큐에 그대로 두어 다음 회차(또는 flood 해제 후)에 다시 시도한다.
+            ctx.storage.touch_notification(row["id"], err)
         else:
+            # 진짜 실패(파싱 오류·chat not found·메시지 초과).
             # 3회까지 재시도. retry_count 가 3이 되면 pending 조회에서 빠진다.
             status = "queued" if int(row.get("retry_count") or 0) < 2 else "failed"
             ctx.storage.mark_notification(row["id"], status, err)
@@ -4793,9 +5099,17 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if prio_count >= PRIORITY_FLOOD_WARN:
         log.warning("우선 기사가 한 회차에 %d건입니다. '항상 발송 키워드'가 너무 넓지 않은지"
                     " 확인하세요(예: '포스코'는 사실상 전체 기사와 매칭됩니다).", prio_count)
-    # 다이제스트 묶음은 폐지됐다 — 전건 개별 카드. 재시도 3회 초과분은 _send_one 이
-    # failed 로 넘긴다(원격 세션의 '영구 실패' 수정 반영).
-    return sum(1 for row in pending if _send_one(row))
+
+    sent = 0
+    for row in pending:
+        if _flood_remaining() > 0:
+            # 방금 발송에서 429 를 받았다 — 남은 건은 큐에 두고 이번 회차를 끝낸다.
+            log.warning("flood 진입 — 이번 회차 남은 %d건은 큐에 유지",
+                        len(pending) - sent)
+            break
+        if _send_one(row):
+            sent += 1
+    return sent
 
 
 def warn_if_bad_chat_id(chat_id: str) -> None:
@@ -4868,13 +5182,10 @@ def _telegram_send(ctx: Context, url: str, text: str,
                    kind: str = "기타", article_id: str | None = None) -> tuple[bool, str | None]:
     """봇으로 메시지 1건을 보낸다. 성공·실패 모두 telegram_log 에 전문을 남긴다.
 
-    kind = 발송 이유. 대시보드 '발송 로그' 에 그대로 표시된다.
-      '자동 알림'   — 파이프라인이 큐에서 발송
-      'URL 등록'    — 사용자가 URL 로 직접 등록한 기사의 알림
-      '우선 발송'   — '항상 발송 키워드'·무조건 점수로 게이트 우회
-      '직접 전송'   — 카드의 ↗ 버튼
-      '봇 응답'     — 텔레그램 봇 명령·질문 응답
-      '연결 테스트' — sendtest 명령
+    kind = 발송 이유. 대시보드 '발송 로그' 에 그대로 표시된다. 큐 알림은
+    발송 시점에 판정한 문구가 들어온다(예: "항상발송 키워드 '포스코퓨처엠'",
+    "중요도 55 ≥ 임계값 30", "무조건 발송 점수 66 ≥ 65", "URL 등록 · …").
+    그 외: '직접 전송'(카드 ↗) · '봇 응답' · '연결 테스트' · '기타'.
     """
     target = chat_id or ctx.cfg.telegram_chat_id
     ok, err = False, None
@@ -4890,6 +5201,19 @@ def _telegram_send(ctx: Context, url: str, text: str,
             ok = True
         else:
             err = str(data.get("description") or resp.status_code)
+            if resp.status_code == 429:
+                # 텔레그램이 준 대기 시간만큼 봇 전체 발송을 보류한다.
+                retry_after = 0
+                try:
+                    retry_after = int((data.get("parameters") or {}).get("retry_after") or 0)
+                except (TypeError, ValueError):
+                    retry_after = 0
+                if retry_after <= 0:
+                    m = re.search(r"retry after (\d+)", err or "", re.IGNORECASE)
+                    retry_after = int(m.group(1)) if m else 30
+                _flood_arm(retry_after)
+                log.warning("텔레그램 429 — %d초 발송 보류 (retry after)", retry_after)
+                err = f"Too Many Requests: retry after {retry_after}"
     except Exception as exc:
         err = str(exc)
     # 로그 기록은 발송 성패에 영향을 주면 안 된다 — 어떤 예외도 삼킨다.
@@ -6326,6 +6650,49 @@ def cmd_regroup(ctx: Context) -> None:
              changed, unchanged, unchecked)
 
 
+def cmd_repeople(ctx: Context, limit: int = 60) -> None:
+    """기존 인사·부고 기사를 사람별 구조 요약(LLM)으로 다시 만든다.
+
+    규칙 기반 덤프로 저장된 카드를 원문에서 본문을 다시 받아 재정리한다.
+    limit 로 LLM 호출 수를 제한한다(비용 관리). `repeople 20` 처럼 쓴다.
+    """
+    rows = [r for r in ctx.storage.list_articles(8000, 0, None, "")
+            if PEOPLE_NEWS_CATEGORY in jload(r.get("categories"), [])]
+    log.info("인사·부고 기사 %d건 중 최대 %d건을 재정리합니다.", len(rows), limit)
+    done = failed = skipped = 0
+    for r in rows:
+        if done >= limit:
+            break
+        kind = people_news_kind(r.get("url_canonical") or "", r.get("title") or "") or "personnel"
+        target = r.get("url_canonical") or r.get("url_original") or r.get("url_source") or ""
+        if not target:
+            skipped += 1
+            continue
+        try:
+            _, html = resolve_canonical(ctx.http, target)
+            body = extract_body(html)
+            if len(body) < 40:
+                skipped += 1
+                continue
+            summary, model, usage = people_summary(
+                ctx, kind, r.get("title") or "", r.get("press_name") or "", body, use_llm=True)
+            if not model:
+                failed += 1
+                continue
+            ctx.storage.save_summary({
+                "id": new_id(), "article_id": r["id"],
+                "summary_text": summary, "perspective_text": "",
+                "summary_source": "notice", "model": model, "token_usage": usage or None,
+                "created_at": iso(now_utc()),
+            })
+            done += 1
+            log.info("  ✓ %s", (r.get("title") or "")[:44])
+        except Exception as exc:
+            failed += 1
+            log.warning("  ✗ %s — %s", (r.get("title") or "")[:44], exc)
+    log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
+
+
 def cmd_fixlinks(ctx: Context) -> None:
     """홈페이지 루트로 잘못 저장된 url_canonical 을 바로잡는다 (일회성).
 
@@ -6581,7 +6948,8 @@ def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
         started = time.monotonic()
         try:
             run_once(ctx)
-            send_notifications(ctx)
+            # 한 회차에 12건까지만 — 억제 해제 등으로 큐가 밀려도 분당 한도를 넘기지 않는다.
+            send_notifications(ctx, limit=SEND_BATCH_PER_CYCLE)
             maybe_run_weekly(ctx)
         except Exception as exc:
             log.exception("파이프라인 실행 중 오류: %s", exc)
@@ -6850,7 +7218,7 @@ def cmd_selftest() -> int:
           "정부/정책" in detect_categories("김정관 산업부 장관, G20 참석"), True)
     check("철강 공정어는 '산업'", "산업" in detect_categories("포스코 포항 3고로 개수 완료"), True)
 
-    print("\n[8-5] 인사·부고 (LLM 없이 공지 원문만)")
+    print("\n[8-5] 인사·부고 (제목 판정 + 규칙 요약 + LLM 구조화)")
     check("[부고] 말머리 → obituary",
           people_news_kind("", "[부고] 홍길동(전 삼성 부사장)씨 모친상"), "obituary")
     check("연합 부고 섹션 URL → obituary",
@@ -6875,6 +7243,32 @@ def cmd_selftest() -> int:
     check("인사 요약 = ◇…블록",
           format_people_notice("기자 구독 구독중 이전 다음 ◇ 편집국 ▲ 산업본부장 류준형 (서울=연합뉴스)", "personnel"),
           "◇ 편집국 ▲ 산업본부장 류준형")
+    # LLM 구조화 결과 렌더 (format_people_llm)
+    _pl = {"kind": "personnel", "people": [{
+        "name": "이지원", "org": "기획예산처 재정관리국", "position": "부이사관", "change": "승진",
+        "exam": "행정고시 45회",
+        "career": ["기획재정부 재정성과평가과장(23.5~25.5)", "기획재정부 재정관리총괄과장"],
+        "duty": "부담금 관리체계 전면 정비", "education": ""}]}
+    _out = format_people_llm(_pl, "personnel")
+    check("인사 구조화 — 머리줄", _out.splitlines()[0], "ㆍ기획예산처 재정관리국 이지원 부이사관 승진")
+    check("인사 구조화 — 고시 줄", "· 행정고시 45회" in _out, True)
+    check("인사 구조화 — 이력 번호",
+          "· 이력: 1) 기획재정부 재정성과평가과장(23.5~25.5) 2) 기획재정부 재정관리총괄과장" in _out, True)
+    check("인사 구조화 — 업무 줄", "· 업무: 부담금 관리체계 전면 정비" in _out, True)
+    check("인사 구조화 — 빈 학력은 생략", "학력" in _out, False)
+    check("이름 없는 항목은 건너뜀",
+          format_people_llm({"people": [{"org": "A"}, {"name": "김", "org": "B"}]}, "personnel"),
+          "ㆍB 김")
+    _po = {"kind": "obituary", "deaths": [{
+        "subject": "홍길동 전 삼성전자 부사장", "relation": "김철수 부장 부친상",
+        "mourners": "홍자녀", "wake": "서울아산병원 3호실",
+        "funeral": "9월 11일", "burial": "OO추모공원", "contact": "02-3010-2000"}]}
+    _ov = format_people_llm(_po, "obituary")
+    check("부고 구조화 — 머리줄",
+          _ov.splitlines()[0], "ㆍ홍길동 전 삼성전자 부사장 / 김철수 부장 부친상")
+    check("부고 구조화 — 발인·장지 한 줄", "· 발인 9월 11일 / 장지 OO추모공원" in _ov, True)
+    check("부고 구조화 — 연락처", "· ☎ 02-3010-2000" in _ov, True)
+    check("빈 파싱 결과 → 빈 문자열", format_people_llm({}, "personnel"), "")
     check("'실적' 단독은 시장/주가 태그 아님",
           "시장/주가" in detect_categories("포스코 2분기 실적 발표"), False)
     check("주가 특화어는 시장/주가 태그",
@@ -7121,10 +7515,53 @@ def cmd_selftest() -> int:
     check("30일 기준이면 오래된 원장 1건 정리", _tmp.prune_url_ledger(90), 1)
 
     print("\n[11-2c] 텔레그램 발송 로그 (telegram_log)")
-    # 발송 이유 판정
+    # 발송 이유 판정 — 판정 근거(키워드·임계값·무조건점수) 없이 부르면 짧은 라벨로 폴백
     check("수동 등록 → 'URL 등록'", _notify_reason({"source_type": "manual"}), "URL 등록")
     check("우선 기사 → '우선 발송'", _notify_reason({"priority": 1}), "우선 발송")
     check("그 외 → '자동 알림'", _notify_reason({"source_type": "naver_api"}), "자동 알림")
+    # 발송 이유 판정 — 근거를 주면 사람이 읽을 문구로
+    _kwrow = {"title": "포스코퓨처엠 양극재 증설", "group_companies": ["포스코퓨처엠"],
+              "importance_score": 40}
+    check("항상발송 키워드 매칭 → 키워드 명시",
+          _notify_reason(_kwrow, ["포스코퓨처엠"], 30, 0), "항상발송 키워드 '포스코퓨처엠'")
+    check("무조건 발송 점수 초과",
+          _notify_reason({"title": "x", "importance_score": 66}, [], 30, 65),
+          "무조건 발송 점수 66 ≥ 65")
+    check("중요도 임계값 초과",
+          _notify_reason({"title": "x", "importance_score": 55}, [], 30, 0),
+          "중요도 55 ≥ 임계값 30")
+    check("수동 등록 + 임계값 초과 → 접두",
+          _notify_reason({"source_type": "manual", "title": "x", "importance_score": 55}, [], 30, 0),
+          "URL 등록 · 중요도 55 ≥ 임계값 30")
+    check("키워드가 점수보다 우선 표기",
+          _notify_reason({"title": "포스코 파업", "group_companies": ["포스코"],
+                          "importance_score": 90}, ["포스코"], 30, 50),
+          "항상발송 키워드 '포스코'")
+    check("_kw_first_hit — 첫 매칭 키워드", _kw_first_hit("리튬 니켈 가격", ["코발트", "니켈"]), "니켈")
+    check("_kw_first_hit — 없으면 None", _kw_first_hit("철강 수출", ["니켈"]), None)
+    # rate limit / flood 헬퍼
+    check("일시 오류 판정 — 429", _is_transient_tg_error("Too Many Requests: retry after 5"), True)
+    check("일시 오류 판정 — chat not found 는 진짜 실패",
+          _is_transient_tg_error("Bad Request: chat not found"), False)
+    _flood_arm(2)
+    check("_flood_arm 후 남은 대기 > 0", _flood_remaining() > 0, True)
+    _FLOOD_GLOBALS = globals()
+    _FLOOD_GLOBALS["_FLOOD_UNTIL"] = 0.0   # 다른 검증에 영향 없도록 즉시 해제
+    check("_flood 해제 후 0", _flood_remaining(), 0.0)
+    # 막힌 발송 실패 되돌리기
+    _tmp._exec("insert into articles (id, url_source, url_canonical, url_original, title,"
+               " published_at, collected_at, source_type, status) values"
+               " (?,?,?,?,?,?,?,?,?)",
+               ("art-rf", "u-rf", "u-rf", "u-rf", "제목", _d030, _d030, "search", "active"))
+    _tmp._exec("insert into notifications (id, article_id, channel, chat_id, status, retry_count,"
+               " created_at) values (?,?,?,?,?,?,?)",
+               ("ntf-rf1", "art-rf", "telegram", "c", "failed", 3, _d030))
+    _tmp._exec("insert into notifications (id, article_id, channel, chat_id, status, retry_count,"
+               " created_at) values (?,?,?,?,?,?,?)",
+               ("ntf-rf2", "art-rf", "telegram", "c2", "queued", 5, _d030))
+    check("실패·소진 2건을 큐로 되돌림", _tmp.requeue_failed_notifications(), 2)
+    check("되돌린 뒤 재시도 카운트 0",
+          _tmp._one("select max(retry_count) as m from notifications where article_id='art-rf'")["m"], 0)
     _tmp.log_telegram({"chat_id": "-100", "kind": "자동 알림", "article_id": "art-core-mid",
                        "text": "🔴 [포스코퓨처엠] 시험 알림", "ok": True, "error": None})
     _tmp.log_telegram({"chat_id": "-100", "kind": "직접 전송", "article_id": None,
@@ -7413,6 +7850,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
+  repeople [N]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (기본 60건까지)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -7420,6 +7858,7 @@ USAGE = """사용법: python backend/main.py <명령>
   run        서버 + 수집 루프 + 텔레그램 챗봇 (운영 모드)
   quotes     시세만 1회 갱신
   notify     대기 중인 텔레그램 알림만 발송
+  retryfailed  발송 실패로 막힌 알림을 다시 큐로 되돌림 (rate limit 등 일시 장애 복구용)
   chatid     텔레그램 chat_id 확인 (봇에게 메시지를 한 번 보낸 뒤 실행)
   sendtest   텔레그램 시험 메시지 1건 발송 (연결 확인용)
   ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
@@ -7461,6 +7900,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_reanalyze(ctx)
     elif command == "reswot":
         cmd_reswot(ctx)
+    elif command == "repeople":
+        limit = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 60
+        cmd_repeople(ctx, limit)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":
@@ -7472,6 +7914,9 @@ def main(argv: Sequence[str]) -> int:
         log.info("시세 %d건 갱신", refresh_quotes(ctx))
     elif command == "notify":
         log.info("텔레그램 발송 %d건", send_notifications(ctx))
+    elif command == "retryfailed":
+        n = ctx.storage.requeue_failed_notifications()
+        log.info("발송 실패 %d건을 큐로 되돌렸습니다. 다음 발송 주기(또는 notify 명령)에 재시도됩니다.", n)
     elif command == "chatid":
         cmd_chatid(ctx)
     elif command == "sendtest":

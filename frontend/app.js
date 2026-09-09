@@ -195,6 +195,16 @@ async function loadStats() {
 
 function stripTags(s) { return (s || '').replace(/<[^>]+>/g, ''); }
 
+/* 발송 이유 문구 → 알약에 넣을 짧은 분류. 전체 문구는 카드 본문에 따로 나온다. */
+function tglogShortKind(kind) {
+  const k = kind || '기타';
+  if (k.startsWith('URL 등록')) return 'URL 등록';
+  if (k.includes('항상발송 키워드')) return '항상발송 키워드';
+  if (k.includes('무조건 발송 점수')) return '무조건 점수';
+  if (k.includes('임계값')) return '중요도 임계값';
+  return k;   // '봇 응답' · '직접 전송' · '연결 테스트' · '자동 알림' 등 이미 짧음
+}
+
 const STAT_DETAIL = {
   notify: {
     title: '발송 실패',
@@ -236,15 +246,22 @@ const STAT_DETAIL = {
   tglog: {
     title: '텔레그램 발송 로그',
     api: '/api/stats/telegram-log',
-    desc: '봇으로 실제 나간 메시지입니다 (알림·봇 응답·테스트). 최근 100건.',
+    desc: '봇으로 실제 나간 메시지입니다. "발송 이유"가 이 기사를 왜 보냈는지 — '
+        + '항상발송 키워드 매칭인지, 중요도 임계값 초과인지 — 알려줍니다. 최근 100건.',
     render: (it) => {
       const box = el('div', `tglog-item${it.ok ? '' : ' tglog-item--fail'}`);
       const head = el('div', 'tglog-head');
-      head.append(el('span', 'tglog-kind', it.kind || '기타'));   // 발송 이유
+      const kind = it.kind || '기타';
+      // 긴 발송 이유 문구는 짧은 분류만 알약으로, 전체 문구는 아래 줄에 보여 준다.
+      head.append(el('span', 'tglog-kind', tglogShortKind(kind)));
       head.append(el('span', `tglog-state tglog-state--${it.ok ? 'ok' : 'fail'}`, it.ok ? '성공' : '실패'));
       if (it.created_at) head.append(el('span', 'tglog-time', formatDate(it.created_at)));
       if (it.chat_id) head.append(el('span', 'tglog-chat', it.chat_id));
       box.append(head);
+      const why = el('div', 'tglog-why');
+      why.append(el('b', null, '발송 이유: '));
+      why.append(document.createTextNode(kind));
+      box.append(why);
       box.append(el('div', 'tglog-text', stripTags(it.text)));
       if (!it.ok && it.error) {
         const e = el('div', 'tglog-err');
@@ -431,7 +448,9 @@ function buildCard(item) {
 
   /* 요약 — '[언론사, 기자]' 머리표 + 본문 (F4.1) */
   if (item.summary_text) {
-    const p = el('p', 'card-summary');
+    /* 인사·부고는 사람별 줄바꿈 구조라 개행을 살린다 */
+    const isPeople = (item.categories || []).includes('인사·부고');
+    const p = el('p', isPeople ? 'card-summary card-summary--people' : 'card-summary');
     if (item.summary_header) {
       p.append(el('span', 'summary-head', item.summary_header + ' '));
     }
