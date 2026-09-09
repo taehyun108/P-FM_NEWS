@@ -60,7 +60,17 @@ def _env_on(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-# 수집 시각(서버 로컬시간 기준 시). 기본 09시·15시 — 하루 2회.
+def app_tz() -> timezone:
+    """운영 기준 시간대. main.load_config 와 같은 APP_TZ_OFFSET 을 읽는다(기본 KST).
+    클라우드 서버는 대개 UTC 라 datetime.now() 를 그대로 쓰면 수집 시각이 9시간 어긋난다."""
+    return timezone(timedelta(hours=_env_int("APP_TZ_OFFSET", 9, -12, 14)))
+
+
+def now_local() -> datetime:
+    return datetime.now(app_tz())
+
+
+# 수집 시각(운영 기준 시간대 = 기본 KST 기준 시). 기본 09시·15시 — 하루 2회.
 def schedule_hours() -> list[int]:
     raw = _env("EA_SCHEDULE_HOURS", "9,15")
     out: list[int] = []
@@ -1022,7 +1032,7 @@ def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             if ea_enabled():
-                now = datetime.now()
+                now = now_local()   # 서버 TZ 가 아니라 운영 기준(KST) 시각으로 판단
                 last = _last_collect_at(db)
                 gap_ok = last is None or (now_utc() - last) >= timedelta(hours=EA_MIN_GAP_HOURS)
                 due = any(now.hour >= h for h in schedule_hours())

@@ -357,7 +357,7 @@
               <!-- 스레드 3 -->
               <rect class="box-navy" x="228" y="74" width="292" height="60" rx="7"/>
               <text class="lbl-b" x="244" y="99">메인 · FastAPI (uvicorn)</text>
-              <text class="lbl-sm" x="244" y="118">27개 엔드포인트 · 인덱스 인라인 서빙</text>
+              <text class="lbl-sm" x="244" y="118">31개 엔드포인트 · 인덱스 인라인 서빙</text>
 
               <rect class="box" x="228" y="150" width="292" height="70" rx="7"/>
               <text class="lbl-b" x="244" y="175">스레드 A · 수집 루프</text>
@@ -1245,11 +1245,50 @@
             <tr><td>임베딩 상한</td><td class="num">30회/실행</td><td>유사 제목 대량 유입 시 폭주 방어</td></tr>
             <tr><td>임베딩 정리</td><td class="num">48시간</td><td>중복 판정 창 밖이면 <code>title_embedding</code> 비움 — 용량 회수</td></tr>
             <tr><td>알림 임계값</td><td class="num">50</td><td>마스터 패널에서 조절</td></tr>
-            <tr><td>야간 모드</td><td class="num">23–07시</td><td>중요도 80 이상만 발송</td></tr>
+            <tr><td>야간 모드</td><td class="num">23–07시</td><td>중요도 80 이상만 발송. <b>운영 기준 시간대</b>(아래) 기준</td></tr>
             <tr><td>주간 레포트</td><td class="num">월 07시</td><td><code>WEEKLY_REPORT_HOUR</code> · 이번 주 미발송이면 자동 생성·발송</td></tr>
             <tr><td>마스터 로그인</td><td class="num">24시간</td><td>서버 메모리 토큰 — 재시작 시 소멸</td></tr>
+            <tr><td>웹 접속 세션</td><td class="num">30일</td><td>비밀번호 해시에서 파생 — 재시작에도 유지, 비밀번호 변경 시 일괄 무효</td></tr>
+            <tr><td>URL 등록 상한</td><td class="num">30건/시간</td><td>요청 1건 = LLM 호출 1건(과금). 비용 폭주 방어</td></tr>
           </tbody>
         </table></div>
+
+        <h3>운영 기준 시간대 — 배포하면 반드시 맞춰야 한다</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          <b>야간 억제(23–07시) · 주간 레포트 발송 시각 · 대외협력 수집 시각(9·15시)</b> 세 가지는
+          <b>한국 시간</b>으로 판단해야 한다. 로컬 PC 는 KST 라 <code>datetime.now()</code> 로도
+          맞았지만, <b>클라우드 서버는 대부분 UTC 로 돈다</b> — 그대로 두면 9시간이 어긋나
+          <b>야간 억제가 대낮에 걸리고 주간 레포트가 일요일 밤에 나간다.</b>
+          그래서 <code>now_local()</code>(main) · <code>now_local()</code>(external_affairs) 이
+          <code>APP_TZ_OFFSET</code>(기본 9) 을 적용한 시각을 돌려주고, 세 판정이 모두 이 함수를 쓴다.
+          저장·비교용 시각은 지금까지처럼 전부 UTC(<code>now_utc()</code>·<code>iso()</code>)다 —
+          지역시간은 <b>스케줄 판단에만</b> 쓴다.
+        </p>
+
+        <h3>접속 통제 (배포용)</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          마스터 토큰은 <b>관리 기능</b>만 지킨다. 배포하면 주소만 알아도 기사 목록은 물론
+          <code>/api/analyze-url</code>(LLM 과금) · <code>/api/articles/{id}/telegram</code>(발송) 까지
+          누구나 부를 수 있으므로, 그 앞에 <b>세션 관문</b>을 하나 둔다.
+          <code>WEB_PASSWORD</code>(또는 마스터 패널의 '웹페이지 비밀번호')가 설정돼 있을 때만 켜지고,
+          비어 있으면(로컬 개발) 아무 것도 막지 않는다.
+          미인증이면 화면은 <b>로그인 페이지</b>, <code>/api/*</code> 는 <b>401</b> 이다.
+          통과하면 <code>pfm_web</code> 쿠키(HttpOnly · SameSite=Lax · 30일 · https 면 Secure)를 받는다.
+          세션 토큰은 <b>저장된 비밀번호 해시에서 파생</b>되므로 서버에 세션을 두지 않아도
+          재시작에 살아남고, 비밀번호를 바꾸면 기존 쿠키가 전부 무효가 된다.
+          잠금과 무관하게 열리는 경로는 <code>/healthz</code> · <code>/api/web/*</code> ·
+          <code>/kakao/callback</code> 뿐이다.
+          <br>덧붙여 CORS 는 <code>ALLOWED_ORIGINS</code> 에 적은 주소만 허용한다(기본: 교차 오리진 차단).
+          수동 URL 등록은 <code>is_public_http_url()</code> 로 사설망·루프백·클라우드 메타데이터
+          (169.254.169.254) 주소를 막아 서버가 내부망을 대신 긁는 <b>SSRF</b> 를 차단한다.
+        </p>
+
+        <div class="note">
+          <b>인스턴스는 반드시 1개.</b> <code>run</code> 한 프로세스 안에서 API 와 함께
+          수집·시세·텔레그램봇·대외협력 스레드가 돈다. 2개로 늘리면 수집·LLM·알림이 두 벌 나간다.
+          텔레그램은 <code>(기사, 채널, 채팅방)</code> UNIQUE 가 일부 막아 주지만 카카오는 막히지 않는다.
+          오토스케일은 최소=최대=1 로 고정한다. 자세한 절차는 <code>DEPLOY.md</code>.
+        </div>
 
         <h3>일회성 정리 명령</h3>
         <p>

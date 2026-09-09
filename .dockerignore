@@ -1,0 +1,21 @@
+# 이미지에 들어가면 안 되는 것 / 넣을 필요 없는 것
+.env
+.env.*
+!.env.example
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+
+# 로컬 SQLite (기사 원문 포함)
+*.db
+*.db-wal
+*.db-shm
+
+# 문서·발표자료 — 런타임에 불필요하고 이미지만 키운다
+docs/*.pptx
+PLAN.md
+PRD.md
+skills

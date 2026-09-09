@@ -1,14 +1,17 @@
 # 승인된 라이브러리 목록 (PLAN 0-2)
 # 이 목록 밖의 패키지는 사용 전 사용자에게 확인한다. (CLAUDE.md 규약)
-requests>=2.31
-feedparser>=6.0
-beautifulsoup4>=4.12
-readability-lxml>=0.8
-openai>=1.40
-python-dotenv>=1.0
-fastapi>=0.110
-uvicorn>=0.29
+#
+# 상한(<)은 배포 때 메이저 버전이 말없이 올라가 깨지는 것을 막기 위한 것이다.
+# 아래 조합은 2026-09-09 기준 로컬에서 검증된 버전 대역이다.
+requests>=2.31,<3
+feedparser>=6.0,<7
+beautifulsoup4>=4.12,<5
+readability-lxml>=0.8,<1
+openai>=1.40,<4
+python-dotenv>=1.0,<2
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
 # DB_BACKEND=supabase 로 전환할 때만 필요
-supabase>=2.4
+supabase>=2.4,<3
 # LANGSMITH_TRACING=true 일 때만 필요 (LLM 호출 추적)
-langsmith>=0.11
+langsmith>=0.11,<1

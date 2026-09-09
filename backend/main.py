@@ -195,6 +195,8 @@ class Config:
     api_host: str
     api_port: int
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
+    web_password: str             # 사이트 접속 비밀번호. 비우면 잠금 없음(로컬 개발)
+    tz_offset_hours: int          # 운영 기준 시간대 UTC 오프셋 (한국 = 9)
     # 주간 레포트 (월요일 아침 이메일)
     weekly_enabled: bool
     weekly_to: list[str]          # 수신자 이메일 (쉼표로 여러 명)
@@ -278,6 +280,11 @@ def load_config() -> Config:
     if not os.path.isabs(sqlite_path):
         sqlite_path = os.path.join(ROOT_DIR, sqlite_path)
 
+    # 야간 억제·주간 레포트·대외협력 스케줄이 쓰는 기준 시간대를 여기서 확정한다.
+    # 클라우드 서버는 UTC 로 도는 경우가 대부분이라 기본값을 KST(+9)로 둔다.
+    tz_off = get_env_int("APP_TZ_OFFSET", 9, -12, 14)
+    set_app_tz(tz_off)
+
     return Config(
         openai_api_key=openai_key,
         llm_model=get_env("LLM_MODEL", "gpt-5.6-luna"),
@@ -307,9 +314,15 @@ def load_config() -> Config:
         # 알림 대상이었거나·중요도 높거나·그룹사 태그가 있는 '핵심' 기사의 보존일.
         # 그 외 잡음 기사는 RETENTION_SOFT_DAYS(90일)만 보관한다. 약 550일 = 18개월.
         article_retention_days=get_env_int("ARTICLE_RETENTION_DAYS", 550, 30),
-        api_host=get_env("API_HOST", "127.0.0.1"),
-        api_port=get_env_int("API_PORT", 8000, 1, 65535),
+        # 컨테이너·클라우드에서는 0.0.0.0 으로 열어야 밖에서 붙는다. PORT 가 주입돼
+        # 있으면(= 클라우드) 기본값을 0.0.0.0 으로 바꾼다. 로컬은 그대로 127.0.0.1.
+        api_host=get_env("API_HOST", "0.0.0.0" if get_env("PORT") else "127.0.0.1"),
+        # 클라우드(Render·Koyeb·Fly·Railway 등)는 리슨 포트를 PORT 로 주입한다.
+        # PORT 가 있으면 그것을 우선한다 — 없으면 기존 API_PORT.
+        api_port=get_env_int("PORT", 0, 0, 65535) or get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
+        web_password=get_env("WEB_PASSWORD"),
+        tz_offset_hours=tz_off,
         weekly_enabled=get_env("WEEKLY_REPORT_ENABLED", "").strip().lower() in ("1", "true", "yes"),
         weekly_to=[e.strip() for e in get_env("WEEKLY_REPORT_TO", "").replace(";", ",").split(",")
                    if e.strip()],
@@ -348,6 +361,24 @@ def parse_dt(value: Any) -> datetime | None:
 
 
 KST = timezone(timedelta(hours=9))  # 한국 표준시
+APP_TZ = KST   # 운영 기준 시간대. load_config() 가 APP_TZ_OFFSET 으로 덮어쓴다.
+
+
+def set_app_tz(offset_hours: float) -> None:
+    """운영 기준 시간대를 UTC 오프셋(시)으로 지정한다. 한국은 서머타임이 없어
+    고정 오프셋으로 충분하다(zoneinfo·tzdata 의존성을 만들지 않는다)."""
+    global APP_TZ
+    APP_TZ = timezone(timedelta(hours=max(-12.0, min(14.0, offset_hours))))
+
+
+def now_local() -> datetime:
+    """운영 기준 지역시간(기본 KST = UTC+9).
+
+    야간 억제(23–07시)·주간 레포트 발송 시각·대외협력 수집 시각은 모두
+    '한국 시간' 기준이어야 한다. 클라우드 서버는 대개 UTC 로 도는데
+    datetime.now() 를 그대로 쓰면 9시간 어긋나 야간 억제가 대낮에 걸린다.
+    """
+    return datetime.now(APP_TZ)
 
 
 def parse_feed_datetime(raw: Any, struct: Any = None) -> datetime | None:
@@ -4889,6 +4920,34 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     return score
 
 
+def is_public_http_url(raw_url: str) -> bool:
+    """공인 인터넷 주소인가 — 사설망·루프백·링크로컬이면 False.
+
+    수동 URL 등록은 서버가 그 주소를 대신 가져온다. 막지 않으면 사내망 주소나
+    클라우드 메타데이터(169.254.169.254)를 대신 긁게 만들 수 있다(SSRF).
+    """
+    import ipaddress
+    import socket
+    host = (urlsplit(raw_url).hostname or "").strip("[]")
+    if not host:
+        return False
+    if host.lower() in ("localhost",) or host.lower().endswith((".local", ".internal")):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False   # 이름을 못 풀면 가져올 수도 없다
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
 def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     """사용자가 직접 붙여넣은 URL 하나를 포토카드로 만든다. (PRD F8 수동 등록)
 
@@ -4901,6 +4960,9 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     raw_url = (raw_url or "").strip()
     if not re.match(r"^https?://", raw_url, re.I):
         return {"ok": False, "error": "http/https 로 시작하는 URL 을 입력하세요."}
+    if not is_public_http_url(raw_url):
+        # 사설망·로컬 주소를 넣어 서버가 내부망을 대신 긁게 만드는 SSRF 를 막는다.
+        return {"ok": False, "error": "외부에 공개된 뉴스 주소만 등록할 수 있습니다."}
 
     url_source = normalize_url(raw_url)
 
@@ -5378,7 +5440,7 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if not pending:
         return 0
 
-    hour = datetime.now().hour
+    hour = now_local().hour   # 서버 TZ 가 아니라 운영 기준(KST) 시각으로 판단
     is_night = hour >= NIGHT_START or hour < NIGHT_END
     if is_night:
         # 야간에는 중요도 80 이상 또는 우선 기사만 즉시 발송, 나머지는 큐에 남긴다. (PRD F7.3)
@@ -6276,8 +6338,8 @@ def maybe_run_weekly(ctx: Context) -> None:
     cfg = ctx.cfg
     if not cfg.weekly_enabled:
         return
-    now_local = datetime.now()
-    if now_local.weekday() != 0 or now_local.hour < cfg.weekly_hour:
+    cur = now_local()   # 서버 TZ 가 아니라 운영 기준(KST) 시각으로 판단
+    if cur.weekday() != 0 or cur.hour < cfg.weekly_hour:
         return
     last = parse_dt(ctx.storage.get_run_state().get("last_weekly_report_at"))
     if last is not None and (now_utc() - last) < timedelta(days=6):
@@ -6333,6 +6395,42 @@ def _issue_master_token() -> str:
 def _valid_master_token(tok: str) -> bool:
     exp = _MASTER_TOKENS.get(tok or "")
     return bool(exp and exp > now_utc())
+
+
+# ── 사이트 전체 잠금 (배포용) ────────────────────────────────────────
+# 마스터 토큰은 관리 기능만 지킨다. 배포하면 URL 만 알아도 기사 목록·URL 등록·
+# 텔레그램 직접 전송 API 를 누구나 쓸 수 있으므로, 그 앞에 세션 관문을 하나 둔다.
+WEB_COOKIE = "pfm_web"
+WEB_SESSION_DAYS = 30
+# 잠금 대상에서 빼는 경로 — 로그인 자체, 헬스체크, 카카오 OAuth 착지점.
+WEB_PUBLIC_PATHS = frozenset({"/api/web/login", "/api/web/logout", "/api/web/status",
+                              "/healthz", "/kakao/callback", "/kakao"})
+_WEB_PW_CACHE: dict[str, Any] = {"at": 0.0, "pw": ""}
+WEB_PW_TTL_SEC = 60.0   # run_state 조회가 요청마다 DB 를 때리지 않게
+
+
+def web_session_token(pw: str) -> str:
+    """비밀번호에서 결정적으로 파생한 세션 토큰.
+
+    서버에 세션을 저장하지 않아 재시작해도 로그인이 풀리지 않고,
+    비밀번호를 바꾸면 기존 쿠키가 자동으로 무효가 된다.
+    """
+    return hmac.new(pw.encode("utf-8"), b"pfm-web-session-v1", hashlib.sha256).hexdigest()
+
+
+# URL 수동 등록은 요청 1건 = LLM 호출 1건(과금)이라 시간당 상한을 둔다.
+_analyze_calls: list[float] = []
+ANALYZE_MAX_PER_HOUR = 30   # 정상 사용(하루 몇 건)에는 걸리지 않는 넉넉한 상한
+
+
+def _rate_ok(bucket: list[float], limit: int, window: float = 3600.0) -> bool:
+    """window 초 안에서 limit 회까지 허용. 통과하면 호출 시각을 기록한다."""
+    now = time.time()
+    bucket[:] = [t for t in bucket if now - t < window]
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    return True
 
 
 def check_master_password(ctx: Context, pw: str) -> bool:
@@ -6530,13 +6628,120 @@ def scan_store_upsert(storage: "Storage", article_id: str) -> None:
 def create_app(ctx: Context):
     fastapi = _import("fastapi", "fastapi")
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
 
     app = fastapi.FastAPI(title="P-FM NEWS API", docs_url="/api/docs")
+    # 프런트는 같은 오리진에서 서빙되므로 CORS 가 필요 없다. 다른 사이트에서
+    # 이 API 를 부르게 두면 세션을 가진 이용자를 통해 발송·분석이 트리거될 수 있다.
+    # ALLOWED_ORIGINS 에 콤마로 적은 주소만 허용하고, 비우면 교차 오리진을 막는다.
+    _origins = [o.strip() for o in get_env("ALLOWED_ORIGINS", "").split(",") if o.strip()]
     app.add_middleware(
-        CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"]
+        CORSMiddleware, allow_origins=_origins, allow_credentials=True,
+        allow_methods=["GET", "POST"], allow_headers=["*"],
     )
+
+    def _web_secret() -> str:
+        """잠금 기준이 되는 비밀 재료. 빈 문자열이면 잠금이 꺼진다(로컬 개발).
+
+        잠금은 '명시적으로 설정했을 때'만 켠다 — .env WEB_PASSWORD 가 있거나,
+        마스터 패널에서 웹 비밀번호를 지정(run_state.web_password)했을 때.
+        예전에 남아 있을 수 있는 web_pw_hash 만으로는 켜지 않는다. 기억 못 하는
+        비밀번호로 화면이 잠겨 버리는 사고를 막기 위해서다.
+
+        검증 재료로는 해시(web_pw_hash)가 있으면 그것을 쓴다. 해시 문자열은
+        비밀번호가 바뀌면 함께 바뀌므로 세션 토큰도 저절로 무효가 된다.
+        """
+        now = time.monotonic()
+        if now - float(_WEB_PW_CACHE["at"]) < WEB_PW_TTL_SEC:
+            return str(_WEB_PW_CACHE["pw"])
+        secret = ""
+        try:
+            st = ctx.storage.get_run_state()
+            if (st.get("web_password") or "").strip():        # 패널에서 지정함 = 잠금 on
+                secret = (st.get("web_pw_hash") or "").strip() or st["web_password"].strip()
+        except Exception as exc:   # DB 장애 때 사이트를 통째로 잠가 버리지 않는다
+            log.debug("웹 비밀번호 조회 실패(.env 값 사용): %s", exc)
+        if not secret and ctx.cfg.web_password:               # .env 로 지정함 = 잠금 on
+            secret = ctx.cfg.web_password
+        _WEB_PW_CACHE.update(at=now, pw=secret)
+        return secret
+
+    def _web_password() -> str:
+        """잠금이 켜져 있는가(빈 문자열이면 꺼짐). 이름은 게이트 가독성 때문에 유지."""
+        return _web_secret()
+
+    def _web_verify(pw: str) -> bool:
+        """입력한 비밀번호가 맞는가. 해시가 있으면 해시로, 없으면 평문과 비교."""
+        secret = _web_secret()
+        if not secret or not isinstance(pw, str) or not pw:
+            return False
+        if secret.count("$") >= 3:      # pbkdf2$iters$salt$hash 형태 = 저장된 해시
+            return verify_password(pw, secret)
+        return hmac.compare_digest(pw, secret)
+
+    def _web_session_ok(token: str) -> bool:
+        secret = _web_secret()
+        return bool(token) and bool(secret) and hmac.compare_digest(
+            token, web_session_token(secret))
+
+    def _web_login_page() -> str:
+        """잠금 상태에서 화면 대신 내주는 로그인 페이지. 외부 파일 없이 자립한다."""
+        return (
+            "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>P-FM NEWS</title><style>"
+            "body{font-family:system-ui,'Malgun Gothic',sans-serif;background:#0E2841;margin:0;"
+            "display:flex;min-height:100vh;align-items:center;justify-content:center}"
+            "form{background:#fff;padding:36px 40px;border-radius:14px;width:300px;"
+            "box-shadow:0 8px 32px rgba(0,0,0,.25)}"
+            "h1{margin:0 0 6px;font-size:19px;color:#0E2841}"
+            "p{margin:0 0 18px;font-size:13px;color:#667}"
+            "input{width:100%;box-sizing:border-box;padding:11px;font-size:14px;"
+            "border:1px solid #ccd;border-radius:7px}"
+            "button{width:100%;margin-top:12px;padding:11px;font-size:14px;font-weight:600;"
+            "background:#156082;color:#fff;border:0;border-radius:7px;cursor:pointer}"
+            "button:disabled{opacity:.6;cursor:default}"
+            ".e{margin-top:10px;font-size:12px;color:#c0392b;min-height:16px}"
+            "</style></head><body><form id='f' autocomplete='on'>"
+            "<h1>P-FM NEWS</h1><p>사내 뉴스 인텔리전스 · 접속 비밀번호를 입력하세요.</p>"
+            "<input id='pw' type='password' name='password' placeholder='비밀번호' "
+            "autocomplete='current-password' autofocus required>"
+            "<button id='b' type='submit'>들어가기</button>"
+            "<div class='e' id='e'></div></form><script>"
+            "var f=document.getElementById('f'),b=document.getElementById('b'),"
+            "e=document.getElementById('e');"
+            "f.addEventListener('submit',async function(ev){ev.preventDefault();"
+            "b.disabled=true;e.textContent='';try{"
+            "var r=await fetch('/api/web/login',{method:'POST',"
+            "headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({password:document.getElementById('pw').value})});"
+            "var d=await r.json();"
+            "if(d.ok){location.replace('/');return;}"
+            "e.textContent=d.error||'로그인에 실패했습니다.';}"
+            "catch(err){e.textContent='서버에 연결하지 못했습니다.';}"
+            "b.disabled=false;});"
+            "</script></body></html>"
+        )
+
+    @app.middleware("http")
+    async def _web_gate(request, call_next):
+        """사이트 전체 잠금 — WEB_PASSWORD(또는 마스터 패널의 웹 비밀번호)가 있을 때만 동작.
+
+        비밀번호가 비어 있으면(로컬 개발) 아무 것도 막지 않는다. 설정돼 있으면
+        쿠키에 든 세션 토큰이 맞아야 화면·API 를 내준다 — 배포 후 URL 만 알면
+        누구나 기사·발송 API 를 쓸 수 있는 상태를 막는 것이 목적이다.
+        """
+        if _web_password() and request.url.path not in WEB_PUBLIC_PATHS:
+            if not _web_session_ok(request.cookies.get(WEB_COOKIE, "")):
+                accept = request.headers.get("accept", "")
+                if request.url.path.startswith("/api/"):
+                    return JSONResponse({"ok": False, "error": "로그인이 필요합니다."},
+                                        status_code=401)
+                if "text/html" in accept or accept in ("", "*/*"):
+                    return HTMLResponse(_web_login_page(), status_code=401)
+                return JSONResponse({"ok": False, "error": "로그인이 필요합니다."}, status_code=401)
+        return await call_next(request)
 
     @app.middleware("http")
     async def _no_cache_frontend(request, call_next):
@@ -6801,7 +7006,6 @@ def create_app(ctx: Context):
         return JSONResponse({"ok": True, "url": url, "kind": "bot"})
 
     def _kakao_cb_page(title: str, body: str, ok: bool):
-        from fastapi.responses import HTMLResponse
         color = "#156082" if ok else "#c0392b"
         html = (
             "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
@@ -6878,6 +7082,46 @@ def create_app(ctx: Context):
 
     app.add_api_route("/kakao/callback", _kakao_callback, methods=["GET"])
     app.add_api_route("/kakao", _kakao_callback, methods=["GET"])  # 구 리다이렉트 URI 호환
+
+    # ── 사이트 접속 로그인 (WEB_PASSWORD 가 설정됐을 때만 의미 있음) ──
+    @app.get("/healthz")
+    def healthz():
+        """플랫폼 프로브·업타임 핑용. DB 를 건드리지 않는 가벼운 응답."""
+        return JSONResponse({"ok": True, "service": "pfm-news"})
+
+    # 주의: 이 파일은 from __future__ import annotations 를 쓰므로 타입 주석이 문자열이다.
+    # create_app 지역의 fastapi 는 모듈 전역이 아니라 FastAPI 가 주석을 풀지 못한다.
+    # 그래서 Request 를 주입받지 않고 Cookie/Header 기본값으로만 값을 받는다.
+    @app.get("/api/web/status")
+    def api_web_status(pfm_web: str = fastapi.Cookie(default="")):
+        """잠금이 켜져 있는지 / 지금 세션이 유효한지."""
+        return JSONResponse({"ok": True, "locked": bool(_web_password()),
+                             "authed": _web_session_ok(pfm_web)})
+
+    @app.post("/api/web/login")
+    async def api_web_login(payload: dict,
+                            x_forwarded_proto: str = fastapi.Header(default="")):
+        """접속 비밀번호 확인 후 세션 쿠키를 심는다. 로그인 페이지가 fetch 로 호출한다."""
+        pw = (payload or {}).get("password", "")
+        secret = _web_secret()
+        if not secret:
+            return JSONResponse({"ok": True, "locked": False})   # 잠금이 꺼져 있음
+        if not _web_verify(pw):
+            return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
+                                status_code=401)
+        resp = JSONResponse({"ok": True})
+        # 프록시가 "https" 또는 "https,http" 처럼 넘기므로 부분 일치로 본다.
+        # HttpOnly + SameSite=Lax 로 자바스크립트 탈취와 교차 사이트 POST 를 막는다.
+        resp.set_cookie(WEB_COOKIE, web_session_token(secret),
+                        max_age=WEB_SESSION_DAYS * 86400, httponly=True, samesite="lax",
+                        secure="https" in x_forwarded_proto.lower(), path="/")
+        return resp
+
+    @app.post("/api/web/logout")
+    def api_web_logout():
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(WEB_COOKIE, path="/")
+        return resp
 
     # ── 마스터 패널 (PRD 추가) ──────────────────────────────────────
     def _master_guard(token: str) -> JSONResponse | None:
@@ -7018,6 +7262,9 @@ def create_app(ctx: Context):
             # 해시와 평문을 함께 보관하고, 평문은 마스터 인증 뒤에서만 노출한다.
             ctx.storage.set_run_state({"web_pw_hash": hash_password(new_pw),
                                        "web_password": new_pw})
+            # 세션 토큰은 비밀번호에서 파생되므로 바꾸는 즉시 기존 쿠키가 무효가 된다.
+            # 캐시를 비워 다음 요청부터 새 값을 쓰게 한다.
+            _WEB_PW_CACHE.update(at=0.0, pw="")
         return JSONResponse({"ok": True})
 
     @app.post("/api/analyze-url")
@@ -7027,6 +7274,12 @@ def create_app(ctx: Context):
         url = (payload or {}).get("url", "")
         if not isinstance(url, str) or len(url) > 2000:
             return JSONResponse({"ok": False, "error": "URL 형식이 올바르지 않습니다."}, status_code=400)
+        # 이 경로는 요청 1건이 곧 LLM 호출 1건(과금)이다. 실수·악용으로 비용이
+        # 새지 않게 시간당 상한을 둔다. 정상 사용(하루 몇 건)에는 걸리지 않는다.
+        if not _rate_ok(_analyze_calls, ANALYZE_MAX_PER_HOUR):
+            return JSONResponse(
+                {"ok": False, "error": f"URL 등록은 시간당 {ANALYZE_MAX_PER_HOUR}건까지입니다."
+                                       " 잠시 후 다시 시도해 주세요."}, status_code=429)
         import anyio
 
         def _work():
@@ -7141,8 +7394,6 @@ def create_app(ctx: Context):
         ea_mod.register_api(app, ctx)
 
     if os.path.isdir(FRONTEND_DIR):
-        from fastapi.responses import HTMLResponse
-
         _index_cache: dict[str, Any] = {"sig": None, "html": ""}
         _index_files = [os.path.join(FRONTEND_DIR, n)
                         for n in ("index.html", "style.css", "app.js",
@@ -8542,6 +8793,42 @@ def cmd_selftest() -> int:
           len(_kakao_text_from_row({**_fr, "summary_text": "요" * 500,
                                     "perspective_text": "관" * 500},
                                    "https://x.test/a")["text"]) <= 200, True)
+
+    print("\n[13-2d] 배포 안전장치 — 시간대 · 세션 · SSRF · 호출 상한")
+    # 시간대: 클라우드는 UTC 로 돌기 때문에 야간 억제·주간 레포트가 어긋난다.
+    _tz_before = APP_TZ
+    set_app_tz(9)
+    check("APP_TZ +9 로 설정", now_local().utcoffset(), timedelta(hours=9))
+    set_app_tz(0)
+    check("APP_TZ 0 (UTC) 로 설정", now_local().utcoffset(), timedelta(hours=0))
+    check("같은 순간이라도 TZ 에 따라 시(hour)가 다르다",
+          (now_local().hour - datetime.now(timezone(timedelta(hours=9))).hour) % 24, 15)
+    set_app_tz(99)   # 범위를 벗어난 값은 잘라 낸다
+    check("APP_TZ 상한 +14 로 제한", now_local().utcoffset(), timedelta(hours=14))
+    globals()["APP_TZ"] = _tz_before   # 다른 검증에 영향 없도록 복원
+
+    # 웹 세션 토큰 — 비밀번호에서 파생되므로 재시작에 안전하고 변경 시 자동 무효화
+    check("같은 비밀번호 → 같은 토큰",
+          web_session_token("pw1") == web_session_token("pw1"), True)
+    check("비밀번호가 바뀌면 토큰도 바뀜",
+          web_session_token("pw1") == web_session_token("pw2"), False)
+    check("토큰은 비밀번호를 노출하지 않음", "pw1" in web_session_token("pw1"), False)
+
+    # SSRF — 서버가 사내망·메타데이터 주소를 대신 긁지 않게 막는다 (IP 리터럴이라 DNS 불필요)
+    check("루프백 차단", is_public_http_url("http://127.0.0.1/a"), False)
+    check("사설망 10.x 차단", is_public_http_url("http://10.0.0.5/a"), False)
+    check("사설망 192.168.x 차단", is_public_http_url("http://192.168.0.1/a"), False)
+    check("클라우드 메타데이터 169.254 차단",
+          is_public_http_url("http://169.254.169.254/latest/meta-data/"), False)
+    check("localhost 이름 차단", is_public_http_url("http://localhost:8000/a"), False)
+    check("공인 IP 는 통과", is_public_http_url("http://8.8.8.8/a"), True)
+    check("호스트 없으면 차단", is_public_http_url("http:///a"), False)
+
+    # URL 등록 시간당 상한 — 요청 1건이 LLM 호출 1건(과금)이라 비용을 묶어 둔다
+    _rl: list[float] = []
+    check("상한까지는 허용", all(_rate_ok(_rl, 3) for _ in range(3)), True)
+    check("상한 초과는 차단", _rate_ok(_rl, 3), False)
+    check("창(window)이 지나면 다시 허용", _rate_ok(_rl, 3, window=0.0), True)
 
     print("\n[13-2b] 무조건 발송 점수 (hard_notify_score) — 우선 판정")
     # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)
