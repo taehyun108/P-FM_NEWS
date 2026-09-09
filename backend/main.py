@@ -536,6 +536,15 @@ class Storage(ABC):
         """
 
     @abstractmethod
+    def changed_articles_since(self, since: str, limit: int = 5000) -> list[dict]:
+        """마지막 스캔 이후 수집·재분석된 행 (상태 무관). scan 스토어 델타 갱신용.
+
+        Supabase 이관 후 요청마다 활성 테이블 전체를 읽으면 무료 대역폭을 넘긴다.
+        메모리 스토어를 두고 이 델타(회당 수십 건)만 읽어 반영한다.
+        보관·삭제·미분석으로 바뀐 행은 status/analyzed_at 을 보고 스토어에서 뺀다.
+        """
+
+    @abstractmethod
     def card_details(self, ids: Sequence[str]) -> list[dict]:
         """화면에 보일 소수 기사만 카드용 전체 컬럼으로 읽는다. 입력 순서를 유지한다."""
 
@@ -1067,6 +1076,17 @@ class SqliteStorage(Storage):
         args.append(limit)
         return self._rows(sql, args)
 
+    def changed_articles_since(self, since: str, limit: int = 5000) -> list[dict]:
+        return self._rows(
+            f"select {ARTICLE_SCAN_COLS}, a.status, s.summary_text"
+            " from articles a"
+            " left join summaries s on s.article_id = a.id"
+            " where a.is_representative=1"
+            " and (a.collected_at >= ? or coalesce(a.analyzed_at,'') >= ?)"
+            " order by a.published_at desc limit ?",
+            (since, since, limit),
+        )
+
     def card_details(self, ids: Sequence[str]) -> list[dict]:
         if not ids:
             return []
@@ -1537,12 +1557,19 @@ class SupabaseStorage(Storage):
         total += len(res.data or [])
         cand = (self._t("articles").select("id,group_companies,importance_score")
                 .neq("status", "draft").lt("published_at", soft_cut)
-                .lt("importance_score", keep_score).limit(20000).execute()).data or []
+                .lt("importance_score", keep_score).limit(50000).execute()).data or []
         ids = [r["id"] for r in cand if not (r.get("group_companies") or [])]
         if ids:
-            notified = {r["article_id"] for r in
-                        (self._t("notifications").select("article_id")
-                         .neq("status", "skipped").limit(100000).execute()).data or []}
+            # 알림된 적 있는지는 '후보 id 에 대해서만' 조회한다. 전체 notifications 를
+            # 상한 걸어 읽으면(예전 limit 100000) 알림 이력이 그 수를 넘긴 뒤부터
+            # 알림됐던 오래된 기사도 잘못 삭제된다.
+            notified: set[str] = set()
+            for i in range(0, len(ids), 300):
+                part = ids[i:i + 300]
+                notified |= {r["article_id"] for r in
+                             (self._t("notifications").select("article_id")
+                              .in_("article_id", part).neq("status", "skipped")
+                              .execute()).data or []}
             drop = [i for i in ids if i not in notified]
             for i in range(0, len(drop), 200):
                 part = drop[i:i + 200]
@@ -1631,6 +1658,15 @@ class SupabaseStorage(Storage):
             like = f"%{query}%"
             q = q.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
         rows = q.order("published_at", desc=True).limit(limit).execute().data
+        return [self._flatten(r) for r in rows]
+
+    def changed_articles_since(self, since: str, limit: int = 5000) -> list[dict]:
+        cols = ARTICLE_SCAN_COLS.replace("a.", "")
+        rows = (self._t("articles")
+                .select(f"{cols}, status, summaries(summary_text)")
+                .eq("is_representative", True)
+                .or_(f"collected_at.gte.{since},analyzed_at.gte.{since}")
+                .order("published_at", desc=True).limit(limit).execute().data) or []
         return [self._flatten(r) for r in rows]
 
     def card_details(self, ids: Sequence[str]) -> list[dict]:
@@ -4567,6 +4603,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             log.info("보존 정리: 기사 %d · 수집로그 %d · URL원장 %d · 발송로그 %d 삭제 (핵심 %d일·잡음 %d일 보관)",
                      gone, logs_gone, ledger_gone, tglog_gone,
                      cfg.article_retention_days, RETENTION_SOFT_DAYS)
+        if gone:
+            # 대량 삭제분을 스캔 스토어(델타는 삭제를 못 봄)에 즉시 반영한다.
+            try:
+                refresh_scan_store(storage, full=True)
+            except Exception as e:   # pragma: no cover
+                log.debug("스캔 스토어 재적재 실패(무시): %s", e)
         # SQLite 는 삭제해도 파일이 안 줄어들어 가끔 VACUUM 으로 회수한다(락 위험 있어 드물게).
         if gone and cfg.db_backend == "sqlite" and (
                 _VACUUM_LAST is None or (_n - _VACUUM_LAST) >= timedelta(days=RETENTION_VACUUM_DAYS)):
@@ -5906,10 +5948,7 @@ def maybe_run_weekly(ctx: Context) -> None:
 
 PERIOD_HOURS = {"today": 24, "7d": 24 * 7, "30d": 24 * 30, "all": 0}
 # 배열 필터(그룹사·카테고리)는 SQL 인덱스로 못 걸어 애플리케이션에서 처리한다.
-# 이 값을 넘으면 오래된 기사가 피드·필터칩·건수에서 조용히 사라지므로 보존 정책
-# (잡음 90일 · 핵심 550일)에서 나올 수 있는 활성 행수보다 넉넉해야 한다.
-# 실측 활성 증가량 약 240건/일 → 90일 약 21,000행. 여유를 둬 30,000 으로 잡는다.
-MAX_SCAN_ROWS = 30000
+# 스캔 대상 행수 상한은 SCAN_STORE_CAP(스토어 정의부 참조).
 
 # ── 마스터 패널 인증 ─────────────────────────────────────────────────
 MASTER_TOKEN_TTL = timedelta(hours=24)      # 로그인 유지 (사용자 지정)
@@ -6083,6 +6122,60 @@ def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses:
     return [t["row"] for t in tagged]
 
 
+# ── 목록 스캔 스토어 ────────────────────────────────────────────────
+# /api/articles·/api/filters 는 활성·분석완료 기사 수천~수만 행을 훑어 필터한다.
+# 요청마다 DB 를 다시 읽으면 Supabase 이관 후 무료 대역폭(5GB/월)을 금방 넘긴다.
+# 태그가 붙은 행을 메모리에 두고, 파이프라인이 사이클마다 '바뀐 것만' 델타로 갱신한다.
+_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0}
+_SCAN_STORE_LOCK = threading.Lock()
+SCAN_STORE_CAP = 40000            # 메모리 상한(≈100일치). 넘으면 발행일 오래된 것부터 버린다.
+SCAN_FULL_RELOAD_SEC = 20 * 3600  # 삭제·상태변경 반영: 하루 1회 전체 재적재
+
+
+def _row_ts(r: dict) -> str:
+    return max(r.get("collected_at") or "", r.get("analyzed_at") or "")
+
+
+def _store_put(st: dict, r: dict) -> None:
+    if r.get("status") in (None, "active") and r.get("analyzed_at"):
+        st["by_id"][r["id"]] = tag_row(r)
+    else:   # 보관·삭제·미분석으로 바뀐 행은 스토어에서 뺀다
+        st["by_id"].pop(r["id"], None)
+
+
+def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
+    """태그가 붙은 활성·분석완료 행 목록. 최초/하루 1회만 전체, 그 외엔 델타만 읽는다."""
+    now = time.monotonic()
+    with _SCAN_STORE_LOCK:
+        st = _SCAN_STORE
+        if full or not st["by_id"] or (now - st["full_at"]) > SCAN_FULL_RELOAD_SEC:
+            rows = storage.scan_articles(SCAN_STORE_CAP, None, "")
+            st["by_id"] = {r["id"]: tag_row(r) for r in rows}
+            st["cursor"] = max((_row_ts(r) for r in rows), default="")
+            st["full_at"] = now
+        elif st["cursor"]:
+            fresh = storage.changed_articles_since(st["cursor"])
+            for r in fresh:
+                _store_put(st, r)
+            if fresh:
+                st["cursor"] = max([st["cursor"]] + [_row_ts(r) for r in fresh])
+            if len(st["by_id"]) > SCAN_STORE_CAP * 1.15:
+                keep = sorted(st["by_id"].values(),
+                              key=lambda t: t["row"].get("published_at") or "", reverse=True)
+                st["by_id"] = {t["row"]["id"]: t for t in keep[:SCAN_STORE_CAP]}
+        return list(st["by_id"].values())
+
+
+def scan_store_upsert(storage: "Storage", article_id: str) -> None:
+    """수동 등록처럼 즉시 반영이 필요한 한 건만 스토어에 넣거나 뺀다."""
+    row = storage.article_detail(article_id)
+    with _SCAN_STORE_LOCK:
+        if row:
+            _store_put(_SCAN_STORE, row)
+        else:
+            _SCAN_STORE["by_id"].pop(article_id, None)
+
+
 def create_app(ctx: Context):
     fastapi = _import("fastapi", "fastapi")
     from fastapi.middleware.cors import CORSMiddleware
@@ -6110,42 +6203,47 @@ def create_app(ctx: Context):
     # 수동 URL 등록이 겹치지 않게 직렬화한다(SQLite 쓰기 경합 방지).
     _manual_lock = threading.Lock()
 
-    def _scan_rows(period: str, query: str) -> list[dict]:
-        hours = PERIOD_HOURS.get(period, 0)
-        since = now_utc() - timedelta(hours=hours) if hours else None
-        # 분석이 끝난 기사만 노출한다(analyzed_at 조건은 scan_articles 가 SQL 에서 건다).
-        # 수집만 된(deferred) 기사는 관련성이 본문으로 아직 확정되지 않아
-        # 오태그(잘못된 포스코·배터리 태그)가 섞인다. (사용자 지정 2026-09-08)
-        return ctx.storage.scan_articles(MAX_SCAN_ROWS, since, query)
-
-    # ── 스캔 + 태그 캐시 ────────────────────────────────────────────
-    # /api/articles·/api/filters 는 매 요청 수천 행을 훑어 필터를 걸고 그중 한 페이지만
-    # 카드로 만든다. 스캔은 경량 컬럼만 읽고(scan_articles), 태그는 기사별로 메모(_TAG_MEMO)
-    # 하며, 데이터는 수집 주기(기본 300초)에 한 번만 바뀌므로 조합별로 캐시한다.
+    # ── 스캔 스토어 + 결과 캐시 ────────────────────────────────────
+    # 태그가 붙은 행은 모듈 전역 _SCAN_STORE 에 있고 파이프라인이 델타로 갱신한다.
+    # 여기서는 (기간, 검색어)로 걸러낸 결과만 짧게 캐시해 재필터 CPU 를 줄인다.
     _scan_cache: dict[str, dict] = {}
     _filters_cache: dict[str, Any] = {"at": 0.0, "data": None}
-    SCAN_TTL_SEC = 30
+    SCAN_TTL_SEC = 20
     FILTERS_TTL_SEC = 30
 
     def _scan_tagged(period: str, query: str) -> list[dict]:
-        """행 + 사전계산된 필터 태그(표시용 리스트 g/c/p, 정규화 키 gk/ck/pk)."""
+        """스토어에서 (기간·검색어) 조건에 맞는 태그된 행만 골라 돌려준다."""
         key = f"{period}\x00{query}"
         now = time.monotonic()
         ent = _scan_cache.get(key)
         if ent and now - ent["at"] < SCAN_TTL_SEC:
             return ent["data"]
-        data = [tag_row(row) for row in _scan_rows(period, query)]
+        rows = refresh_scan_store(ctx.storage)
+        hours = PERIOD_HOURS.get(period, 0)
+        cut = iso(now_utc() - timedelta(hours=hours)) if hours else ""
+        ql = query.lower().strip()
+        data = [
+            t for t in rows
+            if (not cut or (t["row"].get("published_at") or "") >= cut)
+            and (not ql or ql in " ".join((
+                t["row"].get("title") or "", t["row"].get("summary_text") or "",
+                t["row"].get("author") or "", t["row"].get("press_name") or "")).lower())
+        ]
         _scan_cache[key] = {"at": now, "data": data}
-        # 검색어별 항목이 무한히 쌓이지 않게 오래된 것부터 정리한다.
         if len(_scan_cache) > 24:
             for k in sorted(_scan_cache, key=lambda k: _scan_cache[k]["at"])[:12]:
                 _scan_cache.pop(k, None)
         return data
 
-    def _bust_scan_cache() -> None:
-        """수동 등록·draft 확정 등 즉시 반영이 필요한 쓰기 후 캐시를 비운다."""
+    def _bust_scan_cache(article_id: str | None = None) -> None:
+        """수동 등록·draft 확정 등 즉시 반영이 필요할 때. 결과 캐시를 비우고
+        해당 기사만 스토어에 반영(id 없으면 다음 요청에서 전체 재적재)."""
         _scan_cache.clear()
         _filters_cache.update(at=0.0, data=None)
+        if article_id:
+            scan_store_upsert(ctx.storage, article_id)
+        else:
+            _SCAN_STORE["full_at"] = 0.0
 
     @app.get("/api/articles")
     def api_articles(group: str = "", cat: str = "", press: str = "",
@@ -6513,7 +6611,7 @@ def create_app(ctx: Context):
         notified = False
         if row.get("status") == "draft":
             ctx.storage.update_article(article_id, {"status": "active"})
-            _bust_scan_cache()
+            _bust_scan_cache(article_id)
             # 등록 확정 시 임계값을 넘으면 텔레그램 채널에도 발송한다. (사용자 지정 2026-09-08)
             try:
                 notified = queue_manual_notify(ctx, article_id)
@@ -7068,7 +7166,7 @@ def cmd_initdb(ctx: Context) -> None:
 _MIGRATE_TABLES = [
     "press_outlets", "feed_sources", "keyword_sets", "run_state", "url_ledger",
     "articles", "article_bodies", "summaries", "swot_analyses", "notifications",
-    "collection_logs", "market_quotes", "weekly_reports",
+    "collection_logs", "market_quotes", "weekly_reports", "telegram_log",
     "ea_agencies", "ea_policy_items", "ea_analyses", "ea_url_ledger", "ea_run_state",
 ]
 
@@ -7137,6 +7235,8 @@ def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
             # 한 회차에 12건까지만 — 억제 해제 등으로 큐가 밀려도 분당 한도를 넘기지 않는다.
             send_notifications(ctx, limit=SEND_BATCH_PER_CYCLE)
             maybe_run_weekly(ctx)
+            # 목록 스캔 스토어를 델타로 갱신해 둔다(웹 요청 시 DB 재조회 없음).
+            refresh_scan_store(ctx.storage)
         except Exception as exc:
             log.exception("파이프라인 실행 중 오류: %s", exc)
 
@@ -7699,6 +7799,38 @@ def cmd_selftest() -> int:
     check("태그 메모 — 언론사명이 바뀌면 갱신", (tag_row(_r1)["p"], tag_row(_r2)["p"]), ("A", "B"))
     check("태그 메모 — id 없는 행은 캐시하지 않는다",
           tag_row({"group_companies": ["포스코"], "categories": [], "press_name": "Z"})["g"], ["포스코"])
+
+    print("\n[11-2e] 스캔 스토어 델타 갱신 (changed_articles_since · refresh_scan_store)")
+    _SCAN_STORE["by_id"].clear(); _SCAN_STORE["cursor"] = ""; _SCAN_STORE["full_at"] = 0.0
+    _tmp._exec("delete from articles"); _tmp._exec("delete from summaries")
+    _t0 = iso(now_utc() - timedelta(hours=2))
+    for _sid, _pub in (("st-a", _t0), ("st-b", _t0)):
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+            " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_sid, f"h/{_sid}", f"h/{_sid}", f"h/{_sid}", "포스코퓨처엠 " + _sid, _pub, _pub,
+             "search", 70, '["포스코퓨처엠"]', '["양극재"]', "한경", _pub, "active", 1))
+    rows = refresh_scan_store(_tmp, full=True)
+    check("전체 적재 — 2건", sorted(t["row"]["id"] for t in rows), ["st-a", "st-b"])
+    # 새 기사 1건 추가 → 델타로만 반영
+    _later = iso(now_utc() - timedelta(minutes=1))
+    _tmp._exec(
+        "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+        " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+        " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("st-c", "h/c", "h/c", "h/c", "포스코퓨처엠 c", _later, _later, "search", 70,
+         '["포스코퓨처엠"]', '["양극재"]', "한경", _later, "active", 1))
+    rows = refresh_scan_store(_tmp)
+    check("델타 — 신규 1건 반영", "st-c" in {t["row"]["id"] for t in rows}, True)
+    # st-a 를 보관 처리 → 델타가 스토어에서 제거
+    _tmp._exec("update articles set status='archived', collected_at=? where id='st-a'",
+               (iso(now_utc()),))
+    rows = refresh_scan_store(_tmp)
+    check("델타 — 보관된 기사는 스토어에서 빠진다", "st-a" in {t["row"]["id"] for t in rows}, False)
+    check("changed_articles_since 는 상태 무관하게 준다",
+          "st-a" in {r["id"] for r in _tmp.changed_articles_since(iso(now_utc() - timedelta(minutes=5)))}, True)
+    _SCAN_STORE["by_id"].clear(); _SCAN_STORE["cursor"] = ""; _SCAN_STORE["full_at"] = 0.0
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
