@@ -1048,17 +1048,34 @@
           <b>약 200–300 MB 선</b>에서 안정된다. 보존일을 늘리면 용량도 비례해 커진다.
         </p>
 
-        <h3>Supabase 전환 절차</h3>
-        <ol style="margin:8px 0 0 18px; font-size:13px; line-height:1.9;">
-          <li>Supabase 대시보드 &gt; SQL Editor 에서 <code>backend/schema.sql</code> 실행 (테이블 19개 생성)</li>
-          <li><code>.env</code> 에 <code>SUPABASE_URL</code>·<code>SUPABASE_SERVICE_ROLE_KEY</code>·
-              <code>SUPABASE_ANON_KEY</code> 입력. <b>두 키를 서로 바꿔 넣어도</b> 코드가 JWT
-              <code>role</code> 을 보고 <code>service_role</code> 키를 골라 쓴다(<code>_pick_supabase_service_key</code>).</li>
-          <li><code>.env DB_BACKEND=supabase</code> 로 전환</li>
-          <li><code>python backend/main.py migrate</code> — SQLite 전체를 Supabase 로 배치 upsert
-              (JSON 문자열·불리언 자동 변환). 처음이면 <code>initdb</code> 로 시드만 넣어도 된다.</li>
-          <li>서버 재시작. <code>저장소: Supabase</code> 로그 확인.</li>
-        </ol>
+        <h3>Supabase 전환 — 완료 (2026-09-09)</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          <b>운영 DB 를 Supabase 로 옮겼다.</b> SQLite 2,600행을 <code>migrate</code> 로 배치 이관 →
+          <code>DB_BACKEND=supabase</code> → 서버 재시작. 파이프라인 1사이클 <b>149초</b>(SQLite 40~70초 →
+          네트워크 왕복이 더해졌지만 주기 300초 안). 이관 절차: ① SQL Editor 에서 <code>schema.sql</code>
+          실행 ② <code>DB_BACKEND=supabase</code> ③ <code>python backend/main.py migrate</code> ④ 재시작.
+          (<code>schema.sql</code> 이 <b>19개 테이블 전부에 RLS</b> 를 켜므로 SQL Editor 의
+          "Run and enable RLS" 자동 재작성은 쓰지 않는다 — 그게 CREATE TABLE 을 깬다.)
+        </p>
+        <div class="note warn">
+          <b>SQLite 에선 안 보이던 것들이 이관 후 첫 사이클에 터졌다.</b>
+          <ul style="margin:6px 0 0; font-size:13px;">
+            <li><b>PostgREST max-rows(1000)</b> — <code>.limit(40000)</code> 이 조용히 1000 으로 잘려
+              <code>period=all</code> 이 1,000건만 보였다. <code>_page(factory, cap)</code> 로 Range 헤더 페이징.</li>
+            <li><b><code>.in_(...)</code> URL 길이 초과</b> — 구글뉴스 리다이렉트 URL 400개를 쿼리스트링에
+              넣어 <code>Bad Request</code>. <code>_in_batches</code> 로 누적 4KB 씩 분할.</li>
+            <li><b>HTTP 팬아웃 → 연결 끊김</b> — <code>bump_ledger</code> 가 URL 마다 select+update 를
+              순차로(회당 1,000+회) 쳐 HTTP/2 가 죽었다. 배치 조회 + 한 번의 upsert 로. alias 확인도
+              URL 마다 <code>contains</code> 쿼리 대신 alias 붙은 극소수 행만 통째로 훑는다.</li>
+            <li><b><code>collection_logs.id</code> bigserial 충돌</b> — 이관이 명시 id 를 넣어 시퀀스가
+              안 움직였다. <code>migrate</code> 가 bigserial 테이블은 id 를 빼고 넣도록 수정.</li>
+          </ul>
+        </div>
+        <p style="font-size:13px; line-height:1.8;">
+          이관 전 점검에서 미리 고친 것: <code>telegram_log</code> 를 <code>_MIGRATE_TABLES</code> 에 추가,
+          <code>purge_old_articles</code> 의 <code>notifications</code> 전체 조회(<code>limit 100000</code>) →
+          후보 id 만 <code>in_()</code> 청크 조회(9개월 뒤 오삭제 방지), 그리고 아래 <b>스캔 스토어</b>.
+        </p>
       </section>
 
       <!-- ═══════════ 6. 성능 ═══════════ -->
@@ -1069,7 +1086,7 @@
           <thead><tr><th>엔드포인트</th><th class="num">응답</th><th>비고</th></tr></thead>
           <tbody>
             <tr><td><code>GET /</code></td><td class="num">5 ms</td><td>HTML+JS+CSS 조립 결과를 파일 수정시각으로 캐시</td></tr>
-            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 30초 캐시(웜). 콜드 약 184 ms. 필터·정렬(<code>sort=recent|score</code>)·페이지네이션은 매 요청 신선</td></tr>
+            <tr><td><code>GET /api/articles</code></td><td class="num">5/330 ms</td><td>SQLite/Supabase 웜. 스토어 콜드 약 3 s. 필터·정렬(<code>sort=recent|score</code>)·페이지네이션은 매 요청 신선</td></tr>
             <tr><td><code>GET /api/filters</code></td><td class="num">8 ms</td><td>30초 캐시 + <code>/api/articles</code>와 스캔·태그 캐시 공유</td></tr>
             <tr><td><code>GET /api/stats</code></td><td class="num">21 ms</td><td>집계 쿼리</td></tr>
             <tr><td><code>GET /api/weekly</code></td><td class="num">4 ms</td><td>저장된 최신 레포트 반환 (생성은 별도)</td></tr>
@@ -1084,12 +1101,16 @@
           쓰이지도 않는 값이었다. 필요한 컬럼만 고르도록 바꿔 <b>15배</b> 빨라졌다(36 ms).
         </p>
         <p>
-          그 뒤로도 <code>/api/articles</code>는 캐시가 없어 필터 클릭·페이지 이동마다
-          3,000행 조인 조회 + 행마다 <code>card_tags</code>(그룹사 규칙 매칭·정규화)를 다시 돌았다.
-          데이터는 수집 주기(기본 300초)에 한 번만 바뀌므로 <b>(기간, 검색어)별 스캔·태그 결과를
-          30초 캐시</b>하고, 필터링·페이지네이션·카드 생성만 매 요청 수행하도록 바꿨다.
-          <code>/api/filters</code>도 같은 캐시를 공유한다. 웜 응답 기준 다시 <b>7배</b>(36 → 5 ms).
-          수동 등록·draft 확정 시에는 캐시를 즉시 비운다.
+          그 뒤로도 <code>/api/articles</code>는 필터 클릭·페이지 이동마다 수천 행을 다시 읽어
+          <code>card_tags</code>(그룹사 규칙 매칭·정규화)를 다시 돌았다. SQLite 에선 인프로세스라
+          쌌지만 <b>Supabase(네트워크)에선 캐시 미스마다 수 MB~수십 MB 전송</b> — 무료 대역폭(5GB/월)을
+          몇 주면 넘긴다. 그래서 <b>스캔 스토어(<code>_SCAN_STORE</code>, 모듈 전역)</b>를 뒀다:
+          태그 붙인 행을 메모리에 두고, 파이프라인이 사이클마다 <code>changed_articles_since</code>
+          델타(회당 수십 건)만 읽어 반영한다. 전체 재적재는 하루 1회 + 보존 정리(대량 삭제) 직후,
+          API 요청의 델타 조회는 60초로 스로틀한다. <code>/api/articles</code> 는 스토어를
+          (기간·검색어)로 필터하고, 보일 20건만 <code>card_details</code> 로 전체 컬럼 조회한다.
+          웜 응답 SQLite 5 ms / Supabase 약 330 ms(20건 카드 조회 왕복), 콜드(스토어 최초 적재)
+          약 3 s. 수동 등록은 그 1건만 스토어에 upsert 한다.
         </p>
         <p>
           SQLite 커넥션은 <code>synchronous=NORMAL</code>(WAL에서 앱 크래시에 안전) ·
