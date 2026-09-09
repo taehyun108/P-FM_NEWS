@@ -1177,11 +1177,11 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>343개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>348개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (AST로 참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
-          <dt>Storage 정합</dt><dd>ABC <b>62개</b> ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 19개·컬럼 완전 동기</dd>
+          <dt>Storage 정합</dt><dd>ABC <b>64개</b> ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 19개·컬럼 완전 동기 · RLS 19개 전부</dd>
           <dt>복제 유틸</dt><dd><code>main.py</code> ↔ <code>external_affairs.py</code> 공통 이름 6개 중 4개는 동일,
             <code>parse_dt</code>·<code>_parse_json_object</code>는 각자 맥락에 맞춘 변형(기능 동등) — 순환참조를 피하려는 의도적 격리</dd>
           <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 4종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
