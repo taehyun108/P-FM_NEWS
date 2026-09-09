@@ -176,7 +176,10 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     telegram_channel_url: str      # 헤더 'Telegram' 버튼이 여는 주소 (채널 초대 링크 등). 없으면 봇 DM
-    # 카카오톡 '나에게 보내기' (선택) — 텔레그램과 병행. refresh_token 은 run_state 에 저장
+    # 카카오톡 '나에게 보내기' (선택 · 기본 비활성) — 텔레그램과 병행. refresh_token 은 run_state 에 저장
+    #   text 템플릿 200자 한도 때문에 텔레그램 대비 정보량이 적어 기본은 꺼 둔다.
+    #   KAKAO_ENABLED=true 로 명시해야 켜진다. 코드·라우트·selftest 는 그대로 유지.
+    kakao_feature_enabled: bool
     kakao_rest_api_key: str
     kakao_client_secret: str
     kakao_redirect_uri: str
@@ -212,8 +215,13 @@ class Config:
 
     @property
     def kakao_configured(self) -> bool:
-        """카카오 앱 키가 갖춰졌는가. 실제 발송은 refresh_token(run_state)까지 있어야 한다."""
-        return bool(self.kakao_rest_api_key and self.kakao_redirect_uri)
+        """카카오 '나에게 보내기' 기능이 활성이고 앱 키까지 갖춰졌는가.
+
+        기본은 비활성이다. KAKAO_ENABLED=true 로 켜고 + REST 키·redirect 가 있어야
+        하며, 실제 발송은 refresh_token(run_state)까지 있어야 한다(kakao_enabled_now).
+        """
+        return bool(self.kakao_feature_enabled
+                    and self.kakao_rest_api_key and self.kakao_redirect_uri)
 
     @property
     def smtp_configured(self) -> bool:
@@ -296,6 +304,8 @@ def load_config() -> Config:
         telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=get_env("TELEGRAM_CHAT_ID"),
         telegram_channel_url=get_env("TELEGRAM_CHANNEL_URL"),
+        # 기본 비활성. 텔레그램 대비 정보량이 적어(text 200자) 명시적으로 켤 때만 동작.
+        kakao_feature_enabled=get_env("KAKAO_ENABLED", "").strip().lower() in ("1", "true", "yes"),
         kakao_rest_api_key=get_env("KAKAO_REST_API_KEY"),
         kakao_client_secret=get_env("KAKAO_CLIENT_SECRET"),
         kakao_redirect_uri=get_env("KAKAO_REDIRECT_URI"),
@@ -5798,6 +5808,8 @@ def _kakao_send(ctx: Context, title: str, link: str,
 
 def cmd_kakao_auth(ctx: Context) -> None:
     """카카오 '나에게 보내기' 최초 토큰 발급 (1회)."""
+    if not ctx.cfg.kakao_feature_enabled:
+        raise SystemExit("카카오 기능이 비활성 상태입니다. .env 에 KAKAO_ENABLED=true 를 설정하세요.")
     if not ctx.cfg.kakao_configured:
         raise SystemExit("KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI 가 비어 있습니다.")
     redirect = ctx.cfg.kakao_redirect_uri
@@ -7152,6 +7164,7 @@ def create_app(ctx: Context):
             "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
             "kakao_enabled": str(st.get("kakao_enabled") if st.get("kakao_enabled") is not None else 1)
                              not in ("0", "False", "false", ""),
+            "kakao_feature_enabled": ctx.cfg.kakao_feature_enabled,   # KAKAO_ENABLED 토글 (기본 꺼짐)
             "kakao_ready": bool(ctx.cfg.kakao_configured and st.get("kakao_refresh_token")),
             "threshold": effective_threshold(ctx),
             "hard_notify_score": hard_score,          # 0 = 미사용
@@ -8751,10 +8764,13 @@ def cmd_selftest() -> int:
                   fresh_cutoff_hours=6, backfill_cutoff_hours=72, notify_threshold=50,
                   llm_daily_limit=1500, llm_per_run=6, weekly_enabled=False, weekly_to=[],
                   weekly_hour=7, article_retention_days=550)
-    _kc = Config(**{**_blank, "kakao_rest_api_key": "K", "kakao_client_secret": "S",
-                    "kakao_redirect_uri": "https://localhost:3000/kakao"})
-    check("kakao_configured — 키·redirect 있으면 True", _kc.kakao_configured, True)
+    _kc = Config(**{**_blank, "kakao_feature_enabled": True, "kakao_rest_api_key": "K",
+                    "kakao_client_secret": "S", "kakao_redirect_uri": "https://localhost:3000/kakao"})
+    check("kakao_configured — 켜짐 + 키·redirect 있으면 True", _kc.kakao_configured, True)
     check("kakao_configured — 키 없으면 False", Config(**_blank).kakao_configured, False)
+    check("kakao_configured — KAKAO_ENABLED 없으면(기본) False",
+          Config(**{**_blank, "kakao_rest_api_key": "K",
+                    "kakao_redirect_uri": "https://localhost:3000/kakao"}).kakao_configured, False)
     _au = kakao_authorize_url(_kc)
     check("authorize URL — scope=talk_message", "scope=talk_message" in _au, True)
     check("authorize URL — response_type=code", "response_type=code" in _au, True)

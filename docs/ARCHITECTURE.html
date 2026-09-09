@@ -889,7 +889,7 @@
           <thead><tr><th>설정</th><th>기본값</th><th>동작</th></tr></thead>
           <tbody>
             <tr><td>텔레그램 발송</td><td>켜짐</td><td>끄면 발송 중지(큐는 계속 쌓임). 봇 <code>/stop</code>·<code>/start</code>와 동일</td></tr>
-            <tr><td>카카오톡 발송</td><td>켜짐</td><td>텔레그램과 <b>병행</b> 발송(나와의 채팅). <code>.env</code> 키 + 최초 토큰이 없으면 비활성</td></tr>
+            <tr><td>카카오톡 발송</td><td><b>꺼짐</b></td><td>기본 비활성(텔레그램만). <code>KAKAO_ENABLED=true</code> + 최초 토큰이 있어야 켜짐</td></tr>
             <tr><td>관련도 임계값</td><td class="num">50</td><td>0–100 슬라이더. 권장 하한 40을 표시하되 자유롭게 지정</td></tr>
             <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간 게이트를 우회해 즉시 발송. 0=미사용</td></tr>
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td><b>제목·판정 그룹사</b>에 있으면 중요도·야간 게이트를 우회 (본문 스친 언급 제외)</td></tr>
@@ -933,9 +933,13 @@
           <code>RATE_LIMIT_SLEEP</code> 3.5초, 회차당 <code>SEND_BATCH_PER_CYCLE</code> 12건.
           막힌 실패 건은 <code>python backend/main.py retryfailed</code> 로 큐에 되돌린다.
         </p>
-        <h3>카카오톡 '나에게 보내기' 병행 발송 (선택)</h3>
+        <h3>카카오톡 '나에게 보내기' 병행 발송 (선택 · <b>기본 비활성</b>)</h3>
         <p style="font-size:13px; line-height:1.8;">
-          <code>.env</code> 에 <code>KAKAO_REST_API_KEY</code>·<code>KAKAO_CLIENT_SECRET</code>·
+          <b>현재는 꺼져 있다.</b> 카카오 <code>text</code> 템플릿이 200자 한도라 텔레그램(4096자)
+          대비 요약·관점을 다 못 담아, 텔레그램만으로 운영한다. 코드·라우트·selftest 는 그대로
+          남아 있고 <code>KAKAO_ENABLED=true</code> + REST 키 + <code>kakao-auth</code> 1회면 다시 켜진다
+          (<code>Config.kakao_feature_enabled</code> → <code>kakao_configured</code> 게이트).
+          <br>켰을 때 동작: <code>.env</code> 에 <code>KAKAO_REST_API_KEY</code>·<code>KAKAO_CLIENT_SECRET</code>·
           <code>KAKAO_REDIRECT_URI</code> 를 채우고 최초 토큰을 1회 발급하면, 텔레그램으로 나가는
           <b>같은 기사</b>가 <b>텔레그램과 같은 서식</b>(태그·제목·요약·<code>포스코 관점:</code>)으로
           카카오톡 <b>나와의 채팅</b>에도 전송된다
