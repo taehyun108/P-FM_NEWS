@@ -896,7 +896,8 @@
           <figcaption>
             <b>원문은 짧게, 분석 결과는 길게.</b> 본문·미리보기·제목 임베딩(주황)만 시한부다.
             임베딩은 DB 용량의 대부분을 차지하는데 중복 판정에만 쓰는 캐시라 48시간 지나면 비운다.
-            요약·SWOT·메타데이터·주간레포트(초록)는 아카이브로 남는다.
+            요약·SWOT·메타데이터·주간레포트(초록)는 아카이브로 남되, <b>기사 자체는 보존 정책에 따라
+            핵심 기사 18개월 · 잡음 기사 90일 후 삭제</b>된다(아래 참조).
           </figcaption>
         </figure>
 
@@ -926,11 +927,33 @@
         </table></div>
 
         <div class="note warn">
-          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(약 15 MB, 그중
-          7 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 8 MB 선에서 유지)이고
+          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(약 16 MB, 그중
+          8 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 8 MB 선에서 유지)이고
           <code>.gitignore</code>에 있어 GitHub에는 올라가지 않는다. 카드 하단의
           <code>SUPABASE</code> 글자는 하드코딩된 표시 라벨일 뿐 실제 저장소와 무관하다.
         </div>
+
+        <h3>보존 정책 — Supabase 무료 500 MB 한도 대비</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          분석된 기사는 원래 무한 누적됐다. Supabase 무료 티어(Postgres 500 MB)를 넘기지 않도록
+          <code>run_once</code> 가 <b>하루 1회</b> 아래를 정리한다. 자식 테이블(요약·SWOT·본문·알림)은
+          <code>on delete cascade</code> 로 함께 지워진다.
+        </p>
+        <div class="tw"><table>
+          <thead><tr><th>대상</th><th>기준</th><th>보존일</th><th>설정</th></tr></thead>
+          <tbody>
+            <tr><td>핵심 기사</td><td>알림 대상이었음 · 중요도 임계값 이상 · 그룹사 태그 있음 (셋 중 하나)</td><td class="num">550일 (≈18개월)</td><td><code>ARTICLE_RETENTION_DAYS</code></td></tr>
+            <tr><td>잡음·주제이탈 기사</td><td>위 조건에 안 맞는 나머지 (<code>archived</code> 포함)</td><td class="num">90일</td><td><code>RETENTION_SOFT_DAYS</code></td></tr>
+            <tr><td><code>collection_logs</code></td><td>실행 로그 (하루 약 288행)</td><td class="num">90일</td><td><code>RETENTION_LOG_DAYS</code></td></tr>
+            <tr><td><code>url_ledger</code></td><td>영구 제외 URL — 이후 재등장해도 게이트가 다시 거른다</td><td class="num">180일</td><td><code>RETENTION_LEDGER_DAYS</code></td></tr>
+          </tbody>
+        </table></div>
+        <p style="font-size:13px; line-height:1.8;">
+          삭제 후 SQLite 는 <code>VACUUM</code>(최소 7일 간격)으로 파일을 실제로 줄이고, Postgres 는
+          autovacuum 이 처리한다. 실측 유입 약 160–200건/일 기준, 이 정책이면 Supabase 정상 용량은
+          <b>약 200–300 MB 선</b>에서 안정된다. 보존일을 늘리면 용량도 비례해 커진다.
+        </p>
+
         <h3>Supabase 전환 절차</h3>
         <ol style="margin:8px 0 0 18px; font-size:13px; line-height:1.9;">
           <li>Supabase 대시보드 &gt; SQL Editor 에서 <code>backend/schema.sql</code> 실행 (테이블 18개 생성)</li>
@@ -986,7 +1009,7 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>290개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>297개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>

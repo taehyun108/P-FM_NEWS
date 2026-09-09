@@ -187,6 +187,7 @@ class Config:
     notify_threshold: int
     llm_daily_limit: int
     llm_per_run: int
+    article_retention_days: int    # 핵심 기사 보존일 (Supabase 무료 500MB 한도 대비)
     api_host: str
     api_port: int
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
@@ -291,6 +292,9 @@ def load_config() -> Config:
         # 1회 실행에서 분석할 최대 건수. 나머지는 analyzed_at=null 로 남아 다음 실행에 처리된다.
         # 60초 주기를 지키려면 작게 유지한다(모델 1회 호출이 5~10초).
         llm_per_run=get_env_int("LLM_PER_RUN", 20, 1),
+        # 알림 대상이었거나·중요도 높거나·그룹사 태그가 있는 '핵심' 기사의 보존일.
+        # 그 외 잡음 기사는 RETENTION_SOFT_DAYS(90일)만 보관한다. 약 550일 = 18개월.
+        article_retention_days=get_env_int("ARTICLE_RETENTION_DAYS", 550, 30),
         api_host=get_env("API_HOST", "127.0.0.1"),
         api_port=get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
@@ -485,6 +489,20 @@ class Storage(ABC):
 
     @abstractmethod
     def purge_stale_embeddings(self, older_than_hours: int) -> int: ...
+
+    @abstractmethod
+    def purge_old_articles(self, hard_days: int, soft_days: int, keep_score: int) -> int:
+        """오래된 기사 삭제(자식 테이블은 cascade). 핵심 기사는 hard_days, 잡음은 soft_days."""
+
+    @abstractmethod
+    def prune_collection_logs(self, older_than_days: int) -> int: ...
+
+    @abstractmethod
+    def prune_url_ledger(self, older_than_days: int) -> int: ...
+
+    @abstractmethod
+    def vacuum(self) -> None:
+        """저장 공간 회수(SQLite VACUUM). Supabase 는 autovacuum 이 처리하므로 no-op."""
 
     @abstractmethod
     def save_summary(self, row: dict) -> None: ...
@@ -863,6 +881,42 @@ class SqliteStorage(Storage):
             " where title_embedding is not null"
             " and coalesce(published_at, collected_at) < ?", (cutoff,))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def purge_old_articles(self, hard_days: int, soft_days: int, keep_score: int) -> int:
+        """오래된 기사 삭제. 자식(요약·SWOT·본문·알림)은 on delete cascade 로 함께 삭제된다.
+
+        · 핵심 기사(알림 대상이었음 · 중요도 keep_score 이상 · 그룹사 태그 있음)
+          → hard_days 초과 시 삭제
+        · 그 외 일반·주제이탈(archived) 기사 → soft_days 초과 시 삭제
+        draft 는 purge_stale_drafts 가 따로 처리하므로 제외한다.
+        """
+        hard_cut = iso(now_utc() - timedelta(days=hard_days))
+        soft_cut = iso(now_utc() - timedelta(days=soft_days))
+        cur = self._exec(
+            "delete from articles"
+            " where status <> 'draft'"
+            "   and coalesce(published_at, collected_at) < ?"           # 최소 soft_days 경과
+            "   and (coalesce(published_at, collected_at) < ?"          # hard_days 넘으면 무조건
+            "        or (importance_score < ?"                          # 아니면 저가치만
+            "            and coalesce(group_companies, '[]') in ('[]', '')"
+            "            and id not in (select article_id from notifications"
+            "                           where article_id is not null and status <> 'skipped')))",
+            (soft_cut, hard_cut, keep_score))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def prune_collection_logs(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        cur = self._exec("delete from collection_logs where run_at < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def prune_url_ledger(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        cur = self._exec("delete from url_ledger where first_seen < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def vacuum(self) -> None:
+        # VACUUM 은 트랜잭션 밖에서만 실행된다. _exec 는 매 문장 커밋하므로 안전.
+        self._conn().execute("vacuum")
 
     def save_summary(self, row: dict) -> None:
         data = self._encode(row)
@@ -1331,6 +1385,43 @@ class SupabaseStorage(Storage):
         res = (self._t("articles").update({"title_embedding": None})
                .not_.is_("title_embedding", "null").lt("published_at", cutoff).execute())
         return len(res.data or [])
+
+    def purge_old_articles(self, hard_days: int, soft_days: int, keep_score: int) -> int:
+        """SqliteStorage.purge_old_articles 와 동일한 정책. PostgREST 는 서브쿼리가 안 되므로
+        ① hard_days 초과분 일괄 삭제 ② soft~hard 구간은 저가치 후보를 뽑아 알림 이력과 대조 후 삭제."""
+        hard_cut = iso(now_utc() - timedelta(days=hard_days))
+        soft_cut = iso(now_utc() - timedelta(days=soft_days))
+        total = 0
+        res = (self._t("articles").delete()
+               .neq("status", "draft").lt("published_at", hard_cut).execute())
+        total += len(res.data or [])
+        cand = (self._t("articles").select("id,group_companies,importance_score")
+                .neq("status", "draft").lt("published_at", soft_cut)
+                .lt("importance_score", keep_score).limit(20000).execute()).data or []
+        ids = [r["id"] for r in cand if not (r.get("group_companies") or [])]
+        if ids:
+            notified = {r["article_id"] for r in
+                        (self._t("notifications").select("article_id")
+                         .neq("status", "skipped").limit(100000).execute()).data or []}
+            drop = [i for i in ids if i not in notified]
+            for i in range(0, len(drop), 200):
+                part = drop[i:i + 200]
+                self._t("articles").delete().in_("id", part).execute()
+                total += len(part)
+        return total
+
+    def prune_collection_logs(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        res = self._t("collection_logs").delete().lt("run_at", cutoff).execute()
+        return len(res.data or [])
+
+    def prune_url_ledger(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        res = self._t("url_ledger").delete().lt("first_seen", cutoff).execute()
+        return len(res.data or [])
+
+    def vacuum(self) -> None:
+        pass  # Postgres 는 autovacuum 이 처리한다.
 
     def save_summary(self, row: dict) -> None:
         self._t("summaries").upsert(row, on_conflict="article_id").execute()
@@ -3324,6 +3415,18 @@ PEOPLE_BACKFILL_CUTOFF_HOURS = 24 * 30
 # 달리 느슨하게 둔다 — deferred 는 알림 후보가 아니라서 억제를 유지할 이유가 약하다.
 DEFER_BACKLOG_STABLE = 600
 
+# ── 보존 정책 (Supabase 무료 500MB 한도 대비) ─────────────────────────
+# 핵심 기사(알림 대상이었음/중요도 임계값 이상/그룹사 태그 O)는 cfg.article_retention_days
+# (기본 550일 ≈ 18개월) 동안 보관하고, 그 외 잡음·주제이탈 기사는 아래 기간만 보관한다.
+# 자식 테이블(요약·SWOT·본문·알림)은 on delete cascade 로 함께 삭제된다.
+RETENTION_SOFT_DAYS   = 90    # 일반·archived 기사 보관일
+RETENTION_LOG_DAYS    = 90    # collection_logs 보관일 (하루 약 288행 쌓임)
+RETENTION_LEDGER_DAYS = 180   # url_ledger 보관일 (이후 재수집돼도 게이트가 다시 거른다)
+RETENTION_INTERVAL_HOURS = 24 # 보존 정리 실행 간격 (매 수집 사이클마다 하면 과하다)
+RETENTION_VACUUM_DAYS = 7     # SQLite VACUUM(파일 축소) 최소 간격
+_RETENTION_LAST: "datetime | None" = None
+_VACUUM_LAST: "datetime | None" = None
+
 
 def matches_keywords(text: str, keywords: Sequence[str]) -> bool:
     """언론사 RSS 는 키워드로 질의할 수 없으므로 수집 후 로컬에서 거른다. (F1.3)"""
@@ -4032,6 +4135,29 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     cleared = storage.purge_stale_embeddings(48)
     if cleared:
         log.info("오래된 제목 임베딩 %d건 정리", cleared)
+
+    # ── 보존 정책: 하루 1회만 (Supabase 무료 500MB 한도 대비) ─────────
+    # 핵심 기사는 cfg.article_retention_days(≈18개월), 잡음은 RETENTION_SOFT_DAYS(90일).
+    global _RETENTION_LAST, _VACUUM_LAST
+    _n = now_utc()
+    if _RETENTION_LAST is None or (_n - _RETENTION_LAST) >= timedelta(hours=RETENTION_INTERVAL_HOURS):
+        _RETENTION_LAST = _n
+        keep_score = effective_threshold(ctx)
+        gone = storage.purge_old_articles(cfg.article_retention_days, RETENTION_SOFT_DAYS, keep_score)
+        logs_gone = storage.prune_collection_logs(RETENTION_LOG_DAYS)
+        ledger_gone = storage.prune_url_ledger(RETENTION_LEDGER_DAYS)
+        if gone or logs_gone or ledger_gone:
+            log.info("보존 정리: 기사 %d · 수집로그 %d · URL원장 %d 삭제 (핵심 %d일·잡음 %d일 보관)",
+                     gone, logs_gone, ledger_gone, cfg.article_retention_days, RETENTION_SOFT_DAYS)
+        # SQLite 는 삭제해도 파일이 안 줄어들어 가끔 VACUUM 으로 회수한다(락 위험 있어 드물게).
+        if gone and cfg.db_backend == "sqlite" and (
+                _VACUUM_LAST is None or (_n - _VACUUM_LAST) >= timedelta(days=RETENTION_VACUUM_DAYS)):
+            _VACUUM_LAST = _n
+            try:
+                storage.vacuum()
+                log.info("VACUUM 완료 — 삭제분 디스크 회수")
+            except Exception as e:
+                log.warning("VACUUM 실패(무시): %s", e)
 
     # ── 알림 큐 적재 (PRD F3.3 / F7.1) ───────────────────────────────
     queued = 0
@@ -6813,6 +6939,50 @@ def cmd_selftest() -> int:
     check("최근 행 임베딩 보존됨",
           _tmp._one("select title_embedding from articles where id='emb-new'")["title_embedding"] is not None, True)
     check("두 번째 호출은 대상 없음 → 0건", _tmp.purge_stale_embeddings(48), 0)
+
+    print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
+    _tmp._exec("delete from articles")
+    _d600 = iso(now_utc() - timedelta(days=600))
+    _d120 = iso(now_utc() - timedelta(days=120))
+    _d030 = iso(now_utc() - timedelta(days=30))
+    # (id, published_at, score, group_companies, status)
+    _seed = [
+        ("art-core-old", _d600, 80, "[]", "active"),       # 핵심·550일 초과 → 삭제
+        ("art-core-mid", _d120, 80, "[]", "active"),       # 핵심·기간 내 → 유지
+        ("art-noise-old", _d120, 10, "[]", "active"),      # 잡음·90일 초과 → 삭제
+        ("art-noise-fresh", _d030, 10, "[]", "active"),    # 잡음·90일 내 → 유지
+        ("art-noise-notified", _d120, 10, "[]", "active"), # 알림 이력 있음 → 유지
+        ("art-noise-grouped", _d120, 10, '["포스코퓨처엠"]', "active"),  # 그룹사 태그 → 유지
+        ("art-arch-old", _d120, 10, "[]", "archived"),     # 주제이탈·90일 초과 → 삭제
+        ("art-draft-old", _d600, 10, "[]", "draft"),       # draft 는 제외 → 유지
+    ]
+    for _id, _pub, _sc, _grp, _st in _seed:
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, status)"
+            " values (?,?,?,?,?,?,?,?,?,?,?)",
+            (_id, f"http://r/{_id}", f"http://r/{_id}", f"http://r/{_id}", "제목",
+             _pub, _pub, "search", _sc, _grp, _st))
+    _tmp._exec(
+        "insert into notifications (id, article_id, channel, chat_id, status, created_at)"
+        " values (?,?,?,?,?,?)",
+        ("ntf-1", "art-noise-notified", "telegram", "c", "sent", _d120))
+    check("오래된 핵심+잡음+archived 3건 삭제", _tmp.purge_old_articles(550, 90, 50), 3)
+    _left = {r["id"] for r in _tmp._rows("select id from articles")}
+    check("핵심(기간 내)·그룹사·알림이력·최근잡음·draft 는 유지",
+          _left, {"art-core-mid", "art-noise-fresh", "art-noise-notified",
+                  "art-noise-grouped", "art-draft-old"})
+    check("유지된 기사의 알림은 그대로(과잉 삭제 아님)",
+          _tmp._one("select count(*) as n from notifications")["n"], 1)
+    check("두 번째 호출은 삭제 대상 없음 → 0건", _tmp.purge_old_articles(550, 90, 50), 0)
+
+    for _lid, _ts in (("old", _d120), ("new", _d030)):
+        _tmp._exec("insert into collection_logs (run_at, source_type) values (?,?)", (_ts, _lid))
+        _tmp._exec("insert into url_ledger (url_source, reason, first_seen) values (?,?,?)",
+                   (f"http://led/{_lid}", "seen", _ts))
+    check("90일 넘은 수집로그만 정리 → 1건", _tmp.prune_collection_logs(90), 1)
+    check("180일 기준 URL원장 정리 대상 없음 → 0건", _tmp.prune_url_ledger(180), 0)
+    check("30일 기준이면 오래된 원장 1건 정리", _tmp.prune_url_ledger(90), 1)
 
     shutil.rmtree(_dbdir, ignore_errors=True)
 
