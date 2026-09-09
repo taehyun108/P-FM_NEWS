@@ -2666,17 +2666,19 @@ def format_people_llm(parsed: dict, kind: str) -> str:
 
 
 def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
-                   use_llm: bool) -> tuple[str, str, dict]:
+                   use_llm: bool, html: str = "") -> tuple[str, str, dict]:
     """인사·부고 요약 텍스트를 만든다. 반환: (요약, 사용 모델, 토큰 usage).
 
     use_llm 이면 구조화를 시도하고, 실패하거나 use_llm 이 아니면 규칙 기반으로 대체한다.
+    공지가 짧아 본문 추출이 푸터를 잡은 경우 og:description·<article> 텍스트로 보강한다.
     """
+    notice = _notice_text(html, body)
     if use_llm:
-        parsed, usage = ctx.llm.people_notice(kind, title, press, body)
+        parsed, usage = ctx.llm.people_notice(kind, title, press, notice)
         text = format_people_llm(parsed, kind) if parsed else ""
         if text:
             return text[:1600], ctx.llm.model, usage
-    return format_people_notice(body, kind), "", {}
+    return format_people_notice(notice, kind), "", {}
 
 
 def extract_ministry(html: str, body: str) -> str:
@@ -3160,6 +3162,35 @@ def extract_body(html: str) -> str:
         raise
     except Exception:
         return ""
+
+
+_NOTICE_FOOTER_HINT = ("무단 전재", "사업자등록번호", "Copyright", "저작권자", "All rights reserved")
+
+
+def _notice_text(html: str, body: str) -> str:
+    """인사·부고 공지 텍스트를 최대한 알차게 뽑는다.
+
+    이런 공지는 몇 줄로 짧아서 Readability 가 본문 대신 <푸터(회사 정보)>를 잡는 일이 잦다.
+    body · og:description · meta description · <article> 컨테이너 텍스트 중
+    푸터가 아닌 가장 긴 것을 고른다.
+    """
+    cands = [body or ""]
+    for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']'):
+        m = re.search(pat, html or "", re.I)
+        if m:
+            cands.append(html_mod.unescape(m.group(1)))
+    m = re.search(r"<article[^>]*>(.*?)</article>", html or "", re.S | re.I)
+    if m:
+        seg = re.sub(r"<script.*?</script>", " ", m.group(1), flags=re.S | re.I)
+        seg = re.sub(r"<br\s*/?>", "\n", seg, flags=re.I)
+        seg = html_mod.unescape(re.sub(r"<[^>]+>", " ", seg))
+        seg = re.sub(r"[ \t]+", " ", seg).strip()
+        if seg:
+            cands.append(seg)
+    good = [c.strip() for c in cands
+            if c.strip() and not any(h in c for h in _NOTICE_FOOTER_HINT)]
+    return max(good, key=len) if good else (body or "")
 
 
 # =====================================================================
@@ -3810,7 +3841,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
                 "analyzed_at": iso(now_utc()),
             })
             summary, model, usage = people_summary(ctx, pk, art["title"], press_name, body,
-                                                   use_llm=people_llm > 0)
+                                                   use_llm=people_llm > 0, html=html)
             if model:
                 people_llm -= 1
             storage.save_summary({
@@ -3892,7 +3923,7 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "press_name": press_name, "content_hash": row["content_hash"],
         "url_canonical": row["url_canonical"], "url_source": item.url_source,
     })
-    summary, model, usage = people_summary(ctx, kind, item.title, press_name, body, use_llm)
+    summary, model, usage = people_summary(ctx, kind, item.title, press_name, body, use_llm, html=html)
     storage.save_summary({
         "id": new_id(), "article_id": aid,
         "summary_text": summary, "perspective_text": "",
@@ -6650,15 +6681,19 @@ def cmd_regroup(ctx: Context) -> None:
              changed, unchanged, unchecked)
 
 
-def cmd_repeople(ctx: Context, limit: int = 60) -> None:
+def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     """기존 인사·부고 기사를 사람별 구조 요약(LLM)으로 다시 만든다.
 
     규칙 기반 덤프로 저장된 카드를 원문에서 본문을 다시 받아 재정리한다.
+    이미 구조화된(요약이 'ㆍ'로 시작) 카드는 건너뛴다 — `repeople all` 이면 전부 다시.
     limit 로 LLM 호출 수를 제한한다(비용 관리). `repeople 20` 처럼 쓴다.
     """
     rows = [r for r in ctx.storage.list_articles(8000, 0, None, "")
             if PEOPLE_NEWS_CATEGORY in jload(r.get("categories"), [])]
-    log.info("인사·부고 기사 %d건 중 최대 %d건을 재정리합니다.", len(rows), limit)
+    if not force:
+        rows = [r for r in rows if not (r.get("summary_text") or "").lstrip().startswith("ㆍ")]
+    log.info("인사·부고 재정리 대상 %d건 (최대 %d건 처리%s)",
+             len(rows), limit, ", 전체 강제" if force else "")
     done = failed = skipped = 0
     for r in rows:
         if done >= limit:
@@ -6671,11 +6706,12 @@ def cmd_repeople(ctx: Context, limit: int = 60) -> None:
         try:
             _, html = resolve_canonical(ctx.http, target)
             body = extract_body(html)
-            if len(body) < 40:
+            if len(_notice_text(html, body)) < 20:
                 skipped += 1
                 continue
             summary, model, usage = people_summary(
-                ctx, kind, r.get("title") or "", r.get("press_name") or "", body, use_llm=True)
+                ctx, kind, r.get("title") or "", r.get("press_name") or "", body,
+                use_llm=True, html=html)
             if not model:
                 failed += 1
                 continue
@@ -7269,6 +7305,16 @@ def cmd_selftest() -> int:
     check("부고 구조화 — 발인·장지 한 줄", "· 발인 9월 11일 / 장지 OO추모공원" in _ov, True)
     check("부고 구조화 — 연락처", "· ☎ 02-3010-2000" in _ov, True)
     check("빈 파싱 결과 → 빈 문자열", format_people_llm({}, "personnel"), "")
+    # _notice_text — 본문 추출이 푸터를 잡으면 og:description·<article> 로 보강
+    _foot = "대표이사 홍길동 사업자등록번호 102-81-36588 무단 전재ㆍ복사 금지 Copyright"
+    _html = ('<meta property="og:description" content="[세종=뉴시스] ◇부이사관 승진 '
+             '▲기획예산처 이지원 ▲기획예산처 조규산"/>'
+             '<article>[세종=뉴시스] ◇부이사관 승진<br/>▲기획예산처 이지원 '
+             '▲기획예산처 조규산<br/><script>x()</script></article>')
+    _nt = _notice_text(_html, _foot)
+    check("_notice_text — 푸터 대신 실제 공지", "부이사관 승진" in _nt and "무단 전재" not in _nt, True)
+    check("_notice_text — 본문이 알차면 그대로",
+          _notice_text("<article>짧은거</article>", "이미 충분히 긴 정상 본문입니다 " * 3).startswith("이미"), True)
     check("'실적' 단독은 시장/주가 태그 아님",
           "시장/주가" in detect_categories("포스코 2분기 실적 발표"), False)
     check("주가 특화어는 시장/주가 태그",
@@ -7850,7 +7896,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
-  repeople [N]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (기본 60건까지)
+  repeople [N|all]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (구조화 안 된 것만, all 이면 전부)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -7901,8 +7947,10 @@ def main(argv: Sequence[str]) -> int:
     elif command == "reswot":
         cmd_reswot(ctx)
     elif command == "repeople":
-        limit = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 60
-        cmd_repeople(ctx, limit)
+        rest = argv[2:]
+        force = "all" in rest
+        nums = [int(a) for a in rest if a.isdigit()]
+        cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":
