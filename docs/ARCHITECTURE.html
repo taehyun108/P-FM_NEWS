@@ -430,9 +430,10 @@
         <div class="tw"><table>
           <thead><tr><th>파일</th><th class="num">줄</th><th>역할</th></tr></thead>
           <tbody>
-            <tr><td><code>index.html</code></td><td class="num">298</td><td>뼈대 마크업, 마스터 패널 모달, 주간동향 패널</td></tr>
-            <tr><td><code>app.js</code></td><td class="num">1,160</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
-            <tr><td><code>style.css</code></td><td class="num">460</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
+            <tr><td><code>index.html</code></td><td class="num">378</td><td>뼈대 마크업, 마스터 패널 모달, 대외협력·주간동향 패널</td></tr>
+            <tr><td><code>app.js</code></td><td class="num">1,340</td><td>전체 로직 — 프레임워크·빌드 없음</td></tr>
+            <tr><td><code>style.css</code></td><td class="num">583</td><td>딥네이비 테마, 3열 포토카드 그리드</td></tr>
+            <tr><td><code>external_affairs.{js,css}</code></td><td class="num">725</td><td>대외협력 화면 — <code>.ea-</code> 접두사, style.css 는 전역 <code>[hidden]</code> 규칙만 공유</td></tr>
           </tbody>
         </table></div>
 
@@ -1248,6 +1249,14 @@
           헤더의 <b>🏛 대외협력</b> 버튼을 누르면 대외협력 화면으로 바뀌고(버튼 라벨이
           <b>← 전체 기사</b>로), 메인 뉴스 필터·그리드·URL등록·통계는 전부 숨는다. 독립 주소
           <code>/ea</code> 도 유지해(<code>@app.get("/ea")</code>가 같은 SPA 재사용) 링크로 바로 들어올 수 있다.
+          (뷰 전환은 요소에 <code>hidden</code> 을 걸어 하는데, <code>.grid</code> 처럼 <code>display</code> 를
+          지정한 요소는 <code>hidden</code> 을 무시한다 — 전역 <code>[hidden]{display:none!important}</code> 로 강제.)
+        </p>
+        <p>
+          목록은 <b>뉴스와 같은 3열 반응형 포토카드 그리드</b>다. 원문에 사진이 없으므로 썸네일 자리에는
+          <b>카테고리 + 큰 지표</b>를 넣는다 — 예고·의안은 <b>D-day</b>(마감 임박도에 따라 빨강·주황·네이비),
+          정책·통상 뉴스는 <b>중요도 점수</b>. 카드 본문은 제목·기관·기간, 그룹사·영향도 칩,
+          요약, <b>근거</b>(AI 영향분석)·<b>대응(초안)</b>, 원문·의견제출 버튼 순으로 쌓인다.
         </p>
         <p>
           <b>필터는 메인 뉴스 필터와 같은 접기식 칩 패널</b>이되 대외협력 전용이다
