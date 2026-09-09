@@ -937,8 +937,11 @@
         <p style="font-size:13px; line-height:1.8;">
           <code>.env</code> 에 <code>KAKAO_REST_API_KEY</code>·<code>KAKAO_CLIENT_SECRET</code>·
           <code>KAKAO_REDIRECT_URI</code> 를 채우고 최초 토큰을 1회 발급하면, 텔레그램으로 나가는
-          <b>같은 기사</b>의 제목·링크가 카카오톡 <b>나와의 채팅</b>으로도 전송된다
-          (<code>_send_one()</code> 안에서 <code>_telegram_send</code> 직후 <code>_kakao_send</code> 호출).
+          <b>같은 기사</b>가 <b>텔레그램과 같은 구성</b>(태그·제목·요약·포스코 관점·원문 버튼)의
+          카카오 <b>feed 템플릿 카드</b>로 카카오톡 <b>나와의 채팅</b>에도 전송된다
+          (<code>_send_one()</code> 안에서 <code>_telegram_send</code> 직후
+          <code>_kakao_send(row=row)</code> 호출 → <code>_kakao_feed_template()</code>.
+          연결 테스트·콜백 등 <code>row</code> 가 없을 때만 제목+링크 text 템플릿).
           봇 토큰이 없어 <b>사용자 OAuth</b>(scope <code>talk_message</code>)를 쓴다 —
           <code>refresh_token</code>(약 60일)·<code>access_token</code>(약 12시간)을
           <code>run_state</code> 에 저장하고, access token 만료 시
