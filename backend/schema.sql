@@ -215,16 +215,31 @@ create index if not exists idx_articles_dedup      on articles (dedup_group_id);
 create index if not exists idx_notifications_state on notifications (status, created_at);
 
 -- ── RLS (F5) ───────────────────────────────────────────────────────
--- 공개 읽기만 허용한다. 쓰기는 service role key 로만 가능하며,
+-- 모든 테이블에 RLS 를 켠다. 백엔드는 service role key 로 접속해 RLS 를 통과하고,
+-- 프런트엔드는 Supabase 에 직접 접속하지 않는다(백엔드 API 만 호출). 따라서
+-- 아래 '공개 읽기' 정책이 없는 테이블은 anon 키로는 아무것도 안 보인다 = 의도된 것.
 -- service role key 는 backend 밖으로 나가지 않는다. (§6 보안)
-alter table articles       enable row level security;
-alter table summaries      enable row level security;
-alter table swot_analyses  enable row level security;
-alter table market_quotes  enable row level security;
-alter table press_outlets  enable row level security;
-alter table weekly_reports enable row level security;
-alter table telegram_log   enable row level security;
+alter table articles        enable row level security;
+alter table summaries       enable row level security;
+alter table swot_analyses   enable row level security;
+alter table market_quotes   enable row level security;
+alter table press_outlets   enable row level security;
+alter table weekly_reports  enable row level security;
+alter table telegram_log    enable row level security;
+alter table url_ledger      enable row level security;
+alter table run_state       enable row level security;
+alter table article_bodies  enable row level security;
+alter table keyword_sets    enable row level security;
+alter table feed_sources    enable row level security;
+alter table notifications   enable row level security;
+alter table collection_logs enable row level security;
 
+-- 정책은 create 에 if not exists 가 없으므로(PG 15) 재실행 대비 먼저 지운다.
+drop policy if exists "public read articles"  on articles;
+drop policy if exists "public read summaries" on summaries;
+drop policy if exists "public read swot"      on swot_analyses;
+drop policy if exists "public read quotes"    on market_quotes;
+drop policy if exists "public read press"     on press_outlets;
 create policy "public read articles"  on articles      for select using (status = 'active');
 create policy "public read summaries" on summaries     for select using (true);
 create policy "public read swot"      on swot_analyses for select using (true);
