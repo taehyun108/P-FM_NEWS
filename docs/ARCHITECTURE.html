@@ -1069,11 +1069,11 @@
           <thead><tr><th>엔드포인트</th><th class="num">응답</th><th>비고</th></tr></thead>
           <tbody>
             <tr><td><code>GET /</code></td><td class="num">5 ms</td><td>HTML+JS+CSS 조립 결과를 파일 수정시각으로 캐시</td></tr>
-            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 15초 캐시(웜, 미스 시 약 20 ms). 필터·정렬(<code>sort=recent|score</code>)·페이지네이션은 매 요청 신선</td></tr>
-            <tr><td><code>GET /api/filters</code></td><td class="num">2 ms</td><td>20초 캐시 + <code>/api/articles</code>와 스캔·태그 캐시 공유</td></tr>
+            <tr><td><code>GET /api/articles</code></td><td class="num">5 ms</td><td>스캔+태그 30초 캐시(웜). 콜드 약 184 ms. 필터·정렬(<code>sort=recent|score</code>)·페이지네이션은 매 요청 신선</td></tr>
+            <tr><td><code>GET /api/filters</code></td><td class="num">8 ms</td><td>30초 캐시 + <code>/api/articles</code>와 스캔·태그 캐시 공유</td></tr>
             <tr><td><code>GET /api/stats</code></td><td class="num">21 ms</td><td>집계 쿼리</td></tr>
             <tr><td><code>GET /api/weekly</code></td><td class="num">4 ms</td><td>저장된 최신 레포트 반환 (생성은 별도)</td></tr>
-            <tr><td>수집 1회</td><td class="num">3–73 초</td><td>신규 건수에 비례. 목표 20초, 초과 시 경고 로그</td></tr>
+            <tr><td>수집 1회</td><td class="num">6–135 초</td><td>네이버 조회 회차가 무겁다(수집 약 1,800건·HTTP 약 180회). 주기 300초</td></tr>
             <tr><td>주간 레포트 생성</td><td class="num">40–60 초</td><td>섹션 7개 × LLM 1회</td></tr>
           </tbody>
         </table></div>
@@ -1087,7 +1087,7 @@
           그 뒤로도 <code>/api/articles</code>는 캐시가 없어 필터 클릭·페이지 이동마다
           3,000행 조인 조회 + 행마다 <code>card_tags</code>(그룹사 규칙 매칭·정규화)를 다시 돌았다.
           데이터는 수집 주기(기본 300초)에 한 번만 바뀌므로 <b>(기간, 검색어)별 스캔·태그 결과를
-          15초 캐시</b>하고, 필터링·페이지네이션·카드 생성만 매 요청 수행하도록 바꿨다.
+          30초 캐시</b>하고, 필터링·페이지네이션·카드 생성만 매 요청 수행하도록 바꿨다.
           <code>/api/filters</code>도 같은 캐시를 공유한다. 웜 응답 기준 다시 <b>7배</b>(36 → 5 ms).
           수동 등록·draft 확정 시에는 캐시를 즉시 비운다.
         </p>
@@ -1101,13 +1101,68 @@
           호출마다 리스트를 다시 만들던 것을 제거 — 파이프라인·API 공통 경로).
         </p>
 
+        <h3>3차 최적화 — 규모가 커질 때 무너질 자리 (2026-09-09)</h3>
+        <div class="note warn">
+          <b>가장 급했던 것: 조용한 상한.</b> <code>MAX_SCAN_ROWS</code>가 <b>3,000</b>이었다.
+          활성 기사는 이미 2,143건이고 하루 약 240건씩 늘어, <b>나흘 뒤면 상한에 닿을</b> 상태였다.
+          넘는 순간 오래된 기사가 <b>피드·필터 칩·건수에서 조용히 사라진다</b>(에러도 로그도 없다).
+          보존 정책(잡음 90일)에서 나올 수 있는 약 21,000행을 감당하도록 <b>30,000</b>으로 올렸다.
+        </div>
+        <div class="tw"><table>
+          <thead><tr><th>고친 것</th><th>왜 낭비였나</th><th class="num">효과</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>scan_articles()</code> 신설</td>
+              <td>20건 보여주려고 <b>전 행</b>의 SWOT 근거문 4개·포스코 관점·해시까지 읽고 있었다.
+                  화면에 보일 한 페이지만 <code>card_details()</code>로 전체 컬럼 조회</td>
+              <td class="num">3.2 MB → 1.7 MB<br>59 → 38 ms</td>
+            </tr>
+            <tr>
+              <td><code>tag_row</code> 메모</td>
+              <td>그룹사 태그가 빈 기사 <b>46%(977건)</b>에 매 스캔 폴백 판정을 다시 돌렸다 —
+                  실측 적중 <b>0건</b>. 기사별로 한 번만 판정하고 캐시(<code>id+analyzed_at+press_name</code>)</td>
+              <td class="num">48 → 1.2 ms<br>(41배)</td>
+            </tr>
+            <tr>
+              <td>dedup 임베딩 지연 조회</td>
+              <td><code>title_embedding</code>(행당 약 31 KB)을 후보 전건에서 읽었는데,
+                  실제 비교는 4단계 잔여 후보 <b>10건 이하</b>뿐이다. <code>embeddings_for()</code>로 분리</td>
+              <td class="num">7.8 MB → 0<br>매 사이클</td>
+            </tr>
+            <tr>
+              <td><code>_drain_deferred</code> 병렬화</td>
+              <td>회차당 16건을 <b>순차</b> HTTP로 받아, 느린 언론사 한 곳이 사이클 전체를 붙잡았다.
+                  신규 수집과 같은 <code>prefetch_articles</code>로 통일</td>
+              <td class="num">사이클 단축</td>
+            </tr>
+            <tr>
+              <td><code>_weekly_pick</code></td>
+              <td>섹션 7개가 각자 전 행 <code>card_tags</code>를 돌려 같은 계산을 7배 했다</td>
+              <td class="num">1/7</td>
+            </tr>
+            <tr>
+              <td>언론사 칩 접기</td>
+              <td>371곳을 전부 펼쳐 <b>기사 카드가 화면 밖으로</b> 밀렸다. 기본 24개 + '+N개 더'</td>
+              <td class="num">DOM 371 → 25</td>
+            </tr>
+          </tbody>
+        </table></div>
+        <p>
+          종합하면 스캔 사이클이 <b>2.7배</b> 빨라졌고(21,000행 기준 1,052 → 384 ms),
+          매 수집 사이클마다 헛돌던 <b>7.8 MB</b> 읽기가 사라졌다.
+          <code>tag_row</code> 메모는 <code>id</code>가 없는 행(테스트 픽스처 등)에서는 키가 겹쳐
+          <b>남의 태그를 받는 버그</b>가 있어 — selftest가 실제로 잡아냈다 — 그런 행은 캐시하지 않는다.
+        </p>
+
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>307개</b> 검사</dd>
-          <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>343개</b> 검사</dd>
+          <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (AST로 참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
-          <dt>Storage 정합</dt><dd>ABC 57개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 19개·컬럼 완전 동기</dd>
+          <dt>Storage 정합</dt><dd>ABC <b>62개</b> ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 19개·컬럼 완전 동기</dd>
+          <dt>복제 유틸</dt><dd><code>main.py</code> ↔ <code>external_affairs.py</code> 공통 이름 6개 중 4개는 동일,
+            <code>parse_dt</code>·<code>_parse_json_object</code>는 각자 맥락에 맞춘 변형(기능 동등) — 순환참조를 피하려는 의도적 격리</dd>
           <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 4종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
         </div>
 
@@ -1119,7 +1174,7 @@
           한쪽만 고치면 조용히 갈라지는 구조였다. 지금은 <code>tag_row</code>(행 → 태그)와
           <code>filter_tagged</code>(태그 → 필터) 둘로 쪼개고, 목록 API 는 캐시된 태그에
           <code>filter_tagged</code>를, <code>apply_filters</code>는 <code>tag_row</code>를 거쳐
-          같은 <code>filter_tagged</code>를 부른다. 15초 스캔 캐시의 이점은 그대로 두면서
+          같은 <code>filter_tagged</code>를 부른다. 30초 스캔 캐시의 이점은 그대로 두면서
           규칙은 한 곳에만 남는다.
         </p>
       </section>
