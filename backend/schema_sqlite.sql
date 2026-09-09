@@ -80,6 +80,10 @@ create table if not exists run_state (
   trade_required_keywords TEXT default '[]', -- 통상 알림 필수 공통 키워드 (AND)
   last_weekly_report_at TEXT,               -- 주간 레포트 마지막 생성 시각 (중복 발송 방지)
   weekly_report_to TEXT default '[]',       -- 주간 레포트 수신자 목록 (마스터 설정, 비면 .env)
+  kakao_enabled    INTEGER not null default 1,  -- 카카오 '나에게 보내기' 발송 (마스터 토글)
+  kakao_refresh_token TEXT,                 -- 카카오 OAuth refresh token (kakao-auth 로 1회 발급)
+  kakao_access_token  TEXT,                 -- 최근 access token (만료되면 refresh 로 갱신)
+  kakao_token_expires_at TEXT,              -- access token 만료 시각
   updated_at       TEXT not null
 );
 

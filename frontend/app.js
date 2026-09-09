@@ -621,6 +621,11 @@ async function loadMasterSettings() {
   try {
     const d = await (await masterFetch('/api/master/settings')).json();
     $('telegramEnabled').checked = !!d.telegram_enabled;
+    $('kakaoEnabled').checked = !!d.kakao_enabled;
+    $('kakaoEnabled').disabled = !d.kakao_ready;
+    $('kakaoHint').textContent = d.kakao_ready
+      ? "텔레그램과 같은 조건으로, 내 카카오톡 '나와의 채팅'에 기사 링크가 옵니다."
+      : "아직 연결 안 됨 — 서버에서 python backend/main.py kakao-auth 를 1회 실행해야 켤 수 있습니다.";
     $('thRange').value = d.threshold;
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
@@ -770,6 +775,14 @@ function initMaster() {
       await masterFetch('/api/master/settings',
         { method: 'POST', body: JSON.stringify({ telegram_enabled: e.target.checked }) });
       masterMsg('ok', `텔레그램 발송 ${e.target.checked ? '켬' : '끔'}`);
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+  });
+
+  $('kakaoEnabled').addEventListener('change', async (e) => {
+    try {
+      await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ kakao_enabled: e.target.checked }) });
+      masterMsg('ok', `카카오 발송 ${e.target.checked ? '켬' : '끔'}`);
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 

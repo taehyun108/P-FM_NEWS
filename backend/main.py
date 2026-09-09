@@ -176,6 +176,10 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     telegram_channel_url: str      # 헤더 'Telegram' 버튼이 여는 주소 (채널 초대 링크 등). 없으면 봇 DM
+    # 카카오톡 '나에게 보내기' (선택) — 텔레그램과 병행. refresh_token 은 run_state 에 저장
+    kakao_rest_api_key: str
+    kakao_client_secret: str
+    kakao_redirect_uri: str
     # 수집 소스 (선택)
     naver_client_id: str
     naver_client_secret: str
@@ -203,6 +207,11 @@ class Config:
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def kakao_configured(self) -> bool:
+        """카카오 앱 키가 갖춰졌는가. 실제 발송은 refresh_token(run_state)까지 있어야 한다."""
+        return bool(self.kakao_rest_api_key and self.kakao_redirect_uri)
 
     @property
     def smtp_configured(self) -> bool:
@@ -280,6 +289,9 @@ def load_config() -> Config:
         telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=get_env("TELEGRAM_CHAT_ID"),
         telegram_channel_url=get_env("TELEGRAM_CHANNEL_URL"),
+        kakao_rest_api_key=get_env("KAKAO_REST_API_KEY"),
+        kakao_client_secret=get_env("KAKAO_CLIENT_SECRET"),
+        kakao_redirect_uri=get_env("KAKAO_REDIRECT_URI"),
         naver_client_id=get_env("NAVER_CLIENT_ID"),
         naver_client_secret=get_env("NAVER_CLIENT_SECRET"),
         poll_interval_sec=get_env_int("POLL_INTERVAL_SEC", 300, 30, 600),
@@ -771,6 +783,10 @@ class SqliteStorage(Storage):
             "alter table run_state add column last_weekly_report_at TEXT",
             "alter table run_state add column weekly_report_to TEXT default '[]'",
             "alter table run_state add column hard_notify_score INTEGER",
+            "alter table run_state add column kakao_enabled INTEGER not null default 1",
+            "alter table run_state add column kakao_refresh_token TEXT",
+            "alter table run_state add column kakao_access_token TEXT",
+            "alter table run_state add column kakao_token_expires_at TEXT",
         ]
         for sql in migrations:
             try:
@@ -5332,6 +5348,7 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
         hard_score = int(state.get("hard_notify_score") or 0)
     except (TypeError, ValueError):
         hard_score = 0
+    kakao_on = kakao_enabled_now(ctx)   # 카카오 '나에게 보내기' 병행 여부
 
     def _send_one(row: dict) -> bool:
         """개별 카드 발송 — 요약·그룹사·점수가 다 들어간 전체 메시지."""
@@ -5339,6 +5356,12 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
         reason = _notify_reason(row, always_kws, th, hard_score)
         ok, err = _telegram_send(ctx, url, clamp_message(format_message(row)),
                                  kind=reason, article_id=row.get("article_id"))
+        if kakao_on:
+            # 카카오는 제목 + 링크만. 텔레그램 성패와 무관하게 시도한다.
+            link = row.get("url_canonical") or row.get("url_original") or ""
+            if link:
+                _kakao_send(ctx, (row.get("title") or "")[:120], link,
+                            article_id=row.get("article_id"), kind=reason)
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
         elif _notify_too_old(row):
@@ -5486,6 +5509,155 @@ def _telegram_send(ctx: Context, url: str, text: str,
     except Exception as exc:   # pragma: no cover
         log.debug("telegram_log 기록 실패(무시): %s", exc)
     return ok, err
+
+
+# =====================================================================
+# 14a. 카카오톡 '나에게 보내기' (선택) — 텔레그램과 병행 발송
+#      봇 토큰이 없고 사용자 OAuth 토큰이 필요하다. refresh_token 은 run_state 에
+#      저장하고, access token 은 만료(약 12h) 시 자동 갱신한다.
+# =====================================================================
+
+KAKAO_AUTHORIZE = "https://kauth.kakao.com/oauth/authorize"
+KAKAO_TOKEN = "https://kauth.kakao.com/oauth/token"
+KAKAO_MEMO_SEND = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+KAKAO_SCOPE = "talk_message"
+_KAKAO_LOCK = threading.Lock()   # 토큰 갱신·발송 직렬화
+
+
+def kakao_authorize_url(cfg: Config) -> str:
+    q = urlencode({
+        "client_id": cfg.kakao_rest_api_key,
+        "redirect_uri": cfg.kakao_redirect_uri,
+        "response_type": "code",
+        "scope": KAKAO_SCOPE,
+    })
+    return f"{KAKAO_AUTHORIZE}?{q}"
+
+
+def kakao_enabled_now(ctx: Context) -> bool:
+    """앱 키 + refresh_token + 마스터 토글이 모두 켜져 있는가."""
+    if not ctx.cfg.kakao_configured:
+        return False
+    st = ctx.storage.get_run_state()
+    if not st.get("kakao_refresh_token"):
+        return False
+    return str(st.get("kakao_enabled") if st.get("kakao_enabled") is not None else 1) \
+        not in ("0", "False", "false", "")
+
+
+def _kakao_token_request(cfg: Config, http: HttpClient, data: dict) -> dict:
+    if cfg.kakao_client_secret:
+        data["client_secret"] = cfg.kakao_client_secret
+    resp = http.post(KAKAO_TOKEN, data=data,
+                     headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
+    body = resp.json()
+    if resp.status_code != 200:
+        raise RuntimeError(f"{body.get('error')}: {body.get('error_description') or resp.status_code}")
+    return body
+
+
+def kakao_exchange_code(ctx: Context, code: str) -> dict:
+    """인가 코드를 토큰으로 교환하고 refresh_token 을 저장한다. (kakao-auth CLI)"""
+    body = _kakao_token_request(ctx.cfg, ctx.http, {
+        "grant_type": "authorization_code",
+        "client_id": ctx.cfg.kakao_rest_api_key,
+        "redirect_uri": ctx.cfg.kakao_redirect_uri,
+        "code": code.strip(),
+    })
+    exp = iso(now_utc() + timedelta(seconds=int(body.get("expires_in") or 0) - 60))
+    ctx.storage.set_run_state({
+        "kakao_refresh_token": body["refresh_token"],
+        "kakao_access_token": body["access_token"],
+        "kakao_token_expires_at": exp,
+    })
+    return body
+
+
+def _kakao_access_token(ctx: Context) -> str | None:
+    """유효한 access token 을 돌려준다. 만료됐으면 refresh 로 갱신한다."""
+    st = ctx.storage.get_run_state()
+    refresh = st.get("kakao_refresh_token")
+    if not refresh:
+        return None
+    tok = st.get("kakao_access_token")
+    exp = parse_dt(st.get("kakao_token_expires_at"))
+    if tok and exp and exp > now_utc():
+        return tok
+    # 갱신
+    body = _kakao_token_request(ctx.cfg, ctx.http, {
+        "grant_type": "refresh_token",
+        "client_id": ctx.cfg.kakao_rest_api_key,
+        "refresh_token": refresh,
+    })
+    patch: dict[str, Any] = {
+        "kakao_access_token": body["access_token"],
+        "kakao_token_expires_at": iso(now_utc() + timedelta(seconds=int(body.get("expires_in") or 0) - 60)),
+    }
+    if body.get("refresh_token"):   # 남은 유효기간이 1개월 미만일 때만 새로 온다
+        patch["kakao_refresh_token"] = body["refresh_token"]
+    ctx.storage.set_run_state(patch)
+    return body["access_token"]
+
+
+def _kakao_send(ctx: Context, title: str, link: str,
+                article_id: str | None = None, kind: str = "카카오") -> tuple[bool, str | None]:
+    """카카오톡 '나와의 채팅'으로 제목+링크를 보낸다. telegram_log 에 같이 기록한다."""
+    text = f"{title}\n{link}".strip()[:190]   # text 템플릿 200자 한도
+    ok, err = False, None
+    try:
+        with _KAKAO_LOCK:
+            access = _kakao_access_token(ctx)
+            if not access:
+                return False, "refresh_token 없음 (kakao-auth 필요)"
+            template = json.dumps({
+                "object_type": "text",
+                "text": text,
+                "link": {"web_url": link, "mobile_web_url": link},
+                "button_title": "원문 보기",
+            }, ensure_ascii=False)
+            resp = ctx.http.post(
+                KAKAO_MEMO_SEND, data={"template_object": template},
+                headers={"Authorization": f"Bearer {access}",
+                         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
+            data = resp.json()
+            if resp.status_code == 200 and data.get("result_code") == 0:
+                ok = True
+            else:
+                err = f"{data.get('code')}: {data.get('msg') or resp.status_code}"
+    except Exception as exc:
+        err = str(exc)
+    try:
+        ctx.storage.log_telegram({"chat_id": "kakao:me", "kind": f"{kind}(카카오)",
+                                  "article_id": article_id, "text": text, "ok": ok, "error": err})
+    except Exception as exc:   # pragma: no cover
+        log.debug("kakao 로그 기록 실패(무시): %s", exc)
+    return ok, err
+
+
+def cmd_kakao_auth(ctx: Context) -> None:
+    """카카오 '나에게 보내기' 최초 토큰 발급 (1회)."""
+    if not ctx.cfg.kakao_configured:
+        raise SystemExit("KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI 가 비어 있습니다.")
+    print("\n1) 아래 URL 을 브라우저에서 열고 카카오 로그인 + '카카오톡 메시지 전송' 동의:\n")
+    print("   " + kakao_authorize_url(ctx.cfg))
+    print(f"\n2) 동의 후 {ctx.cfg.kakao_redirect_uri}?code=... 로 이동합니다"
+          " (에러 페이지여도 정상).\n   주소창의 code= 값을 복사해 아래에 붙여넣으세요.\n")
+    code = input("   code = ").strip()
+    if not code:
+        raise SystemExit("code 가 비었습니다.")
+    body = kakao_exchange_code(ctx, code)
+    print(f"\n완료. refresh_token 저장됨 (유효 {int(body.get('refresh_token_expires_in', 0)) // 86400}일)."
+          "  python backend/main.py kakao-test 로 시험 발송하세요.")
+
+
+def cmd_kakao_test(ctx: Context) -> None:
+    """카카오 '나에게 보내기' 시험 발송 1건."""
+    ok, err = _kakao_send(
+        ctx, "P-FM NEWS 카카오 연결 확인", "https://developers.kakao.com", kind="연결 테스트")
+    if ok:
+        log.info("시험 메시지 발송 성공. 카카오톡 '나와의 채팅'을 확인하세요.")
+    else:
+        raise SystemExit(f"발송 실패: {err}")
 
 
 # =====================================================================
@@ -6546,6 +6718,9 @@ def create_app(ctx: Context):
         return JSONResponse({
             "ok": True,
             "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
+            "kakao_enabled": str(st.get("kakao_enabled") if st.get("kakao_enabled") is not None else 1)
+                             not in ("0", "False", "false", ""),
+            "kakao_ready": bool(ctx.cfg.kakao_configured and st.get("kakao_refresh_token")),
             "threshold": effective_threshold(ctx),
             "hard_notify_score": hard_score,          # 0 = 미사용
             "recommended_min": RECOMMENDED_MIN_SCORE,
@@ -6584,6 +6759,8 @@ def create_app(ctx: Context):
         patch: dict[str, Any] = {}
         if "telegram_enabled" in (payload or {}):
             patch["notify_paused"] = 0 if payload["telegram_enabled"] else 1
+        if "kakao_enabled" in (payload or {}):
+            patch["kakao_enabled"] = 1 if payload["kakao_enabled"] else 0
         if "threshold" in (payload or {}):
             try:
                 patch["notify_threshold"] = int(clamp(int(payload["threshold"]), 0, 100))
@@ -8129,6 +8306,34 @@ def cmd_selftest() -> int:
     check("정책: OR 매칭 but 필수 불일치 → 제외",
           _kw_hit("가정용 전기요금 인하", ["전기요금"]) and _kw_hit("가정용 전기요금 인하", ["산업"]), False)
 
+    print("\n[13-2c] 카카오 '나에게 보내기'")
+    _blank = {f: "" for f in Config.__dataclass_fields__}
+    _blank.update(smtp_port=587, api_port=8000, poll_interval_sec=300, naver_interval_sec=300,
+                  fresh_cutoff_hours=6, backfill_cutoff_hours=72, notify_threshold=50,
+                  llm_daily_limit=1500, llm_per_run=6, weekly_enabled=False, weekly_to=[],
+                  weekly_hour=7, article_retention_days=550)
+    _kc = Config(**{**_blank, "kakao_rest_api_key": "K", "kakao_client_secret": "S",
+                    "kakao_redirect_uri": "https://localhost:3000/kakao"})
+    check("kakao_configured — 키·redirect 있으면 True", _kc.kakao_configured, True)
+    check("kakao_configured — 키 없으면 False", Config(**_blank).kakao_configured, False)
+    _au = kakao_authorize_url(_kc)
+    check("authorize URL — scope=talk_message", "scope=talk_message" in _au, True)
+    check("authorize URL — response_type=code", "response_type=code" in _au, True)
+    check("authorize URL — redirect_uri 인코딩", "redirect_uri=https%3A%2F%2Flocalhost" in _au, True)
+
+    class _KCtx:
+        def __init__(self, cfg, st):
+            self.cfg = cfg
+            self.storage = type("S", (), {"get_run_state": lambda s: st})()
+    check("kakao_enabled_now — refresh_token 없으면 False",
+          kakao_enabled_now(_KCtx(_kc, {"kakao_enabled": 1})), False)
+    check("kakao_enabled_now — 토큰 있고 토글 켜짐 → True",
+          kakao_enabled_now(_KCtx(_kc, {"kakao_enabled": 1, "kakao_refresh_token": "r"})), True)
+    check("kakao_enabled_now — 토큰 있어도 토글 꺼짐 → False",
+          kakao_enabled_now(_KCtx(_kc, {"kakao_enabled": 0, "kakao_refresh_token": "r"})), False)
+    check("kakao_enabled_now — 앱 키 없으면 False",
+          kakao_enabled_now(_KCtx(Config(**_blank), {"kakao_refresh_token": "r"})), False)
+
     print("\n[13-2b] 무조건 발송 점수 (hard_notify_score) — 우선 판정")
     # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)
     # 우선 기사는 발송 단계에서 임계값·야간 게이트를 우회한다. (다이제스트는 폐지됨)
@@ -8309,6 +8514,8 @@ USAGE = """사용법: python backend/main.py <명령>
   retryfailed  발송 실패로 막힌 알림을 다시 큐로 되돌림 (rate limit 등 일시 장애 복구용)
   chatid     텔레그램 chat_id 확인 (봇에게 메시지를 한 번 보낸 뒤 실행)
   sendtest   텔레그램 시험 메시지 1건 발송 (연결 확인용)
+  kakao-auth   카카오 '나에게 보내기' 최초 토큰 발급 (브라우저 동의 → code 붙여넣기, 1회)
+  kakao-test   카카오 '나에게 보내기' 시험 발송 1건
   ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
   migrate    SQLite → Supabase 전체 이관 (schema.sql 배포 + DB_BACKEND=supabase 후, 일회성)
   weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
@@ -8371,6 +8578,10 @@ def main(argv: Sequence[str]) -> int:
         cmd_chatid(ctx)
     elif command == "sendtest":
         cmd_sendtest(ctx)
+    elif command == "kakao-auth":
+        cmd_kakao_auth(ctx)
+    elif command == "kakao-test":
+        cmd_kakao_test(ctx)
     elif command == "weekly":
         dry = "--dry" in argv[2:]
         rep = run_weekly_report(ctx, send=not dry)
