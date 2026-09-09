@@ -527,6 +527,23 @@ class Storage(ABC):
     def list_articles(self, limit: int, offset: int, since: datetime | None, query: str) -> list[dict]: ...
 
     @abstractmethod
+    def scan_articles(self, limit: int, since: datetime | None, query: str) -> list[dict]:
+        """목록 필터·집계 전용 경량 조회 — 카드 렌더에만 쓰는 긴 텍스트를 빼고 읽는다.
+
+        /api/articles 는 수천 행을 훑어 필터를 걸고 그중 20건만 카드로 만든다.
+        SWOT 근거문 4개·포스코 관점 같은 긴 컬럼을 전 행에서 읽으면 그게 비용의 대부분이다.
+        분석이 끝난(analyzed_at) 행만 돌려준다.
+        """
+
+    @abstractmethod
+    def card_details(self, ids: Sequence[str]) -> list[dict]:
+        """화면에 보일 소수 기사만 카드용 전체 컬럼으로 읽는다. 입력 순서를 유지한다."""
+
+    @abstractmethod
+    def embeddings_for(self, ids: Sequence[str]) -> dict[str, list[float] | None]:
+        """중복 판정 4단계에 실제로 필요한 소수 후보의 제목 임베딩만 읽는다."""
+
+    @abstractmethod
     def article_detail(self, article_id: str) -> dict | None: ...
 
     @abstractmethod
@@ -630,6 +647,16 @@ ARTICLE_CARD_COLS = ", ".join(f"a.{c}" for c in (
     "source_type", "thumbnail_url", "content_hash", "dedup_group_id",
     "is_representative", "is_backfill", "importance_score", "sentiment",
     "keywords", "group_companies", "categories", "analyzed_at", "status",
+))
+
+# 목록 스캔(필터·집계)에만 필요한 컬럼. 카드 렌더 전용 컬럼(SWOT 근거문 4개·포스코 관점·
+# summary_source·URL 원본·해시·dedup 키)은 뺀다 — 수천 행에서 그게 비용의 대부분이다.
+# card_tags 가 그룹사 폴백에 summary_text 를 쓰므로 그것만 남긴다.
+ARTICLE_SCAN_COLS = ", ".join(f"a.{c}" for c in (
+    "id", "url_canonical", "url_original", "title", "press_name", "author",
+    "published_at", "source_type", "thumbnail_url", "is_backfill",
+    "importance_score", "sentiment", "keywords", "group_companies", "categories",
+    "analyzed_at",
 ))
 
 
@@ -816,8 +843,10 @@ class SqliteStorage(Storage):
         return self._one("select * from articles where url_canonical=? limit 1", (url_canonical,))
 
     def recent_articles_for_dedup(self, since: datetime) -> list[dict]:
+        # title_embedding 은 행당 ~31KB 이고 실제 비교는 4단계 잔여 후보 ≤10건뿐이다.
+        # 여기서 다 읽으면 사이클마다 수 MB 를 헛돌린다 → embeddings_for 로 지연 조회한다.
         return self._rows(
-            "select id, title, published_at, dedup_group_id, is_representative, title_embedding,"
+            "select id, title, published_at, dedup_group_id, is_representative,"
             " press_id, press_name, content_hash from articles"
             " where published_at >= ? and status='active'",
             (iso(since),),
@@ -1019,6 +1048,55 @@ class SqliteStorage(Storage):
         sql += " order by a.published_at desc limit ? offset ?"
         args += [limit, offset]
         return self._rows(sql, args)
+
+    def scan_articles(self, limit: int, since: datetime | None, query: str) -> list[dict]:
+        sql = (f"select {ARTICLE_SCAN_COLS}, s.summary_text"
+               " from articles a"
+               " left join summaries s on s.article_id = a.id"
+               " where a.status='active' and a.is_representative=1"
+               " and a.analyzed_at is not null")
+        args: list[Any] = []
+        if since is not None:
+            sql += " and a.published_at >= ?"
+            args.append(iso(since))
+        if query:
+            sql += (" and (a.title like ? or s.summary_text like ?"
+                    " or a.author like ? or a.press_name like ?)")
+            args += [f"%{query}%"] * 4
+        sql += " order by a.published_at desc limit ?"
+        args.append(limit)
+        return self._rows(sql, args)
+
+    def card_details(self, ids: Sequence[str]) -> list[dict]:
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        rows = self._rows(
+            f"select {ARTICLE_CARD_COLS},"
+            " s.summary_text, s.perspective_text, s.summary_source,"
+            " w.total_score as swot_total, w.s_score, w.w_score, w.o_score, w.t_score,"
+            " w.s_text, w.w_text, w.o_text, w.t_text"
+            " from articles a"
+            " left join summaries s on s.article_id = a.id"
+            " left join swot_analyses w on w.article_id = a.id"
+            f" where a.id in ({marks})",
+            list(ids),
+        )
+        by_id = {r["id"]: r for r in rows}
+        return [by_id[i] for i in ids if i in by_id]
+
+    def embeddings_for(self, ids: Sequence[str]) -> dict[str, list[float] | None]:
+        if not ids:
+            return {}
+        out: dict[str, list[float] | None] = {}
+        chunk = 400   # SQLite 변수 상한(999) 안에서
+        for i in range(0, len(ids), chunk):
+            part = list(ids[i:i + chunk])
+            marks = ",".join("?" * len(part))
+            for r in self._rows(
+                    f"select id, title_embedding from articles where id in ({marks})", part):
+                out[r["id"]] = r.get("title_embedding")
+        return out
 
     def article_detail(self, article_id: str) -> dict | None:
         rows = self._rows(
@@ -1359,8 +1437,9 @@ class SupabaseStorage(Storage):
         return rows[0] if rows else None
 
     def recent_articles_for_dedup(self, since: datetime) -> list[dict]:
+        # title_embedding 은 빼고 읽는다 — 4단계 잔여 후보에만 필요하므로 embeddings_for 로 지연 조회.
         return (self._t("articles")
-                .select("id,title,published_at,dedup_group_id,is_representative,title_embedding,press_id,press_name,content_hash")
+                .select("id,title,published_at,dedup_group_id,is_representative,press_id,press_name,content_hash")
                 .gte("published_at", iso(since)).eq("status", "active").execute().data)
 
     def upsert_ledger(self, url_source: str, reason: str) -> None:
@@ -1539,6 +1618,38 @@ class SupabaseStorage(Storage):
             q = q.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
         rows = q.order("published_at", desc=True).range(offset, offset + limit - 1).execute().data
         return [self._flatten(r) for r in rows]
+
+    def scan_articles(self, limit: int, since: datetime | None, query: str) -> list[dict]:
+        cols = ARTICLE_SCAN_COLS.replace("a.", "")
+        q = (self._t("articles")
+             .select(f"{cols}, summaries(summary_text)")
+             .eq("status", "active").eq("is_representative", True)
+             .not_.is_("analyzed_at", "null"))
+        if since is not None:
+            q = q.gte("published_at", iso(since))
+        if query:
+            like = f"%{query}%"
+            q = q.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
+        rows = q.order("published_at", desc=True).limit(limit).execute().data
+        return [self._flatten(r) for r in rows]
+
+    def card_details(self, ids: Sequence[str]) -> list[dict]:
+        if not ids:
+            return []
+        cols = ARTICLE_CARD_COLS.replace("a.", "")
+        rows = (self._t("articles")
+                .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
+                        " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
+                .in_("id", list(ids)).execute().data) or []
+        by_id = {r["id"]: self._flatten(r) for r in rows}
+        return [by_id[i] for i in ids if i in by_id]
+
+    def embeddings_for(self, ids: Sequence[str]) -> dict[str, list[float] | None]:
+        if not ids:
+            return {}
+        rows = (self._t("articles").select("id,title_embedding")
+                .in_("id", list(ids)).execute().data) or []
+        return {r["id"]: r.get("title_embedding") for r in rows}
 
     @staticmethod
     def _flatten(row: dict) -> dict:
@@ -3653,8 +3764,12 @@ def find_duplicate(
     new_vec = llm.embed(title)
     if not new_vec:
         return None
-    for cand, _ in sorted(leftovers, key=lambda x: -x[1])[:10]:
-        cand_vec = jload(cand.get("title_embedding"), None)
+    finalists = [c for c, _ in sorted(leftovers, key=lambda x: -x[1])[:10]]
+    # 후보 목록에는 임베딩이 실려 오지 않는다(행당 ~31KB라 사이클마다 수 MB가 된다).
+    # 여기 도달한 소수 후보의 것만 지금 읽는다.
+    cached = storage.embeddings_for([c["id"] for c in finalists])
+    for cand in finalists:
+        cand_vec = jload(cached.get(cand["id"]), None)
         if not cand_vec:
             cand_vec = llm.embed(cand.get("title", ""))
             if cand_vec:
@@ -3815,13 +3930,16 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
     """
     storage, http = ctx.storage, ctx.http
     done = 0
-    for art in storage.deferred_articles(limit):
+    pending = storage.deferred_articles(limit)
+    # 본문 확보는 신규 수집과 동일하게 병렬로 받는다. 순차로 받으면 느린 언론사 한 곳이
+    # 회차 전체를 붙잡아 사이클 시간이 수십 초씩 늘어난다.
+    targets = {a["id"]: (a.get("url_original") or a.get("url_canonical") or a.get("url_source"))
+               for a in pending}
+    fetched = prefetch_articles(http, [u for u in targets.values() if u])
+    for art in pending:
         aid = art["id"]
-        target = art.get("url_original") or art.get("url_canonical") or art.get("url_source")
-        try:
-            canonical, html = resolve_canonical(http, target)
-        except Exception:
-            canonical, html = "", ""
+        target = targets.get(aid)
+        canonical, html = fetched.get(target, ("", "")) if target else ("", "")
         body = extract_body(html) if html else ""
         if len(body) < 200:
             collected = parse_dt(art.get("collected_at"))
@@ -5026,7 +5144,13 @@ def queue_manual_notify(ctx: Context, article_id: str) -> bool:
     # '항상 발송 키워드'는 제목 + 판정된 그룹사로만 본다(요약에 스친 언급 제외 — run_once 와 동일).
     probe = f"{detail.get('title', '')}\n{' '.join(jload(detail.get('group_companies'), []))}"
     is_priority = _kw_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
-    if not (score >= effective_threshold(ctx) or is_priority):
+    # 임계값도 위에서 읽어 둔 state 로 판정한다(effective_threshold 를 부르면 run_state 를 또 조회한다).
+    try:
+        threshold = int(state["notify_threshold"]) if state.get("notify_threshold") is not None \
+            else cfg.notify_threshold
+    except (TypeError, ValueError):
+        threshold = cfg.notify_threshold
+    if not (score >= threshold or is_priority):
         log.info("수동 등록 기사(점수 %d)가 임계값 미만이라 웹에만 노출: %s",
                  score, (detail.get("title") or "")[:40])
         return False
@@ -5524,16 +5648,19 @@ def weekly_window(now: datetime | None = None) -> tuple[datetime, datetime]:
     return end - timedelta(days=WEEKLY_PERIOD_DAYS), end
 
 
-def _weekly_pick(rows: list[dict], kind: str, key: str) -> list[dict]:
+def _weekly_pick(rows: list[dict], kind: str, key: str,
+                 tags: dict[str, tuple] | None = None) -> list[dict]:
     """섹션 대상 기사를 최대 5건 고른다. rows 는 이미 기간·활성·대표만.
 
     그룹사 섹션은 '제목에 회사명이 있는 기사'를 먼저 올린다. 태그만 붙은
     시황·기관수급 기사(제목은 다른 종목)가 상위를 차지하는 것을 막는다.
+    tags = 기사별 card_tags 결과(섹션 7개가 공유한다. 없으면 그때그때 계산).
     """
     aliases = [a.lower() for a in GROUP_COMPANIES.get(key, [key])] if kind == "group" else []
     hits = []
     for r in rows:
-        groups, cats, _ = card_tags(r)
+        cached = tags.get(r.get("id")) if tags else None
+        groups, cats, _ = cached if cached else card_tags(r)
         if not ((key in groups) if kind == "group" else (key in cats)):
             continue
         title_hit = any(a in (r.get("title") or "").lower() for a in aliases)
@@ -5567,9 +5694,12 @@ def build_weekly_report(ctx: Context) -> dict:
     rows = [r for r in rows
             if (r.get("published_at") or "") <= end_iso and (r.get("summary_text") or "").strip()]
 
+    # 태그는 기사당 한 번만 판정한다 — 섹션 7개가 각자 돌리면 같은 계산을 7배 한다.
+    tags = {r["id"]: card_tags(r) for r in rows if r.get("id")}
+
     sections = []
     for label, kind, key in WEEKLY_SECTIONS:
-        picked = _weekly_pick(rows, kind, key)
+        picked = _weekly_pick(rows, kind, key, tags)
         brief = ctx.llm.weekly_brief(
             "swot" if kind == "group" else "impact", label, picked) if picked else {}
         sections.append({
@@ -5775,7 +5905,11 @@ def maybe_run_weekly(ctx: Context) -> None:
 # =====================================================================
 
 PERIOD_HOURS = {"today": 24, "7d": 24 * 7, "30d": 24 * 30, "all": 0}
-MAX_SCAN_ROWS = 3000   # 배열 필터는 애플리케이션에서 처리하므로 스캔 범위를 제한한다
+# 배열 필터(그룹사·카테고리)는 SQL 인덱스로 못 걸어 애플리케이션에서 처리한다.
+# 이 값을 넘으면 오래된 기사가 피드·필터칩·건수에서 조용히 사라지므로 보존 정책
+# (잡음 90일 · 핵심 550일)에서 나올 수 있는 활성 행수보다 넉넉해야 한다.
+# 실측 활성 증가량 약 240건/일 → 90일 약 21,000행. 여유를 둬 30,000 으로 잡는다.
+MAX_SCAN_ROWS = 30000
 
 # ── 마스터 패널 인증 ─────────────────────────────────────────────────
 MASTER_TOKEN_TTL = timedelta(hours=24)      # 로그인 유지 (사용자 지정)
@@ -5897,19 +6031,33 @@ def _split_multi(value: str) -> list[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
 
+# 태그 계산 결과 메모 — 같은 기사를 매 스캔마다 다시 판정하지 않는다.
+# 키에 analyzed_at·press_name 을 넣어 재분석·언론사명 정정이 반영되게 한다.
+# (그룹사가 빈 기사 46%는 card_tags 의 폴백 판정을 매번 다시 돌리고 있었다.)
+_TAG_MEMO: dict[str, tuple] = {}
+TAG_MEMO_MAX = 60000
+
+
 def tag_row(row: dict) -> dict:
     """행 + 사전계산된 필터 태그(표시용 g/c/p, 정규화 키 gk/ck/pk).
 
     카드로 변환하지 않고 card_tags 만 계산한다 — 전체 스캔 비용을 줄인다.
     /api/articles 의 스캔 캐시와 apply_filters 가 같은 모양을 쓴다.
     """
-    g, c, pname = card_tags(row)
-    return {
-        "row": row, "g": g, "c": c, "p": pname,
-        "gk": {normalize_chip(x) for x in g},
-        "ck": {normalize_chip(x) for x in c},
-        "pk": normalize_chip(pname) if pname else "",
-    }
+    # id 가 없는 행(테스트 픽스처·임시 dict)은 메모하지 않는다 — 키가 겹쳐 남의 태그를 받는다.
+    aid = row.get("id")
+    key = f"{aid}\x00{row.get('analyzed_at')}\x00{row.get('press_name')}" if aid else None
+    memo = _TAG_MEMO.get(key) if key else None
+    if memo is None:
+        g, c, pname = card_tags(row)
+        memo = (g, c, pname, {normalize_chip(x) for x in g},
+                {normalize_chip(x) for x in c}, normalize_chip(pname) if pname else "")
+        if key:
+            if len(_TAG_MEMO) >= TAG_MEMO_MAX:
+                _TAG_MEMO.clear()   # 단순 비우기 — 재계산 비용이 낮고 캐시는 금방 다시 찬다
+            _TAG_MEMO[key] = memo
+    g, c, pname, gk, ck, pk = memo
+    return {"row": row, "g": g, "c": c, "p": pname, "gk": gk, "ck": ck, "pk": pk}
 
 
 def filter_tagged(tagged: list[dict], g_keys: set[str], c_keys: set[str],
@@ -5965,19 +6113,19 @@ def create_app(ctx: Context):
     def _scan_rows(period: str, query: str) -> list[dict]:
         hours = PERIOD_HOURS.get(period, 0)
         since = now_utc() - timedelta(hours=hours) if hours else None
-        # 분석이 끝난 기사만 노출한다. 수집만 된(deferred) 기사는 관련성이 본문으로
-        # 아직 확정되지 않아 오태그(잘못된 포스코·배터리 태그)가 섞인다. (사용자 지정 2026-09-08)
-        return [r for r in ctx.storage.list_articles(MAX_SCAN_ROWS, 0, since, query)
-                if r.get("analyzed_at")]
+        # 분석이 끝난 기사만 노출한다(analyzed_at 조건은 scan_articles 가 SQL 에서 건다).
+        # 수집만 된(deferred) 기사는 관련성이 본문으로 아직 확정되지 않아
+        # 오태그(잘못된 포스코·배터리 태그)가 섞인다. (사용자 지정 2026-09-08)
+        return ctx.storage.scan_articles(MAX_SCAN_ROWS, since, query)
 
     # ── 스캔 + 태그 캐시 ────────────────────────────────────────────
-    # /api/articles·/api/filters 는 매 요청 list_articles(최대 3000행) 조인 조회 +
-    # 행마다 card_tags(그룹사 규칙 매칭·정규화)를 반복한다. 데이터는 수집 주기
-    # (기본 300초)에 한 번만 바뀌므로 (기간, 검색어) 조합을 짧게 캐시한다.
+    # /api/articles·/api/filters 는 매 요청 수천 행을 훑어 필터를 걸고 그중 한 페이지만
+    # 카드로 만든다. 스캔은 경량 컬럼만 읽고(scan_articles), 태그는 기사별로 메모(_TAG_MEMO)
+    # 하며, 데이터는 수집 주기(기본 300초)에 한 번만 바뀌므로 조합별로 캐시한다.
     _scan_cache: dict[str, dict] = {}
     _filters_cache: dict[str, Any] = {"at": 0.0, "data": None}
-    SCAN_TTL_SEC = 15
-    FILTERS_TTL_SEC = 20
+    SCAN_TTL_SEC = 30
+    FILTERS_TTL_SEC = 30
 
     def _scan_tagged(period: str, query: str) -> list[dict]:
         """행 + 사전계산된 필터 태그(표시용 리스트 g/c/p, 정규화 키 gk/ck/pk)."""
@@ -6020,12 +6168,14 @@ def create_app(ctx: Context):
                 t["row"].get("published_at") or "",
             ), reverse=True)
         start = (page - 1) * size
-        # 필터를 통과한 행만 세고, 화면에 보일 페이지 분량만 카드로 만든다.
+        # 스캔은 경량 컬럼만 읽었으므로, 화면에 보일 한 페이지만 카드용 전체 컬럼으로
+        # 다시 읽어 만든다(요약·관점·SWOT 근거문). 스캔 결과가 없으면 조회도 없다.
+        page_ids = [t["row"]["id"] for t in matched[start:start + size]]
         return JSONResponse({
             "total": len(matched),
             "page": page,
             "size": size,
-            "items": [build_card(t["row"]) for t in matched[start:start + size]],
+            "items": [build_card(r) for r in ctx.storage.card_details(page_ids)],
         })
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
@@ -7515,6 +7665,40 @@ def cmd_selftest() -> int:
     check("최근 행 임베딩 보존됨",
           _tmp._one("select title_embedding from articles where id='emb-new'")["title_embedding"] is not None, True)
     check("두 번째 호출은 대상 없음 → 0건", _tmp.purge_stale_embeddings(48), 0)
+
+    print("\n[11-2d] 목록 스캔 경량 조회 (scan_articles · card_details · embeddings_for)")
+    _tmp._exec("delete from articles")
+    for _sid, _an in (("sc-done", iso(now_utc())), ("sc-pending", None)):
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+            " analyzed_at, title_embedding, status, is_representative)"
+            " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_sid, f"http://s/{_sid}", f"http://s/{_sid}", f"http://s/{_sid}", "포스코퓨처엠 증설",
+             iso(now_utc()), iso(now_utc()), "search", 70, '["포스코퓨처엠"]', '["양극재"]',
+             "한국경제", _an, "[0.1,0.2]", "active", 1))
+    _tmp.save_summary({"id": new_id(), "article_id": "sc-done", "summary_text": "요약본문",
+                       "perspective_text": "관점", "summary_source": "fulltext",
+                       "model": "m", "token_usage": None, "created_at": iso(now_utc())})
+    _scan = _tmp.scan_articles(100, None, "")
+    check("분석 끝난 기사만 스캔에 나온다", [r["id"] for r in _scan], ["sc-done"])
+    check("스캔은 SWOT 근거문을 싣지 않는다", "s_text" in _scan[0], False)
+    check("스캔에도 요약은 있다(그룹사 폴백용)", _scan[0].get("summary_text"), "요약본문")
+    check("스캔은 임베딩을 싣지 않는다", "title_embedding" in _scan[0], False)
+    _cd = _tmp.card_details(["sc-done"])
+    check("card_details 는 관점까지 준다", _cd[0].get("perspective_text"), "관점")
+    check("card_details 는 없는 id 를 조용히 건너뛴다", _tmp.card_details(["nope"]), [])
+    check("card_details 는 입력 순서를 지킨다",
+          [r["id"] for r in _tmp.card_details(["sc-pending", "sc-done"])], ["sc-pending", "sc-done"])
+    check("embeddings_for 는 요청한 id 만", sorted(_tmp.embeddings_for(["sc-done"])), ["sc-done"])
+    check("embeddings_for 빈 입력 → 빈 dict", _tmp.embeddings_for([]), {})
+    # 태그 메모: id 가 같아도 언론사명이 바뀌면 다시 판정한다
+    _r1 = {"id": "t1", "analyzed_at": "x", "press_name": "A",
+           "group_companies": ["포스코퓨처엠"], "categories": [], "title": "", "keywords": []}
+    _r2 = dict(_r1, press_name="B")
+    check("태그 메모 — 언론사명이 바뀌면 갱신", (tag_row(_r1)["p"], tag_row(_r2)["p"]), ("A", "B"))
+    check("태그 메모 — id 없는 행은 캐시하지 않는다",
+          tag_row({"group_companies": ["포스코"], "categories": [], "press_name": "Z"})["g"], ["포스코"])
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
