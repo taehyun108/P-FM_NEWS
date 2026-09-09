@@ -1386,6 +1386,45 @@ class SqliteStorage(Storage):
 
 # ── Supabase 구현 ────────────────────────────────────────────────────
 
+_POSTGREST_PATCHED = False
+
+
+def _patch_postgrest_retry() -> None:
+    """postgrest 빌더의 execute() 를 감싸 연결 끊김(Server disconnected) 시 1회 재시도한다.
+
+    Supabase 는 유휴 연결을 조용히 끊는다 — HTTP/1.1 이라도 가끔 RemoteProtocolError 가
+    난다. 모든 호출부(60여 곳)를 고치는 대신 execute 한 곳만 감싼다. 재시도는 같은
+    httpx 클라이언트로 하되, 실패한 keep-alive 소켓은 풀에서 빠지고 새 연결이 쓰인다.
+    """
+    global _POSTGREST_PATCHED
+    if _POSTGREST_PATCHED:
+        return
+    try:
+        import httpx
+        from postgrest._sync import request_builder as _rb
+    except Exception:   # pragma: no cover
+        return
+    _transient = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError,
+                  httpx.WriteError, httpx.PoolTimeout, httpx.ConnectTimeout)
+    for _name in ("SyncQueryRequestBuilder", "SyncSingleRequestBuilder",
+                  "SyncMaybeSingleRequestBuilder"):
+        _cls = getattr(_rb, _name, None)
+        if _cls is None or "execute" not in _cls.__dict__:
+            continue
+        _orig = _cls.execute
+
+        def _wrapped(self, *a, __orig=_orig, **kw):
+            try:
+                return __orig(self, *a, **kw)
+            except _transient as exc:
+                log.warning("Supabase 연결 끊김 — 재시도: %s", exc)
+                time.sleep(0.5)
+                return __orig(self, *a, **kw)
+
+        _cls.execute = _wrapped
+    _POSTGREST_PATCHED = True
+
+
 class SupabaseStorage(Storage):
     """운영용. SQLite 구현과 완전히 같은 메서드 집합을 제공한다.
 
@@ -1395,12 +1434,19 @@ class SupabaseStorage(Storage):
 
     def __init__(self, url: str, key: str) -> None:
         try:
-            from supabase import create_client
+            from supabase import ClientOptions, create_client
         except ImportError as exc:  # pragma: no cover
             raise SystemExit(
                 "supabase 패키지가 없습니다. `pip install supabase` 후 다시 실행하세요."
             ) from exc
-        self.db = create_client(url, key)
+        import httpx
+        _patch_postgrest_retry()
+        # HTTP/2 지속 연결이 Supabase 엣지에서 조용히 끊기면 다음 요청이
+        # RemoteProtocolError("Server disconnected") 로 죽는다. HTTP/1.1 + 커넥션 재시도로
+        # 대부분 흡수한다(끊긴 keep-alive 소켓을 httpx 가 새 연결로 다시 시도).
+        http = httpx.Client(http2=False, timeout=httpx.Timeout(30.0),
+                            transport=httpx.HTTPTransport(retries=2))
+        self.db = create_client(url, key, options=ClientOptions(httpx_client=http))
 
     def _t(self, name: str):
         return self.db.table(name)
