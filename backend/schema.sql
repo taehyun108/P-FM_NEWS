@@ -189,6 +189,21 @@ create table if not exists weekly_reports (
 );
 create index if not exists idx_weekly_generated on weekly_reports (generated_at desc);
 
+-- ── 텔레그램 발신 로그 ─────────────────────────────────────────────
+-- 봇으로 실제 나간 메시지 전문(알림·직접 전송·봇 응답·테스트 전부). 대시보드 '발송 로그' 확인용.
+-- 마스터 전용 데이터라 공개 정책을 두지 않는다(service role 로만 접근). 30일 후 정리.
+create table if not exists telegram_log (
+  id         uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  chat_id    text,
+  kind       text,                      -- 발송 이유: '자동 알림'|'URL 등록'|'우선 발송'|'직접 전송'|'봇 응답'|'연결 테스트'|'기타'
+  article_id uuid,                       -- 기사 알림이면 그 기사 (FK 는 걸지 않는다 — 로그는 기사 삭제와 무관하게 남긴다)
+  text       text not null,              -- 실제 보낸 메시지 본문
+  ok         boolean not null,           -- 성공 여부
+  error      text                        -- 실패 시 텔레그램이 돌려준 사유
+);
+create index if not exists idx_telegram_log_time on telegram_log (created_at desc);
+
 -- ── 인덱스 ─────────────────────────────────────────────────────────
 create index if not exists idx_articles_published  on articles (published_at desc);
 create index if not exists idx_articles_score      on articles (importance_score desc, published_at desc);
@@ -208,6 +223,7 @@ alter table swot_analyses  enable row level security;
 alter table market_quotes  enable row level security;
 alter table press_outlets  enable row level security;
 alter table weekly_reports enable row level security;
+alter table telegram_log   enable row level security;
 
 create policy "public read articles"  on articles      for select using (status = 'active');
 create policy "public read summaries" on summaries     for select using (true);

@@ -840,6 +840,21 @@
           "산업용 전기요금" 기사는 발송되고 "가정용 전기요금" 기사는 걸러진다. 관심어 하나만으로는
           범위가 너무 넓을 때 쓴다.
         </div>
+
+        <h3>대시보드 — 발송 추적</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          통계 바의 <b>분석 대기 · 발송 실패</b> 카드를 누르면 해당 기사가 <b>피드와 똑같은 포토카드</b>로
+          펼쳐진다(<code>/api/stats/analysis-pending</code>·<code>/api/stats/notify-failed</code> 가
+          <code>build_card</code> 결과를 그대로 반환). 발송 실패 카드는 위에 텔레그램이 돌려준
+          <b>실제 원인</b>(예: <code>Too Many Requests: retry after 577</code> — 억제 해제 후 밀린
+          알림이 한꺼번에 나가 초당 제한에 걸린 경우)이 붙는다.
+          <br><b>발송 로그</b> 카드(발송 실패 오른쪽)는 봇으로 <b>실제 나간 메시지 전문</b>과
+          <b>발송 이유</b>를 보여 준다. <code>_telegram_send()</code> 한 곳에서 성공·실패 가리지 않고
+          <code>telegram_log</code> 에 적재하며(로그 실패는 발송에 영향 없음), 30일 후 정리된다.
+          이유 구분: <code>자동 알림</code>(파이프라인이 임계값 초과) · <code>URL 등록</code>(사용자가
+          URL 로 등록한 기사) · <code>우선 발송</code>('항상 발송 키워드'·무조건 점수) ·
+          <code>직접 전송</code>(카드의 ↗ 버튼) · <code>봇 응답</code> · <code>연결 테스트</code>.
+        </p>
       </section>
 
       <!-- ═══════════ 5. 데이터 ═══════════ -->
@@ -901,7 +916,7 @@
           </figcaption>
         </figure>
 
-        <h3>테이블 18개</h3>
+        <h3>테이블 19개</h3>
         <div class="tw"><table>
           <thead><tr><th>테이블</th><th class="num">행</th><th>내용</th></tr></thead>
           <tbody>
@@ -910,6 +925,7 @@
             <tr><td><code>swot_analyses</code></td><td class="num">931</td><td>S/W/O/T 점수·근거</td></tr>
             <tr><td><code>notifications</code></td><td class="num">934</td><td>발송 큐·이력 · <code>priority</code>로 우선 발송 표시</td></tr>
             <tr><td><code>weekly_reports</code></td><td class="num">5</td><td>주간동향 레포트 — payload(JSON) + html · 발송 시각</td></tr>
+            <tr><td><code>telegram_log</code></td><td class="num">—</td><td>봇으로 나간 메시지 전문 + 발송 이유(자동 알림·URL 등록·직접 전송·봇 응답 등) · 대시보드 '발송 로그' · 30일 후 정리</td></tr>
             <tr><td><code>url_ledger</code></td><td class="num">2,324</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
             <tr><td><code>press_outlets</code></td><td class="num">473</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
             <tr><td><code>keyword_sets</code></td><td class="num">118</td><td>검색 키워드 — 그룹사 7 · 산업 48 · 정책 38 · 통상 25</td></tr>
@@ -946,6 +962,7 @@
             <tr><td>잡음·주제이탈 기사</td><td>위 조건에 안 맞는 나머지 (<code>archived</code> 포함)</td><td class="num">90일</td><td><code>RETENTION_SOFT_DAYS</code></td></tr>
             <tr><td><code>collection_logs</code></td><td>실행 로그 (하루 약 288행)</td><td class="num">90일</td><td><code>RETENTION_LOG_DAYS</code></td></tr>
             <tr><td><code>url_ledger</code></td><td>영구 제외 URL — 이후 재등장해도 게이트가 다시 거른다</td><td class="num">180일</td><td><code>RETENTION_LEDGER_DAYS</code></td></tr>
+            <tr><td><code>telegram_log</code></td><td>봇 발신 로그 (대시보드 '발송 로그')</td><td class="num">30일</td><td><code>RETENTION_TGLOG_DAYS</code></td></tr>
           </tbody>
         </table></div>
         <p style="font-size:13px; line-height:1.8;">
@@ -956,7 +973,7 @@
 
         <h3>Supabase 전환 절차</h3>
         <ol style="margin:8px 0 0 18px; font-size:13px; line-height:1.9;">
-          <li>Supabase 대시보드 &gt; SQL Editor 에서 <code>backend/schema.sql</code> 실행 (테이블 18개 생성)</li>
+          <li>Supabase 대시보드 &gt; SQL Editor 에서 <code>backend/schema.sql</code> 실행 (테이블 19개 생성)</li>
           <li><code>.env</code> 에 <code>SUPABASE_URL</code>·<code>SUPABASE_SERVICE_ROLE_KEY</code>·
               <code>SUPABASE_ANON_KEY</code> 입력. <b>두 키를 서로 바꿔 넣어도</b> 코드가 JWT
               <code>role</code> 을 보고 <code>service_role</code> 키를 골라 쓴다(<code>_pick_supabase_service_key</code>).</li>
@@ -1009,11 +1026,11 @@
 
         <h3>검증</h3>
         <div class="kv">
-          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>297개</b> 검사</dd>
+          <dt>selftest</dt><dd><code>python backend/main.py selftest</code> — 순수 함수 <b>307개</b> 검사</dd>
           <dt>미사용 코드</dt><dd>백엔드·프런트 각 <b>0개</b> (참조 0회 정의 0 · selftest 전용 정의 0)</dd>
           <dt>규칙 중복</dt><dd>필터 규칙(F6.1a)은 <code>filter_tagged</code> <b>단일 구현</b>. 목록 API 와 selftest 가 같은 함수를 부른다</dd>
           <dt>API 계약</dt><dd>GET 라우트 16개 전수 호출 성공(마스터 설정은 401 정상), 프런트 호출 라우트 전부 존재</dd>
-          <dt>Storage 정합</dt><dd>ABC 48개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 18개·컬럼 완전 동기</dd>
+          <dt>Storage 정합</dt><dd>ABC 57개 ↔ SqliteStorage·SupabaseStorage 구현 누락 0. schema.sql ↔ schema_sqlite.sql 테이블 19개·컬럼 완전 동기</dd>
           <dt>동시성</dt><dd>스레드별 SQLite 커넥션 + WAL + 락 4종(+대외협력 전용 1종). 공유 캐시는 수집 스레드 전용</dd>
         </div>
 

@@ -501,6 +501,16 @@ class Storage(ABC):
     def prune_url_ledger(self, older_than_days: int) -> int: ...
 
     @abstractmethod
+    def log_telegram(self, entry: dict) -> None:
+        """봇으로 나간 메시지 1건을 telegram_log 에 기록. 실패해도 발송에 영향 없어야 한다."""
+
+    @abstractmethod
+    def recent_telegram_logs(self, limit: int) -> list[dict]: ...
+
+    @abstractmethod
+    def prune_telegram_log(self, older_than_days: int) -> int: ...
+
+    @abstractmethod
     def vacuum(self) -> None:
         """저장 공간 회수(SQLite VACUUM). Supabase 는 autovacuum 이 처리하므로 no-op."""
 
@@ -622,6 +632,18 @@ class SqliteStorage(Storage):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self._local = threading.local()
+        # 기존 DB 에도 telegram_log 가 없으면 만들어 둔다 — initdb 재실행 없이 '발송 로그'가 동작하도록.
+        # (나머지 스키마 변경은 여전히 init_schema 가 담당)
+        try:
+            with sqlite3.connect(path) as _c:
+                _c.execute(
+                    "create table if not exists telegram_log ("
+                    " id TEXT primary key, created_at TEXT not null, chat_id TEXT, kind TEXT,"
+                    " article_id TEXT, text TEXT not null, ok INTEGER not null, error TEXT)")
+                _c.execute("create index if not exists idx_telegram_log_time"
+                           " on telegram_log (created_at desc)")
+        except sqlite3.Error as exc:   # pragma: no cover
+            log.warning("telegram_log 부트스트랩 실패(무시): %s", exc)
 
     def _conn(self) -> sqlite3.Connection:
         # 수집 루프와 API 서버가 다른 스레드에서 접근하므로 스레드별 커넥션을 쓴다.
@@ -914,6 +936,26 @@ class SqliteStorage(Storage):
         cur = self._exec("delete from url_ledger where first_seen < ?", (cutoff,))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+    def log_telegram(self, entry: dict) -> None:
+        self._exec(
+            "insert into telegram_log (id, created_at, chat_id, kind, article_id, text, ok, error)"
+            " values (?,?,?,?,?,?,?,?)",
+            (new_id(), iso(now_utc()), entry.get("chat_id"), entry.get("kind") or "기타",
+             entry.get("article_id"), entry.get("text") or "",
+             1 if entry.get("ok") else 0, entry.get("error")))
+
+    def recent_telegram_logs(self, limit: int) -> list[dict]:
+        return self._rows(
+            "select l.id, l.created_at, l.chat_id, l.kind, l.article_id, l.text, l.ok, l.error,"
+            " a.title, a.url_canonical, a.url_original"
+            " from telegram_log l left join articles a on a.id = l.article_id"
+            " order by l.created_at desc limit ?", (limit,))
+
+    def prune_telegram_log(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        cur = self._exec("delete from telegram_log where created_at < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     def vacuum(self) -> None:
         # VACUUM 은 트랜잭션 밖에서만 실행된다. _exec 는 매 문장 커밋하므로 안전.
         self._conn().execute("vacuum")
@@ -991,12 +1033,14 @@ class SqliteStorage(Storage):
         )
         last = self._one("select max(collected_at) as t from articles")
         failed = self._one("select count(*) as n from notifications where status='failed'")
+        tglog = self._one("select count(*) as n from telegram_log")
         return {
             "total": int(total["n"]) if total else 0,
             "today": int(today_n["n"]) if today_n else 0,
             "last_collected_at": last["t"] if last else None,
             "notify_failed": int(failed["n"]) if failed else 0,
             "analysis_pending": self.unanalyzed_count(),
+            "telegram_log_total": int(tglog["n"]) if tglog else 0,
         }
 
     # ── 주간 레포트 ──────────────────────────────────────────────────
@@ -1154,7 +1198,7 @@ class SqliteStorage(Storage):
     def pending_notifications(self, limit: int) -> list[dict]:
         return self._rows(
             "select n.*, a.title, a.url_canonical, a.url_original, a.press_name, a.author,"
-            " a.importance_score, a.published_at, a.group_companies,"
+            " a.importance_score, a.published_at, a.group_companies, a.source_type,"
             " s.summary_text, s.perspective_text"
             " from notifications n"
             " join articles a on a.id = n.article_id"
@@ -1420,6 +1464,36 @@ class SupabaseStorage(Storage):
         res = self._t("url_ledger").delete().lt("first_seen", cutoff).execute()
         return len(res.data or [])
 
+    def log_telegram(self, entry: dict) -> None:
+        self._t("telegram_log").insert({
+            "chat_id": entry.get("chat_id"), "kind": entry.get("kind") or "기타",
+            "article_id": entry.get("article_id"), "text": entry.get("text") or "",
+            "ok": bool(entry.get("ok")), "error": entry.get("error"),
+        }).execute()
+
+    def recent_telegram_logs(self, limit: int) -> list[dict]:
+        rows = (self._t("telegram_log")
+                .select("id,created_at,chat_id,kind,article_id,text,ok,error")
+                .order("created_at", desc=True).limit(limit).execute().data) or []
+        ids = [r["article_id"] for r in rows if r.get("article_id")]
+        arts = {}
+        if ids:
+            for a in (self._t("articles")
+                      .select("id,title,url_canonical,url_original")
+                      .in_("id", ids).execute().data or []):
+                arts[a["id"]] = a
+        for r in rows:
+            a = arts.get(r.get("article_id"), {})
+            r["title"] = a.get("title")
+            r["url_canonical"] = a.get("url_canonical")
+            r["url_original"] = a.get("url_original")
+        return rows
+
+    def prune_telegram_log(self, older_than_days: int) -> int:
+        cutoff = iso(now_utc() - timedelta(days=older_than_days))
+        res = self._t("telegram_log").delete().lt("created_at", cutoff).execute()
+        return len(res.data or [])
+
     def vacuum(self) -> None:
         pass  # Postgres 는 autovacuum 이 처리한다.
 
@@ -1481,12 +1555,14 @@ class SupabaseStorage(Storage):
         last = (self._t("articles").select("collected_at")
                 .order("collected_at", desc=True).limit(1).execute().data)
         failed = self._t("notifications").select("id", count="exact").eq("status", "failed").execute().count or 0
+        tglog = self._t("telegram_log").select("id", count="exact").execute().count or 0
         return {
             "total": total,
             "today": today_n,
             "last_collected_at": last[0]["collected_at"] if last else None,
             "notify_failed": failed,
             "analysis_pending": self.unanalyzed_count(),
+            "telegram_log_total": tglog,
         }
 
     def save_weekly_report(self, row: dict) -> None:
@@ -1624,7 +1700,7 @@ class SupabaseStorage(Storage):
     def pending_notifications(self, limit: int) -> list[dict]:
         rows = (self._t("notifications")
                 .select("*, articles(title,url_canonical,url_original,press_name,author,"
-                        "importance_score,published_at,group_companies,"
+                        "importance_score,published_at,group_companies,source_type,"
                         "summaries(summary_text,perspective_text))")
                 .eq("status", "queued").lt("retry_count", 3)
                 .order("created_at").limit(limit).execute().data)
@@ -3422,6 +3498,7 @@ DEFER_BACKLOG_STABLE = 600
 RETENTION_SOFT_DAYS   = 90    # 일반·archived 기사 보관일
 RETENTION_LOG_DAYS    = 90    # collection_logs 보관일 (하루 약 288행 쌓임)
 RETENTION_LEDGER_DAYS = 180   # url_ledger 보관일 (이후 재수집돼도 게이트가 다시 거른다)
+RETENTION_TGLOG_DAYS  = 30    # telegram_log(봇 발신 로그) 보관일
 RETENTION_INTERVAL_HOURS = 24 # 보존 정리 실행 간격 (매 수집 사이클마다 하면 과하다)
 RETENTION_VACUUM_DAYS = 7     # SQLite VACUUM(파일 축소) 최소 간격
 _RETENTION_LAST: "datetime | None" = None
@@ -4146,9 +4223,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         gone = storage.purge_old_articles(cfg.article_retention_days, RETENTION_SOFT_DAYS, keep_score)
         logs_gone = storage.prune_collection_logs(RETENTION_LOG_DAYS)
         ledger_gone = storage.prune_url_ledger(RETENTION_LEDGER_DAYS)
-        if gone or logs_gone or ledger_gone:
-            log.info("보존 정리: 기사 %d · 수집로그 %d · URL원장 %d 삭제 (핵심 %d일·잡음 %d일 보관)",
-                     gone, logs_gone, ledger_gone, cfg.article_retention_days, RETENTION_SOFT_DAYS)
+        tglog_gone = storage.prune_telegram_log(RETENTION_TGLOG_DAYS)
+        if gone or logs_gone or ledger_gone or tglog_gone:
+            log.info("보존 정리: 기사 %d · 수집로그 %d · URL원장 %d · 발송로그 %d 삭제 (핵심 %d일·잡음 %d일 보관)",
+                     gone, logs_gone, ledger_gone, tglog_gone,
+                     cfg.article_retention_days, RETENTION_SOFT_DAYS)
         # SQLite 는 삭제해도 파일이 안 줄어들어 가끔 VACUUM 으로 회수한다(락 위험 있어 드물게).
         if gone and cfg.db_backend == "sqlite" and (
                 _VACUUM_LAST is None or (_n - _VACUUM_LAST) >= timedelta(days=RETENTION_VACUUM_DAYS)):
@@ -4594,6 +4673,15 @@ def format_message(row: dict) -> str:
     return "\n".join(lines)
 
 
+def _notify_reason(row: dict) -> str:
+    """알림 큐에서 나가는 기사의 '발송 이유' — 대시보드 '발송 로그' 에 표시된다."""
+    if row.get("source_type") == "manual":
+        return "URL 등록"          # 사용자가 URL 로 직접 등록한 기사
+    if row.get("priority"):
+        return "우선 발송"          # '항상 발송 키워드'·무조건 점수로 게이트 우회
+    return "자동 알림"              # 파이프라인이 중요도 임계값을 넘겨 발송
+
+
 def effective_threshold(ctx: Context) -> int:
     """/threshold 로 지정한 값이 있으면 그것을, 없으면 .env 값을 쓴다."""
     override = ctx.storage.get_run_state().get("notify_threshold")
@@ -4688,7 +4776,8 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
 
     def _send_one(row: dict) -> bool:
         """개별 카드 발송 — 요약·그룹사·점수가 다 들어간 전체 메시지."""
-        ok, err = _telegram_send(ctx, url, clamp_message(format_message(row)))
+        ok, err = _telegram_send(ctx, url, clamp_message(format_message(row)),
+                                 kind=_notify_reason(row), article_id=row.get("article_id"))
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
         else:
@@ -4767,7 +4856,7 @@ def cmd_sendtest(ctx: Context) -> None:
     text = ("✅ <b>P-FM NEWS</b> 텔레그램 연결 확인\n\n"
             f"chat_id: <code>{esc(ctx.cfg.telegram_chat_id)}</code>\n"
             f"시각: {esc(iso(now_utc()))}")
-    ok, err = _telegram_send(ctx, url, text)
+    ok, err = _telegram_send(ctx, url, text, kind="연결 테스트")
     if ok:
         log.info("시험 메시지 발송 성공. 텔레그램에서 확인하세요.")
     else:
@@ -4775,20 +4864,41 @@ def cmd_sendtest(ctx: Context) -> None:
 
 
 def _telegram_send(ctx: Context, url: str, text: str,
-                   chat_id: str | None = None, preview: bool = True) -> tuple[bool, str | None]:
+                   chat_id: str | None = None, preview: bool = True,
+                   kind: str = "기타", article_id: str | None = None) -> tuple[bool, str | None]:
+    """봇으로 메시지 1건을 보낸다. 성공·실패 모두 telegram_log 에 전문을 남긴다.
+
+    kind = 발송 이유. 대시보드 '발송 로그' 에 그대로 표시된다.
+      '자동 알림'   — 파이프라인이 큐에서 발송
+      'URL 등록'    — 사용자가 URL 로 직접 등록한 기사의 알림
+      '우선 발송'   — '항상 발송 키워드'·무조건 점수로 게이트 우회
+      '직접 전송'   — 카드의 ↗ 버튼
+      '봇 응답'     — 텔레그램 봇 명령·질문 응답
+      '연결 테스트' — sendtest 명령
+    """
+    target = chat_id or ctx.cfg.telegram_chat_id
+    ok, err = False, None
     try:
         resp = ctx.http.post(url, json={
-            "chat_id": chat_id or ctx.cfg.telegram_chat_id,
+            "chat_id": target,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": not preview,
         })
         data = resp.json()
         if resp.status_code == 200 and data.get("ok"):
-            return True, None
-        return False, str(data.get("description") or resp.status_code)
+            ok = True
+        else:
+            err = str(data.get("description") or resp.status_code)
     except Exception as exc:
-        return False, str(exc)
+        err = str(exc)
+    # 로그 기록은 발송 성패에 영향을 주면 안 된다 — 어떤 예외도 삼킨다.
+    try:
+        ctx.storage.log_telegram({"chat_id": target, "kind": kind, "article_id": article_id,
+                                  "text": text, "ok": ok, "error": err})
+    except Exception as exc:   # pragma: no cover
+        log.debug("telegram_log 기록 실패(무시): %s", exc)
+    return ok, err
 
 
 # =====================================================================
@@ -4839,7 +4949,7 @@ def _bot_rate_ok(chat_id: str) -> bool:
 
 def tg_send(ctx: Context, chat_id: str, text: str, preview: bool = True) -> None:
     url = TELEGRAM_API.format(token=ctx.cfg.telegram_bot_token)
-    ok, err = _telegram_send(ctx, url, text[:4000], chat_id=chat_id, preview=preview)
+    ok, err = _telegram_send(ctx, url, text[:4000], chat_id=chat_id, preview=preview, kind="봇 응답")
     if not ok:
         log.warning("봇 응답 발송 실패 (%s): %s", chat_id, err)
 
@@ -5620,39 +5730,64 @@ def create_app(ctx: Context):
     def api_stats():
         return JSONResponse(ctx.storage.stats())
 
+    def _detail_card(article_id: str | None, fallback_title: str, fallback_url: str) -> dict:
+        """상세 모달용 카드. 기사가 있으면 목록과 똑같은 포토카드, 없으면 최소 정보만."""
+        row = ctx.storage.article_detail(article_id) if article_id else None
+        if row:
+            return build_card(row)
+        return {"id": article_id, "title": fallback_title, "url": fallback_url or "",
+                "summary_text": "", "keywords": [], "group_companies": [], "categories": [],
+                "importance_score": 0, "swot": None, "published_at": None, "thumbnail_url": ""}
+
     @app.get("/api/stats/notify-failed")
     def api_stats_notify_failed(limit: int = 50):
-        """대시보드 '발송 실패' 카드를 눌렀을 때 — 어떤 기사가 왜 실패했는지."""
+        """대시보드 '발송 실패' 카드를 눌렀을 때 — 실패한 기사 포토카드 + 실패 원인."""
         rows = ctx.storage.failed_notifications(max(1, min(limit, 200)))
-        return JSONResponse({"items": [{
-            "article_id": r.get("article_id"),
-            "title": r.get("title") or "(기사 정보 없음)",
-            "press_name": r.get("press_name"),
-            "url": r.get("url_canonical") or r.get("url_original"),
-            "importance_score": r.get("importance_score"),
-            "status": r.get("status"),
-            "error": r.get("error") or "(원인이 기록되지 않았습니다)",
-            "retry_count": r.get("retry_count"),
-            "channel": r.get("channel"),
-            "created_at": r.get("created_at"),
-            # queued 인데 재시도 한도를 넘긴 건 = 실패로 세어지지도, 재시도되지도 않던 것
-            "stuck": r.get("status") == "queued",
-        } for r in rows]})
+        items = []
+        for r in rows:
+            card = _detail_card(r.get("article_id"), r.get("title") or "(기사 정보 없음)",
+                                r.get("url_canonical") or r.get("url_original") or "")
+            card["fail"] = {
+                "error": r.get("error") or "(원인이 기록되지 않았습니다)",
+                "retry_count": r.get("retry_count"),
+                "created_at": r.get("created_at"),
+                "channel": r.get("channel"),
+                # queued 인데 재시도 한도를 넘긴 건 = 실패로 세어지지도, 재시도되지도 않던 것
+                "stuck": r.get("status") == "queued",
+            }
+            items.append(card)
+        return JSONResponse({"items": items})
 
     @app.get("/api/stats/analysis-pending")
     def api_stats_analysis_pending(limit: int = 50):
         """대시보드 '분석 대기' 카드를 눌렀을 때 — 본문은 받았는데 분석이 안 끝난 기사."""
         rows = ctx.storage.unanalyzed_articles(max(1, min(limit, 200)))
+        items = []
+        for r in rows:
+            card = _detail_card(r.get("article_id"), r.get("title") or "(제목 없음)",
+                                r.get("url_canonical") or r.get("url_original") or "")
+            card["pending"] = {
+                "collected_at": r.get("collected_at"),
+                "fetched_at": r.get("fetched_at"),
+                "summary_source": r.get("summary_source"),
+                "body_len": r.get("body_len"),
+            }
+            items.append(card)
+        return JSONResponse({"items": items})
+
+    @app.get("/api/stats/telegram-log")
+    def api_stats_telegram_log(limit: int = 100):
+        """대시보드 '발송 로그' 카드 — 봇으로 실제 나간 메시지 전문(알림·봇응답·테스트)."""
+        rows = ctx.storage.recent_telegram_logs(max(1, min(limit, 300)))
         return JSONResponse({"items": [{
+            "created_at": r.get("created_at"),
+            "chat_id": r.get("chat_id"),
+            "kind": r.get("kind") or "기타",
+            "ok": bool(r.get("ok")),
+            "error": r.get("error"),
+            "text": r.get("text") or "",
             "article_id": r.get("article_id"),
-            "title": r.get("title") or "(제목 없음)",
-            "press_name": r.get("press_name"),
             "url": r.get("url_canonical") or r.get("url_original"),
-            "importance_score": r.get("importance_score"),
-            "collected_at": r.get("collected_at"),
-            "fetched_at": r.get("fetched_at"),
-            "summary_source": r.get("summary_source"),
-            "body_len": r.get("body_len"),
         } for r in rows]})
 
     @app.get("/api/articles/{article_id}")
@@ -5675,7 +5810,8 @@ def create_app(ctx: Context):
         api_url = TELEGRAM_API.format(token=ctx.cfg.telegram_bot_token)
 
         def _work():
-            return _telegram_send(ctx, api_url, format_message(row))
+            return _telegram_send(ctx, api_url, clamp_message(format_message(row)),
+                                  kind="직접 전송", article_id=article_id)
 
         ok, err = await anyio.to_thread.run_sync(_work)
         if ok:
@@ -6983,6 +7119,29 @@ def cmd_selftest() -> int:
     check("90일 넘은 수집로그만 정리 → 1건", _tmp.prune_collection_logs(90), 1)
     check("180일 기준 URL원장 정리 대상 없음 → 0건", _tmp.prune_url_ledger(180), 0)
     check("30일 기준이면 오래된 원장 1건 정리", _tmp.prune_url_ledger(90), 1)
+
+    print("\n[11-2c] 텔레그램 발송 로그 (telegram_log)")
+    # 발송 이유 판정
+    check("수동 등록 → 'URL 등록'", _notify_reason({"source_type": "manual"}), "URL 등록")
+    check("우선 기사 → '우선 발송'", _notify_reason({"priority": 1}), "우선 발송")
+    check("그 외 → '자동 알림'", _notify_reason({"source_type": "naver_api"}), "자동 알림")
+    _tmp.log_telegram({"chat_id": "-100", "kind": "자동 알림", "article_id": "art-core-mid",
+                       "text": "🔴 [포스코퓨처엠] 시험 알림", "ok": True, "error": None})
+    _tmp.log_telegram({"chat_id": "-100", "kind": "직접 전송", "article_id": None,
+                       "text": "안녕하세요", "ok": False, "error": "Too Many Requests: retry after 5"})
+    # 같은 초에 기록돼 정렬 타이가 나므로 시각을 명시적으로 벌린다(실사용은 1초 이상 간격).
+    _tmp._exec("update telegram_log set created_at=? where kind='자동 알림'",
+               (iso(now_utc() - timedelta(minutes=2)),))
+    _logs = _tmp.recent_telegram_logs(10)
+    check("2건 기록됨", len(_logs), 2)
+    check("최신순 정렬 — 나중 기록이 맨 앞", _logs[0]["kind"], "직접 전송")
+    check("성공 로그의 기사 제목 조인", _logs[1].get("title"), "제목")
+    check("실패 로그에 원인 보존", "Too Many Requests" in (_logs[0]["error"] or ""), True)
+    check("ok 플래그 정수 저장", (_logs[0]["ok"], _logs[1]["ok"]), (0, 1))
+    # created_at 을 과거로 돌려 정리 대상으로 만든다
+    _tmp._exec("update telegram_log set created_at=? where kind='직접 전송'", (_d120,))
+    check("30일 넘은 발송 로그 1건 정리", _tmp.prune_telegram_log(30), 1)
+    check("최근 로그는 남는다", len(_tmp.recent_telegram_logs(10)), 1)
 
     shutil.rmtree(_dbdir, ignore_errors=True)
 

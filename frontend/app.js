@@ -170,6 +170,8 @@ async function loadStats() {
         s.analysis_pending > 0 ? 'analysis' : null],
       ['발송 실패', s.notify_failed.toLocaleString('ko-KR'), false,
         s.notify_failed > 0 ? 'notify' : null],
+      // 봇으로 나간 메시지 전문 — 0건이어도 눌러서 확인할 수 있게 항상 버튼으로 둔다.
+      ['발송 로그', (s.telegram_log_total ?? 0).toLocaleString('ko-KR'), false, 'tglog'],
     ];
     $('stats').replaceChildren(...cards.map(([label, value, small, detail]) => {
       const box = el(detail ? 'button' : 'div', 'stat');
@@ -191,58 +193,65 @@ async function loadStats() {
    숫자만 보여 주면 '무엇이 왜 그런지'를 알 수가 없다. 카드를 누르면
    해당 기사와 실패 원인을 그대로 펼쳐 준다. */
 
+function stripTags(s) { return (s || '').replace(/<[^>]+>/g, ''); }
+
 const STAT_DETAIL = {
   notify: {
     title: '발송 실패',
     api: '/api/stats/notify-failed',
-    desc: '텔레그램으로 보내지 못한 기사입니다. 아래 붉은 칸이 텔레그램이 돌려준 실제 원인입니다.',
+    desc: '텔레그램으로 보내지 못한 기사입니다. 카드 위 붉은 칸이 텔레그램이 돌려준 실제 원인입니다.',
+    cards: true,
     render: (it) => {
-      const box = el('div', 'detail-item');
-      const h = el('h4');
-      if (it.url) {
-        const a = el('a', null, it.title);
-        a.href = it.url; a.target = '_blank'; a.rel = 'noopener';
-        h.append(a);
-      } else {
-        h.textContent = it.title;
-      }
-      if (it.stuck) h.append(el('span', 'detail-tag', '재시도 중단됨'));
-      box.append(h);
-      const meta = el('div', 'detail-meta');
-      [it.press_name, it.created_at ? formatDate(it.created_at) : null,
-       `재시도 ${it.retry_count ?? 0}회`, it.channel,
-       it.importance_score != null ? `중요도 ${it.importance_score}` : null,
-      ].filter(Boolean).forEach((t) => meta.append(el('span', null, t)));
-      box.append(meta);
-      const err = el('div', 'detail-err');
-      err.append(el('b', null, '원인: '));
-      err.append(document.createTextNode(it.error));
-      box.append(err);
-      return box;
+      const wrap = el('div', 'detail-card');
+      const f = it.fail || {};
+      const banner = el('div', 'detail-card-fail');
+      banner.append(el('b', null, '발송 실패: '));
+      banner.append(document.createTextNode(f.error || '(원인이 기록되지 않았습니다)'));
+      const sub = [f.created_at ? formatDate(f.created_at) : null,
+                  `재시도 ${f.retry_count ?? 0}회`,
+                  f.stuck ? '재시도 중단됨' : null].filter(Boolean);
+      banner.append(el('div', 'detail-card-fail-sub', sub.join(' · ')));
+      wrap.append(banner);
+      wrap.append(buildCard(it));
+      return wrap;
     },
   },
   analysis: {
     title: '분석 대기',
     api: '/api/stats/analysis-pending',
     desc: '본문은 받아 왔는데 요약·분석이 끝나지 않은 기사입니다. 다음 분석 주기에 처리됩니다.',
+    cards: true,
     render: (it) => {
-      const box = el('div', 'detail-item');
-      const h = el('h4');
-      if (it.url) {
-        const a = el('a', null, it.title);
-        a.href = it.url; a.target = '_blank'; a.rel = 'noopener';
-        h.append(a);
-      } else {
-        h.textContent = it.title;
+      const wrap = el('div', 'detail-card');
+      const p = it.pending || {};
+      const bits = [p.collected_at ? `수집 ${formatDate(p.collected_at)}` : null,
+                    p.body_len != null ? `본문 ${p.body_len.toLocaleString('ko-KR')}자` : null,
+                    p.summary_source || null].filter(Boolean);
+      wrap.append(el('div', 'detail-card-note',
+                     '분석 대기 중' + (bits.length ? ' · ' + bits.join(' · ') : '')));
+      wrap.append(buildCard(it));
+      return wrap;
+    },
+  },
+  tglog: {
+    title: '텔레그램 발송 로그',
+    api: '/api/stats/telegram-log',
+    desc: '봇으로 실제 나간 메시지입니다 (알림·봇 응답·테스트). 최근 100건.',
+    render: (it) => {
+      const box = el('div', `tglog-item${it.ok ? '' : ' tglog-item--fail'}`);
+      const head = el('div', 'tglog-head');
+      head.append(el('span', 'tglog-kind', it.kind || '기타'));   // 발송 이유
+      head.append(el('span', `tglog-state tglog-state--${it.ok ? 'ok' : 'fail'}`, it.ok ? '성공' : '실패'));
+      if (it.created_at) head.append(el('span', 'tglog-time', formatDate(it.created_at)));
+      if (it.chat_id) head.append(el('span', 'tglog-chat', it.chat_id));
+      box.append(head);
+      box.append(el('div', 'tglog-text', stripTags(it.text)));
+      if (!it.ok && it.error) {
+        const e = el('div', 'tglog-err');
+        e.append(el('b', null, '원인: '));
+        e.append(document.createTextNode(it.error));
+        box.append(e);
       }
-      box.append(h);
-      const meta = el('div', 'detail-meta');
-      [it.press_name,
-       it.collected_at ? `수집 ${formatDate(it.collected_at)}` : null,
-       it.body_len != null ? `본문 ${it.body_len.toLocaleString('ko-KR')}자` : null,
-       it.summary_source,
-      ].filter(Boolean).forEach((t) => meta.append(el('span', null, t)));
-      box.append(meta);
       return box;
     },
   },
@@ -253,16 +262,18 @@ async function openStatDetail(kind) {
   if (!spec) return;
   $('detailTitle').textContent = spec.title;
   $('detailDesc').textContent = spec.desc;
-  $('detailList').replaceChildren(el('div', 'detail-empty', '불러오는 중…'));
+  const list = $('detailList');
+  list.classList.toggle('detail-list--cards', !!spec.cards);
+  list.replaceChildren(el('div', 'detail-empty', '불러오는 중…'));
   $('detailModal').hidden = false;
   try {
     const data = await getJSON(spec.api);
     const items = data.items || [];
-    $('detailList').replaceChildren(
+    list.replaceChildren(
       ...(items.length ? items.map(spec.render)
-                       : [el('div', 'detail-empty', '해당하는 기사가 없습니다.')]));
+                       : [el('div', 'detail-empty', '해당하는 항목이 없습니다.')]));
   } catch (err) {
-    $('detailList').replaceChildren(
+    list.replaceChildren(
       el('div', 'detail-empty', '목록을 불러오지 못했습니다: ' + err.message));
   }
 }

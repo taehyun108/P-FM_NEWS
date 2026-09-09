@@ -116,6 +116,8 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 
 /* 통계 상세 목록 */
 .detail-modal { max-width: 720px; }
+/* 포토카드 그리드일 때는 넓게 — 2열 이상 보이도록 */
+.detail-modal:has(.detail-list--cards) { max-width: 900px; }
 .detail-list { display: flex; flex-direction: column; gap: 10px; max-height: 62vh; overflow-y: auto; }
 .detail-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .detail-item h4 { margin: 0 0 6px; font-size: 13.5px; line-height: 1.45; color: var(--navy); }
@@ -132,6 +134,48 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   border-radius: 999px; background: #fdece9; color: #a1372c; margin-left: 6px;
 }
 .detail-empty { padding: 26px 0; text-align: center; color: var(--ink-soft); font-size: 13px; }
+
+/* 상세 모달을 포토카드 그리드로 — '분석 대기'·'발송 실패' */
+.detail-list--cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 16px; align-items: start;
+}
+.detail-list--cards .detail-empty { grid-column: 1 / -1; }
+.detail-card { display: flex; flex-direction: column; gap: 6px; }
+.detail-card > .card { margin: 0; }
+.detail-card .card-date { white-space: nowrap; }
+.detail-card-fail {
+  background: #fdf2f2; color: #96323b; border: 1px solid #f2c9c9;
+  border-radius: 9px; padding: 8px 11px; font-size: 12px; line-height: 1.5;
+}
+.detail-card-fail b { color: #7a252d; }
+.detail-card-fail-sub { margin-top: 3px; font-size: 11px; color: #b07b7b; }
+.detail-card-note {
+  background: #fff7e6; color: #7c6234; border: 1px solid #efdfba;
+  border-radius: 9px; padding: 7px 11px; font-size: 11.5px; line-height: 1.5;
+}
+
+/* 텔레그램 발송 로그 */
+.tglog-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.tglog-item--fail { border-color: #f0cccc; background: #fdf6f6; }
+.tglog-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  font-size: 11px; color: var(--ink-soft); margin-bottom: 6px;
+}
+.tglog-kind {
+  font-weight: 700; font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+  background: var(--navy-soft); color: var(--navy);
+}
+.tglog-state { font-weight: 700; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; }
+.tglog-state--ok { background: #e8f0e8; color: #2f6b3a; }
+.tglog-state--fail { background: #fde8e6; color: #a1372c; }
+.tglog-time, .tglog-chat { font-variant-numeric: tabular-nums; }
+.tglog-text {
+  white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.55;
+  color: var(--ink); background: var(--bg); border-radius: 8px; padding: 8px 10px;
+  max-height: 220px; overflow-y: auto;
+}
+.tglog-err { margin-top: 6px; font-size: 11.5px; color: #96323b; }
 
 /* ── 필터 (F6.1a) ─────────────────────────────────────────────────── */
 .filters {

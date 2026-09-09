@@ -183,6 +183,20 @@ create table if not exists weekly_reports (
 );
 create index if not exists idx_weekly_generated on weekly_reports (generated_at desc);
 
+-- 텔레그램 발신 로그 — 봇으로 실제 나간 메시지 전문을 남긴다(알림·직접 전송·봇 응답·테스트 전부).
+-- 대시보드 '발송 로그' 에서 확인용. 30일 후 보존 정리에서 삭제된다.
+create table if not exists telegram_log (
+  id         TEXT primary key,
+  created_at TEXT not null,
+  chat_id    TEXT,
+  kind       TEXT,               -- 발송 이유: '자동 알림'|'URL 등록'|'우선 발송'|'직접 전송'|'봇 응답'|'연결 테스트'|'기타'
+  article_id TEXT,               -- 기사 알림이면 그 기사 (없으면 null)
+  text       TEXT not null,      -- 실제 보낸 메시지 본문
+  ok         INTEGER not null,   -- 1 성공 / 0 실패
+  error      TEXT                -- 실패 시 텔레그램이 돌려준 사유
+);
+create index if not exists idx_telegram_log_time on telegram_log (created_at desc);
+
 -- 인덱스 (SQLite 에는 GIN 이 없다. 배열 필터는 애플리케이션에서 처리한다)
 create index if not exists idx_articles_published  on articles (published_at desc);
 create index if not exists idx_articles_score      on articles (importance_score desc, published_at desc);
