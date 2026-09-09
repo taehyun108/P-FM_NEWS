@@ -1389,6 +1389,40 @@ class SupabaseStorage(Storage):
     def _t(self, name: str):
         return self.db.table(name)
 
+    @staticmethod
+    def _in_batches(values: Sequence[str], budget: int = 4000):
+        """.in_(...) 는 값을 URL 쿼리스트링에 전부 넣는다. 구글뉴스 리다이렉트 URL 처럼
+        긴 값을 수백 개 넣으면 요청 URL 이 서버 한도(약 8KB)를 넘어 400 이 난다.
+        누적 길이가 budget 을 넘지 않게 나눈다(항상 최소 1개는 보낸다)."""
+        batch: list[str] = []
+        acc = 0
+        for v in values:
+            n = len(str(v)) * 3 + 1   # URL 인코딩 여유
+            if batch and acc + n > budget:
+                yield batch
+                batch, acc = [], 0
+            batch.append(v)
+            acc += n
+        if batch:
+            yield batch
+
+    @staticmethod
+    def _page(make_query, cap: int, page: int = 1000) -> list[dict]:
+        """PostgREST 는 응답을 1000행으로 자른다(Supabase max-rows). Range 로 이어 받는다.
+
+        make_query() 는 매번 새 쿼리 빌더를 돌려주는 팩토리다(.order 까지 포함, .execute 제외).
+        """
+        out: list[dict] = []
+        start = 0
+        while start < cap:
+            end = min(start + page, cap) - 1
+            rows = make_query().range(start, end).execute().data or []
+            out.extend(rows)
+            if len(rows) < page:
+                break
+            start += page
+        return out
+
     def init_schema(self) -> None:
         raise SystemExit(
             "Supabase 스키마는 자동 생성하지 않습니다.\n"
@@ -1399,25 +1433,30 @@ class SupabaseStorage(Storage):
         if not candidates:
             return set()
         found: set[str] = set()
-        chunk = 400
-        for i in range(0, len(candidates), chunk):
-            part = list(candidates[i:i + chunk])
+        for part in self._in_batches(list(candidates)):
             found.update(
                 r["url_source"] for r in self._t("articles").select("url_source").in_("url_source", part).execute().data
             )
             found.update(
                 r["url_source"] for r in self._t("url_ledger").select("url_source").in_("url_source", part).execute().data
             )
-            remaining = [c for c in part if c not in found]
-            for alias in remaining:
-                hit = self._t("articles").select("id").contains("url_source_aliases", [alias]).limit(1).execute().data
-                if hit:
-                    found.add(alias)
+        remaining = {c for c in candidates if c not in found}
+        if remaining:
+            # alias 로 이미 아는 URL 인지 — 예전엔 URL 마다 contains 쿼리를 순차로 쳤다(수백 회).
+            # alias 가 붙은 기사는 극소수이므로 그 컬럼만 통째로 훑는 게 훨씬 싸다.
+            for r in self._page(lambda: self._t("articles")
+                                .select("url_source_aliases").neq("url_source_aliases", "{}")
+                                .order("collected_at", desc=True), cap=20000):
+                for a in (r.get("url_source_aliases") or []):
+                    if a in remaining:
+                        found.add(a)
         return found
 
     def recent_url_sources(self, hours: int) -> set[str]:
         cutoff = iso(now_utc() - timedelta(hours=hours))
-        rows = self._t("articles").select("url_source,url_source_aliases").gte("collected_at", cutoff).execute().data
+        rows = self._page(lambda: (
+            self._t("articles").select("url_source,url_source_aliases")
+            .gte("collected_at", cutoff).order("collected_at", desc=True)), cap=20000)
         out: set[str] = set()
         for row in rows:
             out.add(row["url_source"])
@@ -1458,24 +1497,37 @@ class SupabaseStorage(Storage):
 
     def recent_articles_for_dedup(self, since: datetime) -> list[dict]:
         # title_embedding 은 빼고 읽는다 — 4단계 잔여 후보에만 필요하므로 embeddings_for 로 지연 조회.
-        return (self._t("articles")
-                .select("id,title,published_at,dedup_group_id,is_representative,press_id,press_name,content_hash")
-                .gte("published_at", iso(since)).eq("status", "active").execute().data)
+        return self._page(lambda: (
+            self._t("articles")
+            .select("id,title,published_at,dedup_group_id,is_representative,press_id,press_name,content_hash")
+            .gte("published_at", iso(since)).eq("status", "active")
+            .order("published_at", desc=True)), cap=20000)
 
     def upsert_ledger(self, url_source: str, reason: str) -> None:
-        existing = self._t("url_ledger").select("hit_count").eq("url_source", url_source).execute().data
-        if existing:
-            self._t("url_ledger").update({"hit_count": existing[0]["hit_count"] + 1}).eq("url_source", url_source).execute()
-        else:
-            self._t("url_ledger").insert(
-                {"url_source": url_source, "reason": reason, "first_seen": iso(now_utc()), "hit_count": 1}
-            ).execute()
+        # 요청 1회. 이미 있으면 덮어쓴다(hit_count 는 1 로). 반복 재등장 카운트는
+        # bump_ledger 가 맡는다 — upsert_ledger 는 '처음 제외' 경로에서만 불린다.
+        self._t("url_ledger").upsert(
+            {"url_source": url_source, "reason": reason,
+             "first_seen": iso(now_utc()), "hit_count": 1},
+            on_conflict="url_source", ignore_duplicates=True,
+        ).execute()
 
     def bump_ledger(self, url_sources: Sequence[str]) -> None:
-        for url in url_sources:
-            rows = self._t("url_ledger").select("hit_count").eq("url_source", url).execute().data
-            if rows:
-                self._t("url_ledger").update({"hit_count": rows[0]["hit_count"] + 1}).eq("url_source", url).execute()
+        # url_sources 는 이번 회차에 다시 본 URL 전체(수백 개) — 대부분 이미 수집된
+        # 기사라 원장에 없다. 원장에 있는 것만 골라(배치 조회) 한 번에 올린다.
+        # 예전엔 URL 마다 select+update 를 순차로 쳐 HTTP/2 연결이 끊겼다.
+        if not url_sources:
+            return
+        rows: list[dict] = []
+        for part in self._in_batches(list(url_sources)):
+            rows += (self._t("url_ledger")
+                     .select("url_source,reason,first_seen,hit_count")
+                     .in_("url_source", part).execute().data or [])
+        if not rows:
+            return
+        payload = [{**r, "hit_count": (r.get("hit_count") or 0) + 1} for r in rows]
+        for i in range(0, len(payload), 500):
+            self._t("url_ledger").upsert(payload[i:i + 500], on_conflict="url_source").execute()
 
     def save_body(self, article_id: str, body: str, summary_source: str) -> None:
         self._t("article_bodies").upsert({
@@ -1520,11 +1572,11 @@ class SupabaseStorage(Storage):
         return [r for r in rows if r["id"] not in bodies][:limit]
 
     def deferred_count(self) -> int:
-        bodies = {r["article_id"] for r in
-                  self._t("article_bodies").select("article_id").execute().data or []}
-        rows = (self._t("articles").select("id")
-                .is_("analyzed_at", "null").eq("status", "active").execute()).data or []
-        return sum(1 for r in rows if r["id"] not in bodies)
+        # 미분석·활성 전체에서 '본문은 있는(unanalyzed_count)' 것을 뺀다.
+        # 행을 다 받아 세면 max-rows(1000) 에 걸려 과소 집계된다.
+        total = (self._t("articles").select("id", count="exact")
+                 .is_("analyzed_at", "null").eq("status", "active").execute().count or 0)
+        return max(0, total - self.unanalyzed_count())
 
     def delete_body(self, article_id: str) -> None:
         self._t("article_bodies").delete().eq("article_id", article_id).execute()
@@ -1555,24 +1607,23 @@ class SupabaseStorage(Storage):
         res = (self._t("articles").delete()
                .neq("status", "draft").lt("published_at", hard_cut).execute())
         total += len(res.data or [])
-        cand = (self._t("articles").select("id,group_companies,importance_score")
-                .neq("status", "draft").lt("published_at", soft_cut)
-                .lt("importance_score", keep_score).limit(50000).execute()).data or []
+        cand = self._page(lambda: (
+            self._t("articles").select("id,group_companies,importance_score")
+            .neq("status", "draft").lt("published_at", soft_cut)
+            .lt("importance_score", keep_score).order("published_at")), cap=50000)
         ids = [r["id"] for r in cand if not (r.get("group_companies") or [])]
         if ids:
             # 알림된 적 있는지는 '후보 id 에 대해서만' 조회한다. 전체 notifications 를
             # 상한 걸어 읽으면(예전 limit 100000) 알림 이력이 그 수를 넘긴 뒤부터
             # 알림됐던 오래된 기사도 잘못 삭제된다.
             notified: set[str] = set()
-            for i in range(0, len(ids), 300):
-                part = ids[i:i + 300]
+            for part in self._in_batches(ids):
                 notified |= {r["article_id"] for r in
                              (self._t("notifications").select("article_id")
                               .in_("article_id", part).neq("status", "skipped")
                               .execute()).data or []}
             drop = [i for i in ids if i not in notified]
-            for i in range(0, len(drop), 200):
-                part = drop[i:i + 200]
+            for part in self._in_batches(drop):
                 self._t("articles").delete().in_("id", part).execute()
                 total += len(part)
         return total
@@ -1600,10 +1651,10 @@ class SupabaseStorage(Storage):
                 .order("created_at", desc=True).limit(limit).execute().data) or []
         ids = [r["article_id"] for r in rows if r.get("article_id")]
         arts = {}
-        if ids:
+        for part in self._in_batches(ids):
             for a in (self._t("articles")
                       .select("id,title,url_canonical,url_original")
-                      .in_("id", ids).execute().data or []):
+                      .in_("id", part).execute().data or []):
                 arts[a["id"]] = a
         for r in rows:
             a = arts.get(r.get("article_id"), {})
@@ -1634,58 +1685,71 @@ class SupabaseStorage(Storage):
     def list_articles(self, limit: int, offset: int, since: datetime | None, query: str) -> list[dict]:
         # '*' 를 쓰지 않는다 — title_embedding(행당 ~31KB)까지 실어와 목록 조회가 크게 느려진다.
         cols = ARTICLE_CARD_COLS.replace("a.", "")
-        q = (self._t("articles")
-             .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
-                     " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
-             .eq("status", "active").eq("is_representative", True))
-        if since is not None:
-            q = q.gte("published_at", iso(since))
-        if query:
-            like = f"%{query}%"
-            q = q.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
-        rows = q.order("published_at", desc=True).range(offset, offset + limit - 1).execute().data
+
+        def q():
+            b = (self._t("articles")
+                 .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
+                         " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
+                 .eq("status", "active").eq("is_representative", True))
+            if since is not None:
+                b = b.gte("published_at", iso(since))
+            if query:
+                like = f"%{query}%"
+                b = b.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
+            return b.order("published_at", desc=True)
+
+        if offset:   # 페이지네이션 호출 — 한 페이지만
+            rows = q().range(offset, offset + limit - 1).execute().data or []
+        else:        # 대량 조회(주간레포트 등) — max-rows(1000) 넘게 이어 받는다
+            rows = self._page(q, cap=limit)
         return [self._flatten(r) for r in rows]
 
     def scan_articles(self, limit: int, since: datetime | None, query: str) -> list[dict]:
         cols = ARTICLE_SCAN_COLS.replace("a.", "")
-        q = (self._t("articles")
-             .select(f"{cols}, summaries(summary_text)")
-             .eq("status", "active").eq("is_representative", True)
-             .not_.is_("analyzed_at", "null"))
-        if since is not None:
-            q = q.gte("published_at", iso(since))
-        if query:
-            like = f"%{query}%"
-            q = q.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
-        rows = q.order("published_at", desc=True).limit(limit).execute().data
-        return [self._flatten(r) for r in rows]
+
+        def q():
+            b = (self._t("articles")
+                 .select(f"{cols}, summaries(summary_text)")
+                 .eq("status", "active").eq("is_representative", True)
+                 .not_.is_("analyzed_at", "null"))
+            if since is not None:
+                b = b.gte("published_at", iso(since))
+            if query:
+                like = f"%{query}%"
+                b = b.or_(f"title.ilike.{like},author.ilike.{like},press_name.ilike.{like}")
+            return b.order("published_at", desc=True)
+
+        return [self._flatten(r) for r in self._page(q, cap=limit)]
 
     def changed_articles_since(self, since: str, limit: int = 5000) -> list[dict]:
         cols = ARTICLE_SCAN_COLS.replace("a.", "")
-        rows = (self._t("articles")
-                .select(f"{cols}, status, summaries(summary_text)")
-                .eq("is_representative", True)
-                .or_(f"collected_at.gte.{since},analyzed_at.gte.{since}")
-                .order("published_at", desc=True).limit(limit).execute().data) or []
-        return [self._flatten(r) for r in rows]
+        return [self._flatten(r) for r in self._page(lambda: (
+            self._t("articles")
+            .select(f"{cols}, status, summaries(summary_text)")
+            .eq("is_representative", True)
+            .or_(f"collected_at.gte.{since},analyzed_at.gte.{since}")
+            .order("published_at", desc=True)), cap=limit)]
 
     def card_details(self, ids: Sequence[str]) -> list[dict]:
         if not ids:
             return []
         cols = ARTICLE_CARD_COLS.replace("a.", "")
-        rows = (self._t("articles")
-                .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
-                        " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
-                .in_("id", list(ids)).execute().data) or []
-        by_id = {r["id"]: self._flatten(r) for r in rows}
+        by_id: dict[str, dict] = {}
+        for part in self._in_batches(list(ids)):
+            for r in (self._t("articles")
+                      .select(f"{cols}, summaries(summary_text,perspective_text,summary_source),"
+                              " swot_analyses(total_score,s_score,w_score,o_score,t_score,s_text,w_text,o_text,t_text)")
+                      .in_("id", part).execute().data) or []:
+                by_id[r["id"]] = self._flatten(r)
         return [by_id[i] for i in ids if i in by_id]
 
     def embeddings_for(self, ids: Sequence[str]) -> dict[str, list[float] | None]:
-        if not ids:
-            return {}
-        rows = (self._t("articles").select("id,title_embedding")
-                .in_("id", list(ids)).execute().data) or []
-        return {r["id"]: r.get("title_embedding") for r in rows}
+        out: dict[str, list[float] | None] = {}
+        for part in self._in_batches(list(ids)):
+            for r in (self._t("articles").select("id,title_embedding")
+                      .in_("id", part).execute().data) or []:
+                out[r["id"]] = r.get("title_embedding")
+        return out
 
     @staticmethod
     def _flatten(row: dict) -> dict:
@@ -1811,7 +1875,7 @@ class SupabaseStorage(Storage):
         return rows[0] if rows else None
 
     def all_press(self) -> list[dict]:
-        return self._t("press_outlets").select("*").execute().data or []
+        return self._page(lambda: self._t("press_outlets").select("*").order("domain"), cap=20000)
 
     def press_tier_by_id(self, press_id: str | None) -> int:
         if not press_id:
@@ -1906,10 +1970,10 @@ class SupabaseStorage(Storage):
                 .order("created_at", desc=True).limit(limit).execute().data) or []
         ids = [r["article_id"] for r in rows if r.get("article_id")]
         arts = {}
-        if ids:
+        for part in self._in_batches(ids):
             for a in (self._t("articles").select(
                     "id,title,press_name,published_at,url_canonical,url_original,importance_score")
-                    .in_("id", ids).execute().data or []):
+                    .in_("id", part).execute().data or []):
                 arts[a["id"]] = a
         out = []
         for r in rows:
@@ -1923,19 +1987,21 @@ class SupabaseStorage(Storage):
 
     def unanalyzed_articles(self, limit: int) -> list[dict]:
         bodies = (self._t("article_bodies").select("article_id,fetched_at,summary_source")
-                  .order("fetched_at", desc=True).limit(2000).execute().data) or []
+                  .order("fetched_at", desc=True).limit(1000).execute().data) or []
         by_id = {b["article_id"]: b for b in bodies}
         if not by_id:
             return []
-        rows = (self._t("articles").select(
-                "id,title,press_name,published_at,collected_at,url_canonical,url_original,importance_score")
-                .is_("analyzed_at", "null").eq("status", "active")
-                .in_("id", list(by_id)[:500])
-                .order("collected_at", desc=True).limit(limit).execute().data) or []
+        rows: list[dict] = []
+        for part in self._in_batches(list(by_id)):
+            rows += (self._t("articles").select(
+                     "id,title,press_name,published_at,collected_at,url_canonical,url_original,importance_score")
+                     .is_("analyzed_at", "null").eq("status", "active")
+                     .in_("id", part).order("collected_at", desc=True).execute().data) or []
+        rows.sort(key=lambda r: r.get("collected_at") or "", reverse=True)
         return [{**r, "article_id": r["id"],
                  "fetched_at": by_id.get(r["id"], {}).get("fetched_at"),
                  "summary_source": by_id.get(r["id"], {}).get("summary_source"),
-                 "body_len": None} for r in rows]
+                 "body_len": None} for r in rows[:limit]]
 
 
 def make_storage(cfg: Config) -> Storage:
@@ -6126,10 +6192,12 @@ def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses:
 # /api/articles·/api/filters 는 활성·분석완료 기사 수천~수만 행을 훑어 필터한다.
 # 요청마다 DB 를 다시 읽으면 Supabase 이관 후 무료 대역폭(5GB/월)을 금방 넘긴다.
 # 태그가 붙은 행을 메모리에 두고, 파이프라인이 사이클마다 '바뀐 것만' 델타로 갱신한다.
-_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0}
+_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0}
 _SCAN_STORE_LOCK = threading.Lock()
 SCAN_STORE_CAP = 40000            # 메모리 상한(≈100일치). 넘으면 발행일 오래된 것부터 버린다.
 SCAN_FULL_RELOAD_SEC = 20 * 3600  # 삭제·상태변경 반영: 하루 1회 전체 재적재
+SCAN_DELTA_MIN_SEC = 60           # 델타 조회 최소 간격 — API 요청마다 DB 치지 않는다
+                                 # (파이프라인이 사이클마다 갱신하므로 이 정도 지연은 무해)
 
 
 def _row_ts(r: dict) -> str:
@@ -6153,7 +6221,9 @@ def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
             st["by_id"] = {r["id"]: tag_row(r) for r in rows}
             st["cursor"] = max((_row_ts(r) for r in rows), default="")
             st["full_at"] = now
-        elif st["cursor"]:
+            st["delta_at"] = now
+        elif st["cursor"] and now - st["delta_at"] >= SCAN_DELTA_MIN_SEC:
+            st["delta_at"] = now
             fresh = storage.changed_articles_since(st["cursor"])
             for r in fresh:
                 _store_put(st, r)
@@ -7192,6 +7262,10 @@ def cmd_migrate(ctx: Context) -> None:
                 return v
         return v
 
+    # id 가 bigserial(자동 증가)인 테이블은 id 를 옮기지 않는다 — 명시 id 로 넣으면
+    # Postgres 시퀀스가 안 움직여, 이후 로그를 쓸 때 id=1 부터 충돌한다.
+    _SERIAL_ID_TABLES = {"collection_logs"}
+
     total = 0
     for table in _MIGRATE_TABLES:
         try:
@@ -7202,11 +7276,14 @@ def cmd_migrate(ctx: Context) -> None:
         if not rows:
             log.info("  %s: 0행", table)
             continue
-        payload = [{k: _coerce(v) for k, v in r.items()} for r in rows]
+        drop_id = table in _SERIAL_ID_TABLES
+        payload = [{k: _coerce(v) for k, v in r.items() if not (drop_id and k == "id")}
+                   for r in rows]
         done = 0
         for i in range(0, len(payload), 500):
             chunk = payload[i:i + 500]
-            tgt.table(table).upsert(chunk).execute()
+            tgt.table(table).insert(chunk).execute() if drop_id else \
+                tgt.table(table).upsert(chunk).execute()
             done += len(chunk)
         total += done
         log.info("  %s: %d행 이관", table, done)
@@ -7801,7 +7878,9 @@ def cmd_selftest() -> int:
           tag_row({"group_companies": ["포스코"], "categories": [], "press_name": "Z"})["g"], ["포스코"])
 
     print("\n[11-2e] 스캔 스토어 델타 갱신 (changed_articles_since · refresh_scan_store)")
-    _SCAN_STORE["by_id"].clear(); _SCAN_STORE["cursor"] = ""; _SCAN_STORE["full_at"] = 0.0
+    def _reset_store():
+        _SCAN_STORE.update(by_id={}, cursor="", full_at=0.0, delta_at=0.0)
+    _reset_store()
     _tmp._exec("delete from articles"); _tmp._exec("delete from summaries")
     _t0 = iso(now_utc() - timedelta(hours=2))
     for _sid, _pub in (("st-a", _t0), ("st-b", _t0)):
@@ -7821,16 +7900,23 @@ def cmd_selftest() -> int:
         " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ("st-c", "h/c", "h/c", "h/c", "포스코퓨처엠 c", _later, _later, "search", 70,
          '["포스코퓨처엠"]', '["양극재"]', "한경", _later, "active", 1))
+    _SCAN_STORE["delta_at"] = 0.0   # 델타 조회 최소 간격(60초) 우회 — 테스트라 바로 확인
     rows = refresh_scan_store(_tmp)
     check("델타 — 신규 1건 반영", "st-c" in {t["row"]["id"] for t in rows}, True)
     # st-a 를 보관 처리 → 델타가 스토어에서 제거
     _tmp._exec("update articles set status='archived', collected_at=? where id='st-a'",
                (iso(now_utc()),))
+    _SCAN_STORE["delta_at"] = 0.0
     rows = refresh_scan_store(_tmp)
     check("델타 — 보관된 기사는 스토어에서 빠진다", "st-a" in {t["row"]["id"] for t in rows}, False)
     check("changed_articles_since 는 상태 무관하게 준다",
           "st-a" in {r["id"] for r in _tmp.changed_articles_since(iso(now_utc() - timedelta(minutes=5)))}, True)
-    _SCAN_STORE["by_id"].clear(); _SCAN_STORE["cursor"] = ""; _SCAN_STORE["full_at"] = 0.0
+    check("델타 조회 최소 간격 — 방금 갱신했으면 DB 안 침",
+          (_SCAN_STORE.update(delta_at=time.monotonic()),
+           _tmp._exec("update articles set title='X' where id='st-b'"),
+           refresh_scan_store(_tmp),
+           _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
+    _reset_store()
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
