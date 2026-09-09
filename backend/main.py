@@ -5684,13 +5684,22 @@ def cmd_kakao_auth(ctx: Context) -> None:
     """카카오 '나에게 보내기' 최초 토큰 발급 (1회)."""
     if not ctx.cfg.kakao_configured:
         raise SystemExit("KAKAO_REST_API_KEY 또는 KAKAO_REDIRECT_URI 가 비어 있습니다.")
+    redirect = ctx.cfg.kakao_redirect_uri
+    auto = "/kakao/callback" in redirect or redirect.rstrip("/").endswith("/kakao")
     print("\n1) 아래 URL 을 브라우저에서 열고 카카오 로그인 + '카카오톡 메시지 전송' 동의:\n")
     print("   " + kakao_authorize_url(ctx.cfg))
-    print(f"\n2) 동의 후 {ctx.cfg.kakao_redirect_uri}?code=... 로 이동합니다"
-          " (에러 페이지여도 정상).\n   주소창의 code= 값을 복사해 아래에 붙여넣으세요.\n")
+    if auto:
+        print(f"\n2) 동의하면 카카오가 {redirect} 로 보내고,"
+              "\n   실행 중인 서버(run)가 code 를 자동으로 받아 토큰을 저장합니다."
+              "\n   → 서버를 켜 둔 상태라면 이 명령은 더 실행할 필요가 없습니다."
+              "\n   → 브라우저에 '카카오 연결 완료' 가 뜨면 끝. (kakao-test 로 확인)\n")
+        print("   서버를 켜지 않았다면, 착지 페이지 주소창의 code= 값을 아래에 붙여넣으세요.")
+    else:
+        print(f"\n2) 동의 후 {redirect}?code=... 로 이동합니다 (에러 페이지여도 정상)."
+              "\n   주소창의 code= 값을 복사해 아래에 붙여넣으세요.\n")
     code = input("   code = ").strip()
     if not code:
-        raise SystemExit("code 가 비었습니다.")
+        raise SystemExit("code 가 비었습니다. (서버가 자동 처리했다면 정상입니다)")
     body = kakao_exchange_code(ctx, code)
     print(f"\n완료. refresh_token 저장됨 (유효 {int(body.get('refresh_token_expires_in', 0)) // 86400}일)."
           "  python backend/main.py kakao-test 로 시험 발송하세요.")
@@ -6736,6 +6745,85 @@ def create_app(ctx: Context):
         if not url:
             return JSONResponse({"ok": False, "error": "봇 주소를 확인하지 못했습니다."})
         return JSONResponse({"ok": True, "url": url, "kind": "bot"})
+
+    def _kakao_cb_page(title: str, body: str, ok: bool):
+        from fastapi.responses import HTMLResponse
+        color = "#156082" if ok else "#c0392b"
+        html = (
+            "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><style>"
+            "body{font-family:system-ui,'Malgun Gothic',sans-serif;background:#f4f6f8;"
+            "margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}"
+            ".box{background:#fff;max-width:520px;padding:36px 40px;border-radius:14px;"
+            "box-shadow:0 6px 24px rgba(0,0,0,.08);line-height:1.6}"
+            f".box h1{{margin:0 0 14px;font-size:20px;color:{color}}}"
+            ".box p{margin:8px 0;color:#333;font-size:14px}"
+            ".box code{background:#eef2f5;padding:2px 6px;border-radius:4px;font-size:13px}"
+            "</style></head><body><div class='box'>"
+            f"<h1>{title}</h1>{body}</div></body></html>"
+        )
+        return HTMLResponse(html, status_code=200 if ok else 400)
+
+    async def _kakao_callback(code: str = "", error: str = "",
+                              error_description: str = ""):
+        """카카오 OAuth 리다이렉트 착지점.
+
+        authorize 동의 후 카카오가 ?code= 를 붙여 이리로 보낸다.
+        서버가 그 code 를 토큰으로 교환하고 refresh_token 을 run_state 에 저장한다.
+        (기존 수동 복사·붙여넣기 kakao-auth 를 대체한다.)
+        """
+        if error:
+            return _kakao_cb_page(
+                "카카오 연결 실패",
+                f"<p>카카오가 오류를 반환했습니다.</p><p><code>{error}</code>"
+                f"<br>{error_description or ''}</p>"
+                "<p>동의 창에서 <b>카카오톡 메시지 전송</b> 항목에 동의했는지 확인하세요.</p>",
+                ok=False)
+        if not code:
+            return _kakao_cb_page(
+                "잘못된 접근",
+                "<p>이 주소는 카카오 로그인 동의 후 자동으로 이동되는 착지점입니다.</p>"
+                "<p>먼저 <code>python backend/main.py kakao-auth</code> 가 안내하는 "
+                "URL 을 브라우저에서 여세요.</p>",
+                ok=False)
+        import anyio
+        try:
+            body = await anyio.to_thread.run_sync(lambda: kakao_exchange_code(ctx, code))
+        except KeyError as exc:   # 토큰 응답에 refresh_token/access_token 이 없음
+            return _kakao_cb_page(
+                "카카오 연결 실패",
+                f"<p>토큰 응답에 필요한 값이 없습니다: <code>{exc}</code></p>"
+                "<p>인가 코드가 만료되었을 수 있습니다(10분). 처음부터 다시 시도하세요.</p>",
+                ok=False)
+        except Exception as exc:
+            msg = str(exc)
+            hint = ""
+            if "kakao_refresh_token" in msg or "column" in msg.lower() \
+                    or "PGRST" in msg or "schema cache" in msg.lower():
+                hint = ("<p><b>원인:</b> 저장소(run_state)에 카카오 컬럼이 아직 없습니다."
+                        " Supabase SQL Editor 에서 아래를 1회 실행하세요.</p>"
+                        "<p><code>alter table run_state "
+                        "add column if not exists kakao_enabled boolean not null default true, "
+                        "add column if not exists kakao_refresh_token text, "
+                        "add column if not exists kakao_access_token text, "
+                        "add column if not exists kakao_token_expires_at timestamptz;</code></p>")
+            return _kakao_cb_page(
+                "카카오 연결 실패",
+                f"<p>토큰 교환 중 오류: <code>{msg}</code></p>{hint}",
+                ok=False)
+        days = int(body.get("refresh_token_expires_in", 0)) // 86400
+        return _kakao_cb_page(
+            "카카오 연결 완료",
+            f"<p>refresh_token 을 저장했습니다. (유효 약 <b>{days}일</b>)</p>"
+            "<p>이제 텔레그램 알림이 나갈 때 카카오톡 <b>나와의 채팅</b>으로도 "
+            "기사 제목·링크가 전송됩니다.</p>"
+            "<p>시험 발송: <code>python backend/main.py kakao-test</code></p>"
+            "<p>이 창은 닫아도 됩니다.</p>",
+            ok=True)
+
+    app.add_api_route("/kakao/callback", _kakao_callback, methods=["GET"])
+    app.add_api_route("/kakao", _kakao_callback, methods=["GET"])  # 구 리다이렉트 URI 호환
 
     # ── 마스터 패널 (PRD 추가) ──────────────────────────────────────
     def _master_guard(token: str) -> JSONResponse | None:

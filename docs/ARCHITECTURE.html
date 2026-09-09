@@ -357,7 +357,7 @@
               <!-- 스레드 3 -->
               <rect class="box-navy" x="228" y="74" width="292" height="60" rx="7"/>
               <text class="lbl-b" x="244" y="99">메인 · FastAPI (uvicorn)</text>
-              <text class="lbl-sm" x="244" y="118">25개 엔드포인트 · 인덱스 인라인 서빙</text>
+              <text class="lbl-sm" x="244" y="118">27개 엔드포인트 · 인덱스 인라인 서빙</text>
 
               <rect class="box" x="228" y="150" width="292" height="70" rx="7"/>
               <text class="lbl-b" x="244" y="175">스레드 A · 수집 루프</text>
@@ -889,6 +889,7 @@
           <thead><tr><th>설정</th><th>기본값</th><th>동작</th></tr></thead>
           <tbody>
             <tr><td>텔레그램 발송</td><td>켜짐</td><td>끄면 발송 중지(큐는 계속 쌓임). 봇 <code>/stop</code>·<code>/start</code>와 동일</td></tr>
+            <tr><td>카카오톡 발송</td><td>켜짐</td><td>텔레그램과 <b>병행</b> 발송(나와의 채팅). <code>.env</code> 키 + 최초 토큰이 없으면 비활성</td></tr>
             <tr><td>관련도 임계값</td><td class="num">50</td><td>0–100 슬라이더. 권장 하한 40을 표시하되 자유롭게 지정</td></tr>
             <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간 게이트를 우회해 즉시 발송. 0=미사용</td></tr>
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td><b>제목·판정 그룹사</b>에 있으면 중요도·야간 게이트를 우회 (본문 스친 언급 제외)</td></tr>
@@ -931,6 +932,26 @@
           <code>NOTIFY_MAX_AGE_HOURS</code>(24) 초과 시 포기하고 failed, ⑤ 발송 간격
           <code>RATE_LIMIT_SLEEP</code> 3.5초, 회차당 <code>SEND_BATCH_PER_CYCLE</code> 12건.
           막힌 실패 건은 <code>python backend/main.py retryfailed</code> 로 큐에 되돌린다.
+        </p>
+        <h3>카카오톡 '나에게 보내기' 병행 발송 (선택)</h3>
+        <p style="font-size:13px; line-height:1.8;">
+          <code>.env</code> 에 <code>KAKAO_REST_API_KEY</code>·<code>KAKAO_CLIENT_SECRET</code>·
+          <code>KAKAO_REDIRECT_URI</code> 를 채우고 최초 토큰을 1회 발급하면, 텔레그램으로 나가는
+          <b>같은 기사</b>의 제목·링크가 카카오톡 <b>나와의 채팅</b>으로도 전송된다
+          (<code>_send_one()</code> 안에서 <code>_telegram_send</code> 직후 <code>_kakao_send</code> 호출).
+          봇 토큰이 없어 <b>사용자 OAuth</b>(scope <code>talk_message</code>)를 쓴다 —
+          <code>refresh_token</code>(약 60일)·<code>access_token</code>(약 12시간)을
+          <code>run_state</code> 에 저장하고, access token 만료 시
+          <code>_kakao_access_token()</code> 이 refresh 로 자동 갱신한다.
+          <br><b>최초 토큰 발급.</b> 서버를 켠 상태에서 <code>python backend/main.py kakao-auth</code>
+          가 출력하는 카카오 동의 URL 을 브라우저에서 한 번 연다 → 동의하면 카카오가
+          <code>GET /kakao/callback?code=…</code> 로 돌려보내고, 이 FastAPI 라우트가 코드를
+          토큰으로 교환해 저장한 뒤 "카카오 연결 완료" 페이지를 보여 준다(수동 복사·붙여넣기 불필요).
+          리다이렉트 URI 는 카카오 콘솔 '카카오 로그인 &gt; Redirect URI' 에 똑같이 등록해야 한다
+          (로컬 <code>http://localhost:8000/kakao/callback</code>, 배포 시 <code>https://&lt;배포주소&gt;/kakao/callback</code>).
+          <br>발송 결과는 텔레그램과 같은 <code>telegram_log</code> 에 <code>kind</code> 뒤에 <code>(카카오)</code>
+          를 붙여 기록한다. 마스터 패널 <b>알림 채널</b>의 카카오 토글(<code>kakao_enabled</code>)로 끌 수 있고,
+          토큰이 없으면 토글은 비활성으로 표시된다.
         </p>
       </section>
 
