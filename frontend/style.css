@@ -247,6 +247,12 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   background: var(--navy); border-color: var(--navy); color: #fff; font-weight: 600;
 }
 .chip:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
+/* '+N개 더' · '접기' — 값 칩이 아니라 조작 버튼이므로 톤을 낮춘다. */
+.chip-more {
+  border-style: dashed; border-color: var(--line);
+  color: var(--ink-soft); font-weight: 600;
+}
+.chip-more:hover { background: var(--bg); color: var(--navy); border-color: var(--navy-line); }
 
 .search {
   flex: 1; border: 1px solid var(--line); border-radius: 9px;

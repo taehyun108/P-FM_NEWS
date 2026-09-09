@@ -299,6 +299,10 @@ function closeStatDetail() { $('detailModal').hidden = true; }
 
 /* ── 필터 UI (F6.1a) ────────────────────────────────────────────── */
 
+/* 언론사는 370곳이 넘어 전부 펼치면 필터가 화면을 다 먹는다. 기본은 접어 둔다. */
+const PRESS_CHIP_LIMIT = 24;
+let pressChipsExpanded = false;
+
 function renderChipGroup(container, values, selected, onToggle, single = false) {
   container.replaceChildren(...values.map((v) => {
     const key = typeof v === 'string' ? v : v.key;
@@ -319,7 +323,10 @@ async function loadFilters() {
     console.warn('필터 조회 실패', err);
     return;
   }
+  renderFilterChips(data);
+}
 
+function renderFilterChips(data) {
   renderChipGroup($('periodChips'), data.periods, state.period, (key) => {
     // 기간은 구간이 배타적이므로 단일 선택이다.
     state.period = key;
@@ -333,16 +340,37 @@ async function loadFilters() {
   }, true);
 
   const multi = [
-    ['groupChips', data.groups, state.group],
-    ['catChips', data.categories, state.cat],
-    ['pressChips', data.presses, state.press],
+    ['groupChips', data.groups, state.group, 0],
+    ['catChips', data.categories, state.cat, 0],
+    // 언론사는 370곳이 넘는다. 전부 펼치면 필터만으로 화면을 채워 기사 카드가
+    // 스크롤 밖으로 밀린다. 선택된 것 + 상위 일부만 보이고 나머지는 접는다.
+    ['pressChips', data.presses, state.press, PRESS_CHIP_LIMIT],
   ];
-  for (const [id, values, set] of multi) {
-    renderChipGroup($(id), values, set, (key) => {
+  for (const [id, values, set, cap] of multi) {
+    const onToggle = (key) => {
       // 재클릭하면 해제된다. (F6.1a)
       if (set.has(key)) set.delete(key); else set.add(key);
       refresh(true);
-    });
+    };
+    if (cap && values.length > cap && !pressChipsExpanded) {
+      // 선택된 언론사는 접혀도 항상 보여야 해제할 수 있다.
+      const picked = values.filter((v) => set.has(v));
+      const rest = values.filter((v) => !set.has(v));
+      const shown = [...picked, ...rest].slice(0, Math.max(cap, picked.length));
+      renderChipGroup($(id), shown, set, onToggle);
+      const more = el('button', 'chip chip-more', `+${values.length - shown.length}개 더`);
+      more.type = 'button';
+      more.addEventListener('click', () => { pressChipsExpanded = true; renderFilterChips(data); });
+      $(id).append(more);
+    } else {
+      renderChipGroup($(id), values, set, onToggle);
+      if (cap && values.length > cap) {
+        const less = el('button', 'chip chip-more', '접기');
+        less.type = 'button';
+        less.addEventListener('click', () => { pressChipsExpanded = false; renderFilterChips(data); });
+        $(id).append(less);
+      }
+    }
   }
 }
 
