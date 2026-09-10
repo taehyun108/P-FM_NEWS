@@ -486,6 +486,12 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 .master-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--ink-mid); }
 .master-field input[type="range"] { width: 100%; }
 .master-field b { color: var(--navy); }
+.night-row { display: flex; gap: 16px; align-items: center; }
+.night-row label { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; }
+.night-num {
+  width: 52px; padding: 5px 6px; text-align: center; font-size: 13px;
+  border: 1px solid var(--navy-line); border-radius: 6px; background: #fff;
+}
 
 .kw-input { display: flex; gap: 8px; margin: 10px 0 8px; }
 .kw-list { display: flex; flex-wrap: wrap; gap: 6px; }

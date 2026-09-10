@@ -617,6 +617,29 @@ async function showMasterPanel() {
   await loadMasterSettings();
 }
 
+// 야간 억제 표시 — 시간대 창 문구와 최소 점수 상태
+function renderNightWindow() {
+  const s = $('nightStart').value, e = $('nightEnd').value;
+  const tz = $('nightTz').dataset.tz || '서울시간';
+  $('nightWindow').textContent = `${s}시 ~ ${e}시`;
+  $('nightTz').textContent = `(${tz})`;
+}
+function renderNightMin(v) {
+  $('nightMinVal').textContent = v > 100 ? '전면 차단' : v;
+  $('nightMinState').textContent = v > 100
+    ? '— 예외 규칙 걸린 기사만 발송'
+    : (v > 0 ? '점 이상만 발송' : '— 야간에도 전부 발송');
+}
+function applyNightSettings(d) {
+  $('nightStart').value = d.night_start ?? 23;
+  $('nightEnd').value = d.night_end ?? 7;
+  $('nightTz').dataset.tz = `${d.night_tz || 'UTC+9'} 서울시간`;
+  const nm = Number(d.night_min_score ?? 80);
+  $('nightMinRange').value = nm;
+  renderNightWindow();
+  renderNightMin(nm);
+}
+
 async function loadMasterSettings() {
   try {
     const d = await (await masterFetch('/api/master/settings')).json();
@@ -628,6 +651,7 @@ async function loadMasterSettings() {
     $('hardRange').value = hs;
     $('hardVal').textContent = hs;
     $('hardState').textContent = hs > 0 ? '이상' : '(사용 안 함)';
+    applyNightSettings(d);
     $('webPwNow').textContent = d.web_password || '(미설정)';
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
@@ -774,6 +798,34 @@ function initMaster() {
         { method: 'POST', body: JSON.stringify({ telegram_enabled: e.target.checked }) });
       masterMsg('ok', `텔레그램 발송 ${e.target.checked ? '켬' : '끔'}`);
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+  });
+
+  // 야간 억제 — 시각 2개(number) + 최소 점수(range). run_state 에 저장(마스터 우선).
+  let nightTimer;
+  const nightSave = (payload, okMsg) => {
+    clearTimeout(nightTimer);
+    nightTimer = setTimeout(async () => {
+      try {
+        await masterFetch('/api/master/settings', { method: 'POST', body: JSON.stringify(payload) });
+        masterMsg('ok', okMsg);
+      } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+    }, 500);
+  };
+  const clampHour = (v) => Math.max(0, Math.min(23, parseInt(v, 10) || 0));
+  $('nightStart').addEventListener('change', (e) => {
+    e.target.value = clampHour(e.target.value);
+    renderNightWindow();
+    nightSave({ night_start: Number(e.target.value) }, `야간 시작 ${e.target.value}시`);
+  });
+  $('nightEnd').addEventListener('change', (e) => {
+    e.target.value = clampHour(e.target.value);
+    renderNightWindow();
+    nightSave({ night_end: Number(e.target.value) }, `야간 종료 ${e.target.value}시`);
+  });
+  $('nightMinRange').addEventListener('input', (e) => {
+    renderNightMin(Number(e.target.value));
+    nightSave({ night_min_score: Number(e.target.value) },
+      Number(e.target.value) > 100 ? '야간 전면 차단' : `야간 최소 점수 ${e.target.value}`);
   });
 
 

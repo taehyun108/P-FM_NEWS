@@ -82,11 +82,31 @@
       </section>
 
       <section class="master-section">
-        <h3><span class="ms-step">3</span> 꼭 받아야 하는 기사 — 예외 규칙</h3>
+        <h3><span class="ms-step">3</span> 야간 억제 — 조용히 할 시간대</h3>
+        <label class="master-field">
+          <span>야간 억제 시간대 <b id="nightWindow">23시 ~ 7시</b>
+            <small id="nightTz">(서울시간)</small></span>
+          <div class="night-row">
+            <label>시작 <input type="number" id="nightStart" min="0" max="23" class="night-num"> 시</label>
+            <label>종료 <input type="number" id="nightEnd" min="0" max="23" class="night-num"> 시</label>
+          </div>
+          <small>이 시간대엔 아래 '야간 최소 점수' 이상(또는 예외 규칙에 걸린 기사)만 즉시 발송하고,
+            나머지는 아침에 한꺼번에 나갑니다. 자정을 넘는 창(예 23→7)도 됩니다.</small>
+        </label>
+        <label class="master-field">
+          <span>야간 최소 점수 <b id="nightMinVal">80</b> <span id="nightMinState"></span></span>
+          <input type="range" id="nightMinRange" min="0" max="101" step="1">
+          <small><b>101</b>로 올리면 야간엔 예외 규칙(무조건 점수·항상 발송 키워드)에 걸린 기사만 나가고
+            나머지는 <b>전부 아침에</b> 옵니다.</small>
+        </label>
+      </section>
+
+      <section class="master-section">
+        <h3><span class="ms-step">4</span> 꼭 받아야 하는 기사 — 예외 규칙</h3>
         <label class="master-field">
           <span>무조건 발송 점수 <b id="hardVal">0</b> <span id="hardState">(사용 안 함)</span></span>
           <input type="range" id="hardRange" min="0" max="100" step="5">
-          <small>이 점수 이상인 기사는 <b>야간(밤 11시~오전 7시)에도</b> 즉시 발송합니다.
+          <small>이 점수 이상인 기사는 <b>야간에도</b> 즉시 발송합니다.
             (임계값이 50, 이 값이 80이면 → 50~79점은 낮에만, 80점 이상은 밤에도) · <b>0 = 사용 안 함</b></small>
         </label>
 
@@ -101,7 +121,7 @@
       </section>
 
       <section class="master-section">
-        <h3><span class="ms-step">4</span> 추가 주제 켜기</h3>
+        <h3><span class="ms-step">5</span> 추가 주제 켜기</h3>
         <small class="ms-lead">아래 두 주제는 <b>포스코 회사명이 안 나와도</b> 수집되는 기사입니다.
           기본은 웹에만 보이고, 켜면 텔레그램으로도 옵니다. <b>2단 키워드</b>로 원하는 것만 골라 받으세요.</small>
 
@@ -144,7 +164,7 @@
       </section>
 
       <section class="master-section">
-        <h3><span class="ms-step">5</span> 주간 레포트 수신자 (이메일)</h3>
+        <h3><span class="ms-step">6</span> 주간 레포트 수신자 (이메일)</h3>
         <small id="weeklyToHint">월요일 아침, 한 주치 그룹 동향 요약이 이 주소들로 발송됩니다. (비우면 서버 기본 수신자)</small>
         <div class="kw-input">
           <input type="email" id="weeklyToNew" class="url-add-input" placeholder="이메일 주소 입력 후 추가">
@@ -154,7 +174,7 @@
       </section>
 
       <section class="master-section">
-        <h3><span class="ms-step">6</span> 운영자 설정 — 비밀번호</h3>
+        <h3><span class="ms-step">7</span> 운영자 설정 — 비밀번호</h3>
         <form class="master-pwform" id="pwMasterForm">
           <input type="password" id="pwMasterCur" class="url-add-input" placeholder="현재 마스터 비밀번호" autocomplete="current-password">
           <input type="password" id="pwMasterNew" class="url-add-input" placeholder="새 마스터 비밀번호 (4자 이상)" autocomplete="new-password">

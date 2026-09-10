@@ -81,6 +81,9 @@ create table if not exists run_state (
   kakao_refresh_token text,                -- 카카오 OAuth refresh token (kakao-auth 로 1회 발급)
   kakao_access_token  text,                -- 최근 access token (만료되면 refresh 로 갱신)
   kakao_token_expires_at timestamptz,      -- access token 만료 시각
+  night_start_hour int,                    -- 야간 억제 시작 시각 (마스터 설정, null 이면 .env / 기본 23)
+  night_end_hour   int,                    -- 야간 억제 종료 시각 (null 이면 .env / 기본 7)
+  night_min_score  int,                    -- 야간엔 이 점수 이상만 발송. 101=전면차단 (null 이면 .env / 기본 80)
   updated_at      timestamptz default now()
 );
 

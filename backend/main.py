@@ -836,6 +836,9 @@ class SqliteStorage(Storage):
             "alter table run_state add column kakao_refresh_token TEXT",
             "alter table run_state add column kakao_access_token TEXT",
             "alter table run_state add column kakao_token_expires_at TEXT",
+            "alter table run_state add column night_start_hour INTEGER",
+            "alter table run_state add column night_end_hour INTEGER",
+            "alter table run_state add column night_min_score INTEGER",
         ]
         for sql in migrations:
             try:
@@ -5379,6 +5382,24 @@ def effective_threshold(ctx: Context) -> int:
     return ctx.cfg.notify_threshold
 
 
+def _int_or(value: Any, fallback: int) -> int:
+    try:
+        return int(value) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def effective_night(ctx: Context, state: dict | None = None) -> tuple[int, int, int]:
+    """야간 억제 (시작시각, 종료시각, 최소점수). 마스터 패널(run_state)이 우선,
+    없으면 .env(Config). 시각은 모두 운영 기준 시간대(APP_TZ_OFFSET, 기본 KST)."""
+    st = state if state is not None else ctx.storage.get_run_state()
+    return (
+        _int_or(st.get("night_start_hour"), _int_or(ctx.cfg.night_start_hour, 23)),
+        _int_or(st.get("night_end_hour"), _int_or(ctx.cfg.night_end_hour, 7)),
+        _int_or(st.get("night_min_score"), _int_or(ctx.cfg.night_min_score, 80)),
+    )
+
+
 def queue_manual_notify(ctx: Context, article_id: str) -> bool:
     """수동 등록(URL) 기사를 알림 큐에 올리고 즉시 발송을 시도한다.
 
@@ -5471,13 +5492,14 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if not pending:
         return 0
 
-    # 서버 TZ 가 아니라 운영 기준 시각(APP_TZ_OFFSET · 기본 KST)으로 야간 여부를 판단한다.
+    # 야간 억제 — 마스터 패널(run_state) 값이 우선, 없으면 .env. 시각은 운영 기준(APP_TZ_OFFSET · 기본 KST).
+    n_start, n_end, n_min = effective_night(ctx, state)
     hour = now_local().hour
-    if _in_night_window(hour, cfg.night_start_hour, cfg.night_end_hour):
-        # 야간엔 중요도 night_min_score 이상(또는 우선 기사)만 즉시 발송, 나머지는 큐에 남긴다.
-        # night_min_score=101 이면 우선 기사만 나가고 사실상 전면 억제된다. (PRD F7.3)
+    if _in_night_window(hour, n_start, n_end):
+        # 야간엔 중요도 n_min 이상(또는 우선 기사)만 즉시 발송, 나머지는 큐에 남긴다.
+        # n_min=101 이면 우선 기사만 나가고 사실상 전면 억제된다. (PRD F7.3)
         pending = [p for p in pending
-                   if int(p.get("importance_score") or 0) >= cfg.night_min_score or _is_priority(p)]
+                   if int(p.get("importance_score") or 0) >= n_min or _is_priority(p)]
         if not pending:
             return 0
 
@@ -7181,6 +7203,7 @@ def create_app(ctx: Context):
             hard_score = int(st.get("hard_notify_score") or 0)
         except (TypeError, ValueError):
             hard_score = 0
+        n_start, n_end, n_min = effective_night(ctx, st)
         return JSONResponse({
             "ok": True,
             "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
@@ -7188,6 +7211,8 @@ def create_app(ctx: Context):
             # 다시 쓰려면 .env KAKAO_ENABLED=true + kakao-auth (ARCHITECTURE 04절).
             "threshold": effective_threshold(ctx),
             "hard_notify_score": hard_score,          # 0 = 미사용
+            "night_start": n_start, "night_end": n_end, "night_min_score": n_min,
+            "night_tz": f"UTC{ctx.cfg.tz_offset_hours:+d}",
             "recommended_min": RECOMMENDED_MIN_SCORE,
             "keywords": jload(st.get("always_notify_keywords"), []),
             "web_password": st.get("web_password") or "",
@@ -7202,8 +7227,8 @@ def create_app(ctx: Context):
             "weekly_smtp_ready": ctx.cfg.smtp_configured,
             # 중요도 점수 산정 규칙 — 마스터 패널에 그대로 표시한다(단일 출처).
             "score_rules": {
-                "night": {"start": ctx.cfg.night_start_hour, "end": ctx.cfg.night_end_hour,
-                          "min_score": ctx.cfg.night_min_score, "tz": f"UTC{ctx.cfg.tz_offset_hours:+d}"},
+                "night": {"start": n_start, "end": n_end, "min_score": n_min,
+                          "tz": f"UTC{ctx.cfg.tz_offset_hours:+d}"},
                 "items": [
                     {"label": "포스코퓨처엠이 제목에", "points": SCORE_FUTUREM_TITLE},
                     {"label": "포스코퓨처엠이 본문에만", "points": SCORE_FUTUREM_BODY},
@@ -7237,6 +7262,18 @@ def create_app(ctx: Context):
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "무조건 발송 점수는 0~100 숫자여야 합니다."},
                                     status_code=400)
+        # 야간 억제 — 시각은 0~23(운영 기준 시간대), 점수는 0~101(101=전면 차단)
+        for key, col, lo, hi, label in (
+            ("night_start", "night_start_hour", 0, 23, "야간 시작 시각"),
+            ("night_end", "night_end_hour", 0, 23, "야간 종료 시각"),
+            ("night_min_score", "night_min_score", 0, 101, "야간 최소 점수"),
+        ):
+            if key in (payload or {}):
+                try:
+                    patch[col] = int(clamp(int(payload[key]), lo, hi))
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": f"{label}은 {lo}~{hi} 숫자여야 합니다."},
+                                        status_code=400)
         # 키워드 목록 필드 — 같은 방식으로 정리(중복 제거, 30개 상한)
         for field, col in (("keywords", "always_notify_keywords"),
                            ("policy_keywords", "policy_notify_keywords"),
@@ -7268,7 +7305,19 @@ def create_app(ctx: Context):
                 emails.append(e)
             patch["weekly_report_to"] = jdump(emails[:30])
         if patch:
-            ctx.storage.set_run_state(patch)
+            try:
+                ctx.storage.set_run_state(patch)
+            except Exception as exc:
+                msg = str(exc)
+                if "night_" in msg and ("column" in msg.lower() or "PGRST" in msg
+                                        or "schema cache" in msg.lower()):
+                    return JSONResponse(
+                        {"ok": False, "error": "저장소(run_state)에 야간 설정 컬럼이 없습니다. "
+                         "Supabase SQL Editor 에서 아래를 1회 실행하세요:\n"
+                         "alter table run_state add column if not exists night_start_hour int, "
+                         "add column if not exists night_end_hour int, "
+                         "add column if not exists night_min_score int;"}, status_code=500)
+                raise
         return JSONResponse({"ok": True})
 
     @app.post("/api/master/password")
@@ -8851,6 +8900,20 @@ def cmd_selftest() -> int:
     check("야간 22→6 으로 바꾸면 22시가 야간", _in_night_window(22, 22, 6), True)
     check("창이 낮(9→18)이면 자정 넘지 않게 처리", _in_night_window(3, 9, 18), False)
     check("start==end 면 창 없음", _in_night_window(5, 0, 0), False)
+
+    # effective_night — run_state(마스터 패널) 우선, 없으면 .env(Config)
+    _ncfg = Config(**{**_blank, "night_start_hour": 23, "night_end_hour": 7, "night_min_score": 80})
+    _NCtx = type("C", (), {})()
+    _NCtx.cfg = _ncfg
+    check("effective_night — run_state 비면 .env 값", effective_night(_NCtx, {}), (23, 7, 80))
+    check("effective_night — run_state 가 .env 를 덮어씀",
+          effective_night(_NCtx, {"night_start_hour": 22, "night_end_hour": 6, "night_min_score": 101}),
+          (22, 6, 101))
+    check("effective_night — 일부만 지정되면 나머지는 .env",
+          effective_night(_NCtx, {"night_min_score": 50}), (23, 7, 50))
+    check("_int_or — None 이면 fallback", _int_or(None, 9), 9)
+    check("_int_or — 빈 문자열도 fallback", _int_or("", 9), 9)
+    check("_int_or — 숫자면 그 값", _int_or("22", 9), 22)
 
     # 웹 세션 토큰 — 비밀번호에서 파생되므로 재시작에 안전하고 변경 시 자동 무효화
     check("같은 비밀번호 → 같은 토큰",
