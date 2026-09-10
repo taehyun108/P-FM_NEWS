@@ -3526,6 +3526,28 @@ def extract_published(html: str) -> datetime | None:
     return None
 
 
+_JSON_BODY_RE = re.compile(r'"type"\s*:\s*"text"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _json_script_body(html: str) -> str:
+    """SPA(Next.js 등)가 본문을 <script> 안 JSON 으로 넣는 사이트 대응.
+
+    news1.kr 처럼 문단을 {"type":"text","content":"..."} 배열로 담는 구조를 읽는다.
+    이런 페이지는 <script> 를 걷어내는 readability·BeautifulSoup 폴백이 내비게이션만
+    긁어 와서 본문이 통째로 비고, '포스코'가 본문에만 있는 기사가 무관 처리됐다.
+    """
+    parts: list[str] = []
+    for mo in _JSON_BODY_RE.finditer(html or ""):
+        try:
+            txt = json.loads(f'"{mo.group(1)}"')
+        except ValueError:
+            continue
+        txt = txt.strip()
+        if txt:
+            parts.append(txt)
+    return "\n".join(parts)
+
+
 def extract_body(html: str) -> str:
     """Readability 를 1순위로 본문을 뽑는다. 실패해도 예외를 던지지 않는다. (F4.5)"""
     if not html:
@@ -3536,12 +3558,20 @@ def extract_body(html: str) -> str:
         doc = readability.Document(html)
         soup = bs4.BeautifulSoup(doc.summary(), "html.parser")
         text = soup.get_text("\n", strip=True)
-        if len(text) >= 200:
-            return text
+        readable = text
     except SystemExit:
         raise
     except Exception as exc:
         log.debug("Readability 실패: %s", exc)
+        readable = ""
+    # SPA(Next.js 등)는 본문이 <script> JSON 안에 있어 readability 가 내비게이션만 긁는다.
+    # JSON 문단 쪽이 더 길면 그것을 본문으로 쓴다. (문자열 포함 검사라 대부분 비용 0)
+    if '"type":"text"' in (html or ""):
+        json_body = _json_script_body(html)
+        if len(json_body) > len(readable):
+            return json_body
+    if len(readable) >= 200:
+        return readable
     # 폴백: 전체 문서에서 텍스트만 긁는다.
     try:
         bs4 = _import("bs4", "beautifulsoup4")
@@ -8829,6 +8859,20 @@ def cmd_selftest() -> int:
           "무조건 받을 키워드 '포스코'")
     check("_kw_first_hit — 첫 매칭 키워드", _kw_first_hit("리튬 니켈 가격", ["코발트", "니켈"]), "니켈")
     check("_kw_first_hit — 없으면 None", _kw_first_hit("철강 수출", ["니켈"]), None)
+
+    # SPA(Next.js) 본문 추출 — <script> JSON 문단을 읽는다 (news1.kr 등)
+    _spa = ('<html><body><nav>메뉴 메뉴 메뉴</nav>'
+            '<script>{"body":[{"type":"text","content":"\uc0c1\uc7a5\ubc95\uc778 \uc2dc\uac00\ucd1d\uc561\uc774 \ub298\uc5c8\ub2e4."},'
+            '{"type":"image","content":"x.jpg"},'
+            '{"type":"text","content":"\ubc95\uc778\ubcc4\ub85c\ub294 \ud3ec\uc2a4\ucf54\ud4e8\ucc98\uc5e0 \uc21c\uc774\ub2e4."}]}</script>'
+            '</body></html>')
+    _jb = _json_script_body(_spa)
+    check("JSON 문단 2개를 이어붙임", _jb.count("\n"), 1)
+    check("JSON 본문에 포스코퓨처엠 포함", "포스코퓨처엠" in _jb, True)
+    check("image 타입은 본문에서 제외", "x.jpg" in _jb, False)
+    check("extract_body 가 JSON 본문을 택함", "포스코퓨처엠" in extract_body(_spa), True)
+    check("JSON 마커 없으면 기존 경로 유지",
+          _json_script_body("<html><body><p>일반 기사</p></body></html>"), "")
     # rate limit / flood 헬퍼
     check("일시 오류 판정 — 429", _is_transient_tg_error("Too Many Requests: retry after 5"), True)
     check("일시 오류 판정 — chat not found 는 진짜 실패",
