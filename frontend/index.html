@@ -107,17 +107,22 @@
           제외가 항상 우선합니다(무조건 받을 키워드와 겹치면 발송 안 함).</small>
 
         <p class="kw-label" style="margin-top:14px">무조건 받을 키워드</p>
-        <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>임계값·야간과 무관하게</b> 무조건 발송합니다.
+        <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>임계값과 무관하게</b> 발송합니다.
           예: <b>포스코퓨처엠</b>, <b>수소환원제철</b>, <b>장인화</b></small>
         <div class="kw-input">
           <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 Enter 또는 추가">
           <button type="button" class="url-add-btn" id="kwAdd">추가</button>
         </div>
         <div class="kw-list" id="kwList"></div>
+        <label class="master-toggle" style="margin-top:8px">
+          <input type="checkbox" id="alwaysKwBypassNight">
+          <span><b>야간 억제 시간(3번)에도</b> 이 키워드 기사는 즉시 발송 <span style="color:var(--ink-soft)">(끄면 야간엔 아침까지 대기)</span></span>
+        </label>
 
         <p class="kw-label" style="margin-top:16px">제외할 키워드</p>
         <small><b>제목</b>에 이 단어가 있으면 임계값을 넘어도, 위 '무조건 받을 키워드'에 걸려도
-          <b>알림하지 않습니다</b>(웹에는 그대로 보임). 예: <b>채용</b>, <b>부고</b>, <b>인사발령</b></small>
+          <b>알림하지 않습니다</b>(웹에는 그대로 보임). <b>제외가 최우선.</b>
+          예: <b>채용</b>, <b>부고</b>, <b>인사발령</b></small>
         <div class="kw-input">
           <input type="text" id="excludeNew" class="url-add-input" placeholder="제외 키워드 입력 후 Enter 또는 추가">
           <button type="button" class="url-add-btn" id="excludeAdd">추가</button>
@@ -128,42 +133,55 @@
       <section class="master-section">
         <h3><span class="ms-step">5</span> 추가 주제 켜기</h3>
         <small class="ms-lead">아래 두 주제는 <b>포스코 회사명이 안 나와도</b> 수집되는 기사입니다.
-          기본은 웹에만 보이고, 켜면 텔레그램으로도 옵니다. <b>2단 키워드</b>로 원하는 것만 골라 받으세요.</small>
+          기본은 웹에만 보이고, 켜면 텔레그램으로도 옵니다.
+          <b>① 관심 키워드와 ② 필수 공통 키워드가 둘 다 매칭</b>돼야 발송됩니다 (한쪽이라도 비면 발송 안 함).</small>
 
         <label class="master-toggle">
           <input type="checkbox" id="notifyPolicy">
           <span><b>정책브리핑</b>(korea.kr) 기사도 텔레그램으로</span>
         </label>
-        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b> 있으면 (비우면 전체)</span></p>
+        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나 필수</b></span></p>
         <div class="kw-input">
           <input type="text" id="policyKwNew" class="url-add-input" placeholder="예: 전기요금, 배출권, 특화단지">
           <button type="button" class="url-add-btn" id="policyKwAdd">추가</button>
         </div>
         <div class="kw-list" id="policyKwList"></div>
-        <p class="kw-label">② 필수 공통 키워드 <span>— ① 과 <b>함께</b> 있어야 함 (AND, 비우면 조건 없음)</span></p>
+        <p class="kw-label">② 필수 공통 키워드 <span>— 이 중 <b>하나 필수</b> (① 과 AND)</span></p>
         <div class="kw-input">
           <input type="text" id="policyReqNew" class="url-add-input" placeholder="예: 산업, 제조, 철강">
           <button type="button" class="url-add-btn" id="policyReqAdd">추가</button>
         </div>
         <div class="kw-list" id="policyReqList"></div>
-        <small>예) ① <b>전기요금</b> + ② <b>산업</b> → "산업용 전기요금" 은 발송, "가정용 전기요금" 은 제외</small>
+        <p class="kw-label">✕ 제외 키워드 <span>— <b>제목</b>에 있으면 이 주제에서 뺌</span></p>
+        <div class="kw-input">
+          <input type="text" id="policyExNew" class="url-add-input" placeholder="예: 공모, 채용, 시상">
+          <button type="button" class="url-add-btn" id="policyExAdd">추가</button>
+        </div>
+        <div class="kw-list" id="policyExList"></div>
+        <small>예) ① <b>전기요금</b> + ② <b>산업</b> → "산업용 전기요금" 발송, "가정용 전기요금" 제외</small>
 
         <label class="master-toggle" style="margin-top:16px">
           <input type="checkbox" id="notifyTrade">
           <span><b>글로벌 통상환경</b>(미국·EU·중국 통상 조치) 기사도 텔레그램으로</span>
         </label>
-        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나라도</b></span></p>
+        <p class="kw-label">① 관심 키워드 <span>— 이 중 <b>하나 필수</b></span></p>
         <div class="kw-input">
           <input type="text" id="tradeKwNew" class="url-add-input" placeholder="예: IRA, CBAM, 반덤핑, 화이트리스트">
           <button type="button" class="url-add-btn" id="tradeKwAdd">추가</button>
         </div>
         <div class="kw-list" id="tradeKwList"></div>
-        <p class="kw-label">② 필수 공통 키워드 <span>— ① 과 <b>함께</b> (AND)</span></p>
+        <p class="kw-label">② 필수 공통 키워드 <span>— 이 중 <b>하나 필수</b> (① 과 AND)</span></p>
         <div class="kw-input">
           <input type="text" id="tradeReqNew" class="url-add-input" placeholder="예: 배터리, 철강, 이차전지">
           <button type="button" class="url-add-btn" id="tradeReqAdd">추가</button>
         </div>
         <div class="kw-list" id="tradeReqList"></div>
+        <p class="kw-label">✕ 제외 키워드 <span>— <b>제목</b>에 있으면 이 주제에서 뺌</span></p>
+        <div class="kw-input">
+          <input type="text" id="tradeExNew" class="url-add-input" placeholder="예: 공모, 채용, 시상">
+          <button type="button" class="url-add-btn" id="tradeExAdd">추가</button>
+        </div>
+        <div class="kw-list" id="tradeExList"></div>
         <small>수집 대상: 미국(IRA·OBBBA·232조), EU(CBAM·핵심원자재법), 중국(흑연·요소 수출통제) 등 —
           철강·배터리 산업이 함께 언급된 기사</small>
       </section>

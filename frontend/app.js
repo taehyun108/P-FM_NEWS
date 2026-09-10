@@ -559,8 +559,10 @@ let masterKeywords = [];
 let excludeKeywords = [];
 let policyKeywords = [];
 let policyRequired = [];
+let policyExclude = [];
 let tradeKeywords = [];
 let tradeRequired = [];
+let tradeExclude = [];
 let weeklyTo = [];       // 주간 레포트 수신자 이메일 목록
 let thTimer;
 
@@ -650,14 +652,17 @@ async function loadMasterSettings() {
     $('thRec').textContent = d.recommended_min;
     applyNightSettings(d);
     $('webPwNow').textContent = d.web_password || '(미설정)';
+    $('alwaysKwBypassNight').checked = d.always_kw_bypass_night !== false;
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
     masterKeywords = d.keywords || [];
     excludeKeywords = d.exclude_keywords || [];
     policyKeywords = d.policy_keywords || [];
     policyRequired = d.policy_required || [];
+    policyExclude = d.policy_exclude || [];
     tradeKeywords = d.trade_keywords || [];
     tradeRequired = d.trade_required || [];
+    tradeExclude = d.trade_exclude || [];
     weeklyTo = d.weekly_to || [];
     const hint = $('weeklyToHint');
     if (hint) {
@@ -669,8 +674,10 @@ async function loadMasterSettings() {
     renderExcludeList();
     renderPolicyKwList();
     renderPolicyReqList();
+    renderPolicyExList();
     renderTradeKwList();
     renderTradeReqList();
+    renderTradeExList();
     renderWeeklyToList();
     renderScoreRules(d.score_rules);
   } catch (e) {
@@ -694,11 +701,14 @@ function renderScoreRules(rules) {
     '예) "<b>포스코퓨처엠</b> 양극재 3만톤 증설"(조선일보) = 50(제목) + 10(주요 언론사) = <b>60점</b>';
   const n = rules.night || {};
   const nb = (n.min_score ?? 80) > 100;
+  const kw = $('alwaysKwBypassNight') && $('alwaysKwBypassNight').checked
+    ? "'무조건 받을 키워드'(4번)" : '';
   $('scoreNight').innerHTML =
     `야간(${n.start ?? 23}시~${n.end ?? 7}시, ${n.tz ?? 'UTC+9'} 서울시간)에는 ` +
     (nb
-      ? `<b>'무조건 받을 키워드'에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다. (마스터 3번)`
-      : `<b>${n.min_score ?? 80}점 이상</b> 또는 '무조건 받을 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다. (마스터 3번에서 조정)`);
+      ? (kw ? `<b>${kw}에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다.`
+            : `<b>모든 기사가 아침까지 대기</b>합니다 (야간 완전 무음).`)
+      : `<b>${n.min_score ?? 80}점 이상</b>${kw ? ` 또는 ${kw}에 걸린 기사만` : ''} 즉시 나가고, 나머지는 아침에 발송됩니다.`);
 }
 
 /** 칩 목록 렌더 — 삭제 버튼은 arr 에서 빼고 save 콜백을 부른다. */
@@ -715,6 +725,8 @@ function renderChipEditor(container, arr, save) {
 
 function renderKwList() { renderChipEditor('kwList', masterKeywords, (next) => { masterKeywords = next; renderKwList(); saveKw('keywords', masterKeywords); }); }
 function renderExcludeList() { renderChipEditor('excludeList', excludeKeywords, (next) => { excludeKeywords = next; renderExcludeList(); saveKw('exclude_keywords', excludeKeywords); }); }
+function renderPolicyExList() { renderChipEditor('policyExList', policyExclude, (next) => { policyExclude = next; renderPolicyExList(); saveKw('policy_exclude', policyExclude); }); }
+function renderTradeExList() { renderChipEditor('tradeExList', tradeExclude, (next) => { tradeExclude = next; renderTradeExList(); saveKw('trade_exclude', tradeExclude); }); }
 function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords, (next) => { policyKeywords = next; renderPolicyKwList(); saveKw('policy_keywords', policyKeywords); }); }
 function renderPolicyReqList() { renderChipEditor('policyReqList', policyRequired, (next) => { policyRequired = next; renderPolicyReqList(); saveKw('policy_required', policyRequired); }); }
 function renderTradeKwList() { renderChipEditor('tradeKwList', tradeKeywords, (next) => { tradeKeywords = next; renderTradeKwList(); saveKw('trade_keywords', tradeKeywords); }); }
@@ -824,6 +836,15 @@ function initMaster() {
   wireToggle('notifyPolicy', 'notify_policy', '정책브리핑 기사');
   wireToggle('notifyTrade', 'notify_trade', '글로벌 통상환경 기사');
 
+  $('alwaysKwBypassNight').addEventListener('change', async (e) => {
+    try {
+      await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ always_kw_bypass_night: e.target.checked }) });
+      masterMsg('ok', `무조건 받을 키워드 야간 발송 ${e.target.checked ? '켬' : '끔'}`);
+      loadMasterSettings();   // 2번의 야간 안내 문구 갱신
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+  });
+
   const wireKwAdd = (btnId, inputId, arrGetter, arrSetter, render, field) => {
     const add = () => {
       const v = $(inputId).value.trim();
@@ -841,8 +862,10 @@ function initMaster() {
   wireKwAdd('excludeAdd', 'excludeNew', () => excludeKeywords, (a) => { excludeKeywords = a; }, renderExcludeList, 'exclude_keywords');
   wireKwAdd('policyKwAdd', 'policyKwNew', () => policyKeywords, (a) => { policyKeywords = a; }, renderPolicyKwList, 'policy_keywords');
   wireKwAdd('policyReqAdd', 'policyReqNew', () => policyRequired, (a) => { policyRequired = a; }, renderPolicyReqList, 'policy_required');
+  wireKwAdd('policyExAdd', 'policyExNew', () => policyExclude, (a) => { policyExclude = a; }, renderPolicyExList, 'policy_exclude');
   wireKwAdd('tradeKwAdd', 'tradeKwNew', () => tradeKeywords, (a) => { tradeKeywords = a; }, renderTradeKwList, 'trade_keywords');
   wireKwAdd('tradeReqAdd', 'tradeReqNew', () => tradeRequired, (a) => { tradeRequired = a; }, renderTradeReqList, 'trade_required');
+  wireKwAdd('tradeExAdd', 'tradeExNew', () => tradeExclude, (a) => { tradeExclude = a; }, renderTradeExList, 'trade_exclude');
   wireKwAdd('weeklyToAdd', 'weeklyToNew', () => weeklyTo, (a) => { weeklyTo = a; }, renderWeeklyToList, 'weekly_to');
 
   $('pwMasterForm').addEventListener('submit', async (e) => {

@@ -840,6 +840,9 @@ class SqliteStorage(Storage):
             "alter table run_state add column night_end_hour INTEGER",
             "alter table run_state add column night_min_score INTEGER",
             "alter table run_state add column exclude_notify_keywords TEXT default '[]'",
+            "alter table run_state add column always_kw_bypass_night INTEGER not null default 1",
+            "alter table run_state add column policy_exclude_keywords TEXT default '[]'",
+            "alter table run_state add column trade_exclude_keywords TEXT default '[]'",
         ]
         for sql in migrations:
             try:
@@ -4545,20 +4548,23 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # 알림 판정에 필요한 항목만 담는다. {id, score, is_backfill, published_at, priority,
     #  policy: (해당여부, 키워드통과), trade: (해당여부, 키워드통과)}
     saved_for_notify: list[dict] = []
-    # 마스터가 지정한 '항상 발송' 키워드 — 제목·계열사에 있으면 점수·야간 무관 무조건 알림
+    # '무조건 받을' 키워드 — 제목·계열사에 있으면 임계값 무관 무조건 알림(우선 기사)
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
-    # '제외' 키워드 — 제목에 있으면 임계값을 넘어도, 항상발송 키워드에 걸려도 알림하지 않는다(최우선).
+    # '제외' 키워드 — 제목에 있으면 임계값·무조건 받을 키워드보다 우선해서 알림하지 않는다(최우선).
     exclude_kws = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
-    # 무조건 발송 점수 — 이 값 이상이면 우선 기사처럼 다뤄 야간 게이트를 우회한다. (0/None = 미사용)
+    # (하위호환) 무조건 발송 점수 — UI 제거됨, 컬럼·기본 0. 설정돼 있으면 우선 기사로 취급.
     try:
         hard_score = int(state.get("hard_notify_score") or 0)
     except (TypeError, ValueError):
         hard_score = 0
-    # 특수 주제 알림 키워드 (OR: 하나라도) / 필수 공통 키워드 (AND: 반드시). 둘 다 비면 전부.
+    # 특수 주제(정책·통상) — 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수).
+    # 제목에 제외 키워드가 있으면 이 주제 알림에서 뺀다.
     policy_notify_kws = [k for k in jload(state.get("policy_notify_keywords"), []) if k]
     policy_required_kws = [k for k in jload(state.get("policy_required_keywords"), []) if k]
+    policy_exclude_kws = [k for k in jload(state.get("policy_exclude_keywords"), []) if k]
     trade_notify_kws = [k for k in jload(state.get("trade_notify_keywords"), []) if k]
     trade_required_kws = [k for k in jload(state.get("trade_required_keywords"), []) if k]
+    trade_exclude_kws = [k for k in jload(state.get("trade_exclude_keywords"), []) if k]
 
     # ── G3: 리다이렉트 해제 + HTML 확보 (병렬) ───────────────────────
     prefetched = prefetch_articles(http, [item.url_original for item, _ in fresh])
@@ -4716,14 +4722,19 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         is_priority = (not excluded) and (
             _kw_hit_any(priority_probe, always_kws)
             or (hard_score > 0 and score >= hard_score))
-        # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
+        # 특수 주제 발송 조건: 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수, 비면 발송 안 함).
+        # 제목에 그 주제의 제외 키워드가 있으면 뺀다.
+        policy_ok = (_kw_hit_any(probe, policy_notify_kws)
+                     and _kw_hit_any(probe, policy_required_kws)
+                     and not _kw_hit_any(item.title, policy_exclude_kws))
+        trade_ok = (_kw_hit_any(probe, trade_notify_kws)
+                    and _kw_hit_any(probe, trade_required_kws)
+                    and not _kw_hit_any(item.title, trade_exclude_kws))
         saved_for_notify.append({
             "id": article_id, "score": score, "is_backfill": is_backfill,
             "published_at": item.published_at, "priority": is_priority, "excluded": excluded,
-            "policy": (is_policy,
-                       _kw_hit(probe, policy_notify_kws) and _kw_hit(probe, policy_required_kws)),
-            "trade": (is_trade,
-                      _kw_hit(probe, trade_notify_kws) and _kw_hit(probe, trade_required_kws)),
+            "policy": (is_policy, policy_ok),
+            "trade": (is_trade, trade_ok),
         })
 
     # ── 넘친 신선 후보를 메타데이터만 저장한다 (본문·LLM 없음, 비용 0) ──
@@ -5510,12 +5521,15 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
 
     # 야간 억제 — 마스터 패널(run_state) 값이 우선, 없으면 .env. 시각은 운영 기준(APP_TZ_OFFSET · 기본 KST).
     n_start, n_end, n_min = effective_night(ctx, state)
+    # '무조건 받을 키워드' 기사를 야간에도 즉시 보낼지 (마스터 체크, 기본 켜짐)
+    bypass_night = str(state.get("always_kw_bypass_night", 1) or 0) not in ("0", "False", "false", "")
     hour = now_local().hour
     if _in_night_window(hour, n_start, n_end):
-        # 야간엔 중요도 n_min 이상(또는 우선 기사)만 즉시 발송, 나머지는 큐에 남긴다.
-        # n_min=101 이면 우선 기사만 나가고 사실상 전면 억제된다. (PRD F7.3)
+        # 야간엔 중요도 n_min 이상만 즉시 발송. 우선 기사는 위 체크가 켜져 있을 때만 야간 우회.
+        # n_min=101 이면 우선 기사(체크 시)만 나가고 사실상 전면 억제된다. (PRD F7.3)
         pending = [p for p in pending
-                   if int(p.get("importance_score") or 0) >= n_min or _is_priority(p)]
+                   if int(p.get("importance_score") or 0) >= n_min
+                   or (_is_priority(p) and bypass_night)]
         if not pending:
             return 0
 
@@ -7227,13 +7241,17 @@ def create_app(ctx: Context):
             "recommended_min": RECOMMENDED_MIN_SCORE,
             "keywords": jload(st.get("always_notify_keywords"), []),
             "exclude_keywords": jload(st.get("exclude_notify_keywords"), []),
+            "always_kw_bypass_night": str(st.get("always_kw_bypass_night", 1) or 0)
+                                      not in ("0", "False", "false", ""),
             "web_password": st.get("web_password") or "",
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
             "policy_keywords": jload(st.get("policy_notify_keywords"), []),
             "policy_required": jload(st.get("policy_required_keywords"), []),
+            "policy_exclude": jload(st.get("policy_exclude_keywords"), []),
             "notify_trade": str(st.get("notify_trade") or "0") not in ("0", "False", "false", ""),
             "trade_keywords": jload(st.get("trade_notify_keywords"), []),
             "trade_required": jload(st.get("trade_required_keywords"), []),
+            "trade_exclude": jload(st.get("trade_exclude_keywords"), []),
             "weekly_to": weekly_recipients(ctx),
             "weekly_env_to": list(ctx.cfg.weekly_to),
             "weekly_smtp_ready": ctx.cfg.smtp_configured,
@@ -7285,8 +7303,10 @@ def create_app(ctx: Context):
                            ("exclude_keywords", "exclude_notify_keywords"),
                            ("policy_keywords", "policy_notify_keywords"),
                            ("policy_required", "policy_required_keywords"),
+                           ("policy_exclude", "policy_exclude_keywords"),
                            ("trade_keywords", "trade_notify_keywords"),
-                           ("trade_required", "trade_required_keywords")):
+                           ("trade_required", "trade_required_keywords"),
+                           ("trade_exclude", "trade_exclude_keywords")):
             if field in (payload or {}):
                 kws = payload[field]
                 if not isinstance(kws, list):
@@ -7294,7 +7314,8 @@ def create_app(ctx: Context):
                                         status_code=400)
                 patch[col] = jdump(dedupe_chips(
                     str(k).strip() for k in kws if str(k).strip())[:30])
-        for field, col in (("notify_policy", "notify_policy"), ("notify_trade", "notify_trade")):
+        for field, col in (("notify_policy", "notify_policy"), ("notify_trade", "notify_trade"),
+                           ("always_kw_bypass_night", "always_kw_bypass_night")):
             if field in (payload or {}):
                 patch[col] = 1 if payload[field] else 0
         if "weekly_to" in (payload or {}):
@@ -7325,7 +7346,10 @@ def create_app(ctx: Context):
                          "  add column if not exists night_start_hour int,\n"
                          "  add column if not exists night_end_hour int,\n"
                          "  add column if not exists night_min_score int,\n"
-                         "  add column if not exists exclude_notify_keywords text default '[]';"},
+                         "  add column if not exists exclude_notify_keywords text default '[]',\n"
+                         "  add column if not exists always_kw_bypass_night boolean not null default true,\n"
+                         "  add column if not exists policy_exclude_keywords text default '[]',\n"
+                         "  add column if not exists trade_exclude_keywords text default '[]';"},
                         status_code=500)
                 raise
         return JSONResponse({"ok": True})
@@ -8808,6 +8832,15 @@ def cmd_selftest() -> int:
     check("제외 목록이 비면 아무 영향 없음",
           _notify_decision("채용 관련 없는 기사", 60, 50, [], []), True)
 
+    # 야간 우회 체크 — '무조건 받을 키워드' 우선 기사가 야간에 나갈지
+    def _night_pass(score, n_min, is_priority, bypass):
+        return score >= n_min or (is_priority and bypass)
+    check("야간: 우선 기사 + 체크 켜짐 → 발송", _night_pass(40, 80, True, True), True)
+    check("야간: 우선 기사 + 체크 꺼짐 → 아침 대기", _night_pass(40, 80, True, False), False)
+    check("야간: 점수 높으면 체크와 무관하게 발송", _night_pass(90, 80, False, False), True)
+    check("야간: n_min=101 + 우선 + 체크 → 발송", _night_pass(100, 101, True, True), True)
+    check("야간: n_min=101 + 우선 + 체크 꺼짐 → 전면 억제", _night_pass(100, 101, True, False), False)
+
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")
     check("따옴표 값 보존", _clean('"a # b"'), "a # b")
@@ -8846,11 +8879,21 @@ def cmd_selftest() -> int:
     check("항상 발송 키워드 매칭 → 우선", _kw_hit("포스코퓨처엠 양극재 증설", ["포스코퓨처엠"]), True)
     check("키워드 목록 비면 조건 없음(True)", _kw_hit("아무 본문", []), True)
     check("키워드 불일치 → 우선 아님", _kw_hit("삼성전자 실적", ["포스코퓨처엠"]), False)
-    # 정책 알림: OR 키워드 AND 필수 공통 키워드
-    check("정책: OR 매칭 + 필수 매칭 → 발송",
-          _kw_hit("산업용 전기요금 인하", ["전기요금"]) and _kw_hit("산업용 전기요금 인하", ["산업"]), True)
-    check("정책: OR 매칭 but 필수 불일치 → 제외",
-          _kw_hit("가정용 전기요금 인하", ["전기요금"]) and _kw_hit("가정용 전기요금 인하", ["산업"]), False)
+    # 정책·통상 주제: 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수) · 제목 제외 키워드
+    def _topic_match(text, notify, required, exclude=()):
+        return (_kw_hit_any(text, [k for k in notify if k])
+                and _kw_hit_any(text, [k for k in required if k])
+                and not _kw_hit_any(text, [k for k in exclude if k]))
+    check("정책: 관심 매칭 + 필수 매칭 → 발송",
+          _topic_match("산업용 전기요금 인하", ["전기요금"], ["산업"]), True)
+    check("정책: 관심 매칭 but 필수 불일치 → 제외",
+          _topic_match("가정용 전기요금 인하", ["전기요금"], ["산업"]), False)
+    check("정책: 관심 목록 비면 발송 안 함(둘 다 필수)",
+          _topic_match("산업용 전기요금 인하", [], ["산업"]), False)
+    check("정책: 필수 목록 비면 발송 안 함",
+          _topic_match("산업용 전기요금 인하", ["전기요금"], []), False)
+    check("정책: 조건 맞아도 제목에 제외 키워드 → 제외",
+          _topic_match("산업용 전기요금 인하 공청회 채용 공고", ["전기요금"], ["산업"], ["채용"]), False)
 
     print("\n[13-2c] 카카오 '나에게 보내기'")
     _blank = {f: "" for f in Config.__dataclass_fields__}
