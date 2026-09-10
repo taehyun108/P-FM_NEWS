@@ -173,29 +173,48 @@ text(s, M, Inches(6.35), CW, Inches(0.4),
      [("10분 · 화면 둘러보기 · 알림 설정 · 중요도 점수", 12, False, RGBColor(0x9A, 0xB0, 0xD8))], spacing=1.0)
 
 # ════════════════════════════════════════════════════════════════════
-# 2 · 왜 필요한가
+# 2 · 왜 필요한가 — 숫자로 보면 (실측 기반)
 # ════════════════════════════════════════════════════════════════════
+# 하루 367건 · 7일 누적 2,607건은 make_decks.py 의 실측값(F, 2026-09-09 기준 7일차 무인 운영)과 동일 출처.
+# "사람이 건당 5분씩 분석한다"는 가정 하에, 연간 소요 시간 = 하루 건수 × 5분 × 365일 ÷ 60(분→시간 환산).
+PER_DAY = 367
+PER_WEEK = 2607
+MIN_PER_ARTICLE = 5
+YEAR_HOURS = round(PER_DAY * MIN_PER_ARTICLE * 365 / 60)          # 약 11,163시간
+YEAR_FTE = round(YEAR_HOURS / 2000, 1)                            # 연 250일·일 8시간 근무 가정 환산
+
 s = slide()
-y = header(s, "01  왜 만들었나", "하루 수천 건 기사, 놓치면 안 되는 것은 소수",
-           "관련 뉴스를 사람이 매일 훑는 것은 불가능하고, 정작 중요한 건은 묻힙니다.")
-text(s, M, y + Inches(0.05), CW, Inches(0.4),
-     [("하루에 들어오는 기사", 13, True, NAVY_DARK)], spacing=1.0)
-box(s, M, y + Inches(0.5), CW, Inches(0.66), fill=PAPER, line=LINE, radius=0.06)
-text(s, M + Inches(0.3), y + Inches(0.66), Inches(3.2), Inches(0.4),
-     [("약 3,600건", 22, True, NAVY)], spacing=1.0)
-text(s, M + Inches(3.4), y + Inches(0.72), CW - Inches(3.6), Inches(0.4),
-     [("네이버·구글·언론사 RSS 에서 그룹사·이차전지·정책·통상 키워드로 수집", 11.5, False, INK_SOFT)], spacing=1.2)
-arrow(s, W / 2 - Inches(0.2), y + Inches(1.42), Inches(0.4))
-box(s, M, y + Inches(1.9), CW, Inches(0.66), fill=NAVY_SOFT, line=LINE, radius=0.06)
-text(s, M + Inches(0.3), y + Inches(2.06), Inches(3.2), Inches(0.4),
-     [("실제 알림 5~15건/일", 22, True, NAVY)], spacing=1.0)
-text(s, M + Inches(3.9), y + Inches(2.12), CW - Inches(4.1), Inches(0.4),
-     [("중요도 점수·관련성 필터·중복 제거를 거쳐 걸러진 것만", 11.5, False, INK_SOFT)], spacing=1.2)
-bullet(s, M, y + Inches(3.05), CW, [
+y = header(s, "01  왜 만들었나", f"하루 {PER_DAY}건, 사람이 다 읽으면 1년에 {YEAR_HOURS:,}시간",
+           "기사가 넘쳐날수록 판단 기준은 사람마다 달라지고, 일관성을 지키기 어렵습니다.")
+
+colw = (CW - Inches(0.6)) // 3
+stats = [
+    ("하루 수집 기사", f"{PER_DAY}건", "최근 7일 실측 평균 · 그룹사·이차전지·정책 키워드 118개 기준", NAVY),
+    ("1주일만 지나도", f"{PER_WEEK:,}건", "7일 누적 수집 건수 (실측)", NAVY),
+    ("사람이 건당 5분씩 분석한다면", f"연 {YEAR_HOURS:,}시간", f"정규직 약 {YEAR_FTE}명이 1년 내내 매달려야 하는 양", RED),
+]
+for i, (label, big, caption, color) in enumerate(stats):
+    x = M + (colw + Inches(0.3)) * i
+    box(s, x, y + Inches(0.05), colw, Inches(1.55), fill=PAPER, line=LINE, radius=0.06)
+    box(s, x, y + Inches(0.05), colw, Inches(0.07), fill=color)
+    text(s, x + Inches(0.24), y + Inches(0.26), colw - Inches(0.48), Inches(0.5),
+         [(label, 11.5, True, INK_SOFT)], spacing=1.15)
+    text(s, x + Inches(0.24), y + Inches(0.66), colw - Inches(0.48), Inches(0.5),
+         [(big, 25, True, color)], spacing=1.0)
+    text(s, x + Inches(0.24), y + Inches(1.16), colw - Inches(0.48), Inches(0.42),
+         [(caption, 9.5, False, INK_SOFT)], spacing=1.15)
+
+bullet(s, M, y + Inches(1.85), CW, [
+    ("정보 과부하", "기사가 넘쳐날수록 무엇을 먼저 봐야 할지 판단하기 어렵고, 확인 기준이 사람마다 달라 일관성을 유지하기 힘듭니다"),
     ("놓치면 큰일 나는 것", "포스코 노조 파업 · 미국 반덤핑 관세 · 경쟁사 증설·투자 · IRA/CBAM 세부지침"),
-    ("사람이 하던 일", "담당자가 아침마다 포털 검색 → 요약 → 관련자 공유 (1~2시간)"),
-    ("이 플랫폼이 하는 일", "그 과정을 자동화하고, 중요한 건만 텔레그램으로 밀어 줌"),
-], gap=Inches(0.66))
+    ("AI 자동화의 역할", "AI가 자동으로 수집·분석해 핵심만 빠르게 파악하게 하고, 그만큼 빨리 대응 전략을 세울 수 있게 합니다"),
+], size=12.5, gap=Inches(0.62))
+
+box(s, M, y + Inches(3.9), CW, Inches(0.58), fill=NAVY_SOFT, radius=0.06)
+text(s, M + Inches(0.3), y + Inches(4.06), CW - Inches(0.6), Inches(0.4),
+     [("결과  ", 12.5, True, NAVY),
+      ("확인에 드는 시간을 걷어낸 만큼, 회사의 리스크가 줄어듭니다.", 12, False, INK)],
+     spacing=1.2)
 page(s)
 
 # ════════════════════════════════════════════════════════════════════
