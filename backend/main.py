@@ -2044,12 +2044,21 @@ class SupabaseStorage(Storage):
             raise
 
     def pending_notifications(self, limit: int) -> list[dict]:
-        rows = (self._t("notifications")
-                .select("*, articles(title,url_canonical,url_original,press_name,author,"
-                        "importance_score,published_at,group_companies,source_type,"
-                        "summaries(summary_text,perspective_text))")
-                .eq("status", "queued").lt("retry_count", 3)
-                .order("created_at").limit(limit).execute().data)
+        # PostgREST 는 notifications->articles 처럼 다대일로 임베드된 테이블의 컬럼으로
+        # 부모 행을 정렬하지 못한다(foreign_table 정렬은 1:N 임베드 배열 내부 정렬용).
+        # 그래서 importance_score 내림차순 정렬은 파이썬에서 한다 — 단, .limit(limit) 을
+        # 먼저 걸어버리면 created_at 오름차순으로 잘린 뒤(가장 오래된 것부터) 그 안에서만
+        # 재정렬하게 되어, 대기 건수가 많을 때(예: 야간 억제 후 한꺼번에 풀릴 때) 정작
+        # 중요도가 높은 기사가 뒤로 밀리는 문제가 있었다. 실제 하루 대기량이 넘지 않을
+        # 만큼 넉넉한 상한(2000)까지 모두 가져온 뒤 정렬하고, 그다음에 limit 만큼 자른다.
+        rows = self._page(lambda: (
+            self._t("notifications")
+            .select("*, articles(title,url_canonical,url_original,press_name,author,"
+                    "importance_score,published_at,group_companies,source_type,"
+                    "summaries(summary_text,perspective_text))")
+            .eq("status", "queued").lt("retry_count", 3)
+            .order("created_at")
+        ), cap=2000)
         out = []
         for row in rows:
             article = row.pop("articles", None) or {}
@@ -2058,7 +2067,7 @@ class SupabaseStorage(Storage):
                 summary = summary[0] if summary else None
             out.append({**row, **article, **(summary or {})})
         out.sort(key=lambda r: r.get("importance_score") or 0, reverse=True)
-        return out
+        return out[:limit]
 
     def mark_notification(self, notif_id: str, status: str, error: str | None) -> None:
         rows = self._t("notifications").select("retry_count").eq("id", notif_id).execute().data
@@ -7761,10 +7770,17 @@ def cmd_fixcategories(ctx: Context) -> None:
 
     과거엔 본문 2000자를 스캔하고 규칙에 '정부'·'정책' 같은 흔한 단어가 있어
     거의 모든 기사에 3~4개 카테고리가 붙어 필터가 변별력을 잃었다.
+
+    인사·부고는 detect_categories 가 전혀 모르는 별도 판정 경로(people_news_kind)로
+    붙는 태그라, 예전엔 이 함수가 지나갈 때마다 조용히 지워졌다(2026-09-10 발견 —
+    인사·부고 기사 104건이 이 명령 실행 시점에 태그를 잃고 탭에서 사라짐). 그래서
+    인사·부고 기사는 재태깅 대상에서 제외하고 태그를 그대로 둔다.
     """
     rows = ctx.storage.list_articles(5000, 0, None, "")
     fixed = 0
     for r in rows:
+        if people_news_kind(r.get("url_canonical") or r.get("url_source") or "", r.get("title") or ""):
+            continue
         cur = dedupe_chips(jload(r.get("categories"), []))
         probe = f"{r.get('summary_text') or ''}\n{' '.join(jload(r.get('keywords'), []))}"
         new = detect_categories(r.get("title") or "", probe)
@@ -8913,6 +8929,30 @@ def cmd_selftest() -> int:
     _tmp._exec("update telegram_log set created_at=? where kind='직접 전송'", (_d120,))
     check("30일 넘은 발송 로그 1건 정리", _tmp.prune_telegram_log(30), 1)
     check("최근 로그는 남는다", len(_tmp.recent_telegram_logs(10)), 1)
+
+    print("\n[11-6] cmd_fixcategories — 인사·부고 태그는 재태깅에서 보호 (회귀 방지)")
+    # 2026-09-10 발견: detect_categories 는 인사·부고를 모르는데 cmd_fixcategories 가
+    # 전체 기사의 categories 를 그걸로 덮어써, 실행 시점마다 인사·부고 태그가 지워지고
+    # 탭에서 기사가 사라졌다(104건 피해). people_news_kind 대상은 건너뛰도록 고쳤다.
+    _tmp._exec("delete from articles")
+    _tmp._exec(
+        "insert into articles (id, url_source, url_canonical, url_original, title,"
+        " published_at, collected_at, source_type, categories, status) values (?,?,?,?,?,?,?,?,?,?)",
+        ("art-people", "http://r/people", "http://r/people", "http://r/people",
+         "[부고] 김철수(전 삼성전자 부사장)씨 별세", _d030, _d030, "rss", '["인사·부고"]', "active"))
+    _tmp._exec(
+        "insert into articles (id, url_source, url_canonical, url_original, title,"
+        " published_at, collected_at, source_type, categories, status) values (?,?,?,?,?,?,?,?,?,?)",
+        ("art-normal", "http://r/normal", "http://r/normal", "http://r/normal",
+         "포스코 주가 코스피 상한가", _d030, _d030, "rss", "[]", "active"))
+    from types import SimpleNamespace
+    cmd_fixcategories(SimpleNamespace(storage=_tmp))
+    check("인사·부고 기사는 태그 유지",
+          jload(_tmp._one("select categories from articles where id='art-people'")["categories"], []),
+          ["인사·부고"])
+    check("일반 기사는 그대로 재태깅됨(회귀 아님)",
+          "시장/주가" in jload(_tmp._one("select categories from articles where id='art-normal'")["categories"], []),
+          True)
 
     shutil.rmtree(_dbdir, ignore_errors=True)
 
