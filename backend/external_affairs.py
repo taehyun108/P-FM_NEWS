@@ -319,6 +319,417 @@ class EaDB:
             "excluded": n("select count(*) as n from ea_url_ledger"),
         }
 
+    # ── 조회(뷰) — 화면·주간레포트·마이그레이션이 공유 ──
+    def agency_name_by_id(self, agency_id: str) -> str:
+        if not agency_id:
+            return ""
+        row = self.one("select name from ea_agencies where id=?", (agency_id,))
+        return (row or {}).get("name", "")
+
+    def backfill_group_targets(self) -> list[dict]:
+        """group_companies 가 비어 있는 항목 — id·title·law_name·category 만."""
+        return self.rows("select id, title, law_name, category from ea_policy_items"
+                         " where group_companies is null or group_companies in ('', '[]')")
+
+    def update_item_groups(self, item_id: str, groups_json: str) -> None:
+        self.exec("update ea_policy_items set group_companies=? where id=?",
+                  (groups_json, item_id))
+
+    def last_item_collected_at_raw(self) -> str | None:
+        row = self.one("select max(collected_at) as t from ea_policy_items")
+        return row.get("t") if row else None
+
+    def ensure_ready(self) -> None:
+        """뒤늦게 추가한 컬럼·테이블 보강. Supabase 는 schema.sql 이 이미 최신이라 _ensure_cols 로 위임."""
+        self._ensure_cols()
+
+    def query_items(self, *, item_type: str = "", agency: str = "", impact: str = "",
+                    status: str = "", due: str = "", q: str = "", group: str = "",
+                    sort: str = "deadline") -> list[dict]:
+        """정렬은 sort 파라미터로 고른다. 기본은 마감일 오름차순. (SS8.4)
+
+        정렬 자체는 SQL 이 아니라 _ea_sort_rows() 가 한다 - Supabase 백엔드와
+        똑같은 함수를 써서 두 저장소의 정렬 결과가 어긋나지 않게 한다.
+        """
+        sql, args = _ITEM_SELECT + " where 1=1", []
+        if group:
+            parts = group.split(",")
+            sql += " and (" + " or ".join(["p.group_companies like ?"] * len(parts)) + ")"
+            args += [f'%"{g}"%' for g in parts]
+        if item_type:
+            marks = ",".join("?" * len(item_type.split(",")))
+            sql += f" and p.item_type in ({marks})"; args += item_type.split(",")
+        if agency:
+            parts = agency.split(",")
+            marks = ",".join("?" * len(parts))
+            sql += f" and coalesce(g.name, p.agency_raw) in ({marks})"; args += parts
+        if impact:
+            marks = ",".join("?" * len(impact.split(",")))
+            sql += f" and ifnull(a.impact_level,'') in ({marks})"; args += impact.split(",")
+        if status:
+            marks = ",".join("?" * len(status.split(",")))
+            sql += f" and ifnull(p.status,'') in ({marks})"; args += status.split(",")
+        if due in ("7", "14", "30"):
+            today = datetime.now(KST).date()
+            sql += " and p.notice_end is not null and p.notice_end >= ? and p.notice_end <= ?"
+            args += [today.isoformat(), (today + timedelta(days=int(due))).isoformat()]
+        if q:
+            sql += (" and (p.title like ? or ifnull(p.law_name,'') like ?"
+                   " or ifnull(a.summary,'') like ?)")
+            args += [f"%{q}%"] * 3
+        rows = self.rows(sql, args)
+        return _ea_sort_rows(rows, sort)
+
+    def filters_agency_counts(self, types: list[str]) -> dict[str, int]:
+        where, args = "", []
+        if types:
+            where = f" where p.item_type in ({','.join('?' * len(types))})"
+            args = list(types)
+        return {r["v"]: r["n"] for r in self.rows(
+            "select coalesce(g.name, p.agency_raw) as v, count(*) as n"
+            " from ea_policy_items p left join ea_agencies g on g.id=p.agency_id"
+            + where + " group by v", args) if r["v"]}
+
+    def filters_group_counts(self, types: list[str]) -> dict[str, int]:
+        where, args = "", []
+        if types:
+            where = f" where p.item_type in ({','.join('?' * len(types))})"
+            args = list(types)
+        gcounts: dict[str, int] = {}
+        for r in self.rows("select group_companies as v from ea_policy_items p" + where, args):
+            for g in jload(r.get("v"), []):
+                gcounts[g] = gcounts.get(g, 0) + 1
+        return gcounts
+
+    def filters_statuses(self, types: list[str]) -> list[str]:
+        if types:
+            where = f" where p.item_type in ({','.join('?' * len(types))})"
+            rows = self.rows("select distinct p.status as v from ea_policy_items p" + where
+                             + " order by v", types)
+        else:
+            rows = self.rows("select distinct status as v from ea_policy_items order by v")
+        return [r["v"] for r in rows if r["v"]]
+
+    def item_detail(self, item_id: str) -> dict | None:
+        return self.one(_ITEM_SELECT + " where p.id=?", (item_id,))
+
+    def recent_news_items_for_weekly(self, ea_types: Sequence[str], limit: int = 120) -> list[dict]:
+        if not ea_types:
+            return []
+        marks = ",".join("?" * len(ea_types))
+        return self.rows(
+            _ITEM_SELECT + f" where p.item_type in ({marks})"
+            " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc limit ?",
+            list(ea_types) + [limit])
+
+
+def _ea_pick_service_key(k1: str, k2: str) -> str:
+    """main._pick_supabase_service_key 와 동일한 로직을 독립 구현한다(main.py 미임포트 원칙)."""
+    import base64
+    for k in (k1, k2):
+        if not k:
+            continue
+        try:
+            payload = k.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            if json.loads(base64.urlsafe_b64decode(payload)).get("role") == "service_role":
+                return k
+        except Exception:
+            continue
+    return k1 or k2
+
+
+def _ea_sort_rows(rows: list[dict], sort: str) -> list[dict]:
+    """query_items 공통 정렬. EaDB(SQLite)와 EaSupabaseDB 양쪽이 이 함수 하나로 정렬해
+    두 백엔드의 정렬 결과가 어긋나지 않는다.
+
+    - deadline(기본): 마감일 있는 항목 먼저, 마감일 오름차순, 같은 마감일은 수집 최신순
+    - recent: 공고 시작일(없으면 수집일) 내림차순
+    - impact: deadline 순서를 기본으로 두고 영향도 등급으로 다시 정렬(안정 정렬)
+    """
+    rows = list(rows)
+    rows.sort(key=lambda r: r.get("collected_at") or "", reverse=True)
+    if sort == "recent":
+        rows.sort(key=lambda r: r.get("notice_start") or (r.get("collected_at") or "")[:10],
+                  reverse=True)
+    else:
+        rows.sort(key=lambda r: r.get("notice_end") or "9999-99-99")
+    if sort == "impact":
+        rows.sort(key=lambda r: _IMPACT_RANK.get(r.get("impact_level") or "", 0), reverse=True)
+    return rows
+
+
+class EaSupabaseDB:
+    """EaDB 와 같은 메서드 인터페이스를 Supabase(PostgREST)로 구현한다.
+
+    DB_BACKEND=supabase 일 때 make_ea_db() 가 이걸 돌려준다. 대외협력 데이터는
+    수백 건 규모라 JOIN·집계를 SQL 에 맡기지 않고 관련 테이블을 통째로 읽어
+    파이썬에서 처리한다(PostgREST 는 임의 JOIN 을 지원하지 않는다).
+    main.py 를 import 하지 않는다는 이 파일의 설계 원칙을 그대로 지킨다 -
+    Supabase 클라이언트를 독립적으로 만든다(SupabaseStorage 코드와 일부 중복되지만
+    의도된 것이다).
+    """
+
+    def __init__(self) -> None:
+        from supabase import create_client
+        url = _env("SUPABASE_URL")
+        key = _ea_pick_service_key(_env("SUPABASE_SERVICE_ROLE_KEY"), _env("SUPABASE_ANON_KEY"))
+        if not url or not key:
+            raise RuntimeError("대외협력: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 가 필요합니다.")
+        self.db = create_client(url, key)
+
+    def _t(self, name: str):
+        return self.db.table(name)
+
+    # ── 부처 ──
+    def seed_agencies(self, rows: Iterable[tuple[str, str, str]]) -> int:
+        n = 0
+        for name, short, kind in rows:
+            existing = self._t("ea_agencies").select("id,kind").eq("name", name).execute().data
+            if existing:
+                if (existing[0].get("kind") or "") != kind:
+                    self._t("ea_agencies").update({"kind": kind}).eq("name", name).execute()
+                continue
+            self._t("ea_agencies").insert(
+                {"id": str(uuid.uuid4()), "name": name, "short_name": short,
+                 "kind": kind, "enabled": True}).execute()
+            n += 1
+        return n
+
+    def agencies(self, enabled_only: bool = True) -> list[dict]:
+        q = self._t("ea_agencies").select("*")
+        if enabled_only:
+            q = q.eq("enabled", True)
+        return q.order("name").execute().data
+
+    def agency_id_by_name(self, name: str) -> str | None:
+        if not name:
+            return None
+        rows = (self._t("ea_agencies").select("id")
+               .or_(f"name.eq.{name},short_name.eq.{name}").limit(1).execute().data)
+        return rows[0]["id"] if rows else None
+
+    def agency_name_by_id(self, agency_id: str) -> str:
+        if not agency_id:
+            return ""
+        rows = self._t("ea_agencies").select("name").eq("id", agency_id).limit(1).execute().data
+        return rows[0]["name"] if rows else ""
+
+    def relink_agencies(self) -> int:
+        agencies = {a["name"]: a["id"] for a in self._t("ea_agencies").select("id,name").execute().data}
+        if not agencies:
+            return 0
+        targets = (self._t("ea_policy_items").select("id,agency_raw")
+                  .is_("agency_id", "null").not_.is_("agency_raw", "null").execute().data)
+        n = 0
+        for r in targets:
+            aid = agencies.get(r.get("agency_raw") or "")
+            if aid:
+                self._t("ea_policy_items").update({"agency_id": aid}).eq("id", r["id"]).execute()
+                n += 1
+        return n
+
+    # ── 게이트용 조회 ──
+    def known_url_sources(self, candidates: Sequence[str]) -> set[str]:
+        if not candidates:
+            return set()
+        found: set[str] = set()
+        chunk = 200
+        cands = list(candidates)
+        for i in range(0, len(cands), chunk):
+            part = cands[i:i + chunk]
+            for table in ("ea_policy_items", "ea_url_ledger"):
+                rows = self._t(table).select("url_source").in_("url_source", part).execute().data
+                found.update(r["url_source"] for r in rows)
+        return found
+
+    def recent_url_sources(self, hours: int) -> set[str]:
+        cutoff = iso(now_utc() - timedelta(hours=hours))
+        rows = self._t("ea_policy_items").select("url_source").gte("collected_at", cutoff).execute().data
+        return {r["url_source"] for r in rows}
+
+    def upsert_ledger(self, url_source: str, reason: str) -> None:
+        existing = (self._t("ea_url_ledger").select("hit_count")
+                   .eq("url_source", url_source).limit(1).execute().data)
+        if existing:
+            self._t("ea_url_ledger").update(
+                {"hit_count": int(existing[0].get("hit_count") or 0) + 1}
+            ).eq("url_source", url_source).execute()
+        else:
+            self._t("ea_url_ledger").insert(
+                {"url_source": url_source, "reason": reason, "first_seen": iso(now_utc()),
+                 "hit_count": 1}).execute()
+
+    # ── 실행 상태 ──
+    def get_run_state(self, key: str) -> str:
+        rows = self._t("ea_run_state").select("value").eq("key", key).limit(1).execute().data
+        return (rows[0].get("value") or "") if rows else ""
+
+    def set_run_state(self, key: str, value: str) -> None:
+        self._t("ea_run_state").upsert({"key": key, "value": value}, on_conflict="key").execute()
+
+    def ensure_ready(self) -> None:
+        pass
+
+    # ── 항목 ──
+    def insert_item(self, row: dict) -> bool:
+        try:
+            self._t("ea_policy_items").insert(row).execute()
+            return True
+        except Exception as exc:
+            msg = str(exc)
+            if "duplicate key" in msg.lower() or "23505" in msg:
+                return False
+            raise
+
+    def unanalyzed_items(self, limit: int) -> list[dict]:
+        analyzed_ids = {r["policy_item_id"]
+                        for r in self._t("ea_analyses").select("policy_item_id").execute().data}
+        items = self._t("ea_policy_items").select("*").execute().data
+        pending = [r for r in items if r["id"] not in analyzed_ids]
+        pending.sort(key=lambda r: (r.get("notice_end") is None, r.get("notice_end") or ""))
+        return pending[:limit]
+
+    def save_analysis(self, row: dict) -> None:
+        self._t("ea_analyses").insert(row).execute()
+
+    def analyses_today(self) -> int:
+        midnight = iso(now_utc().replace(hour=0, minute=0, second=0, microsecond=0))
+        return (self._t("ea_analyses").select("id", count="exact")
+               .gte("created_at", midnight).limit(1).execute().count or 0)
+
+    def stats(self) -> dict:
+        today = datetime.now(KST).date().isoformat()
+        total = self._t("ea_policy_items").select("id", count="exact").limit(1).execute().count or 0
+        open_n = (self._t("ea_policy_items").select("id", count="exact")
+                 .not_.is_("notice_end", "null").gte("notice_end", today)
+                 .limit(1).execute().count or 0)
+        analyzed = self._t("ea_analyses").select("id", count="exact").limit(1).execute().count or 0
+        excluded = self._t("ea_url_ledger").select("url_source", count="exact").limit(1).execute().count or 0
+        return {"total": total, "open": open_n, "analyzed": analyzed, "excluded": excluded}
+
+    # ── 그룹사 소급 ──
+    def backfill_group_targets(self) -> list[dict]:
+        rows = self._t("ea_policy_items").select("id,title,law_name,category,group_companies").execute().data
+        return [r for r in rows if not r.get("group_companies") or r.get("group_companies") in ("", "[]")]
+
+    def update_item_groups(self, item_id: str, groups_json: str) -> None:
+        self._t("ea_policy_items").update({"group_companies": groups_json}).eq("id", item_id).execute()
+
+    def last_item_collected_at_raw(self) -> str | None:
+        rows = (self._t("ea_policy_items").select("collected_at")
+               .order("collected_at", desc=True).limit(1).execute().data)
+        return rows[0]["collected_at"] if rows else None
+
+    # ── 조회(뷰) — 3테이블 조인은 파이썬에서 ──
+    def _joined_items(self) -> list[dict]:
+        items = self._t("ea_policy_items").select("*").execute().data
+        agency_by_id = {a["id"]: a["name"] for a in self._t("ea_agencies").select("id,name").execute().data}
+        analyses = {a["policy_item_id"]: a for a in self._t("ea_analyses").select(
+            "policy_item_id,impact_level,summary,impact_rationale,affected_areas,suggested_action"
+        ).execute().data}
+        out = []
+        for r in items:
+            row = dict(r)
+            row["agency_name"] = agency_by_id.get(r.get("agency_id") or "")
+            a = analyses.get(r["id"])
+            if a:
+                row.update({k: a.get(k) for k in
+                           ("impact_level", "summary", "impact_rationale",
+                            "affected_areas", "suggested_action")})
+            out.append(row)
+        return out
+
+    def query_items(self, *, item_type: str = "", agency: str = "", impact: str = "",
+                    status: str = "", due: str = "", q: str = "", group: str = "",
+                    sort: str = "deadline") -> list[dict]:
+        rows = self._joined_items()
+        if group:
+            parts = set(group.split(","))
+            rows = [r for r in rows if parts & set(jload(r.get("group_companies"), []))]
+        if item_type:
+            types = set(item_type.split(","))
+            rows = [r for r in rows if (r.get("item_type") or "") in types]
+        if agency:
+            names = set(agency.split(","))
+            rows = [r for r in rows if (r.get("agency_name") or r.get("agency_raw") or "") in names]
+        if impact:
+            levels = set(impact.split(","))
+            rows = [r for r in rows if (r.get("impact_level") or "") in levels]
+        if status:
+            statuses = set(status.split(","))
+            rows = [r for r in rows if (r.get("status") or "") in statuses]
+        if due in ("7", "14", "30"):
+            today = datetime.now(KST).date().isoformat()
+            end = (datetime.now(KST).date() + timedelta(days=int(due))).isoformat()
+            rows = [r for r in rows if r.get("notice_end") and today <= r["notice_end"] <= end]
+        if q:
+            rows = [r for r in rows if q in (r.get("title") or "") or q in (r.get("law_name") or "")
+                   or q in (r.get("summary") or "")]
+        return _ea_sort_rows(rows, sort)
+
+    def filters_agency_counts(self, types: list[str]) -> dict[str, int]:
+        rows = self._joined_items()
+        if types:
+            rows = [r for r in rows if (r.get("item_type") or "") in types]
+        counts: dict[str, int] = {}
+        for r in rows:
+            name = r.get("agency_name") or r.get("agency_raw")
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def filters_group_counts(self, types: list[str]) -> dict[str, int]:
+        rows = self._joined_items()
+        if types:
+            rows = [r for r in rows if (r.get("item_type") or "") in types]
+        gcounts: dict[str, int] = {}
+        for r in rows:
+            for g in jload(r.get("group_companies"), []):
+                gcounts[g] = gcounts.get(g, 0) + 1
+        return gcounts
+
+    def filters_statuses(self, types: list[str]) -> list[str]:
+        rows = self._t("ea_policy_items").select("item_type,status").execute().data
+        if types:
+            rows = [r for r in rows if (r.get("item_type") or "") in types]
+        return sorted({r["status"] for r in rows if r.get("status")})
+
+    def item_detail(self, item_id: str) -> dict | None:
+        rows = self._t("ea_policy_items").select("*").eq("id", item_id).limit(1).execute().data
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row["agency_name"] = self.agency_name_by_id(row.get("agency_id") or "")
+        arows = (self._t("ea_analyses")
+                .select("impact_level,summary,impact_rationale,affected_areas,suggested_action")
+                .eq("policy_item_id", item_id).limit(1).execute().data)
+        if arows:
+            row.update(arows[0])
+        return row
+
+    def recent_news_items_for_weekly(self, ea_types: Sequence[str], limit: int = 120) -> list[dict]:
+        if not ea_types:
+            return []
+        types = set(ea_types)
+        rows = [r for r in self._joined_items() if (r.get("item_type") or "") in types]
+        rows.sort(key=lambda r: r.get("notice_start") or (r.get("collected_at") or "")[:10],
+                  reverse=True)
+        return rows[:limit]
+
+
+def make_ea_db(ctx: Any):
+    """DB_BACKEND 에 맞는 대외협력 저장소를 돌려준다.
+
+    main.py 를 import 하지 않으므로 ctx.cfg 는 덕타이핑으로만 쓴다
+    (db_backend, sqlite_path 속성만 있으면 됨). Supabase 접속 정보는 main.py 와
+    같은 .env 변수(SUPABASE_URL 등)를 이 파일이 직접 읽는다.
+    """
+    backend = str(getattr(ctx.cfg, "db_backend", "sqlite") or "sqlite").lower()
+    if backend == "supabase":
+        return EaSupabaseDB()
+    return EaDB(ctx.cfg.sqlite_path)
+
 
 # ── 관심 부처 시드 ───────────────────────────────────────────────────
 # 정부조직 개편으로 이름이 자주 바뀐다. 옛 이름도 함께 넣어 과거 공고를 놓치지 않는다.
@@ -383,23 +794,22 @@ EA_RELEVANCE_KW: list[str] = [
 ]
 
 
-def _keyword_sets_terms(db: EaDB) -> list[str]:
-    """기존 keyword_sets(산업·정책·통상)를 읽기 전용으로 빌려 쓴다. 쓰기는 하지 않는다.
+def _keyword_sets_terms(db: Any, keyword_rows: list[dict]) -> list[str]:
+    """keyword_rows(ctx.storage.enabled_keywords() 결과)의 산업·정책·통상 카테고리만 쓴다.
+
+    main.py 의 저장소를 그대로 인자로 받는다 - DB_BACKEND 가 무엇이든 항상 '지금
+    운영 중인' 키워드를 본다(예전엔 이 파일이 로컬 sqlite 의 keyword_sets 를 직접
+    읽어, Supabase 로 전환한 뒤에도 마스터 패널에서 키워드를 바꾸면 반영되지 않았다).
 
     단, **부처·기관명은 뺀다.** keyword_sets 는 뉴스 검색어라 '국토교통부' 같은
     부처명이 들어 있는데, 그대로 쓰면 is_relevant 가 부처명만으로 통과시켜
     '관심 부처라는 이유만으로는 통과시키지 않는다'는 규칙이 뒷문으로 무너진다
     (실제로 '국토교통부와 그 소속기관 직제 일부개정령안'이 이 경로로 들어왔다).
     """
-    try:
-        terms = [r["keyword"] for r in db.rows(
-            "select keyword from keyword_sets where enabled=1 and category in ('산업','정책','통상')")]
-    except sqlite3.Error as exc:
-        log.debug("keyword_sets 조회 실패(무시): %s", exc)
-        return []
+    terms = [r["keyword"] for r in keyword_rows if (r.get("category") or "") in ("산업", "정책", "통상")]
     try:
         agencies = db.agencies()
-    except sqlite3.Error:
+    except Exception:
         return terms
     names = {a["name"] for a in agencies} | {a["short_name"] for a in agencies if a.get("short_name")}
     return [t for t in terms if t not in names]
@@ -428,12 +838,12 @@ def is_relevant(title: str, law_name: str = "", agency: str = "",
 class Gates:
     """기존 파이프라인과 같은 순서로 거른다. HTTP·LLM 은 G2.5 통과분에만 쓴다."""
 
-    def __init__(self, db: EaDB) -> None:
+    def __init__(self, db: Any, keyword_rows: list[dict] = ()) -> None:
         self.db = db
         self.seen: set[str] = db.recent_url_sources(EA_SEEN_CACHE_HOURS)
         self.agency_names = {a["name"] for a in db.agencies()} | {
             a["short_name"] for a in db.agencies() if a.get("short_name")}
-        self.extra_terms = _keyword_sets_terms(db)
+        self.extra_terms = _keyword_sets_terms(db, list(keyword_rows))
         self.counts = {"fetched": 0, "g0": 0, "g1": 0, "g2": 0, "g2_5": 0, "off_topic": 0}
 
     def filter(self, items: list[dict]) -> list[dict]:
@@ -841,29 +1251,27 @@ def detect_ea_groups(title: str, law_name: str = "", category: str = "") -> list
     return [name for name, words in EA_GROUP_RULES if _kw_in(probe, words)]
 
 
-def backfill_groups(db: EaDB) -> int:
+def backfill_groups(db: Any) -> int:
     """group_companies 가 비어 있는 항목을 규칙으로 채운다(컬럼을 뒤늦게 추가했다).
 
     규칙만 쓰므로 LLM 비용이 없고, 규칙을 고치면 다시 돌려 소급 반영할 수 있다.
     """
-    rows = db.rows("select id, title, law_name, category from ea_policy_items"
-                   " where group_companies is null or group_companies in ('', '[]')")
+    rows = db.backfill_group_targets()
     n = 0
     for r in rows:
         groups = detect_ea_groups(r.get("title") or "", r.get("law_name") or "",
                                   r.get("category") or "")
         if groups:
-            db.exec("update ea_policy_items set group_companies=? where id=?",
-                    (jdump(groups), r["id"]))
+            db.update_item_groups(r["id"], jdump(groups))
             n += 1
     return n
 
 
 # ── 수집 1회 ────────────────────────────────────────────────────────
-def collect_once(ctx: Any, db: EaDB) -> dict:
+def collect_once(ctx: Any, db: Any) -> dict:
     """스레드 C 가 하루 2회 부르는 진입점. 기존 수집 루프와 완전히 분리돼 있다."""
     started = time.monotonic()
-    db._ensure_cols()
+    db.ensure_ready()
     db.seed_agencies(SEED_AGENCIES)
     relinked = db.relink_agencies()
     if relinked:
@@ -884,7 +1292,12 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
             active_sources.append(label)
             raw.extend(got)
 
-    gates = Gates(db)
+    try:
+        keyword_rows = ctx.storage.enabled_keywords()
+    except Exception as exc:
+        log.debug("키워드 조회 실패(무시, 대외협력 자체 규칙만 적용): %s", exc)
+        keyword_rows = []
+    gates = Gates(db, keyword_rows)
     kept = gates.filter(raw)
 
     # 처리 상한 — 실행 시간을 예측 가능하게 묶는다. 넘친 항목은 아직
@@ -995,7 +1408,7 @@ def collect_once(ctx: Any, db: EaDB) -> dict:
 EA_MIN_GAP_HOURS = 1   # 재시작 폭주 방지 백스톱. 같은 시각 중복은 아래 slot_missed 가 막는다
 
 
-def _last_collect_at(db: EaDB) -> datetime | None:
+def _last_collect_at(db: Any) -> datetime | None:
     """마지막으로 수집을 **실행한** 시각.
 
     저장된 항목의 collected_at 으로 판단하면 안 된다 — 크롤은 돌았는데 새 항목이
@@ -1006,8 +1419,7 @@ def _last_collect_at(db: EaDB) -> datetime | None:
     marked = parse_dt(db.get_run_state("last_collect_at"))
     if marked:
         return marked
-    row = db.one("select max(collected_at) as t from ea_policy_items")
-    return parse_dt(row.get("t")) if row and row.get("t") else None
+    return parse_dt(db.last_item_collected_at_raw())
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -1026,7 +1438,7 @@ def scheduler_loop(ctx: Any, stop: threading.Event) -> None:
     마지막 수집 시각을 DB(ea_policy_items.collected_at)에서 읽어 판단하므로,
     서버를 자주 재시작해도 EA_MIN_GAP_HOURS 안에는 다시 크롤·분석하지 않는다.
     """
-    db = EaDB(ctx.cfg.sqlite_path)
+    db = make_ea_db(ctx)
     log.info("대외협력 수집 스레드 시작 (매일 %s시)",
              "·".join(str(h) for h in schedule_hours()))
     while not stop.is_set():
@@ -1208,7 +1620,7 @@ _TRADE_IMPACT_KW = {
 }
 
 
-def _kotra_rule_analysis(db: EaDB, item: dict) -> bool:
+def _kotra_rule_analysis(db: Any, item: dict) -> bool:
     """KOTRA 해외시장뉴스는 본문이 없다(제목이 완결된 문장). LLM 없이 규칙으로
     요약·영향도를 채운다 — 전용 LLM 상한(EA_LLM_DAILY_LIMIT)을 예고 분석에 남긴다."""
     title = item.get("title") or ""
@@ -1235,7 +1647,7 @@ def _kotra_rule_analysis(db: EaDB, item: dict) -> bool:
     return True
 
 
-def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
+def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     """항목 1건 분석 후 ea_analyses 에 저장. 성공하면 True.
 
     source_text: 수집 시 API 응답에 들어 있던 제안이유·주요내용. 이게 있으면
@@ -1253,8 +1665,7 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     period = " ~ ".join(x for x in (item.get("notice_start"), item.get("notice_end")) if x) or "미상"
     agency = ""
     if item.get("agency_id"):
-        row = db.one("select name from ea_agencies where id=?", (item["agency_id"],))
-        agency = (row or {}).get("name", "")
+        agency = db.agency_name_by_id(item["agency_id"])
     # 매핑된 부처명이 없으면 크롤 원문을 쓴다 — 화면(_item_view)과 같은 폴백이어야
     # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
     agency = agency or (item.get("agency_raw") or "")
@@ -1314,7 +1725,7 @@ def analyze_item(ctx: Any, db: EaDB, item: dict, source_text: str = "") -> bool:
     return True
 
 
-def analysis_budget(ctx: Any, db: EaDB) -> int:
+def analysis_budget(ctx: Any, db: Any) -> int:
     """이번에 분석할 수 있는 건수. 전용 상한과 전체 상한 중 작은 쪽."""
     ea_limit = EA_LLM_DAILY_LIMIT()
     if ea_limit <= 0:
@@ -1350,7 +1761,7 @@ def _news_body_map(items: list[dict]) -> dict[str, str]:
     return out
 
 
-def analyze_backlog(ctx: Any, db: EaDB) -> int:
+def analyze_backlog(ctx: Any, db: Any) -> int:
     """미분석 항목을 처리한다. KOTRA(trade_news)는 규칙 기반이라 상한 밖에서 전부,
     나머지는 전용 LLM 상한 안에서(마감 임박 우선)."""
     done = 0
@@ -1418,6 +1829,68 @@ _ITEM_SELECT = (
 )
 
 
+_EA_IMPACT_LABEL = {"high": "높음", "medium": "보통", "low": "낮음", "none": "해당없음"}
+
+
+def _ea_format_message(view: dict) -> str:
+    """대외협력 항목 1건을 텔레그램 평문 메시지로 만든다. (수동 전송 버튼용)"""
+    lines = [f"🏛 [{view.get('category') or '대외협력'}] {view.get('title') or ''}"]
+    sub = [x for x in (view.get("agency"), view.get("law_name")) if x]
+    if sub:
+        lines.append(" · ".join(sub))
+    if view.get("notice_start") or view.get("notice_end"):
+        period = f"{view.get('notice_start') or '미정'} ~ {view.get('notice_end') or '미정'}"
+        if view.get("d_day"):
+            period += f" ({view['d_day']})"
+        lines.append(f"공고기간: {period}")
+    if view.get("status"):
+        lines.append(f"상태: {view['status']}")
+    groups = view.get("group_companies") or []
+    if groups:
+        lines.append("관련 계열사: " + ", ".join(groups))
+    if view.get("summary"):
+        lines.append("")
+        lines.append(view["summary"])
+    if view.get("impact_level"):
+        lines.append("")
+        lines.append(f"포스코 영향: {_EA_IMPACT_LABEL.get(view['impact_level'], view['impact_level'])}")
+        if view.get("impact_rationale"):
+            lines.append(f"근거: {view['impact_rationale']}")
+    if view.get("suggested_action"):
+        lines.append(f"대응(초안): {view['suggested_action']}")
+    if view.get("url"):
+        lines.append("")
+        lines.append(f"원문: {view['url']}")
+    return "\n".join(lines)
+
+
+def _ea_telegram_send(ctx: Any, text: str) -> tuple[bool, str | None]:
+    """대외협력 항목을 텔레그램으로 수동 전송한다 (뉴스 카드의 '↗ 직접 전송' 버튼과 같은
+    direct-send 방식 - main.py 의 알림 큐 notifications 는 건드리지 않는다. 이 파일
+    상단의 설계 원칙("텔레그램·notifications 는 읽지도 쓰지도 않는다")은 자동 알림
+    파이프라인에 얹지 않는다는 뜻이라, 사람이 누르는 수동 전송 버튼과는 무관하다.
+
+    main.py 를 import 하지 않는다는 원칙에 따라 발송 로직을 최소한으로 복제한다
+    (main._telegram_send 의 flood-control·재시도까지는 필요 없다 - 수동 단발 전송이다).
+    """
+    token = getattr(ctx.cfg, "telegram_bot_token", "") or ""
+    chat_id = getattr(ctx.cfg, "telegram_chat_id", "") or ""
+    if not token or not chat_id:
+        return False, "텔레그램이 설정되지 않았습니다."
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(
+            url, json={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": False},
+            timeout=10)
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            return True, None
+        return False, str(data.get("description") or resp.status_code)
+    except Exception as exc:
+        return False, str(exc)
+
+
 # 화면 상단 카테고리(=탭). key 는 프런트·필터 API 가 공유한다.
 EA_CATEGORIES = [
     {"key": "notice", "label": "입법·행정예고"},
@@ -1480,60 +1953,18 @@ _EA_ORDER_SQL = {
 }
 
 
-def query_items(db: EaDB, *, item_type: str = "", agency: str = "", impact: str = "",
-                status: str = "", due: str = "", q: str = "", group: str = "",
-                sort: str = "deadline") -> list[dict]:
-    """정렬은 sort 파라미터로 고른다. 기본은 마감일 오름차순. (§8.4)"""
-    sql, args = _ITEM_SELECT + " where 1=1", []
-    if group:
-        # group_companies 는 JSON 배열 문자열이다. 회사명은 서로 포함관계가 없어
-        # ("포스코"는 "포스코퓨처엠"의 접두사지만 따옴표로 감싸면 구분된다) LIKE 로 충분하다.
-        parts = group.split(",")
-        sql += " and (" + " or ".join(["p.group_companies like ?"] * len(parts)) + ")"
-        args += [f'%"{g}"%' for g in parts]
-    if item_type:
-        marks = ",".join("?" * len(item_type.split(",")))
-        sql += f" and p.item_type in ({marks})"; args += item_type.split(",")
-    if agency:
-        # 부처명은 매핑된 이름(g.name)이 없으면 크롤 원문(p.agency_raw)으로 맞춘다.
-        parts = agency.split(",")
-        marks = ",".join("?" * len(parts))
-        sql += f" and coalesce(g.name, p.agency_raw) in ({marks})"; args += parts
-    if impact:
-        marks = ",".join("?" * len(impact.split(",")))
-        sql += f" and ifnull(a.impact_level,'') in ({marks})"; args += impact.split(",")
-    if status:
-        marks = ",".join("?" * len(status.split(",")))
-        sql += f" and ifnull(p.status,'') in ({marks})"; args += status.split(",")
-    if due in ("7", "14", "30"):
-        today = datetime.now(KST).date()
-        sql += " and p.notice_end is not null and p.notice_end >= ? and p.notice_end <= ?"
-        args += [today.isoformat(), (today + timedelta(days=int(due))).isoformat()]
-    if q:
-        sql += (" and (p.title like ? or ifnull(p.law_name,'') like ?"
-                " or ifnull(a.summary,'') like ?)")
-        args += [f"%{q}%"] * 3
-    sort = sort if sort in _EA_ORDER_SQL else "deadline"
-    sql += _EA_ORDER_SQL[sort]
-    rows = db.rows(sql, args)
-    if sort == "impact":
-        # 영향도 높은 순 → 같은 등급 안에서는 SQL 이 준 마감임박순 유지(안정 정렬).
-        rows.sort(key=lambda r: _IMPACT_RANK.get(r.get("impact_level") or "", 0), reverse=True)
-    return rows
-
-
 def register_api(app: Any, ctx: Any) -> None:
     """main.create_app 에서 한 줄로 호출된다. 기존 라우트는 건드리지 않는다."""
     from fastapi.responses import JSONResponse
 
-    db = EaDB(ctx.cfg.sqlite_path)
+    db = make_ea_db(ctx)
     # 뒤늦게 추가한 컬럼·시드를 서버 기동 시 1회 보강한다(부처 재연결 + 그룹사 소급).
     try:
-        db._ensure_cols()
+        db.ensure_ready()
         db.seed_agencies(SEED_AGENCIES)
         db.relink_agencies()
         backfill_groups(db)
-    except sqlite3.Error as exc:   # pragma: no cover — 실패해도 API 는 떠야 한다
+    except Exception as exc:   # pragma: no cover — 실패해도 API 는 떠야 한다
         log.warning("대외협력 부처·그룹사 보강 스킵: %s", exc)
 
     @app.get("/api/ea/items")
@@ -1542,15 +1973,15 @@ def register_api(app: Any, ctx: Any) -> None:
                  page: int = 1, size: int = EA_PAGE_SIZE):
         page = max(1, page)
         size = max(1, min(size, 100))
-        rows = query_items(db, item_type=item_type, agency=agency, impact=impact,
-                           status=status, due=due, q=q, group=group, sort=sort)
+        rows = db.query_items(item_type=item_type, agency=agency, impact=impact,
+                             status=status, due=due, q=q, group=group, sort=sort)
         start = (page - 1) * size
         return JSONResponse({"total": len(rows), "page": page, "size": size,
                              "items": [_item_view(r) for r in rows[start:start + size]]})
 
     @app.get("/api/ea/stats")
     def ea_stats():
-        urgent = [_item_view(r) for r in query_items(db, due=str(EA_DUE_SOON_DAYS))
+        urgent = [_item_view(r) for r in db.query_items(due=str(EA_DUE_SOON_DAYS))
                   if (r.get("status") or "") != "종료"]
         return JSONResponse({**db.stats(), "enabled": ea_enabled(),
                              # 크롤링이 있어 소스는 키 없이도 동작한다. rest 는 키가 있을 때만.
@@ -1570,27 +2001,15 @@ def register_api(app: Any, ctx: Any) -> None:
         (비어 있으면 (0)). 카테고리마다 성격이 다르다 — 입법·행정예고=소관 부처,
         국회 의안=소관 상임위, 부처별 동향=부처, 통상 환경=KOTRA·부처, 정책 동향=발표 부처.
         """
-        def col(sql: str, args: Sequence[Any] = ()) -> list[str]:
-            return [r["v"] for r in db.rows(sql, args) if r["v"]]
-
         # item_type(구버전 파라미터)이 오면 카테고리로 역매핑
         cat = category or {"legislation,admin_notice": "notice", "bill": "bill",
                            "ministry_news": "ministry", "trade_news": "trade"}.get(item_type, "notice")
         types = EA_CATEGORY_TYPES.get(cat, [])
         want_kind = "committee" if cat == "bill" else "ministry"
 
-        where, args = "", []
-        if types:
-            where = f" where p.item_type in ({','.join('?' * len(types))})"
-            args = list(types)
-        counts = {r["v"]: r["n"] for r in db.rows(
-            "select coalesce(g.name, p.agency_raw) as v, count(*) as n"
-            " from ea_policy_items p left join ea_agencies g on g.id=p.agency_id"
-            + where + " group by v", args) if r["v"]}
-
+        counts = db.filters_agency_counts(types)
         if cat in ("notice", "bill", "ministry"):
-            seeded = col("select name as v from ea_agencies where enabled=1 and ifnull(kind,'')=?",
-                         (want_kind,))
+            seeded = [a["name"] for a in db.agencies(True) if (a.get("kind") or "") == want_kind]
             names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
         elif cat == "trade":
             names = sorted(set(["KOTRA"]) | set(counts), key=lambda n: (-counts.get(n, 0), n))
@@ -1599,10 +2018,7 @@ def register_api(app: Any, ctx: Any) -> None:
         agencies = [{"key": n, "label": f"{n} ({counts.get(n, 0)})" if n in counts else n,
                      "count": counts.get(n, 0)} for n in names]
 
-        gcounts: dict[str, int] = {}
-        for r in db.rows("select group_companies as v from ea_policy_items p" + where, args):
-            for g in jload(r.get("v"), []):
-                gcounts[g] = gcounts.get(g, 0) + 1
+        gcounts = db.filters_group_counts(types)
         groups = [{"key": g, "label": f"{g} ({gcounts.get(g, 0)})", "count": gcounts.get(g, 0)}
                   for g in EA_GROUP_ORDER]
 
@@ -1613,9 +2029,7 @@ def register_api(app: Any, ctx: Any) -> None:
             "categories": EA_CATEGORIES,
             "impacts": [{"key": "high", "label": "높음"}, {"key": "medium", "label": "보통"},
                         {"key": "low", "label": "낮음"}, {"key": "none", "label": "해당없음"}],
-            "statuses": (col("select distinct p.status as v from ea_policy_items p"
-                             + where + " order by v", args) if types
-                         else col("select distinct status as v from ea_policy_items order by v")),
+            "statuses": db.filters_statuses(types),
             "dues": [{"key": "7", "label": "D-7"}, {"key": "14", "label": "D-14"},
                      {"key": "30", "label": "D-30"}],
             "sorts": EA_SORTS,
@@ -1623,10 +2037,30 @@ def register_api(app: Any, ctx: Any) -> None:
 
     @app.get("/api/ea/items/{item_id}")
     def ea_item(item_id: str):
-        row = db.one(_ITEM_SELECT + " where p.id=?", (item_id,))
+        row = db.item_detail(item_id)
         if row is None:
             return JSONResponse({"ok": False, "error": "항목을 찾을 수 없습니다."}, status_code=404)
         return JSONResponse({"ok": True, "item": _item_view(row)})
+
+    @app.post("/api/ea/items/{item_id}/telegram")
+    async def ea_item_telegram(item_id: str):
+        """대외협력 카드의 '텔레그램 전송' 버튼 - 요약을 그대로 채널에 보낸다."""
+        if not getattr(ctx.cfg, "telegram_enabled", False):
+            return JSONResponse({"ok": False, "error": "텔레그램이 설정되지 않았습니다."},
+                                status_code=400)
+        row = db.item_detail(item_id)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "항목을 찾을 수 없습니다."}, status_code=404)
+        import anyio
+        text = _ea_format_message(_item_view(row))
+
+        def _work():
+            return _ea_telegram_send(ctx, text)
+
+        ok, err = await anyio.to_thread.run_sync(_work)
+        if ok:
+            return JSONResponse({"ok": True})
+        return JSONResponse({"ok": False, "error": err or "발송에 실패했습니다."}, status_code=502)
 
     # ── 정책 동향·통상 환경 — 기존 기사 재사용(읽기 전용) + KOTRA 항목 병합 ──
     def _news(article_cat: str, limit: int, ea_types: Sequence[str] = (),
@@ -1642,13 +2076,10 @@ def register_api(app: Any, ctx: Any) -> None:
                     "published_at": (r.get("published_at") or "")[:10],
                     "score": int(r.get("importance_score") or 0),
                     "summary": r.get("summary_text") or "",
+                    "source": "article",   # /api/articles/{id}/telegram 로 전송
                 })
         if ea_types:
-            marks = ",".join("?" * len(ea_types))
-            for r in db.rows(
-                _ITEM_SELECT + f" where p.item_type in ({marks})"
-                " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc limit 120",
-                    list(ea_types)):
+            for r in db.recent_news_items_for_weekly(ea_types, limit=120):
                 out.append({
                     "id": r["id"], "title": r.get("title") or "",
                     "url": r.get("url_canonical") or r.get("url_source") or "",
@@ -1657,6 +2088,7 @@ def register_api(app: Any, ctx: Any) -> None:
                     "published_at": (r.get("notice_start") or r.get("collected_at") or "")[:10],
                     "score": _IMPACT_RANK.get(r.get("impact_level") or "", 0) * 25,
                     "summary": r.get("summary") or "",
+                    "source": "ea",   # /api/ea/items/{id}/telegram 로 전송
                 })
         out.sort(key=lambda x: x["published_at"], reverse=True)
         if agency:

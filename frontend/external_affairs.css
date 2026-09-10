@@ -116,6 +116,12 @@
 }
 .ea-actions a:hover { border-color: var(--navy); color: var(--navy); }
 .ea-actions a.is-primary { background: var(--navy); border-color: var(--navy); color: #fff; }
+.ea-tg-btn {
+  border: 1px solid var(--line); border-radius: 7px; padding: 4px 11px;
+  font-size: 12px; color: var(--ink-mid); background: #fff; cursor: pointer;
+}
+.ea-tg-btn:hover { border-color: var(--navy); color: var(--navy); }
+.ea-tg-btn:disabled { opacity: .6; cursor: default; }
 
 /* 상태 */
 .ea-state {

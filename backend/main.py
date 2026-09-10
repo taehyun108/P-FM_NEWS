@@ -9324,6 +9324,32 @@ def cmd_selftest() -> int:
               (_parsed[0]["title"], "차관은 회의에" in _parsed[0]["description"]) if _parsed else None,
               ("제1회 협의회 개최", True))
 
+        print("\n[16-2] 대외협력 - Supabase/SQLite 공용 저장소 계층")
+        # EaDB(SQLite)·EaSupabaseDB 양쪽이 이 함수 하나로 정렬해 백엔드가 바뀌어도
+        # 화면에 보이는 순서가 달라지지 않는다. (2026-09-10 EA -> Supabase 이관)
+        _er = [
+            {"id": "a", "notice_end": "2026-09-20", "collected_at": "2026-09-01T00:00:00Z",
+             "impact_level": "low"},
+            {"id": "b", "notice_end": None, "collected_at": "2026-09-05T00:00:00Z",
+             "impact_level": "high"},
+            {"id": "c", "notice_end": "2026-09-10", "collected_at": "2026-09-02T00:00:00Z",
+             "impact_level": "medium"},
+        ]
+        check("deadline 정렬 - 마감일 있는 항목 먼저, 오름차순",
+              [r["id"] for r in ea_mod._ea_sort_rows(_er, "deadline")], ["c", "a", "b"])
+        check("recent 정렬 - notice_end 무관, notice_start/collected_at 내림차순",
+              [r["id"] for r in ea_mod._ea_sort_rows(_er, "recent")], ["b", "c", "a"])
+        check("impact 정렬 - 영향도 등급 내림차순(high>medium>low)",
+              [r["id"] for r in ea_mod._ea_sort_rows(_er, "impact")], ["b", "c", "a"])
+        _ev = {"title": "산업가속화법 시행령 개정안", "category": "통상", "agency": "산업통상부",
+              "notice_start": "2026-09-01", "notice_end": "2026-09-20", "d_day": "D-10",
+              "status": "예고중", "group_companies": ["포스코"], "summary": "요약문",
+              "impact_level": "high", "impact_rationale": "제3조 인용",
+              "suggested_action": "의견서 제출 검토", "url": "https://x.test/a"}
+        _msg = ea_mod._ea_format_message(_ev)
+        check("텔레그램 메시지에 제목·기관·요약·영향도·원문 전부 포함",
+              all(s in _msg for s in ("산업가속화법", "산업통상부", "요약문", "높음", "x.test/a")), True)
+
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))
         return 1
@@ -9431,7 +9457,7 @@ def main(argv: Sequence[str]) -> int:
     elif command == "ea-collect":
         if ea_mod is None:
             raise SystemExit("external_affairs 모듈을 불러오지 못했습니다.")
-        ea_mod.collect_once(ctx, ea_mod.EaDB(ctx.cfg.sqlite_path))
+        ea_mod.collect_once(ctx, ea_mod.make_ea_db(ctx))
     elif command == "migrate":
         cmd_migrate(ctx)
     elif command == "serve":

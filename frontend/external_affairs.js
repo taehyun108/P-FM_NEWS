@@ -173,6 +173,28 @@
     return eaThumb(currentCat().label, 'D-' + d, end + ' 까지', 'is-open');
   }
 
+  /* 텔레그램 전송 버튼 — 뉴스 카드의 '↗ 직접 전송'과 같은 direct-send 방식.
+     endpoint 만 다르게 넘긴다(기사=/api/articles/.., 대외협력 항목=/api/ea/items/..). */
+  function telegramButton(endpoint) {
+    var btn = el('button', 'ea-tg-btn', '✈ 텔레그램 전송');
+    btn.type = 'button';
+    btn.addEventListener('click', function () {
+      var original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '전송 중…';
+      fetch(endpoint, { method: 'POST' })
+        .then(function (r) { return r.json().catch(function () { return {}; }); })
+        .then(function (d) {
+          btn.textContent = d.ok ? '✓ 전송됨' : (d.error || '전송 실패');
+        })
+        .catch(function () { btn.textContent = '서버 연결 실패'; })
+        .finally(function () {
+          setTimeout(function () { btn.textContent = original; btn.disabled = false; }, 2500);
+        });
+    });
+    return btn;
+  }
+
   /* ── 항목 카드 (예고·부처동향) — 뉴스 포토카드와 같은 세로 카드 ── */
   function buildCard(it) {
     var card = el('article', 'ea-card');
@@ -229,6 +251,7 @@
     (it.attachment_urls || []).forEach(function (u, i) {
       acts.append(link('첨부 ' + (i + 1), u));
     });
+    acts.append(telegramButton('/api/ea/items/' + it.id + '/telegram'));
     body.append(acts);
 
     card.append(body);
@@ -262,6 +285,10 @@
     if (n.summary) { body.append(el('p', 'ea-summary', n.summary)); }
     var acts = el('div', 'ea-actions');
     acts.append(link('원문', n.url));
+    var sendUrl = n.source === 'article'
+      ? '/api/articles/' + n.id + '/telegram'
+      : '/api/ea/items/' + n.id + '/telegram';
+    acts.append(telegramButton(sendUrl));
     body.append(acts);
 
     card.append(body);
