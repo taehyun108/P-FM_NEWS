@@ -2438,19 +2438,46 @@ GROUP_LEAD_CHARS = 700
 # 참여/시공/수주한다' 처럼 참여사·제안사·수상사 등을 정식으로 나열하는 문장
 # (실제 사례 ①: 대보건설 신안산선 기사, 본문 835자 중 737번째 '포스코이앤씨' —
 #  700자 컷에 37자 차이로 빠짐.
-#  실제 사례 ②: QuINSA 총회 기사, 본문 1,715자 중 800번째 "IQM, 포스코홀딩스, SDT,
-#  노르마, 연세대 등이 … 표준화 과제를 제안했다" — 동사 화이트리스트에 '제안'이
-#  없어서 빠짐. 이런 나열문에 쓰이는 동사는 제안·발표·수상·선정·체결 등 사실상
-#  무한해서 화이트리스트로는 계속 새 사례가 새는 게 확인돼 동사 조건 자체를 뺐다.)
+#  실제 사례 ②: QuINSA 총회 기사, "IQM, 포스코홀딩스, SDT, 노르마, 연세대 등이 …
+#  표준화 과제를 제안했다" — 동사 화이트리스트에 '제안'이 없어서 빠짐. 이런
+#  나열문 동사는 제안·발표·수상·선정·체결 등 사실상 무한해 동사 조건을 뺐었다.)
 #
 # 처음엔 "기사가 짧으면 통째로 본다"로 고쳤다가 회귀를 냈다: '포스코 노사 파업'
-# 기사(1,030자)에서 873번째 인용문 "이제 공은 포스코홀딩스 장인화 회장에게
-# 넘어갔다"의 '포스코홀딩스' 가 detect_group_companies 의 `if not found` 때문에
-# 진짜 주체인 '포스코' 를 밀어냈다 — 원래 700자 컷이 막던 바로 그 실패 모드다.
-# 이 회귀를 막는 건 동사가 아니라 '쉼표로 3개 이상 나열' 이라는 문장 구조 신호다
-# (인용문 속 회장 이름 같은 단발 언급은 나열 항목이 1~2개뿐이라 애초에 걸러진다).
-# 그래서 본문을 통째로 보는 대신, 리드 밖 문장 중 이 나열 패턴에 맞는 것만 리드에
-# '추가'한다(대체가 아니라 합집합이라 원래 주체를 밀어내지 않는다).
+# 기사에서 인용문 "이제 공은 포스코홀딩스 장인화 회장에게 넘어갔다"의
+# '포스코홀딩스' 가 detect_group_companies 의 `if not found` 때문에 진짜 주체인
+# '포스코' 를 밀어냈다 — 원래 700자 컷이 막던 바로 그 실패 모드다. '쉼표 3개
+# 이상'만으로 막았더니(②를 고치며 동사 조건을 뺀 뒤) 다시 회귀가 났다: 같은
+# 파업 기사의 "2022년 출범한 지주회사인 포스코홀딩스로 배당금, 브랜드사용료
+# 등이 상당액 들어가면서, 포스코 영업이익이 …" 처럼 쉼표 3개짜리 '서술 문장'이
+# '회사 나열 문장'으로 오인됐다.
+# 두 문장의 진짜 차이는 '항목이 짧은 명사 그 자체로 끝나는가' 다 — 진짜 나열은
+# 'A, B, C 등이' 처럼 각 항목이 조사·어미 없이 뚝뚝 끊기고 짧다. 그래서 마지막
+# 항목(서술부가 붙는 게 정상)을 뺀 나머지 항목이 전부 15자 이내이고 조사·연결
+# 어미로 끝나지 않아야 '나열 문장' 으로 인정한다.
+_LIST_ITEM_MAX_CHARS = 15
+_NOT_LIST_ITEM_END_RE = re.compile(
+    r"(?:은|는|이|가|을|를|의|에|와|과|로|으로|에서|에게|한테|보다|처럼|만큼|"
+    r"까지|부터|면서|하며|이며|다가|해서|이라|라서|고|며|서|면|데|니|자)$")
+
+
+def _is_company_list_sentence(sentence: str) -> bool:
+    """'A, B, C 등이 …' 처럼 명사를 나열하는 문장인지 — 서술 문장 속 쉼표 3개와
+    구분한다(위 group_lead_text 주석의 실패 사례 참고).
+
+    첫 항목은 '공사에는 대보건설을 비롯해 포스코이앤씨' 처럼 도입구가 붙어 길어질
+    수 있어 길이는 안 재고 조사/어미로 안 끝나는지만 본다. 중간 항목(있다면)은
+    도입구·서술부 둘 다 없는 '진짜 나열 한복판'이라 짧고 깨끗해야 한다. 마지막
+    항목은 서술부('~등이 참여했다')가 붙는 게 정상이라 아예 안 본다.
+    """
+    parts = [p.strip() for p in re.split(r"[,·]", sentence) if p.strip()]
+    if len(parts) < 3:
+        return False
+    if _NOT_LIST_ITEM_END_RE.search(parts[0]):
+        return False
+    for item in parts[1:-1]:
+        if len(item) > _LIST_ITEM_MAX_CHARS or _NOT_LIST_ITEM_END_RE.search(item):
+            return False
+    return True
 
 
 def group_lead_text(body: str) -> str:
@@ -2461,11 +2488,7 @@ def group_lead_text(body: str) -> str:
         return lead
     extra: list[str] = []
     for sentence in re.split(r"(?<=[.\n])\s*", tail):
-        if not sentence:
-            continue
-        # 회사명이 쉼표·가운뎃점으로 3개 이상 나열돼야 '정식 disclosure' 로 본다.
-        # 인용문 속 회장 이름 같은 단발 언급은 나열 항목이 1~2개뿐이라 걸러진다.
-        if len(re.split(r"[,·]", sentence)) < 3:
+        if not sentence or not _is_company_list_sentence(sentence):
             continue
         if any(alias in sentence.lower() for aliases in _GROUP_ALIASES_LOWER.values() for alias in aliases):
             extra.append(sentence)
@@ -8657,6 +8680,19 @@ def cmd_selftest() -> int:
                      " 연세대 등이 신규 표준화 과제를 제안했다.")
     check("group_lead_text — '제안했다'처럼 화이트리스트 밖 동사도 나열 구조면 살아남음",
           "포스코홀딩스" in detect_group_companies(group_lead_text(_propose_body)), True)
+
+    # 실제 오탐 사례(2026-09-10 ④, ③의 수정이 냈던 회귀): 동사 조건을 뺀 순수
+    # '쉼표 3개' 조건만으로는 서술 문장도 걸린다. 같은 '포스코 파업' 기사의
+    # "2022년 출범한 지주회사인 포스코홀딩스로 배당금, 브랜드사용료 등이 상당액
+    # 들어가면서, 포스코 영업이익이 …" 가 쉼표 3개짜리 문장이라 나열문으로
+    # 오인돼 주체가 다시 '포스코홀딩스'로 뒤바뀌었다. 항목이 짧고 조사·어미 없이
+    # 끝나야 '진짜 나열' 이라는 조건(_is_company_list_sentence)으로 막는다.
+    _narrative_comma_body = (
+        "포스코 노사가 임금협상 이견을 좁히지 못했다. " + "ㅁ" * 700
+        + " 2022년 출범한 지주회사인 포스코홀딩스로 배당금, 브랜드사용료 등이"
+          " 상당액 들어가면서, 포스코 영업이익이 계속 줄어드는 구조적 문제가 크다.")
+    check("group_lead_text — 서술문 속 쉼표 3개는 나열 아님(회귀 방지)",
+          detect_group_companies(group_lead_text(_narrative_comma_body)), ["포스코"])
     check("group_lead_text — 긴 기사(원래 사례)는 여전히 700자로 잘라 주체 유지",
           detect_group_companies(group_lead_text(_lead + "\n" + _tail)), ["포스코"])
 
