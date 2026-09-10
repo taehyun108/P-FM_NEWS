@@ -40,6 +40,9 @@ flowchart TB
 **핵심:** 저장소는 SQLite(로컬 개발·사내 배포) 또는 Supabase(현재), `DB_BACKEND` 로 전환.
 어느 쪽이든 `Storage` ABC + 두 구현이 **동일 스키마**를 유지한다
 (`schema_sqlite.sql` + `init_schema()` 의 `alter table` 리스트 ↔ `schema.sql`).
+대외협력(`ea_*` 5테이블)도 같은 원칙을 따로 구현한다 — `make_ea_db(ctx)` 가
+`DB_BACKEND` 를 보고 `EaDB`(SQLite)/`EaSupabaseDB`(Supabase) 를 고른다
+(main.py 의 `Storage` 클래스 자체는 아니고, `external_affairs.py` 안의 같은 패턴).
 PC 프로세스는 재시작해도 잃을 게 없다. → 인스턴스는 **반드시 1개** (2개면 알림 중복).
 
 ---

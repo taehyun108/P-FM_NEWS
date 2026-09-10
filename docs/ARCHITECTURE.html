@@ -276,9 +276,10 @@
       그리고 무엇을 얼마나 보관하는지를 정리했다.
     </p>
     <div class="stamp">
-      <span>기준 <b>2026-09-09</b></span>
-      <span>저장소 <b>SQLite 19.7 MB</b></span>
-      <span>노출 기사 <b>약 2,070건</b></span>
+      <span>기준 <b>2026-09-10</b></span>
+      <span>저장소 <b>Supabase(운영) · SQLite(선택)</b></span>
+      <span>노출 기사 <b>약 3,120건</b></span>
+      <span>selftest <b>440건</b></span>
       <span>코드 <b>main.py + external_affairs.py</b></span>
     </div>
   </header>
@@ -332,14 +333,17 @@
         <h2><span class="tag">01 — 구성</span>무엇이 어디서 돌고 있나</h2>
 
         <p>
-          파이썬 파일 <code>backend/main.py</code> 하나(약 7,900줄)가 API 서버·수집 루프·
-          텔레그램 봇·주간 레포트를 모두 담고 있다. 프런트엔드는 프레임워크 없는 바닐라 JS
-          3파일이고, 데이터는 로컬 SQLite 파일 하나에 들어간다.
+          파이썬 파일 <code>backend/main.py</code> 하나(약 9,400줄)가 API 서버·수집 루프·
+          텔레그램 봇·주간 레포트를 모두 담고, <code>backend/external_affairs.py</code>
+          (별도 모듈, main.py를 import하지 않는다)가 대외협력을 담당한다. 프런트엔드는
+          프레임워크 없는 바닐라 JS이고, 데이터는 <code>DB_BACKEND</code> 환경변수 하나로
+          <b>Supabase</b>(현재 운영값) 또는 <b>로컬 SQLite</b>(사내 PC·오프라인용) 중 고른다 —
+          같은 스키마를 두 곳에 유지한다(<code>schema.sql</code> ↔ <code>schema_sqlite.sql</code>).
         </p>
 
         <figure>
           <div class="fig-scroll">
-            <svg viewBox="0 0 860 420" role="img" aria-label="브라우저가 FastAPI 서버를 호출하고, 서버 안에서 수집 루프·텔레그램 봇·API 세 스레드가 SQLite 한 파일을 공유하며, 외부로는 구글·네이버·OpenAI·텔레그램·네이버증시를 호출하는 구성도">
+            <svg viewBox="0 0 860 420" role="img" aria-label="브라우저가 FastAPI 서버를 호출하고, 서버 안에서 수집 루프·텔레그램 봇·API 스레드가 Supabase 또는 SQLite 저장소를 공유하며, 외부로는 구글·네이버·OpenAI·텔레그램·네이버증시를 호출하는 구성도">
               <defs>
                 <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                   <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
@@ -373,8 +377,8 @@
 
               <!-- DB -->
               <rect class="box-navy" x="228" y="320" width="292" height="52" rx="7"/>
-              <text class="lbl-b" x="244" y="343">SQLite · pfm_news.db</text>
-              <text class="lbl-sm" x="244" y="361">WAL · 스레드별 커넥션 · 19개 테이블(ea_ 5개 포함)</text>
+              <text class="lbl-b" x="244" y="343">Storage 추상화 · DB_BACKEND 로 선택</text>
+              <text class="lbl-sm" x="244" y="361">Supabase(PostgREST) 또는 SQLite · 19개 테이블(ea_ 5개 포함)</text>
 
               <!-- 외부 -->
               <rect class="box" x="606" y="52" width="238" height="46" rx="7"/>
@@ -667,6 +671,38 @@
           그런데 <b>정부 정책·해외 통상 조치·배터리 생태계</b> 뉴스는 회사명이 안 나와도
           대외협력·소재사업에 직결된다. 그래서 세 갈래의 예외를 뒀다.
         </p>
+
+        <div class="note">
+          <b>네이버 수집 1차 필터(제목 전용)가 관련 기사를 통째로 버리던 문제 (2026-09-10 수정).</b>
+          <code>_naver_item_relevant()</code> 는 네이버 API 가 준 <b>제목</b>만 보고 "이 기사를 아예
+          받을지" 를 정한다(본문은 아직 안 받은 상태). 여기서 탈락하면 뒤의 배터리·통상 예외
+          규칙(위 세 갈래)까지 갈 기회조차 없다. 실제 누락 사례 두 건으로 원인을 확정했다:
+          <ul style="margin:6px 0 0; font-size:13px;">
+            <li>"금양, 기장공장을 데이터센터로 물적분할…" — 제목에 '배터리'가 없고 <b>금양이
+              배터리 회사 목록에 없어서</b> 탈락. 본문은 배터리 사업 얘기였다.</li>
+            <li>"산업장관, EU 산업가속화법 우려 전달…" — <code>산업가속화법</code>(2025~2026 EU
+              신규 산업·탈탄소 입법)이 <code>TRADE_MEASURE_KW</code> 에 없어 통상 조치로 인식되지
+              않았다.</li>
+          </ul>
+          대응: ① <code>TRADE_MEASURE_KW</code>·<code>BATTERY_SCOPE_KW</code> 에 신규 항목 보강.
+          ② <b>회사명·통상 조치명 같은 고정밀 신호는 제목이 아니라 리드(스니펫)에 있어도 인정</b>
+          하도록 <code>_naver_item_relevant()</code>·<code>_title_snippet_relevant()</code> 를 확장 —
+          단 '배터리'·'통상' 같은 일반어는 여전히 <b>제목에만</b> 있어야 인정한다(느슨하게 풀면
+          네이버 검색 블러브 특유의 무관 기사가 대거 유입된다). ③ <code>금양</code>처럼 지명(금양읍)과
+          겹치는 짧은 회사명은 <code>battery_company_hit()</code> 가 지명 형태로만 나오면 회사
+          언급으로 안 본다.
+        </div>
+        <div class="note">
+          <b>SPA(<code>&lt;script&gt;</code> JSON) 본문 추출 실패로 news1.kr 기사가 전부 무관
+          처리되던 문제 (2026-09-10 수정).</b> news1.kr 은 본문 문단을 <code>&lt;script&gt;</code>
+          안 <code>{"type":"text","content":"..."}</code> JSON 배열로 넣는다. 본문 추출 1순위인
+          readability, 그 폴백인 BeautifulSoup 둘 다 <code>&lt;script&gt;</code> 를 걷어내므로
+          내비게이션·저작권 문구 수백 자만 남고 실제 본문(그 안에 '포스코퓨처엠' 이 있어도)은
+          통째로 사라졌다 — <b>이 언론사 기사 전체에 영향을 준 버그</b>였다. <code>extract_body()</code>
+          가 이제 <code>'"type":"text"'</code> 문자열이 있으면 <code>_json_script_body()</code> 로
+          그 문단들을 이어붙이고, readability 결과보다 길면 그쪽을 채택한다(다른 사이트는 이 문자열이
+          없어 비용 0).
+        </div>
 
         <figure>
           <div class="fig-scroll">
@@ -1040,33 +1076,39 @@
         <div class="tw"><table>
           <thead><tr><th>테이블</th><th class="num">행</th><th>내용</th></tr></thead>
           <tbody>
-            <tr><td><code>articles</code></td><td class="num">961</td><td>기사 메타 + 그룹사·카테고리·키워드·중요도 (노출 705 / 보관 256)</td></tr>
-            <tr><td><code>summaries</code></td><td class="num">948</td><td>LLM 요약·포스코 관점</td></tr>
-            <tr><td><code>swot_analyses</code></td><td class="num">931</td><td>S/W/O/T 점수·근거</td></tr>
-            <tr><td><code>notifications</code></td><td class="num">934</td><td>발송 큐·이력 · <code>priority</code>로 우선 발송 표시</td></tr>
+            <tr><td><code>articles</code></td><td class="num">3,612</td><td>기사 메타 + 그룹사·카테고리·키워드·중요도 (노출 <code>status='active'</code> 3,124건)</td></tr>
+            <tr><td><code>summaries</code></td><td class="num">3,368</td><td>LLM 요약·포스코 관점</td></tr>
+            <tr><td><code>swot_analyses</code></td><td class="num">3,185</td><td>S/W/O/T 점수·근거</td></tr>
+            <tr><td><code>notifications</code></td><td class="num">2,853</td><td>발송 큐·이력 · <code>priority</code>(0 일반 · 1 무조건 받을 키워드 · 2 정책·통상 주제)</td></tr>
             <tr><td><code>weekly_reports</code></td><td class="num">5</td><td>주간동향 레포트 — payload(JSON) + html · 발송 시각</td></tr>
-            <tr><td><code>telegram_log</code></td><td class="num">—</td><td>봇으로 나간 메시지 전문 + 발송 이유(자동 알림·URL 등록·직접 전송·봇 응답 등) · 대시보드 '발송 로그' · 30일 후 정리</td></tr>
-            <tr><td><code>url_ledger</code></td><td class="num">2,324</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
-            <tr><td><code>press_outlets</code></td><td class="num">473</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
-            <tr><td><code>keyword_sets</code></td><td class="num">118</td><td>검색 키워드 — 그룹사 7 · 산업 48 · 정책 38 · 통상 25</td></tr>
-            <tr><td><code>collection_logs</code></td><td class="num">2,060</td><td>실행별 수집·중복·HTTP 횟수</td></tr>
-            <tr><td><code>run_state</code></td><td class="num">1</td><td>파이프라인 상태 + 마스터 설정(임계값·키워드·수신자·비밀번호 해시)</td></tr>
+            <tr><td><code>telegram_log</code></td><td class="num">82</td><td>봇으로 나간 메시지 전문 + 발송 이유(무조건 받을 키워드·정책·통상 주제·URL 등록·직접 전송·봇 응답 등) · 대시보드 '발송 로그' · 30일 후 정리</td></tr>
+            <tr><td><code>url_ledger</code></td><td class="num">6,764</td><td>영구 제외 URL — <code>stale</code>·<code>off_topic</code>·<code>extract_failed</code></td></tr>
+            <tr><td><code>press_outlets</code></td><td class="num">599</td><td>언론사 도메인·이름·등급(1 주요지 / 2 경제지 / 3 기타)</td></tr>
+            <tr><td><code>keyword_sets</code></td><td class="num">118</td><td>검색 키워드 — 그룹사·산업·정책·통상</td></tr>
+            <tr><td><code>collection_logs</code></td><td class="num">2,752</td><td>실행별 수집·중복·HTTP 횟수</td></tr>
+            <tr><td><code>run_state</code></td><td class="num">1</td><td>파이프라인 상태 + 마스터 설정(임계값·야간 억제·무조건 받을/제외할 키워드·정책·통상 필터·수신자·비밀번호 해시)</td></tr>
             <tr><td><code>article_bodies</code></td><td class="num">3</td><td>분석 대기 중인 본문 임시 보관</td></tr>
             <tr><td><code>market_quotes</code></td><td class="num">6</td><td>주가 2 · 환율 4</td></tr>
-            <tr><td><code>feed_sources</code></td><td class="num">11</td><td>수집 소스 on/off</td></tr>
-            <tr><td><code>ea_policy_items</code></td><td class="num">12</td><td>입법·행정예고 · 국회 의안 — 마감일 · 소관 · 분류 · 관련 그룹사</td></tr>
-            <tr><td><code>ea_analyses</code></td><td class="num">12</td><td>영향도(high/medium/low/none) · 근거 조문 · 대응 초안</td></tr>
-            <tr><td><code>ea_agencies</code></td><td class="num">35</td><td>관심 부처 24 + 국회 상임위 11 (<code>kind</code>로 구분)</td></tr>
-            <tr><td><code>ea_url_ledger</code></td><td class="num">92</td><td>대외협력 전용 제외 URL — 기존 <code>url_ledger</code>는 건드리지 않는다</td></tr>
+            <tr><td><code>feed_sources</code></td><td class="num">12</td><td>수집 소스 on/off</td></tr>
+            <tr><td><code>ea_policy_items</code></td><td class="num">73</td><td>입법·행정예고 · 국회 의안 · 부처동향 · 통상뉴스 — 마감일 · 소관 · 분류 · 관련 그룹사</td></tr>
+            <tr><td><code>ea_analyses</code></td><td class="num">73</td><td>영향도(high/medium/low/none) · 근거 조문 · 대응 초안</td></tr>
+            <tr><td><code>ea_agencies</code></td><td class="num">35</td><td>관심 부처 + 국회 상임위 (<code>kind</code>로 구분)</td></tr>
+            <tr><td><code>ea_url_ledger</code></td><td class="num">279</td><td>대외협력 전용 제외 URL — 기존 <code>url_ledger</code>는 건드리지 않는다</td></tr>
             <tr><td><code>ea_run_state</code></td><td class="num">1</td><td>대외협력 수집 실행 시각 — 저장 0건이어도 남겨 재시작 재크롤을 막는다</td></tr>
           </tbody>
         </table></div>
 
-        <div class="note warn">
-          <b>지금은 로컬 SQLite다.</b> <code>backend/pfm_news.db</code> 파일 하나(약 16 MB, 그중
-          8 MB가 제목 임베딩 — 48시간 후 정리되어 실제로는 8 MB 선에서 유지)이고
-          <code>.gitignore</code>에 있어 GitHub에는 올라가지 않는다. 카드 하단의
-          <code>SUPABASE</code> 글자는 하드코딩된 표시 라벨일 뿐 실제 저장소와 무관하다.
+        <div class="note">
+          <b>지금은 Supabase가 운영 저장소다.</b> <code>.env</code>의 <code>DB_BACKEND=supabase</code> 로
+          정해진다. 카드 하단의 <code>SUPABASE</code> 글자는 실제로 그 저장소에서 왔다는 뜻이다.
+          <code>DB_BACKEND=sqlite</code> 로 바꾸면 같은 코드가 <code>backend/pfm_news.db</code> 파일
+          하나(<code>.gitignore</code>라 GitHub엔 안 올라감)로 그대로 동작한다 — 사내 PC·오프라인
+          개발용. 두 백엔드는 <code>Storage</code> 추상 클래스(63개 메서드)로 완전히 대칭이고,
+          스키마도 <code>schema.sql</code> ↔ <code>schema_sqlite.sql</code> 로 항상 같이 관리한다
+          (19개 테이블·컬럼 전부 일치 확인됨). 대외협력(<code>ea_</code> 5개 테이블)도
+          2026-09-10부로 같은 원칙을 따른다 — 그 전엔 <code>DB_BACKEND</code> 와 무관하게 항상
+          로컬 SQLite에만 저장돼, 이 저장소를 다른 PC로 복사하면 대외협력 탭만 빈 화면이 되는
+          문제가 있었다(<code>make_ea_db()</code> 로 해결. → 09절).
         </div>
 
         <h3>보존 정책 — Supabase 무료 500 MB 한도 대비</h3>
@@ -1477,7 +1519,7 @@
             <tr><td>수집</td><td>300초 · 스레드 A</td><td><b>하루 2회(09·15시) · 스레드 C</b></td></tr>
             <tr><td>저장</td><td><code>articles</code></td><td><code>ea_policy_items</code></td></tr>
             <tr><td>분석</td><td>요약 + SWOT</td><td>요약 + 영향도(SWOT 없음)</td></tr>
-            <tr><td>알림</td><td>텔레그램 발송</td><td><b>발송하지 않는다</b></td></tr>
+            <tr><td>알림</td><td>임계값 넘으면 자동 발송</td><td><b>자동 발송 없음</b> · 카드의 '✈ 텔레그램 전송' 버튼으로 수동 발송만</td></tr>
           </tbody>
         </table></div>
 
@@ -1497,9 +1539,25 @@
         <div class="note">
           <b><code>external_affairs.py</code>는 <code>main.py</code>를 import 하지 않는다.</b>
           순환 참조를 만들지 않으려고 <code>now_utc</code>·<code>iso</code>·<code>jload</code> 같은
-          3~5줄 유틸은 복제했다. DB도 Storage 클래스에 손대지 않고 스레드 전용 커넥션을 새로 연다.
-          기존 <code>url_ledger</code>·<code>keyword_sets</code>는 <b>읽기만</b> 하고, 쓰기는
-          <code>ea_url_ledger</code>에만 한다.
+          3~5줄 유틸은 복제했다. 기존 <code>keyword_sets</code>는 <code>ctx.storage.enabled_keywords()</code>
+          로 <b>읽기만</b> 하고(main.py 의 저장소 객체를 인자로 받는 것뿐, import 는 아니다),
+          쓰기는 <code>ea_url_ledger</code>에만 한다.
+        </div>
+        <div class="note">
+          <b>저장소도 <code>DB_BACKEND</code> 를 따른다 (2026-09-10 정비).</b> 이전엔 이 모듈이
+          <code>ctx.cfg.db_backend</code> 값과 무관하게 <b>항상 로컬 SQLite 파일 하나</b>
+          (<code>EaDB(ctx.cfg.sqlite_path)</code>)만 썼다 — 뉴스가 Supabase 로 넘어간 뒤에도
+          대외협력 5개 테이블은 계속 그 파일에만 쌓여, 저장소를 다른 PC로 복사하면 대외협력
+          탭만 빈 화면이 되는 문제가 있었다. 지금은 <code>make_ea_db(ctx)</code> 가
+          <code>DB_BACKEND</code> 를 보고 <code>EaDB</code>(SQLite) 또는 <code>EaSupabaseDB</code>
+          (PostgREST) 를 고른다. 데이터량이 수백 건 규모라 <code>EaSupabaseDB</code> 는
+          JOIN·집계를 SQL 에 맡기지 않고 <code>ea_policy_items</code>·<code>ea_agencies</code>·
+          <code>ea_analyses</code> 를 통째로 읽어 파이썬에서 조인한다(PostgREST 는 임의 JOIN 을
+          지원하지 않는다). 두 백엔드가 같은 메서드 이름(<code>query_items</code>·
+          <code>filters_agency_counts</code>·<code>item_detail</code> 등)을 구현하므로
+          <code>register_api</code>·<code>collect_once</code>·주간레포트 쪽 코드는 어느 백엔드인지
+          모른 채 호출만 한다 — main.py 의 <code>Storage</code> ABC 와 같은 패턴이다.
+          정렬은 <code>_ea_sort_rows()</code> 하나로 통일해 두 백엔드의 표시 순서가 어긋나지 않는다.
         </div>
 
         <h3>데이터 소스</h3>
@@ -1572,10 +1630,22 @@
           <dd>전용 일일 상한 <code>EA_LLM_DAILY_LIMIT</code>(기본 50). 전체 상한과 작은 쪽을 쓰되,
               초과 시 <b>대외협력만 멈추고 뉴스 분석은 계속</b>된다.
               LangSmith 태그 <code>external_affairs</code>로 비용을 따로 본다.</dd>
-          <dt>알림</dt>
-          <dd>만들지 않았다. <code>ea_policy_items</code>는 <code>articles</code>가 아니므로
-              구조적으로 기존 알림 큐에 들어갈 수 없다. <code>category</code> 값만 채워 두어,
-              나중에 마스터 패널 토글 하나로 붙일 수 있게 했다.</dd>
+          <dt>알림 (자동)</dt>
+          <dd>없다. <code>ea_policy_items</code>는 <code>articles</code>가 아니므로 구조적으로
+              기존 알림 큐(<code>notifications</code>)에 들어갈 수 없다.</dd>
+          <dt>알림 (수동, 2026-09-10 추가)</dt>
+          <dd>대외협력 카드마다 <b>'✈ 텔레그램 전송'</b> 버튼이 있다 — 뉴스 카드의
+              '↗ 직접 전송'과 같은 <b>즉시 전송</b> 방식으로, 알림 큐를 거치지 않고
+              <code>POST /api/ea/items/{'{id}'}/telegram</code> 이 그 자리에서 바로 보낸다.
+              <code>_ea_format_message()</code> 가 제목·기관·공고기간·요약·영향도·근거·
+              대응(초안)·원문 링크를 평문 메시지로 묶고, <code>_ea_telegram_send()</code> 가
+              (main.py 의 <code>_telegram_send</code> 를 복제하지 않고) 텔레그램 API 를 직접
+              호출한다 — flood-control·재시도 같은 자동 발송 안전장치는 없다(단발 수동 전송이라
+              불필요). "정책 동향"·"통상 환경" 탭은 항목이 기존 뉴스 기사와 대외협력 항목이
+              섞여 있어(<code>_news()</code>), 각 항목에 <code>source</code>(<code>article</code>
+              또는 <code>ea</code>)를 붙여 프런트가 알맞은 엔드포인트로 보낸다.
+              발송 결과는 <code>telegram_log</code>(대시보드 '발송 로그')에는 남기지 않는다 —
+              이 모듈은 그 테이블에 쓰지 않는다는 원칙을 유지했다.</dd>
         </div>
 
         <div class="note">

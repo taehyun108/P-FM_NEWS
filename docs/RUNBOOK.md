@@ -23,6 +23,16 @@
 ```bash
 python backend/main.py initdb      # 스키마 갱신 (idempotent — 여러 번 돌려도 안전)
 ```
+
+### 대외협력(EA)도 같은 원칙 (2026-09-10부터)
+
+`external_affairs.py` 의 5개 테이블(`ea_policy_items` 등)은 **2026-09-10 이전엔
+`DB_BACKEND` 와 무관하게 항상 로컬 `backend/pfm_news.db` 에만 저장됐다** — 뉴스와
+저장소가 어긋나 있어, 이 저장소를 다른 PC로 복사하면 대외협력 탭만 빈 화면이 됐다.
+지금은 `make_ea_db(ctx)` 가 `DB_BACKEND` 를 보고 `EaDB`(SQLite) 또는
+`EaSupabaseDB`(Supabase) 를 고른다 — 뉴스와 똑같이 동기화된다. 스키마는 이미
+`schema.sql`/`schema_sqlite.sql` 에 처음부터 같이 있었으므로 이 전환에서 새로 늘어난
+`alter table` 은 없다.
 `initdb` 가 `create table if not exists` + `alter table … (있으면 무시)` + 시드 upsert 를
 수행한다. 데이터는 그대로. Supabase 쪽은 `alter table` 을 SQL Editor 에서 1회 (§2-3).
 
