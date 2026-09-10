@@ -4380,7 +4380,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
         pk = people_news_kind(canonical or art["url_source"], art["title"])
         if pk:
             press_name, press_id, _ = resolve_press(storage, canonical or target,
-                                                    art.get("press_name") or "", html)
+                                                    art.get("press_name") or "", html, http)
             storage.update_article(aid, {
                 "url_canonical": canonical or art["url_canonical"],
                 "press_id": press_id, "press_name": press_name,
@@ -4419,7 +4419,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             continue
 
         press_name, press_id, press_tier = resolve_press(storage, canonical or target,
-                                                         art.get("press_name") or "", html)
+                                                         art.get("press_name") or "", html, http)
         storage.update_article(aid, {
             "url_canonical": canonical or art["url_canonical"],
             "press_id": press_id, "press_name": press_name,
@@ -4537,6 +4537,8 @@ def clean_site_name(name: str, domain: str = "") -> str:
         name = next((p for p in reversed(parts) if _has_hangul(p)), parts[-1]).strip()
     else:
         # 첫 구분자 앞이 매체명. 뒤는 대개 슬로건·부제다.
+        # 쉼표는 넣지 않는다 — '중국, 리튬 배터리…' 같은 기사 제목에서 첫 쉼표 앞
+        # 조각이 매체명으로 오인된다(홈페이지 title 전용 처리는 _homepage_site_name 참고).
         name = re.split(r"\s*[|\-–]\s*", name, maxsplit=1)[0].strip()
         # 끝에 붙은 '(English…)' 영문 병기 제거 (한글 병기 '(주간)' 등은 남긴다).
         name = re.sub(r"\s*\([A-Za-z0-9 .,'&/\-]+\)\s*$", "", name).strip()
@@ -4548,6 +4550,10 @@ def site_name_from_html(html: str, domain: str = "") -> str:
 
     SEED_PRESS 에 없는 매체도 대부분 이 태그에 한글 매체명을 넣는다.
     영문 사이트명·도메인 형태는 신뢰하지 않는다(한글이 있어야 채택).
+    <title> 은 여기서 보지 않는다 — 개별 기사 페이지의 <title>은 '차세대 배터리
+    기술 한눈에'처럼 기사 제목 그 자체인 경우가 흔해서, 짧다는 것만으로는 매체명과
+    구분이 안 된다. <title> 기반 추정은 홈페이지에서만 신뢰할 수 있다
+    (_homepage_site_name — 홈페이지 title은 '기사 제목'이 될 수 없다).
     """
     for pat in (r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']+)["\']',
                 r'<meta[^>]+name=["\'](?:twitter:site|publisher|source)["\'][^>]+content=["\']([^"\']+)["\']'):
@@ -4559,10 +4565,39 @@ def site_name_from_html(html: str, domain: str = "") -> str:
     return ""
 
 
-def resolve_press(storage: Storage, url: str, hint: str, html: str = "") -> tuple[str, str | None, int]:
+def _homepage_site_name(http: "HttpClient", domain: str) -> str:
+    """새 언론사를 처음 만났을 때 1회, 기사 페이지에서 매체명을 못 찾으면
+    홈페이지에서 다시 시도한다 — 홈페이지 title 은 거의 항상 매체명을 담고,
+    (기사 제목과 달리) 짧아도 매체명으로 신뢰할 수 있다."""
+    try:
+        resp = http.get(f"https://{domain}/", timeout=6)
+        resp.raise_for_status()
+        html = decode_html(resp)
+    except Exception as exc:
+        log.debug("홈페이지 매체명 조회 실패 %s: %s", domain, exc)
+        return ""
+    name = site_name_from_html(html, domain)
+    if name:
+        return name
+    # og:site_name 이 없으면 <title> 을 본다 — '매체명 - 슬로건'/'매체명 | 슬로건'
+    # 뿐 아니라 '한국무역신문, 주간무역, 한국무역의 길잡이 한국무역신문'처럼 쉼표로
+    # 슬로건을 늘어놓는 매체도 있어 쉼표까지 구분자에 넣는다(기사 제목이 아니므로
+    # 첫 조각을 매체명으로 믿을 수 있다 — clean_site_name 은 이 구분을 못 하므로
+    # 기사 제목에도 함께 쓰이는 쉼표는 그쪽에서 구분자로 넣지 않는다).
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+    if not m:
+        return ""
+    first = re.split(r"\s*[|\-–,]\s*", html_mod.unescape(m.group(1)).strip(), maxsplit=1)[0].strip()
+    if first and _has_hangul(first) and not _looks_like_domain(first) and len(first) <= 20:
+        return first
+    return ""
+
+
+def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
+                  http: "HttpClient | None" = None) -> tuple[str, str | None, int]:
     """도메인으로 언론사를 식별한다. 미등록이면 pending 으로 적재하고 수집을 막지 않는다. (F2.3)
 
-    우선순위: SEED_PRESS > 본문 og:site_name > 피드 힌트 > 도메인 표기.
+    우선순위: SEED_PRESS > 본문 og:site_name/<title> > 홈페이지 재조회 > 피드 힌트 > 도메인 표기.
     """
     domain = domain_of(url)
     if not domain:
@@ -4571,6 +4606,14 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "") -> tupl
     row = storage.press_by_domain(domain)
     seed = SEED_PRESS.get(domain)
     og_name = site_name_from_html(html, domain)
+    # 이 매체를 처음 보는데(row is None) 기사 페이지에서 이름을 못 찾았으면, 홈페이지를
+    # 한 번 더 본다(신규 매체당 1회뿐이라 부담이 작다). 기사 페이지는 SEO 상 기사
+    # 제목만 <title>에 넣는 경우가 많아 실패하기 쉬운데, 홈페이지는 거의 항상
+    # 매체명을 담는다. 이렇게 안 하면 언론사명이 도메인 그대로('skyedaily.com')
+    # 굳어 화면 필터 칩에 그대로 노출된다.
+    if not og_name and http is not None and row is None and not seed and (
+            not hint or _looks_like_domain(hint)):
+        og_name = _homepage_site_name(http, domain)
 
     if row is None:
         if seed:
@@ -4802,7 +4845,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         if summary_source == "snippet":
             body = item.snippet or item.title
 
-        press_name, press_id, press_tier = resolve_press(storage, canonical, item.press_hint, html)
+        press_name, press_id, press_tier = resolve_press(storage, canonical, item.press_hint, html, http)
         is_policy = bool(KOREA_KR_NEWS_RE.search(canonical or ""))
         # 정책브리핑 기사는 기자명 대신 발표 부처명을 넣는다. (사용자 지정)
         author = extract_ministry(html, body) if is_policy else extract_author(html, body, press_name)
@@ -5267,7 +5310,7 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     if not title:
         title = body[:40].strip() or "제목 없음"
 
-    press_name, press_id, press_tier = resolve_press(storage, canonical, "", html)
+    press_name, press_id, press_tier = resolve_press(storage, canonical, "", html, http)
     author = extract_author(html, body, press_name)
     published = extract_published(html) or now_utc()
     content_hash = sha256(body) if summary_source == "fulltext" else ""
@@ -7866,7 +7909,9 @@ def cmd_fixpress(ctx: Context) -> None:
             cleaned += 1
 
     # SEED_PRESS 에 없어 도메인·조각으로 남은 매체는 대표 기사 1건을 받아
-    # og:site_name 에서 한글 매체명을 시도한다. 실패하면 도메인 전체로 둔다.
+    # og:site_name/<title> 에서 한글 매체명을 시도한다. 기사 페이지는 SEO 상
+    # 기사 제목만 <title>에 넣는 경우가 많아 실패하기 쉬우니, 안 되면 홈페이지도
+    # 한 번 더 본다(_homepage_site_name). 그래도 실패하면 도메인 전체로 둔다.
     ogfix = 0
     tried: set[str] = set()
     for r in ctx.storage.list_articles(5000, 0, None, ""):
@@ -7884,6 +7929,8 @@ def cmd_fixpress(ctx: Context) -> None:
             og = site_name_from_html(html, domain)
         except Exception as exc:
             log.debug("og:site_name 조회 실패 %s: %s", target, exc)
+        if not og:
+            og = _homepage_site_name(ctx.http, domain)
         ctx.storage.update_press_name(domain, og or domain, 3)
         if og:
             ogfix += 1
@@ -8659,8 +8706,58 @@ def cmd_selftest() -> int:
     check("한글 병기 괄호는 유지", clean_site_name("주간동아(주간)"), "주간동아(주간)")
     check("래퍼 도메인은 뒤쪽(실제 출처)", clean_site_name("Daum | 뉴스1", "daum.net"), "뉴스1")
     check("일반 도메인은 앞쪽(매체명)", clean_site_name("AP신문 | 부제", "apnews.kr"), "AP신문")
+    check("쉼표는 구분자 아님 — 기사 제목 오인 방지('중국, 리튬…')",
+          clean_site_name("중국, 리튬 배터리 소식"), "중국, 리튬 배터리 소식")
     check("SEED_PRESS 신규 매핑(KPI뉴스)", SEED_PRESS.get("kpinews.kr", ("", 0))[0], "KPI뉴스")
+
+    # site_name_from_html 은 <title> 을 절대 안 본다 (2026-09-10) — 개별 기사 페이지의
+    # <title>이 '차세대 배터리 기술 한눈에'처럼 그냥 기사 제목인 경우가 흔해서, 한때
+    # <title> 폴백을 넣었다가 이런 기사 제목을 매체명으로 오인하는 회귀를 냈다.
+    # <title> 기반 추정은 _homepage_site_name(홈페이지 전용)에서만 한다.
+    check("og:site_name 없으면 <title> 이 있어도 그냥 빈 문자열",
+          site_name_from_html("<title>스카이데일리 - 뉴 패러다임을 선도하는 종합일간지</title>"), "")
+    check("기사 제목이 짧아도 <title> 은 안 봄(회귀 재현 방지)",
+          site_name_from_html("<title>차세대 배터리 기술 한눈에</title>"), "")
+    check("og:site_name 은 여전히 정상 추출", site_name_from_html(
+        '<meta property="og:site_name" content="정식매체명"/><title>딴 내용</title>'), "정식매체명")
     check("SEED_PRESS 신규 매핑(여성소비자신문)", SEED_PRESS.get("wsobi.com", ("", 0))[0], "여성소비자신문")
+
+    # resolve_press — 신규 매체는 기사 페이지에 매체명이 없으면 홈페이지를 한 번 더 본다
+    # (2026-09-10, 필터 칩에 도메인 그대로 노출되던 문제의 실제 원인)
+    class _FakeResp:
+        def __init__(self, body: str):
+            self.content = body.encode("utf-8")
+            self.encoding = "utf-8"
+
+        def raise_for_status(self):
+            pass
+
+    class _FakeHttp:
+        def get(self, url, **kw):
+            return _FakeResp("<title>스카이데일리 - 뉴 패러다임을 선도하는 종합일간지</title>")
+
+    import tempfile as _tf1
+    import shutil as _sh1
+    _pdir = _tf1.mkdtemp()
+    _pstore = SqliteStorage(os.path.join(_pdir, "press.db"))
+    _pstore.init_schema()
+    _name, _pid, _tier = resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=1",
+                                       "", "<title>차세대 배터리 기술 한눈에</title>", _FakeHttp())
+    check("신규 매체 — 기사 페이지에 매체명 없으면 홈페이지 재조회로 복구", _name, "스카이데일리")
+    check("두 번째 호출은 이미 저장된 이름을 그대로 씀(재조회 안 함)",
+          resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=2", "", "", None)[0],
+          "스카이데일리")
+
+    class _FakeHttpComma:
+        """홈페이지 title 이 '매체명 - 슬로건' 도 아니고 og:site_name 도 없어서
+        _homepage_site_name 의 쉼표 최후 수단까지 가는 실사례(weeklytrade.co.kr)."""
+        def get(self, url, **kw):
+            return _FakeResp("<title>한국무역신문, 주간무역, 한국무역의 길잡이 한국무역신문</title>")
+
+    _name2, _, _ = resolve_press(_pstore, "https://weeklytrade.co.kr/news/view.html?no=1",
+                                 "", "<title>중국, 리튬 배터리 소식 :: 한국무역신문</title>", _FakeHttpComma())
+    check("홈페이지 title 이 쉼표로 슬로건을 늘어놓아도 첫 조각(매체명) 복구", _name2, "한국무역신문")
+    _sh1.rmtree(_pdir, ignore_errors=True)
 
     print("\n[8-1] 카테고리 태깅 (PRD F3.1)")
     check("'지역' 카테고리는 폐지됨", "지역" in detect_categories("포항 공장에서 사고"), False)
