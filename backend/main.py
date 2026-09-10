@@ -2338,6 +2338,9 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     # 사용자 확인 매체 (2026-09-08) — 도메인·부제 그대로 노출되던 것 정정
     "wsobi.com": ("여성소비자신문", 3), "tbc.co.kr": ("TBC", 2),
     "ppss.kr": ("PPSS", 3), "ktv.go.kr": ("KTV 국민방송", 2),
+    # 홈페이지 og:site_name·<title> 이 영문뿐이라(예: "JTV", "CatchNews") 자동 복구가
+    # 안 되는 매체 — 한글 정식명을 수동으로 등록한다. (2026-09-10)
+    "jtv.co.kr": ("전주방송", 3), "catchnews.kr": ("캐치뉴스", 3),
     "kpinews.kr": ("KPI뉴스", 3), "kjdaily.com": ("광주매일신문", 3),
     "kgnews.co.kr": ("경기신문", 3), "gosiweek.com": ("피앤피뉴스", 3),
     "unn.net": ("한국대학신문", 3), "ttlnews.com": ("퍼블릭뉴스통신", 3),
@@ -4583,31 +4586,61 @@ def site_name_from_html(html: str, domain: str = "") -> str:
     return ""
 
 
-def _homepage_site_name(http: "HttpClient", domain: str) -> str:
+def _title_media_name(title_raw: str) -> str:
+    """<title> 에서 매체명 후보를 뽑는다.
+
+    '매체명 - 슬로건'(스카이데일리) · '매체명, 슬로건, …'(한국무역신문) 은 첫 조각이
+    매체명이지만, '슬로건 - 매체명'(조선비즈가 만드는 프리미엄 경제 주간지 - 이코노미조선)
+    처럼 매체명이 맨 뒤에 오는 사이트도 있다. 첫 조각이 실패하면 마지막 조각도 본다.
+    """
+    raw = html_mod.unescape(title_raw).strip()
+    parts = [p.strip() for p in re.split(r"\s*[|\-–,]\s*", raw) if p.strip()]
+    for cand in ((parts[0], parts[-1]) if parts else ()):
+        if cand and _has_hangul(cand) and not _looks_like_domain(cand) and len(cand) <= 20:
+            return cand
+    return ""
+
+
+def _homepage_site_name(http: "HttpClient", domain: str, source_host: str = "") -> str:
     """새 언론사를 처음 만났을 때 1회, 기사 페이지에서 매체명을 못 찾으면
     홈페이지에서 다시 시도한다 — 홈페이지 title 은 거의 항상 매체명을 담고,
-    (기사 제목과 달리) 짧아도 매체명으로 신뢰할 수 있다."""
-    try:
-        resp = http.get(f"https://{domain}/", timeout=6)
-        resp.raise_for_status()
-        html = decode_html(resp)
-    except Exception as exc:
-        log.debug("홈페이지 매체명 조회 실패 %s: %s", domain, exc)
-        return ""
-    name = site_name_from_html(html, domain)
-    if name:
-        return name
-    # og:site_name 이 없으면 <title> 을 본다 — '매체명 - 슬로건'/'매체명 | 슬로건'
-    # 뿐 아니라 '한국무역신문, 주간무역, 한국무역의 길잡이 한국무역신문'처럼 쉼표로
-    # 슬로건을 늘어놓는 매체도 있어 쉼표까지 구분자에 넣는다(기사 제목이 아니므로
-    # 첫 조각을 매체명으로 믿을 수 있다 — clean_site_name 은 이 구분을 못 하므로
-    # 기사 제목에도 함께 쓰이는 쉼표는 그쪽에서 구분자로 넣지 않는다).
-    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
-    if not m:
-        return ""
-    first = re.split(r"\s*[|\-–,]\s*", html_mod.unescape(m.group(1)).strip(), maxsplit=1)[0].strip()
-    if first and _has_hangul(first) and not _looks_like_domain(first) and len(first) <= 20:
-        return first
+    (기사 제목과 달리) 짧아도 매체명으로 신뢰할 수 있다.
+
+    domain_of() 가 news.tvchosun.com 같은 서브도메인을 등록 도메인(tvchosun.com)
+    으로 접는데, 그 등록 도메인 자체는 리다이렉트 스텁만 있는 경우가 있다(실사례:
+    tvchosun.com·dizzo.com 은 각각 55·77바이트짜리 빈 페이지만 준다). 기사가 실제로
+    있던 호스트를 먼저 시도하고, 안 되면 등록 도메인 · www. 붙인 도메인 순으로 넘어간다.
+    호스트마다 https 를 먼저, 안 되면 http 로도 시도한다(실사례: areyou.co.kr 은
+    인증서가 호스트명과 안 맞아 https 전체가 SSLError 로 막혀 있었다).
+    """
+    candidates = [source_host, domain]
+    if not domain.startswith("www."):
+        candidates.append(f"www.{domain}")
+    hosts: list[str] = []
+    for h in candidates:
+        if h and h not in hosts:
+            hosts.append(h)
+
+    for host in hosts:
+        html = ""
+        for scheme in ("https", "http"):
+            try:
+                resp = http.get(f"{scheme}://{host}/", timeout=6)
+                resp.raise_for_status()
+                html = decode_html(resp)
+                break
+            except Exception as exc:
+                log.debug("홈페이지 매체명 조회 실패 %s://%s: %s", scheme, host, exc)
+        if not html:
+            continue
+        name = site_name_from_html(html, domain)
+        if name:
+            return name
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        if m:
+            name = _title_media_name(m.group(1))
+            if name:
+                return name
     return ""
 
 
@@ -4631,7 +4664,7 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     # 굳어 화면 필터 칩에 그대로 노출된다.
     if not og_name and http is not None and row is None and not seed and (
             not hint or _looks_like_domain(hint)):
-        og_name = _homepage_site_name(http, domain)
+        og_name = _homepage_site_name(http, domain, urlsplit(url).hostname or "")
 
     if row is None:
         if seed:
@@ -7948,7 +7981,7 @@ def cmd_fixpress(ctx: Context) -> None:
         except Exception as exc:
             log.debug("og:site_name 조회 실패 %s: %s", target, exc)
         if not og:
-            og = _homepage_site_name(ctx.http, domain)
+            og = _homepage_site_name(ctx.http, domain, urlsplit(target).hostname or "")
         ctx.storage.update_press_name(domain, og or domain, 3)
         if og:
             ogfix += 1
@@ -8789,6 +8822,37 @@ def cmd_selftest() -> int:
     _name2, _, _ = resolve_press(_pstore, "https://weeklytrade.co.kr/news/view.html?no=1",
                                  "", "<title>중국, 리튬 배터리 소식 :: 한국무역신문</title>", _FakeHttpComma())
     check("홈페이지 title 이 쉼표로 슬로건을 늘어놓아도 첫 조각(매체명) 복구", _name2, "한국무역신문")
+
+    # _title_media_name — 매체명이 맨 앞(스카이데일리류)과 맨 뒤(이코노미조선류) 둘 다
+    # 실사례가 있다(2026-09-10). 실패하면 빈 문자열.
+    check("매체명이 맨 앞", _title_media_name("스카이데일리 - 뉴 패러다임을 선도하는 종합일간지"),
+          "스카이데일리")
+    check("매체명이 맨 뒤(조선비즈가 만드는... - 이코노미조선)",
+          _title_media_name("조선비즈가 만드는 프리미엄 경제 주간지 - 이코노미조선"), "이코노미조선")
+    check("양쪽 다 실패하면 빈 문자열",
+          _title_media_name("영문뿐인 사이트 이름은 아니지만 앞뒤 다 너무 길게 늘어진 슬로건" * 2), "")
+
+    class _FakeHttpHostOrder:
+        """등록 도메인(tvchosun.com)은 리다이렉트 스텁만 주고, 기사가 실제로 있던
+        서브도메인(news.tvchosun.com)에 진짜 매체명이 있는 실사례."""
+        def get(self, url, **kw):
+            if "news.tvchosun.com" in url:
+                return _FakeResp("<title>TV조선뉴스</title>")
+            return _FakeResp("")  # 등록 도메인은 빈 페이지(리다이렉트 스텁)
+
+    check("서브도메인이 접힌 등록 도메인이 스텁이어도, 기사가 있던 호스트를 먼저 시도",
+          _homepage_site_name(_FakeHttpHostOrder(), "tvchosun.com", "news.tvchosun.com"),
+          "TV조선뉴스")
+
+    class _FakeHttpHttpsFail:
+        """https 전체가 SSLError 로 막혀 있고 http 로만 되는 실사례(areyou.co.kr)."""
+        def get(self, url, **kw):
+            if url.startswith("https://"):
+                raise Exception("SSLError: certificate verify failed")
+            return _FakeResp("<title>AU경제</title>")
+
+    check("https 가 SSLError 면 http 로 재시도",
+          _homepage_site_name(_FakeHttpHttpsFail(), "areyou.co.kr"), "AU경제")
     _sh1.rmtree(_pdir, ignore_errors=True)
 
     print("\n[8-1] 카테고리 태깅 (PRD F3.1)")
