@@ -4,8 +4,27 @@
 확인해야 하는지 정리한 것이다. 클라우드 배포는 [DEPLOY.md](DEPLOY.md) 를 본다.
 
 > 한 줄 요약: 이 시스템은 **`python backend/main.py run` 프로세스 1개**가
-> API 서버 + 수집·시세·텔레그램봇·대외협력 스레드를 다 돌린다. 저장소는 **Supabase**
-> (외부). 로컬 PC는 상태를 갖지 않는다.
+> API 서버 + 수집·시세·텔레그램봇·대외협력 스레드를 다 돌린다.
+> 저장소는 `DB_BACKEND` 로 고른다 — **`sqlite`**(사내 배포·오프라인) 또는 **`supabase`**(현재).
+> 로컬 PC는 상태를 갖지 않는다(SQLite면 `backend/pfm_news.db` 파일이 상태).
+
+## 저장소 — SQLite 와 Supabase 동시 유지
+
+`Storage` ABC + `SqliteStorage` / `SupabaseStorage` 두 구현이 **같은 스키마**를 유지한다.
+스키마를 바꾸는 커밋은 **항상 세 곳을 같이** 고친다:
+
+| 파일 | 역할 |
+|---|---|
+| `backend/schema_sqlite.sql` | SQLite `create table` (신규 DB) |
+| `backend/main.py` `SqliteStorage.init_schema()` 의 `migrations` 리스트 | 기존 SQLite DB 에 `alter table` (자동 실행) |
+| `backend/schema.sql` | Supabase `create table` + 기존 프로젝트용 `alter table` 안내 |
+
+**사내 배포에서 `DB_BACKEND=sqlite` 를 쓸 때** 스키마 변경 반영:
+```bash
+python backend/main.py initdb      # 스키마 갱신 (idempotent — 여러 번 돌려도 안전)
+```
+`initdb` 가 `create table if not exists` + `alter table … (있으면 무시)` + 시드 upsert 를
+수행한다. 데이터는 그대로. Supabase 쪽은 `alter table` 을 SQL Editor 에서 1회 (§2-3).
 
 ---
 
@@ -91,7 +110,7 @@ python backend/main.py run             # 운영 모드
 |---|---|---|
 | 1 | 코드 받기 | `git pull` |
 | 2 | **의존성 변경?** `backend/requirements.txt` 가 diff 에 있으면 | `pip install -r backend/requirements.txt` |
-| 3 | **스키마 변경?** `backend/schema.sql` 가 diff 에 있으면 | 바뀐 `alter table` / `create table` 구문을 **Supabase SQL Editor** 에서 1회 실행. 최근 예: `run_state` 에 `night_start_hour·night_end_hour·night_min_score` 추가 |
+| 3 | **스키마 변경?** `backend/schema*.sql` 가 diff 에 있으면 | **SQLite**: `python backend/main.py initdb` (idempotent). **Supabase**: 바뀐 `alter table` 을 SQL Editor 에서 1회. 최근: `run_state` 에 `night_start_hour·night_end_hour·night_min_score·exclude_notify_keywords` 추가 |
 | 4 | **새 환경변수?** `.env.example` 이 diff 에 있으면 | 새로 생긴 줄을 `.env` 에도 추가 (값이 필요하면 채움) |
 | 5 | **검증** | `python backend/main.py selftest` → `전체 통과` 확인 |
 | 6 | **서버 재시작** | 기존 `run` 프로세스 종료 후 다시 `python backend/main.py run` |
@@ -200,6 +219,8 @@ OpenAI 대시보드 월 하드 리밋. `$X/월` 로 묶으려면 `LLM_DAILY_LIMI
 |---|---|
 | 야간(23~7시)에 알림이 옴 | 정상 — 중요도 `NIGHT_MIN_SCORE`(기본 80) 이상·우선 기사는 야간에도 발송. **완전 무음**은 마스터 패널 3번에서 최소 점수를 **101** 로 |
 | 야간 시간이 안 맞음 | `APP_TZ_OFFSET=9` 확인. 마스터 패널 3번에서 시각 조정 (서울시간 기준) |
+| 특정 주제(채용·부고 등)가 계속 알림됨 | 마스터 패널 **4번 '제외할 키워드'** 에 그 단어 추가 (제목 기준). 임계값·'무조건 받을 키워드'보다 우선 |
+| 마스터 패널 저장 시 `이 설정용 컬럼이 아직 없습니다` | Supabase 스키마 미반영 → §2-3 의 `alter table` 실행 (SQLite 는 자동) |
 | 알림에 요약·SWOT 이 없고 제목만 옴 | OpenAI 한도 소진 or 키 오류. `[ERROR] LLM 분석` 로그 확인. 한도 리셋되면 소급 분석됨 |
 | 발송 실패 다수 (`Too Many Requests`) | 텔레그램 rate limit. `retryfailed` 로 복구. 자동 회복도 됨 |
 | `SystemExit: 환경변수가 비어 있습니다` | `.env` 필수 키 누락 |

@@ -839,6 +839,7 @@ class SqliteStorage(Storage):
             "alter table run_state add column night_start_hour INTEGER",
             "alter table run_state add column night_end_hour INTEGER",
             "alter table run_state add column night_min_score INTEGER",
+            "alter table run_state add column exclude_notify_keywords TEXT default '[]'",
         ]
         for sql in migrations:
             try:
@@ -4544,8 +4545,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # 알림 판정에 필요한 항목만 담는다. {id, score, is_backfill, published_at, priority,
     #  policy: (해당여부, 키워드통과), trade: (해당여부, 키워드통과)}
     saved_for_notify: list[dict] = []
-    # 마스터가 지정한 '항상 발송' 키워드 — 본문에 있으면 점수 무관 알림
+    # 마스터가 지정한 '항상 발송' 키워드 — 제목·계열사에 있으면 점수·야간 무관 무조건 알림
     always_kws = [k for k in jload(state.get("always_notify_keywords"), []) if k]
+    # '제외' 키워드 — 제목에 있으면 임계값을 넘어도, 항상발송 키워드에 걸려도 알림하지 않는다(최우선).
+    exclude_kws = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
     # 무조건 발송 점수 — 이 값 이상이면 우선 기사처럼 다뤄 야간 게이트를 우회한다. (0/None = 미사용)
     try:
         hard_score = int(state.get("hard_notify_score") or 0)
@@ -4709,12 +4712,14 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 포스코 그룹 기사 대부분에 '포스코홀딩스'·'포스코퓨처엠'이 스치듯 등장해
         # 사실상 모든 그룹 기사가 야간에도 발송된다(파업 기사 오발송 사례, 2026-09-08).
         priority_probe = f"{item.title}\n{' '.join(rule_groups)}"
-        is_priority = (_kw_hit_any(priority_probe, always_kws)
-                       or (hard_score > 0 and score >= hard_score))
+        excluded = _kw_hit_any(item.title, exclude_kws)   # 제목에 제외 키워드 → 무조건 알림 안 함
+        is_priority = (not excluded) and (
+            _kw_hit_any(priority_probe, always_kws)
+            or (hard_score > 0 and score >= hard_score))
         # 특수 주제 발송 조건: (OR 키워드 하나 이상) AND (필수 공통 키워드 하나 이상)
         saved_for_notify.append({
             "id": article_id, "score": score, "is_backfill": is_backfill,
-            "published_at": item.published_at, "priority": is_priority,
+            "published_at": item.published_at, "priority": is_priority, "excluded": excluded,
             "policy": (is_policy,
                        _kw_hit(probe, policy_notify_kws) and _kw_hit(probe, policy_required_kws)),
             "trade": (is_trade,
@@ -4815,10 +4820,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             break
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
+            and (not it.get("excluded"))           # 제목에 '제외' 키워드 → 무조건 웹에만
             and (not it["is_backfill"])            # 6시간 넘은 기사는 웹에만
             and _topic_ok(it["policy"], notify_policy)
             and _topic_ok(it["trade"], notify_trade)
-            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선·무조건점수는 우회)
+            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선은 우회)
             and it["published_at"] is not None
             and it["published_at"] >= bootstrap_at  # 파이프라인 가동 이전 기사는 절대 알림 안 함
         )
@@ -5427,6 +5433,11 @@ def queue_manual_notify(ctx: Context, article_id: str) -> bool:
         hard_score = 0
     # '항상 발송 키워드'는 제목 + 판정된 그룹사로만 본다(요약에 스친 언급 제외 — run_once 와 동일).
     probe = f"{detail.get('title', '')}\n{' '.join(jload(detail.get('group_companies'), []))}"
+    excl_kws = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
+    if _kw_hit_any(detail.get("title", ""), excl_kws):
+        log.info("수동 등록 기사 제목에 '제외' 키워드 → 웹에만 노출: %s",
+                 (detail.get("title") or "")[:40])
+        return False
     is_priority = _kw_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
     # 임계값도 위에서 읽어 둔 state 로 판정한다(effective_threshold 를 부르면 run_state 를 또 조회한다).
     try:
@@ -5484,6 +5495,11 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     def _is_priority(p: dict) -> bool:
         # 큐 적재 시 run_once 가 '항상 발송 키워드' 매칭으로 판정해 둔 값.
         return bool(p.get("priority"))
+
+    # 큐 적재 후 마스터가 '제외 키워드'를 추가했을 수 있으니 발송 직전에 한 번 더 거른다.
+    excl_kws = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
+    if excl_kws:
+        pending = [p for p in pending if not _kw_hit_any(p.get("title") or "", excl_kws)]
 
     # /threshold 로 조정한 임계값을 큐 단계에서 한 번 더 적용 (큐 적재는 .env 기준으로 됐을 수 있음)
     # 우선 기사(마스터 '항상 발송 키워드' 매칭)는 임계값·야간 게이트를 우회한다.
@@ -7199,10 +7215,6 @@ def create_app(ctx: Context):
         if (err := _master_guard(x_master_token)):
             return err
         st = ctx.storage.get_run_state()
-        try:
-            hard_score = int(st.get("hard_notify_score") or 0)
-        except (TypeError, ValueError):
-            hard_score = 0
         n_start, n_end, n_min = effective_night(ctx, st)
         return JSONResponse({
             "ok": True,
@@ -7210,11 +7222,11 @@ def create_app(ctx: Context):
             # 카카오 발송은 기본 비활성 — 마스터 패널 UI 에서는 노출하지 않는다.
             # 다시 쓰려면 .env KAKAO_ENABLED=true + kakao-auth (ARCHITECTURE 04절).
             "threshold": effective_threshold(ctx),
-            "hard_notify_score": hard_score,          # 0 = 미사용
             "night_start": n_start, "night_end": n_end, "night_min_score": n_min,
             "night_tz": f"UTC{ctx.cfg.tz_offset_hours:+d}",
             "recommended_min": RECOMMENDED_MIN_SCORE,
             "keywords": jload(st.get("always_notify_keywords"), []),
+            "exclude_keywords": jload(st.get("exclude_notify_keywords"), []),
             "web_password": st.get("web_password") or "",
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
             "policy_keywords": jload(st.get("policy_notify_keywords"), []),
@@ -7256,12 +7268,6 @@ def create_app(ctx: Context):
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
                                     status_code=400)
-        if "hard_notify_score" in (payload or {}):
-            try:
-                patch["hard_notify_score"] = int(clamp(int(payload["hard_notify_score"]), 0, 100))
-            except (TypeError, ValueError):
-                return JSONResponse({"ok": False, "error": "무조건 발송 점수는 0~100 숫자여야 합니다."},
-                                    status_code=400)
         # 야간 억제 — 시각은 0~23(운영 기준 시간대), 점수는 0~101(101=전면 차단)
         for key, col, lo, hi, label in (
             ("night_start", "night_start_hour", 0, 23, "야간 시작 시각"),
@@ -7276,6 +7282,7 @@ def create_app(ctx: Context):
                                         status_code=400)
         # 키워드 목록 필드 — 같은 방식으로 정리(중복 제거, 30개 상한)
         for field, col in (("keywords", "always_notify_keywords"),
+                           ("exclude_keywords", "exclude_notify_keywords"),
                            ("policy_keywords", "policy_notify_keywords"),
                            ("policy_required", "policy_required_keywords"),
                            ("trade_keywords", "trade_notify_keywords"),
@@ -7309,14 +7316,17 @@ def create_app(ctx: Context):
                 ctx.storage.set_run_state(patch)
             except Exception as exc:
                 msg = str(exc)
-                if "night_" in msg and ("column" in msg.lower() or "PGRST" in msg
-                                        or "schema cache" in msg.lower()):
+                if ("column" in msg.lower() or "PGRST204" in msg
+                        or "schema cache" in msg.lower()):
                     return JSONResponse(
-                        {"ok": False, "error": "저장소(run_state)에 야간 설정 컬럼이 없습니다. "
+                        {"ok": False, "error": "저장소(run_state)에 이 설정용 컬럼이 아직 없습니다. "
                          "Supabase SQL Editor 에서 아래를 1회 실행하세요:\n"
-                         "alter table run_state add column if not exists night_start_hour int, "
-                         "add column if not exists night_end_hour int, "
-                         "add column if not exists night_min_score int;"}, status_code=500)
+                         "alter table run_state\n"
+                         "  add column if not exists night_start_hour int,\n"
+                         "  add column if not exists night_end_hour int,\n"
+                         "  add column if not exists night_min_score int,\n"
+                         "  add column if not exists exclude_notify_keywords text default '[]';"},
+                        status_code=500)
                 raise
         return JSONResponse({"ok": True})
 
@@ -8781,6 +8791,22 @@ def cmd_selftest() -> int:
           _prio_probe("포스코 노조, 48시간 부분파업 D-1", ["포스코"]), False)
     check("항상발송 키워드 비면 우선 아님 (_kw_hit_any)",
           _kw_hit_any("포스코퓨처엠 양극재 증설", []), False)
+
+    # 제외 키워드 — 제목에 있으면 임계값·항상발송 키워드보다 우선해서 알림 차단
+    def _notify_decision(title, score, threshold, always, exclude):
+        excluded = _kw_hit_any(title, [k for k in exclude if k])
+        is_priority = (not excluded) and _kw_hit_any(title, [k for k in always if k])
+        return (not excluded) and (score >= threshold or is_priority)
+    check("제외 키워드 없음 + 임계값 초과 → 발송",
+          _notify_decision("포스코퓨처엠 양극재 증설", 70, 50, [], []), True)
+    check("제외 키워드 매칭 → 임계값 넘어도 차단",
+          _notify_decision("포스코퓨처엠 신입 채용 공고", 70, 50, [], ["채용"]), False)
+    check("제외가 항상발송 키워드를 이긴다",
+          _notify_decision("포스코퓨처엠 경력 채용", 30, 50, ["포스코퓨처엠"], ["채용"]), False)
+    check("제외 키워드가 제목에 없으면 정상 발송",
+          _notify_decision("포스코퓨처엠 3분기 실적 발표", 30, 50, ["포스코퓨처엠"], ["채용"]), True)
+    check("제외 목록이 비면 아무 영향 없음",
+          _notify_decision("채용 관련 없는 기사", 60, 50, [], []), True)
 
     print("\n[12] .env 인라인 주석 처리")
     check("주석 제거", _clean("60          # 폴링 주기"), "60")

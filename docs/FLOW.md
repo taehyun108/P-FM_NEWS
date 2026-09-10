@@ -37,8 +37,10 @@ flowchart TB
     class GN,NV,OAI,TG,MKT,SMTP,GOV ext
 ```
 
-**핵심:** 상태는 전부 Supabase. PC 프로세스는 재시작해도 잃을 게 없다(인메모리 캐시는
-Supabase 에서 재구성). → 인스턴스는 **반드시 1개** (2개면 알림 중복).
+**핵심:** 저장소는 SQLite(로컬 개발·사내 배포) 또는 Supabase(현재), `DB_BACKEND` 로 전환.
+어느 쪽이든 `Storage` ABC + 두 구현이 **동일 스키마**를 유지한다
+(`schema_sqlite.sql` + `init_schema()` 의 `alter table` 리스트 ↔ `schema.sql`).
+PC 프로세스는 재시작해도 잃을 게 없다. → 인스턴스는 **반드시 1개** (2개면 알림 중복).
 
 ---
 
@@ -81,7 +83,9 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    A(["저장된 기사"]) --> B{"억제 모드 아님?\n(부트스트랩·복구)"}
+    A(["저장된 기사"]) --> X{"제목에 '제외할 키워드'?\n(마스터 4번)"}
+    X -->|있음| SKIP0["무조건 웹에만 (skipped) · 최우선"]
+    X -->|없음| B{"억제 모드 아님?\n(부트스트랩·복구)"}
     B -->|아니오| SKIP1["queued 안 함 (skipped)"]
     B -->|예| C{"발행 6시간 이내?\n(is_backfill 아님)"}
     C -->|아니오| SKIP2["웹에만 노출"]
@@ -97,8 +101,10 @@ flowchart TB
     class Q q
 ```
 
-`우선 기사` = 마스터의 **항상 발송 키워드**가 제목·판정 그룹사에 있음
-**또는** 중요도 ≥ **무조건 발송 점수**(`hard_notify_score`).
+- `우선 기사` = 마스터의 **무조건 받을 키워드**가 제목·판정 그룹사에 있음
+  (`hard_notify_score` 는 야간 최소 점수와 중복이라 UI 제거 · 기본 0)
+- `제외할 키워드` 는 임계값·우선 여부를 **모두 이긴다** — 제목에 있으면 무조건 웹에만.
+  `run_once` 와 `_send_notifications` 양쪽에서 검사
 
 ### 3-2. 실제 발송 (`_send_notifications` — 파이프라인 회차마다)
 
@@ -106,7 +112,9 @@ flowchart TB
 flowchart TB
     P(["큐의 queued 기사\n(중요도 내림차순)"]) --> PAUSE{"텔레그램 발송 토글 ON?\n(notify_paused)"}
     PAUSE -->|OFF| HOLD1["큐에 그대로 (다시 켜면 발송)"]
-    PAUSE -->|ON| FLOOD{"텔레그램 flood 대기 중?\n(429 retry_after)"}
+    PAUSE -->|ON| EXCL{"제목에 '제외할 키워드'?\n(큐 적재 후 추가됐을 수 있음)"}
+    EXCL -->|있음| DROP2["이번 회차 제외"]
+    EXCL -->|없음| FLOOD{"텔레그램 flood 대기 중?\n(429 retry_after)"}
     FLOOD -->|대기| HOLD2["이번 회차 건너뜀"]
     FLOOD -->|아니오| TH{"중요도 ≥ 현재 임계값\nOR 우선?"}
     TH -->|아니오| HOLD3["큐에 남음"]

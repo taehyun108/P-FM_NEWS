@@ -90,34 +90,39 @@
             <label>시작 <input type="number" id="nightStart" min="0" max="23" class="night-num"> 시</label>
             <label>종료 <input type="number" id="nightEnd" min="0" max="23" class="night-num"> 시</label>
           </div>
-          <small>이 시간대엔 아래 '야간 최소 점수' 이상(또는 예외 규칙에 걸린 기사)만 즉시 발송하고,
-            나머지는 아침에 한꺼번에 나갑니다. 자정을 넘는 창(예 23→7)도 됩니다.</small>
+          <small>이 시간대엔 아래 '야간 최소 점수' 이상(또는 4번의 '무조건 받을 키워드'에 걸린 기사)만
+            즉시 발송하고, 나머지는 아침에 한꺼번에 나갑니다. 자정을 넘는 창(예 23→7)도 됩니다.</small>
         </label>
         <label class="master-field">
           <span>야간 최소 점수 <b id="nightMinVal">80</b> <span id="nightMinState"></span></span>
           <input type="range" id="nightMinRange" min="0" max="101" step="1">
-          <small><b>101</b>로 올리면 야간엔 예외 규칙(무조건 점수·항상 발송 키워드)에 걸린 기사만 나가고
+          <small><b>101</b>로 올리면 야간엔 4번의 '무조건 받을 키워드'에 걸린 기사만 나가고
             나머지는 <b>전부 아침에</b> 옵니다.</small>
         </label>
       </section>
 
       <section class="master-section">
-        <h3><span class="ms-step">4</span> 꼭 받아야 하는 기사 — 예외 규칙</h3>
-        <label class="master-field">
-          <span>무조건 발송 점수 <b id="hardVal">0</b> <span id="hardState">(사용 안 함)</span></span>
-          <input type="range" id="hardRange" min="0" max="100" step="5">
-          <small>이 점수 이상인 기사는 <b>야간에도</b> 즉시 발송합니다.
-            (임계값이 50, 이 값이 80이면 → 50~79점은 낮에만, 80점 이상은 밤에도) · <b>0 = 사용 안 함</b></small>
-        </label>
+        <h3><span class="ms-step">4</span> 무조건 받을 키워드 · 제외할 키워드</h3>
+        <small class="ms-lead">점수·시간과 상관없이 <b>키워드로</b> 발송 여부를 강제합니다.
+          제외가 항상 우선합니다(무조건 받을 키워드와 겹치면 발송 안 함).</small>
 
-        <p class="kw-label" style="margin-top:14px">항상 발송 키워드</p>
-        <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>점수·야간과 무관하게</b> 무조건 발송합니다.
+        <p class="kw-label" style="margin-top:14px">무조건 받을 키워드</p>
+        <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>임계값·야간과 무관하게</b> 무조건 발송합니다.
           예: <b>포스코퓨처엠</b>, <b>수소환원제철</b>, <b>장인화</b></small>
         <div class="kw-input">
           <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 Enter 또는 추가">
           <button type="button" class="url-add-btn" id="kwAdd">추가</button>
         </div>
         <div class="kw-list" id="kwList"></div>
+
+        <p class="kw-label" style="margin-top:16px">제외할 키워드</p>
+        <small><b>제목</b>에 이 단어가 있으면 임계값을 넘어도, 위 '무조건 받을 키워드'에 걸려도
+          <b>알림하지 않습니다</b>(웹에는 그대로 보임). 예: <b>채용</b>, <b>부고</b>, <b>인사발령</b></small>
+        <div class="kw-input">
+          <input type="text" id="excludeNew" class="url-add-input" placeholder="제외 키워드 입력 후 Enter 또는 추가">
+          <button type="button" class="url-add-btn" id="excludeAdd">추가</button>
+        </div>
+        <div class="kw-list" id="excludeList"></div>
       </section>
 
       <section class="master-section">

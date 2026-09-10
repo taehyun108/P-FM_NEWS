@@ -556,6 +556,7 @@ async function shareToTelegram(articleId, btn) {
 /* ── 마스터 패널 ───────────────────────────────────────────────── */
 
 let masterKeywords = [];
+let excludeKeywords = [];
 let policyKeywords = [];
 let policyRequired = [];
 let tradeKeywords = [];
@@ -627,7 +628,7 @@ function renderNightWindow() {
 function renderNightMin(v) {
   $('nightMinVal').textContent = v > 100 ? '전면 차단' : v;
   $('nightMinState').textContent = v > 100
-    ? '— 예외 규칙 걸린 기사만 발송'
+    ? "— '무조건 받을 키워드'만 발송"
     : (v > 0 ? '점 이상만 발송' : '— 야간에도 전부 발송');
 }
 function applyNightSettings(d) {
@@ -647,15 +648,12 @@ async function loadMasterSettings() {
     $('thRange').value = d.threshold;
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
-    const hs = Number(d.hard_notify_score || 0);
-    $('hardRange').value = hs;
-    $('hardVal').textContent = hs;
-    $('hardState').textContent = hs > 0 ? '이상' : '(사용 안 함)';
     applyNightSettings(d);
     $('webPwNow').textContent = d.web_password || '(미설정)';
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
     masterKeywords = d.keywords || [];
+    excludeKeywords = d.exclude_keywords || [];
     policyKeywords = d.policy_keywords || [];
     policyRequired = d.policy_required || [];
     tradeKeywords = d.trade_keywords || [];
@@ -668,6 +666,7 @@ async function loadMasterSettings() {
         : '⚠ .env 에 SMTP_USER · SMTP_APP_PASSWORD 를 채워야 실제 발송됩니다.';
     }
     renderKwList();
+    renderExcludeList();
     renderPolicyKwList();
     renderPolicyReqList();
     renderTradeKwList();
@@ -698,8 +697,8 @@ function renderScoreRules(rules) {
   $('scoreNight').innerHTML =
     `야간(${n.start ?? 23}시~${n.end ?? 7}시, ${n.tz ?? 'UTC+9'} 서울시간)에는 ` +
     (nb
-      ? `<b>'무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다.`
-      : `<b>${n.min_score ?? 80}점 이상</b> 또는 위 '무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다.`);
+      ? `<b>'무조건 받을 키워드'에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다. (마스터 3번)`
+      : `<b>${n.min_score ?? 80}점 이상</b> 또는 '무조건 받을 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다. (마스터 3번에서 조정)`);
 }
 
 /** 칩 목록 렌더 — 삭제 버튼은 arr 에서 빼고 save 콜백을 부른다. */
@@ -715,6 +714,7 @@ function renderChipEditor(container, arr, save) {
 }
 
 function renderKwList() { renderChipEditor('kwList', masterKeywords, (next) => { masterKeywords = next; renderKwList(); saveKw('keywords', masterKeywords); }); }
+function renderExcludeList() { renderChipEditor('excludeList', excludeKeywords, (next) => { excludeKeywords = next; renderExcludeList(); saveKw('exclude_keywords', excludeKeywords); }); }
 function renderPolicyKwList() { renderChipEditor('policyKwList', policyKeywords, (next) => { policyKeywords = next; renderPolicyKwList(); saveKw('policy_keywords', policyKeywords); }); }
 function renderPolicyReqList() { renderChipEditor('policyReqList', policyRequired, (next) => { policyRequired = next; renderPolicyReqList(); saveKw('policy_required', policyRequired); }); }
 function renderTradeKwList() { renderChipEditor('tradeKwList', tradeKeywords, (next) => { tradeKeywords = next; renderTradeKwList(); saveKw('trade_keywords', tradeKeywords); }); }
@@ -773,21 +773,6 @@ function initMaster() {
         await masterFetch('/api/master/settings',
           { method: 'POST', body: JSON.stringify({ threshold: Number(e.target.value) }) });
         masterMsg('ok', `임계값 ${e.target.value} 저장`);
-      } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
-    }, 400);
-  });
-
-  let hardTimer;
-  $('hardRange').addEventListener('input', (e) => {
-    const v = Number(e.target.value);
-    $('hardVal').textContent = v;
-    $('hardState').textContent = v > 0 ? '이상' : '(사용 안 함)';
-    clearTimeout(hardTimer);
-    hardTimer = setTimeout(async () => {
-      try {
-        await masterFetch('/api/master/settings',
-          { method: 'POST', body: JSON.stringify({ hard_notify_score: v }) });
-        masterMsg('ok', v > 0 ? `무조건 발송 점수 ${v} 저장` : '무조건 발송 점수 사용 안 함');
       } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
     }, 400);
   });
@@ -853,6 +838,7 @@ function initMaster() {
     $(inputId).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
   };
   wireKwAdd('kwAdd', 'kwNew', () => masterKeywords, (a) => { masterKeywords = a; }, renderKwList, 'keywords');
+  wireKwAdd('excludeAdd', 'excludeNew', () => excludeKeywords, (a) => { excludeKeywords = a; }, renderExcludeList, 'exclude_keywords');
   wireKwAdd('policyKwAdd', 'policyKwNew', () => policyKeywords, (a) => { policyKeywords = a; }, renderPolicyKwList, 'policy_keywords');
   wireKwAdd('policyReqAdd', 'policyReqNew', () => policyRequired, (a) => { policyRequired = a; }, renderPolicyReqList, 'policy_required');
   wireKwAdd('tradeKwAdd', 'tradeKwNew', () => tradeKeywords, (a) => { tradeKeywords = a; }, renderTradeKwList, 'trade_keywords');

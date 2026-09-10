@@ -65,7 +65,8 @@ create table if not exists run_state (
   notify_threshold int,                     -- /threshold 로 지정한 임계값 (null 이면 .env 값)
   hard_notify_score int,                    -- 무조건 발송 점수. 이 값 이상이면 야간·묶음 우회 (null·0=미사용)
   tg_offset       bigint not null default 0,           -- 텔레그램 getUpdates offset
-  always_notify_keywords text default '[]', -- 이 단어가 본문에 있으면 점수 무관 알림 (마스터 설정)
+  always_notify_keywords text default '[]', -- 이 단어가 제목·계열사에 있으면 점수·야간 무관 무조건 알림
+  exclude_notify_keywords text default '[]', -- 이 단어가 제목에 있으면 임계값을 넘어도 알림 안 함 (최우선)
   master_pw_hash  text,                     -- 마스터 비밀번호 (pbkdf2, null 이면 .env 값 사용)
   web_pw_hash     text,                     -- 웹페이지 비밀번호 해시 (게이트는 추후)
   web_password    text,                     -- 웹페이지 비밀번호 평문 (마스터 패널에서 확인용)
