@@ -4829,19 +4829,25 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     for it in saved_for_notify:
         if not cfg.telegram_enabled:
             break
+        # 정책·통상 주제 기사가 ①관심 + ②필수공통 키워드를 모두 통과하고 토글이 켜져 있으면
+        # → 일반 중요도 임계값을 우회해 발송한다(정책·통상 기사는 포스코 미언급이라 점수가 낮다).
+        #   ②(필수공통) 가 비어 있으면 kw_ok=False → 여전히 발송 안 됨.
+        topic_hit = ((it["policy"][0] and it["policy"][1] and notify_policy)
+                     or (it["trade"][0] and it["trade"][1] and notify_trade))
         should_send = (
             (not suppressed)                       # 부트스트랩·복구 억제
             and (not it.get("excluded"))           # 제목에 '제외' 키워드 → 무조건 웹에만
             and (not it["is_backfill"])            # 6시간 넘은 기사는 웹에만
             and _topic_ok(it["policy"], notify_policy)
             and _topic_ok(it["trade"], notify_trade)
-            and (it["score"] >= notify_threshold or it["priority"])  # 중요도 게이트(우선은 우회)
+            and (it["score"] >= notify_threshold or it["priority"] or topic_hit)  # 중요도 게이트(우선·주제매칭은 우회)
             and it["published_at"] is not None
             and it["published_at"] >= bootstrap_at  # 파이프라인 가동 이전 기사는 절대 알림 안 함
         )
         status = "queued" if should_send else "skipped"
-        if storage.queue_notification(it["id"], cfg.telegram_chat_id, status,
-                                      1 if it["priority"] else 0):
+        # priority: 1 = '무조건 받을 키워드'(야간도 우회 가능) · 2 = 정책·통상 주제 매칭(임계값만 우회)
+        prio_val = 1 if it["priority"] else (2 if topic_hit else 0)
+        if storage.queue_notification(it["id"], cfg.telegram_chat_id, status, prio_val):
             queued += 1 if should_send else 0
 
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -5377,7 +5383,9 @@ def _notify_reason(row: dict, always_kws: Sequence[str] = (),
     probe = f"{row.get('title') or ''}\n{' '.join(jload(row.get('group_companies'), []))}"
     kw = _kw_first_hit(probe, [k for k in always_kws if k])
     if kw:
-        return f"{prefix}항상발송 키워드 '{kw}'"
+        return f"{prefix}무조건 받을 키워드 '{kw}'"
+    if int(row.get("priority") or 0) == 2:
+        return f"{prefix}정책·통상 주제 키워드 매칭"
     if hard_score > 0 and score >= hard_score:
         return f"{prefix}무조건 발송 점수 {score} ≥ {hard_score}"
     if threshold > 0 and score >= threshold:
@@ -5504,8 +5512,12 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if not pending:
         return 0
     def _is_priority(p: dict) -> bool:
-        # 큐 적재 시 run_once 가 '항상 발송 키워드' 매칭으로 판정해 둔 값.
+        # priority 1(무조건 받을 키워드)·2(정책·통상 주제) 둘 다 임계값을 우회한다.
         return bool(p.get("priority"))
+
+    def _kw_priority(p: dict) -> bool:
+        # 야간 우회는 '무조건 받을 키워드'(priority 1)만 — 정책·통상(2)은 야간 억제를 지킨다.
+        return int(p.get("priority") or 0) == 1
 
     # 큐 적재 후 마스터가 '제외 키워드'를 추가했을 수 있으니 발송 직전에 한 번 더 거른다.
     excl_kws = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
@@ -5525,11 +5537,11 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     bypass_night = str(state.get("always_kw_bypass_night", 1) or 0) not in ("0", "False", "false", "")
     hour = now_local().hour
     if _in_night_window(hour, n_start, n_end):
-        # 야간엔 중요도 n_min 이상만 즉시 발송. 우선 기사는 위 체크가 켜져 있을 때만 야간 우회.
-        # n_min=101 이면 우선 기사(체크 시)만 나가고 사실상 전면 억제된다. (PRD F7.3)
+        # 야간엔 중요도 n_min 이상만 즉시 발송. '무조건 받을 키워드' 기사는 위 체크가 켜져 있을 때만
+        # 야간 우회(정책·통상 주제 매칭 기사는 야간엔 아침까지 대기). n_min=101 이면 사실상 전면 억제.
         pending = [p for p in pending
                    if int(p.get("importance_score") or 0) >= n_min
-                   or (_is_priority(p) and bypass_night)]
+                   or (_kw_priority(p) and bypass_night)]
         if not pending:
             return 0
 
@@ -8701,9 +8713,12 @@ def cmd_selftest() -> int:
     # 발송 이유 판정 — 근거를 주면 사람이 읽을 문구로
     _kwrow = {"title": "포스코퓨처엠 양극재 증설", "group_companies": ["포스코퓨처엠"],
               "importance_score": 40}
-    check("항상발송 키워드 매칭 → 키워드 명시",
-          _notify_reason(_kwrow, ["포스코퓨처엠"], 30, 0), "항상발송 키워드 '포스코퓨처엠'")
-    check("무조건 발송 점수 초과",
+    check("무조건 받을 키워드 매칭 → 키워드 명시",
+          _notify_reason(_kwrow, ["포스코퓨처엠"], 30, 0), "무조건 받을 키워드 '포스코퓨처엠'")
+    check("priority 2 → 정책·통상 주제 매칭",
+          _notify_reason({"title": "x", "importance_score": 20, "priority": 2}, [], 60, 0),
+          "정책·통상 주제 키워드 매칭")
+    check("무조건 발송 점수 초과(하위호환)",
           _notify_reason({"title": "x", "importance_score": 66}, [], 30, 65),
           "무조건 발송 점수 66 ≥ 65")
     check("중요도 임계값 초과",
@@ -8715,7 +8730,7 @@ def cmd_selftest() -> int:
     check("키워드가 점수보다 우선 표기",
           _notify_reason({"title": "포스코 파업", "group_companies": ["포스코"],
                           "importance_score": 90}, ["포스코"], 30, 50),
-          "항상발송 키워드 '포스코'")
+          "무조건 받을 키워드 '포스코'")
     check("_kw_first_hit — 첫 매칭 키워드", _kw_first_hit("리튬 니켈 가격", ["코발트", "니켈"]), "니켈")
     check("_kw_first_hit — 없으면 None", _kw_first_hit("철강 수출", ["니켈"]), None)
     # rate limit / flood 헬퍼
@@ -8894,6 +8909,17 @@ def cmd_selftest() -> int:
           _topic_match("산업용 전기요금 인하", ["전기요금"], []), False)
     check("정책: 조건 맞아도 제목에 제외 키워드 → 제외",
           _topic_match("산업용 전기요금 인하 공청회 채용 공고", ["전기요금"], ["산업"], ["채용"]), False)
+    # 주제 매칭이면 일반 임계값을 우회한다 (정책·통상 기사는 포스코 미언급이라 점수가 낮다)
+    def _should_send(score, threshold, priority, topic_hit):
+        return score >= threshold or priority or topic_hit
+    check("정책 주제 매칭 → 점수 낮아도 발송", _should_send(20, 60, False, True), True)
+    check("정책 주제 매칭 안 되고 점수도 낮으면 → 웹에만", _should_send(20, 60, False, False), False)
+    check("주제 무관 기사는 여전히 임계값 필요", _should_send(70, 60, False, False), True)
+    # 야간: 주제 매칭(priority 2)은 야간 우회 안 함 — priority 1만 (체크 시)
+    def _night_ok(score, n_min, prio_val, bypass):
+        return score >= n_min or (prio_val == 1 and bypass)
+    check("야간: 정책 주제(prio 2) → 아침 대기", _night_ok(20, 80, 2, True), False)
+    check("야간: 무조건 받을 키워드(prio 1) + 체크 → 발송", _night_ok(20, 80, 1, True), True)
 
     print("\n[13-2c] 카카오 '나에게 보내기'")
     _blank = {f: "" for f in Config.__dataclass_fields__}
