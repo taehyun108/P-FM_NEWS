@@ -2425,6 +2425,40 @@ _GROUP_ALIASES_LOWER: dict[str, list[str]] = {
 # 4개 계열사가 그대로 잡힌다(계열사명이 0~270자에 등장). detect_categories 가
 # 제목+요약만 보는 것과 같은 이유다.
 GROUP_LEAD_CHARS = 700
+# 700자 고정컷 밖에서도 예외적으로 살리는 문장: '~을 비롯해 A, 포스코이앤씨, B 등이
+# 참여/시공/수주한다' 처럼 참여사를 정식으로 나열하는 문장(실제 사례: 대보건설
+# 신안산선 기사, 본문 835자 중 737번째 '포스코이앤씨' — 700자 컷에 37자 차이로 빠짐).
+#
+# 처음엔 "기사가 짧으면 통째로 본다"로 고쳤다가 회귀를 냈다: '포스코 노사 파업'
+# 기사(1,030자)에서 873번째 인용문 "이제 공은 포스코홀딩스 장인화 회장에게
+# 넘어갔다"의 '포스코홀딩스' 가 detect_group_companies 의 `if not found` 때문에
+# 진짜 주체인 '포스코' 를 밀어냈다 — 원래 700자 컷이 막던 바로 그 실패 모드다.
+# '말미 스치는 언급'(인용문 속 한 번)과 '참여사 정식 disclosure'(쉼표로 3개 이상
+# 나열)는 길이로는 구분이 안 되고 문장 구조로만 구분된다. 그래서 본문을 통째로
+# 보는 대신, 리드 밖 문장 중 이 나열 패턴에 맞는 것만 리드에 '추가'한다(대체가
+# 아니라 합집합이라 원래 주체를 밀어내지 않는다).
+_GROUP_PARTICIPANT_VERBS = ("참여", "시공", "수주", "컨소시엄", "합류", "공급", "시행")
+
+
+def group_lead_text(body: str) -> str:
+    """그룹사 판정용 리드 텍스트 — 기본 리드 + 참여사 나열 문장(리드 밖이어도)."""
+    lead = body[:GROUP_LEAD_CHARS]
+    tail = body[GROUP_LEAD_CHARS:]
+    if not tail:
+        return lead
+    extra: list[str] = []
+    for sentence in re.split(r"(?<=[.\n])\s*", tail):
+        if not sentence or not any(v in sentence for v in _GROUP_PARTICIPANT_VERBS):
+            continue
+        # 회사명이 쉼표·가운뎃점으로 3개 이상 나열돼야 '정식 disclosure' 로 본다.
+        # 인용문 속 회장 이름 같은 단발 언급은 나열 항목이 1~2개뿐이라 걸러진다.
+        if len(re.split(r"[,·]", sentence)) < 3:
+            continue
+        if any(alias in sentence.lower() for aliases in _GROUP_ALIASES_LOWER.values() for alias in aliases):
+            extra.append(sentence)
+    return lead + "\n" + "\n".join(extra) if extra else lead
+
+
 REGROUP_DAYS = 3   # `regroup` 명령이 되돌아볼 기간. 그보다 오래된 카드는 화면에서 밀려난다.
 
 TRADE_CATEGORY = "글로벌 통상환경"
@@ -3797,9 +3831,12 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 기사가 요약하기에 불충분하면 summary 를 ["요약불가"] 로만 채운다
 
 [포스코 관점]
-- perspective: 포스코퓨처엠 사업 관점의 시사점 1~2문장
+- perspective: 이 기사에 등장하는 포스코 그룹 계열사(포스코홀딩스·포스코·포스코퓨처엠·
+  포스코이앤씨·포스코DX·포스코인터내셔널 등) 입장에서의 시사점 1~2문장
+- 포스코퓨처엠이 아닌 다른 계열사 기사여도(예: 포스코이앤씨 수주, 포스코 노사 이슈)
+  그 계열사 관점에서 반드시 작성한다 — 포스코퓨처엠 사업으로 좁혀서 판단하지 않는다
 - "검토할 필요가 있습니다" 수준의 확인 요청 톤으로 쓰고 단정하지 않는다
-- 관련성이 없으면 빈 문자열
+- 어느 계열사와도 관련이 없으면 빈 문자열
 
 [키워드]
 - keywords: 기사 핵심 키워드 최대 6개, 한국어 명사구
@@ -4363,7 +4400,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             done += 1
             continue
 
-        rule_groups = detect_group_companies(f"{art['title']}\n{body[:GROUP_LEAD_CHARS]}")
+        rule_groups = detect_group_companies(f"{art['title']}\n{group_lead_text(body)}")
         probe = f"{art['title']}\n{body}"
         if not (rule_groups or POSCO_MENTION_RE.search(probe)
                 or is_battery_scope(art["title"], body[:1500])
@@ -4814,7 +4851,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
         # 그룹사는 제목+리드까지만 본다 — 본문 말미의 스치는 계열사 언급이
         # 기사 주체를 가로채는 것을 막는다. (GROUP_LEAD_CHARS 주석 참고)
-        rule_groups = detect_group_companies(f"{item.title}\n{body[:GROUP_LEAD_CHARS]}")
+        rule_groups = detect_group_companies(f"{item.title}\n{group_lead_text(body)}")
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
         # 글로벌 통상환경 기사: 제목에 통상 조치명 + 포스코 관련 산업어가 함께 있으면
         # 포스코 미언급이어도 수집한다. (사용자 지정)
@@ -5097,7 +5134,7 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     # 본문 전체를 근거로 삼으면 말미의 스치는 언급까지 통과해 기사 주체가 뒤바뀐다.
     kw_text = " ".join(analysis.keywords)
     mentioned = set(detect_group_companies(
-        f"{row['title']}\n{body[:GROUP_LEAD_CHARS]}\n{analysis.summary_text}\n{kw_text}"))
+        f"{row['title']}\n{group_lead_text(body)}\n{analysis.summary_text}\n{kw_text}"))
     llm_verified = [g for g in analysis.group_companies if g in mentioned]
     # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다.
     kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코"]
@@ -5242,7 +5279,7 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
         storage.append_alias(dup["id"], url_source)
         return _existing_result(dup["id"])
 
-    groups = detect_group_companies(f"{title}\n{body[:GROUP_LEAD_CHARS]}")
+    groups = detect_group_companies(f"{title}\n{group_lead_text(body)}")
     # 카테고리는 제목 기준 임시값. 아래 analyze_and_save 에서 요약으로 다시 계산된다.
     categories = detect_categories(title)
     score_overrides, score_customs = get_score_rules(storage)
@@ -7974,7 +8011,7 @@ def cmd_regroup(ctx: Context) -> None:
             unchecked += 1
             continue  # 원문 확인 불가 — 기존 태그 유지
         probe = "\n".join([
-            r.get("title") or "", body[:GROUP_LEAD_CHARS],
+            r.get("title") or "", group_lead_text(body),
             r.get("summary_text") or "", " ".join(jload(r.get("keywords"), [])),
         ])
         new = normalize_group_list(detect_group_companies(probe))
@@ -8190,6 +8227,47 @@ def cmd_reswot(ctx: Context) -> None:
             log.debug("SWOT 재분석 실패 %s: %s", target, exc)
             failed += 1
     log.info("SWOT 재분석: 성공 %d건 · 실패 %d건", done, failed)
+
+
+def cmd_reperspective(ctx: Context, limit: int = 500) -> None:
+    """계열사 태그는 있는데 '포스코 관점'이 빈 기사를 재분석한다 (일회성).
+
+    2026-09-10 이전 프롬프트는 perspective 를 '포스코퓨처엠 사업 관점'으로만
+    좁혀 물어봤다. 그래서 포스코·포스코이앤씨·홀딩스 등 다른 계열사만 다루고
+    이차전지와 무관한 기사(노사 이슈·아파트 분양 등)는 관점이 통째로 비었다.
+    프롬프트를 '포스코 그룹 전체 관점'으로 넓힌 뒤, 이미 group_companies 가
+    붙어 있는데 관점이 빈 기존 카드를 다시 돌려 채운다.
+    """
+    rows = ctx.storage.list_articles(8000, 0, None, "")
+    targets = [r for r in rows
+               if r.get("analyzed_at") and r.get("summary_source") == "fulltext"
+               and jload(r.get("group_companies"), [])
+               and not (r.get("perspective_text") or "").strip()][:limit]
+    log.info("포스코 관점 재분석 대상 %d건", len(targets))
+    done = failed = 0
+    for r in targets:
+        target = r.get("url_canonical") or r.get("url_original") or ""
+        try:
+            _, html = resolve_canonical(ctx.http, target)
+            body = extract_body(html)
+            if len(body) < 300:
+                failed += 1
+                continue
+            ctx.storage.save_body(r["id"], body, "fulltext")
+            row = {
+                "id": r["id"], "title": r.get("title") or "",
+                "press_id": r.get("press_id"), "press_name": r.get("press_name") or "",
+                "importance_score": r.get("importance_score") or 0,
+                "group_companies": jload(r.get("group_companies"), []),
+            }
+            if analyze_and_save(ctx, r["id"], row, body, "fulltext") is not None:
+                done += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            log.debug("포스코 관점 재분석 실패 %s: %s", target, exc)
+            failed += 1
+    log.info("포스코 관점 재분석: 성공 %d건 · 실패 %d건", done, failed)
 
 
 def cmd_fixdates(ctx: Context) -> None:
@@ -8448,6 +8526,28 @@ def cmd_selftest() -> int:
     check("계열사 나열 기사는 리드에서 전부 잡힘",
           sorted(detect_group_companies(_hire[:GROUP_LEAD_CHARS])),
           sorted(["포스코홀딩스", "포스코DX", "포스코인터내셔널", "포스코이앤씨"]))
+
+    # 실제 오탐 사례(2026-09-10 ①): 대보건설 신안산선 기사, 본문 835자 중 737번째
+    # 참여사 나열 문장('포스코이앤씨' 등)이 700자 리드 컷에 37자 차이로 빠졌다.
+    # 회사명이 쉼표로 3개 이상 나열된 '정식 disclosure' 문장은 리드 밖이어도 살린다.
+    _list_body = ("ㅁ" * 730 + " 공사에는 대보건설을 비롯해 포스코이앤씨, 롯데건설, 서희건설 등이 참여하고 있다.")
+    check("본문 리드컷 밖 — 700자 컷만이면 빠짐(회귀 재현)",
+          "포스코이앤씨" in detect_group_companies(_list_body[:GROUP_LEAD_CHARS]), False)
+    check("group_lead_text — 참여사 3개 이상 나열 문장은 리드 밖이어도 살아남음",
+          "포스코이앤씨" in detect_group_companies(group_lead_text(_list_body)), True)
+
+    # 실제 오탐 사례(2026-09-10 ②, 위 ①의 1차 수정이 냈던 회귀): '포스코 노사 파업'
+    # 기사(본문 1,030자)의 873번째 인용문 "이제 공은 포스코홀딩스 장인화 회장에게
+    # 넘어갔다"— 단발 언급(나열 아님)이라 detect_group_companies 의 `if not found` 로
+    # 주체 '포스코' 가 밀려났다. '기사가 짧으면 통째로 본다'로 고쳤다가 이 사례가
+    # 다시 터졌다 — 그래서 나열 패턴(쉼표 3개 이상)만 골라 살리는 방식으로 바꿨다.
+    _quote_body = ("포스코 노사가 임금협상 이견을 좁히지 못했다. " + "ㅁ" * 800
+                  + " 노조 위원장은 이제 공은 포스코홀딩스 장인화 회장에게 넘어갔다고 말했다.")
+    check("group_lead_text — 인용문 속 단발 언급은 안 살아남음(회귀 방지)",
+          detect_group_companies(group_lead_text(_quote_body)), ["포스코"])
+    check("group_lead_text — 긴 기사(원래 사례)는 여전히 700자로 잘라 주체 유지",
+          detect_group_companies(group_lead_text(_lead + "\n" + _tail)), ["포스코"])
+
     check("카테고리에 '그룹사' 없음", "그룹사" in detect_categories("포스코퓨처엠 양극재 증설"), False)
     check("병합 시 상위 개념 제거",
           normalize_group_list(["포스코홀딩스", "포스코", "포스코퓨처엠"]),
@@ -9563,6 +9663,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
+  reperspective [N]  계열사 태그는 있는데 포스코 관점이 빈 기사를 재분석 (일회성, 기본 500건)
   repeople [N|all]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (구조화 안 된 것만, all 이면 전부)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
@@ -9615,6 +9716,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_reanalyze(ctx)
     elif command == "reswot":
         cmd_reswot(ctx)
+    elif command == "reperspective":
+        _lim = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 500
+        cmd_reperspective(ctx, _lim)
     elif command == "repeople":
         rest = argv[2:]
         force = "all" in rest
