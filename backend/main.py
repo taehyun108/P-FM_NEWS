@@ -2426,6 +2426,10 @@ TRADE_MEASURE_KW = [
     # 유럽
     "CBAM", "탄소국경조정", "탄소국경세", "핵심원자재법", "CRMA", "역외보조금 규정",
     "EU 배터리규정", "공급망실사지침", "CSDDD",
+    # 유럽 — 산업·탈탄소 입법 (2025~2026). 조치명이 명시적이라 오탐 낮다.
+    "산업가속화법", "산업 가속화법", "탄소중립산업법", "넷제로산업법", "NZIA",
+    "청정산업딜", "클린산업딜", "그린딜 산업계획", "외국보조금규정", "외국보조금 규정",
+    "역내산 요건", "역내 조달 요건", "저탄소 제품 기준", "저탄소 조달",
     # 중국
     "흑연 수출통제", "갈륨 수출", "게르마늄 수출", "안티모니 수출", "희토류 수출통제",
     "요소 수출제한", "반도체 장비 수출통제", "수출허가 대상",
@@ -2831,6 +2835,10 @@ BATTERY_SCOPE_KW = [
     "BTR", "베이터루이", "샨샨", "샨산", "룽바이", "롱바이", "CNGR", "중웨이",
     "화유코발트", "당성과기", "스미토모금속광산", "니치아",
     "LG화학 양극재", "LG화학 첨단소재",
+    # 국내 배터리 생태계 (셀·소재·부품·리사이클) — 제목에 '배터리'가 없어도 이 회사명이면 관련 기사다.
+    # 지명과 겹치는 짧은 이름(금양·천보)은 여기 두지 않고 BATTERY_COMPANY_KW + 가드로만 본다.
+    "에코프로비엠", "에코프로머티리얼즈", "성일하이텍", "새빗켐", "탑머티리얼",
+    "SK아이이테크놀로지", "더블유씨피", "동화일렉트로라이트", "엔켐", "솔루스첨단소재",
     # 전기차 수요
     "전기차 판매", "전기차 수요", "전기차 보조금", "전기차 캐즘", "EV 수요", "전기차 시장",
     # ESS (에너지저장)
@@ -2844,8 +2852,49 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
     """포스코퓨처엠 전·후방(소재·셀·전기차·ESS·원료) 기사인가.
 
     이 범위면 포스코 미언급이어도 수집한다 — 전방 수요·경쟁 동향이 사업에 직결된다.
+    지명과 겹치는 짧은 회사명은 battery_company_hit 이 가드와 함께 판정한다.
     """
-    return _kw_hit_any(f"{title}\n{extra}", BATTERY_SCOPE_KW)
+    probe = f"{title}\n{extra}"
+    return _kw_hit_any(probe, BATTERY_SCOPE_KW) or battery_company_hit(probe)
+
+
+# 배터리 생태계 '회사명'만 추린 고정밀 신호.
+# 일반어('배터리'·'전기차')와 달리 회사명은 검색 블러브에 우연히 끼어들지 않으므로,
+# 제목이 아닌 **리드(스니펫)** 에서 발견돼도 관련 기사로 인정한다.
+#   실제 누락 사례: "금양, 기장공장을 데이터센터로 물적분할 추진…상폐 돌파구"
+#   — 제목에 '배터리'가 없어 제목 전용 필터에서 통째로 버려졌다(본문은 배터리 사업 얘기).
+BATTERY_COMPANY_KW = [
+    "LG에너지솔루션", "삼성SDI", "SK온", "CATL", "BYD", "파나소닉",
+    "에코프로", "에코프로비엠", "에코프로머티리얼즈", "엘앤에프", "코스모신소재",
+    "대주전자재료", "나노신소재", "한솔케미칼", "금양", "성일하이텍", "새빗켐",
+    "탑머티리얼", "SK아이이테크놀로지", "더블유씨피", "천보", "동화일렉트로라이트",
+    "엔켐", "솔루스첨단소재",
+    "BTR", "베이터루이", "샨샨", "룽바이", "CNGR", "중웨이", "화유코발트", "당성과기",
+]
+
+# 짧은 회사명은 지명·학교명과 글자가 겹친다. 그 형태로만 나오면 회사 언급이 아니다.
+#   예: '부산 기장군 금양읍 도시계획' → '금양'(배터리 셀 업체)이 아니다.
+BATTERY_COMPANY_FALSE_HINTS: dict[str, list[str]] = {
+    "금양": ["금양읍", "금양면", "금양리", "금양동", "금양초", "금양중", "금양고", "금양역"],
+    "천보": ["천보산", "천보사", "천보루"],
+}
+
+
+def battery_company_hit(text: str) -> bool:
+    """배터리 생태계 회사명이 실제로 언급됐는가 (지명·학교명 오탐 제외)."""
+    t = text or ""
+    for kw in BATTERY_COMPANY_KW:
+        if kw not in t:
+            continue
+        hints = BATTERY_COMPANY_FALSE_HINTS.get(kw)
+        if hints:
+            stripped = t
+            for h in hints:
+                stripped = stripped.replace(h, "")
+            if kw not in stripped:
+                continue   # 지명·기관명 형태로만 나왔다 — 회사 언급 아님
+        return True
+    return False
 
 
 # ── 인사·부고 (포스코 관점 없이 공지 원문만 요약) ───────────────────────
@@ -3034,22 +3083,33 @@ _NAVER_TRADE_TITLE_KW = ["관세", "반덤핑", "상계관세", "세이프가드
                          "무역장벽", "무역분쟁", "무역전쟁", "통상", "FTA", "덤핑", "무역확장법"]
 
 
-def _naver_item_relevant(title: str, category: str, keyword: str = "") -> bool:
-    """네이버가 느슨하게 매칭한 무관 기사를 거른다. **제목** 기준으로만 판정한다.
+def _naver_item_relevant(title: str, category: str, keyword: str = "",
+                         snippet: str = "") -> bool:
+    """네이버가 느슨하게 매칭한 무관 기사를 거른다.
 
     네이버 description 은 검색어를 그대로 되풀이하는 블러브(기사 요약 아님)라
-    본문·요약으로는 걸러지지 않는다. 그래서 관련성 신호가 **제목**에 있어야 통과시킨다.
-    이 필터가 없으면 "니켈" 검색의 원자재 시황, "국정감사" 검색의 정치 기사,
-    "SK온" 검색의 SK 시황이 배터리·포스코 태그를 달고 대거 유입된다.
+    **일반어**('배터리'·'통상' 등)로는 걸러지지 않는다. 그래서 느슨한 신호는
+    **제목**에 있어야 통과시킨다. 이 필터가 없으면 "니켈" 검색의 원자재 시황,
+    "국정감사" 검색의 정치 기사가 배터리·포스코 태그를 달고 대거 유입된다.
 
-    · 포스코·계열사가 제목에 있으면 카테고리 불문 통과
-    · '그룹사' 검색은 포스코가 제목에 없으면 탈락
+    다만 **회사명·명시적 조치명**은 블러브에 우연히 끼어들지 않는 고정밀 신호라
+    제목이 아닌 **리드(스니펫)** 에서 발견돼도 인정한다 — 제목이 사업을 안 드러내는
+    기사('금양, 기장공장을 데이터센터로…')가 통째로 버려지던 문제를 막는다.
+
+    · 포스코·계열사·배터리 회사명·통상 조치명이 제목/리드에 있으면 통과 (고정밀)
+    · '그룹사' 검색은 포스코가 없으면 탈락
     · 검색어가 제목에 그대로 들어 있으면 통과(정밀 매칭)
-    · 그 밖에는 카테고리별 신호(배터리 생태계 / 정책어 / 통상 조치어)가 제목에 있어야 통과
+    · 그 밖에는 카테고리별 느슨한 신호가 **제목**에 있어야 통과
     """
     t = title or ""
-    if POSCO_MENTION_RE.search(t) or detect_group_companies(t):
+    lead = f"{t}\n{snippet or ''}"
+    # ── 고정밀 신호: 제목이 아니라 리드에 있어도 인정 ──────────────────
+    if POSCO_MENTION_RE.search(lead) or detect_group_companies(lead):
         return True
+    if category != "그룹사" and (battery_company_hit(lead)
+                                 or _kw_hit_any(lead, TRADE_MEASURE_KW)):
+        return True
+    # ── 느슨한 신호: 제목에만 있어야 인정 ──────────────────────────────
     if category == "그룹사":
         return False
     if keyword and keyword in t:
@@ -3114,7 +3174,7 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
                 continue
             title = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("title", ""))).strip()
             snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("description", ""))).strip()
-            if not _naver_item_relevant(title, category, keyword):
+            if not _naver_item_relevant(title, category, keyword, snippet):
                 dropped += 1
                 continue
             published = parse_feed_datetime(entry.get("pubDate"))
@@ -4078,14 +4138,17 @@ def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
     """본문 없이 관련성을 저비용 판정한다. (keep, groups) 반환.
 
     스니펫(특히 네이버 description)은 검색어를 되풀이하는 블러브라 신뢰도가 낮다.
-    그래서 배터리·통상 신호는 **제목**에서만 인정하고, 그룹사·포스코 언급은
-    스니펫도 함께 본다(회사명은 블러브에 우연히 나오기 어렵다). 최종 관련성은
-    _drain_deferred 가 본문으로 다시 판정하므로 여기서 조금 놓쳐도 복구된다."""
+    그래서 배터리·통상 **일반어**는 제목에서만 인정하고, 그룹사·포스코 언급과
+    **회사명·명시적 조치명**은 스니펫도 함께 본다(고정밀 신호는 블러브에 우연히
+    나오기 어렵다). 최종 관련성은 _drain_deferred 가 본문으로 다시 판정하므로
+    여기서 조금 놓쳐도 복구된다."""
     probe = f"{title}\n{snippet or ''}"
     groups = normalize_group_list(detect_group_companies(probe))
     keep = bool(
         groups
         or POSCO_MENTION_RE.search(probe)
+        or battery_company_hit(probe)                 # 회사명은 리드에 있어도 인정
+        or _kw_hit_any(probe, TRADE_MEASURE_KW)       # 조치명도 마찬가지
         or is_battery_scope(title, "")
         or is_trade_topic(title, "")
         or people_news_kind("", title)
@@ -4636,7 +4699,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
         # 글로벌 통상환경 기사: 제목에 통상 조치명 + 포스코 관련 산업어가 함께 있으면
         # 포스코 미언급이어도 수집한다. (사용자 지정)
-        is_trade = is_trade_topic(item.title, item.snippet or "")
+        # 조치명은 여전히 **제목**에서만 인정하되(is_trade_topic 내부), 산업어는 본문까지 본다 —
+        # "산업장관, EU 산업가속화법 우려 전달" 처럼 조치명만 제목에 있고 철강·배터리는
+        # 본문에서 설명되는 기사가 통째로 버려지던 문제를 막는다.
+        is_trade = is_trade_topic(item.title, f"{item.snippet or ''}\n{body[:1500]}")
         if is_policy:
             # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집.
             if not matches_keywords(relevance_probe, POLICY_RELEVANCE_KW):
@@ -8422,6 +8488,28 @@ def cmd_selftest() -> int:
           _naver_item_relevant("K-배터리 소재 국산화 시동…정부 2조 투입", "산업", "양극재"), True)
     check("포스코가 제목에 있으면 카테고리 불문 통과",
           _naver_item_relevant("포스코홀딩스 주가 강세", "통상", "관세"), True)
+    # 고정밀 신호(회사명·조치명)는 제목이 아니라 리드(스니펫)에 있어도 인정한다.
+    #   실제 누락 사례: 제목이 사업을 안 드러내는 기사가 통째로 버려졌다.
+    _t모호 = "기장공장 부지 활용 방안 이사회 의결…상폐 돌파구"
+    check("제목·리드 모두 신호 없으면 탈락",
+          _naver_item_relevant(_t모호, "산업", ""), False)
+    check("리드에 배터리 회사명 있으면 통과",
+          _naver_item_relevant(_t모호, "산업", "", "금양이 배터리 사업 부진으로 상장폐지 기로에"), True)
+    check("제목에 배터리 회사명이 있으면 리드 없이도 통과",
+          _naver_item_relevant("금양, 기장공장을 데이터센터로 물적분할 추진", "산업", ""), True)
+    check("리드에 통상 조치명 있으면 통과",
+          _naver_item_relevant("산업장관, 통상현안 간담회", "통상", "",
+                               "EU 산업가속화법의 역내산 요건을 논의했다"), True)
+    check("리드가 있어도 '그룹사' 검색은 포스코 없으면 탈락",
+          _naver_item_relevant("금양 신공장", "그룹사", "", "금양이 배터리 공장을"), False)
+    # 짧은 회사명의 지명·학교명 오탐 가드
+    check("battery_company_hit — 회사 언급", battery_company_hit("금양이 배터리 신공장을 짓는다"), True)
+    check("battery_company_hit — 지명만이면 아님", battery_company_hit("금양읍 도시계획 변경 고시"), False)
+    check("battery_company_hit — 지명+회사 함께면 인정",
+          battery_company_hit("금양읍에 금양이 공장을 짓는다"), True)
+    check("battery_company_hit — 천보산은 회사 아님", battery_company_hit("천보산 등산로 정비"), False)
+    check("지명 오탐은 본문 게이트도 통과 못 함",
+          is_battery_scope("부산 기장군 금양읍 도시계획", "기장군은 금양읍 일대를"), False)
 
     print("\n[8-2b] 정책브리핑(korea.kr) 수집")
     check("정책브리핑 URL 판정",
@@ -8457,6 +8545,14 @@ def cmd_selftest() -> int:
           is_trade_topic("종합상사 부활…공급망 재편 수혜"), False)
     check("조치명만 있고 산업어 없으면 아님", is_trade_topic("美, 對中 반도체 301조 관세"), False)
     check("산업어만 있고 조치명 없으면 아님", is_trade_topic("포스코 철강 신제품 출시"), False)
+    # EU 산업·탈탄소 입법 (2026 누락 사례) — 조치명은 제목, 산업어는 본문에 있어도 인정
+    check("EU 산업가속화법 + 본문 철강 → 통상환경",
+          is_trade_topic("산업장관, EU 산업가속화법 우려 전달",
+                         "역내산 요건과 저탄소 기준이 한국 철강·배터리 기업에"), True)
+    check("탄소중립산업법도 조치명으로 인정",
+          is_trade_topic("EU 탄소중립산업법 시행", "배터리 업계 대응 분주"), True)
+    check("조치명이 본문에만 있으면 여전히 아님",
+          is_trade_topic("정부, 통상 현안 점검회의", "EU 산업가속화법과 철강 영향을 논의"), False)
     check("통상환경 카테고리 태그로 판정",
           is_trade_article({"categories": ["글로벌 통상환경"]}), True)
     check("detect_categories: 제목에 조치명 있을 때만 태깅",
