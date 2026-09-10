@@ -74,8 +74,18 @@
         </label>
 
         <div class="score-box" id="scoreBox">
-          <div class="score-box-head">중요도 점수는 이렇게 매겨집니다 <span>제목·본문·언론사를 규칙으로 채점 → 0~100</span></div>
-          <ul class="score-rules" id="scoreRules"><li>불러오는 중…</li></ul>
+          <div class="score-box-head">중요도 점수는 이렇게 매겨집니다 <span>제목·본문·언론사를 규칙으로 채점 → 0~100. 점수·사용여부를 고칠 수 있습니다.</span></div>
+          <ul class="score-rules score-rules--edit" id="scoreRules"><li>불러오는 중…</li></ul>
+
+          <div class="kw-label">내가 추가한 항목 <span>제목(또는 제목+본문)에 키워드가 있으면 점수를 더하거나 뺍니다</span></div>
+          <ul class="score-custom-list" id="scoreCustomList"></ul>
+          <button type="button" class="score-add-btn" id="scoreCustomAdd">+ 항목 추가</button>
+
+          <div class="score-save-row">
+            <button type="button" class="url-add-btn" id="scoreSaveBtn">중요도 규칙 저장</button>
+            <span id="scoreSaveMsg"></span>
+          </div>
+
           <p class="score-eg" id="scoreEg"></p>
           <p class="score-note" id="scoreNight"></p>
         </div>

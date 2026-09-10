@@ -843,6 +843,8 @@ class SqliteStorage(Storage):
             "alter table run_state add column always_kw_bypass_night INTEGER not null default 1",
             "alter table run_state add column policy_exclude_keywords TEXT default '[]'",
             "alter table run_state add column trade_exclude_keywords TEXT default '[]'",
+            "alter table run_state add column score_overrides TEXT default '{}'",
+            "alter table run_state add column score_custom_rules TEXT default '[]'",
         ]
         for sql in migrations:
             try:
@@ -2517,6 +2519,39 @@ SCORE_TRADE = 15           # 글로벌 통상환경 신호
 SCORE_POLICY = 20
 SCORE_MAJOR_PRESS = 10
 SCORE_MARKET_PENALTY = -15
+
+# 기본 중요도 항목 — 마스터 패널이 점수·사용여부를 그대로 편집한다(단일 출처).
+# 판정 로직(is_battery_scope 등)은 코드에 있어 항목 자체를 지울 순 없지만,
+# enabled=false 로 두면 점수 기여가 0이 되어 사실상 삭제와 같은 효과를 낸다.
+SCORE_RULE_DEFS: dict[str, tuple[int, str]] = {
+    "futurem_title": (SCORE_FUTUREM_TITLE, "포스코퓨처엠이 제목에"),
+    "futurem_body": (SCORE_FUTUREM_BODY, "포스코퓨처엠이 본문에만"),
+    "group": (SCORE_GROUP, "다른 계열사(홀딩스·DX·인터내셔널·이앤씨 등)"),
+    "battery_title": (SCORE_BATTERY_TITLE, "배터리 생태계(소재·셀·전기차·ESS·원료)가 제목에"),
+    "battery_body": (SCORE_BATTERY_BODY, "배터리 생태계가 본문에만"),
+    "trade": (SCORE_TRADE, "해외 통상 조치(IRA·CBAM·반덤핑 등) 신호"),
+    "policy": (SCORE_POLICY, "정책 키워드(전기요금·배출권·특화단지 등)"),
+    "major_press": (SCORE_MAJOR_PRESS, "주요 언론사(연합·전자신문·머니투데이 등)"),
+    "market_penalty": (SCORE_MARKET_PENALTY, "단순 시황·주가 기사(목표주가·코스피·투자의견)"),
+}
+SCORE_CUSTOM_MAX = 30       # 사용자 추가 항목 상한
+SCORE_RULES_CACHE_SEC = 20  # run_state 재조회 간격 — 기사마다 DB 를 다시 묻지 않는다
+
+_score_rules_cache: dict[str, Any] = {"at": 0.0, "overrides": {}, "customs": []}
+
+
+def get_score_rules(storage: "Storage") -> tuple[dict[str, dict], list[dict]]:
+    """마스터 패널에서 고친 중요도 규칙(기본 항목 재정의 + 사용자 추가 항목).
+
+    호출마다 DB 를 묻지 않도록 짧게 캐시한다(파이프라인 한 회차 안에서 기사마다
+    다시 조회하면 Supabase 왕복이 기사 수만큼 늘어난다)."""
+    now = time.monotonic()
+    if now - _score_rules_cache["at"] > SCORE_RULES_CACHE_SEC:
+        state = storage.get_run_state()
+        _score_rules_cache["overrides"] = jload(state.get("score_overrides"), {}) or {}
+        _score_rules_cache["customs"] = jload(state.get("score_custom_rules"), []) or []
+        _score_rules_cache["at"] = now
+    return _score_rules_cache["overrides"], _score_rules_cache["customs"]
 SCORE_PEOPLE_NEWS = 12     # 인사·부고 — 웹 전용(임계값 미만), 알림 안 나감
 
 POLICY_KEYWORDS = ["정책", "규제", "법안", "수사", "사고", "화재", "제재", "과징금",
@@ -3674,38 +3709,70 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     return dedupe_chips(found)
 
 
-def score_article(title: str, body: str, group_companies: Sequence[str], press_tier: int) -> int:
-    """중요도 0~100. (PRD F3.2)"""
+def score_article(title: str, body: str, group_companies: Sequence[str], press_tier: int,
+                  overrides: dict[str, dict] | None = None,
+                  custom_rules: Sequence[dict] | None = None) -> int:
+    """중요도 0~100. (PRD F3.2)
+
+    overrides: 마스터 패널에서 고친 기본 항목 {키: {"points": int, "enabled": bool}}.
+    custom_rules: 마스터 패널에서 추가한 키워드 기반 항목
+                  [{"keywords": [...], "scope": "title"|"title_or_body", "points": int}, ...].
+    둘 다 없으면(선택 인자) 기존 하드코딩 상수 그대로 동작한다."""
     title_l = (title or "").lower()
     full_l = f"{title} {body}".lower()
     score = 0
 
+    def pts(key: str) -> int:
+        default, _label = SCORE_RULE_DEFS[key]
+        rule = (overrides or {}).get(key)
+        if not rule:
+            return default
+        if rule.get("enabled") is False:
+            return 0
+        try:
+            return int(rule.get("points", default))
+        except (TypeError, ValueError):
+            return default
+
     futurem = _GROUP_ALIASES_LOWER["포스코퓨처엠"]
     if any(a in title_l for a in futurem):
-        score += SCORE_FUTUREM_TITLE
+        score += pts("futurem_title")
     elif any(a in full_l for a in futurem):
-        score += SCORE_FUTUREM_BODY
+        score += pts("futurem_body")
 
     if any(g != "포스코퓨처엠" for g in group_companies):
-        score += SCORE_GROUP
+        score += pts("group")
 
     # 배터리 생태계 기사(포스코 미언급 허용 대상)는 그룹사 언급이 없어도
     # 전방 수요·경쟁 동향이라 최소 중요도를 준다. 예전엔 0점이라 큐에서 굶었다.
     if is_battery_scope(title_l, ""):
-        score += SCORE_BATTERY_TITLE
+        score += pts("battery_title")
     elif is_battery_scope("", body[:1500]):
-        score += SCORE_BATTERY_BODY
+        score += pts("battery_body")
     if is_trade_topic(title):
-        score += SCORE_TRADE
+        score += pts("trade")
 
     if any(w in full_l for w in _POLICY_KEYWORDS_LOWER):
-        score += SCORE_POLICY
+        score += pts("policy")
     if press_tier <= 1:
-        score += SCORE_MAJOR_PRESS
+        score += pts("major_press")
 
     # 단순 시황·주가 기사는 알림 피로를 유발하므로 감점한다.
     if any(w in title_l for w in _MARKET_ONLY_KEYWORDS_LOWER):
-        score += SCORE_MARKET_PENALTY
+        score += pts("market_penalty")
+
+    # 사용자가 마스터 패널에서 추가한 키워드 항목 — 제목(또는 제목+본문)에
+    # 키워드 중 하나라도 있으면 점수를 더하거나(양수) 뺀다(음수).
+    for rule in (custom_rules or []):
+        kws = [str(k).lower() for k in (rule.get("keywords") or []) if str(k).strip()]
+        if not kws:
+            continue
+        hay = title_l if rule.get("scope") == "title" else full_l
+        if any(k in hay for k in kws):
+            try:
+                score += int(rule.get("points") or 0)
+            except (TypeError, ValueError):
+                pass
 
     return int(clamp(score, 0, 100))
 
@@ -4205,6 +4272,7 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
     """
     storage = ctx.storage
     known = {c.get("url_canonical") or c.get("url_source") for c in dedup_candidates}
+    score_overrides, score_customs = get_score_rules(storage)
     saved = 0
     for item, is_backfill in overflow[:DEFER_PER_RUN]:
         if item.url_source in known or item.url_original in known:
@@ -4224,7 +4292,8 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
             "source_type": item.source_type, "thumbnail_url": "",
             "content_hash": "", "dedup_group_id": aid, "is_representative": True,
             "is_backfill": is_backfill,
-            "importance_score": SCORE_PEOPLE_NEWS if pk else score_article(item.title, "", groups, 3),
+            "importance_score": SCORE_PEOPLE_NEWS if pk else score_article(
+                item.title, "", groups, 3, score_overrides, score_customs),
             "sentiment": None, "keywords": [], "group_companies": groups,
             "categories": cats,
             "title_embedding": None, "analyzed_at": None, "status": "active",
@@ -4251,6 +4320,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
     people_llm = 이 드레인에서 인사·부고 구조화에 쓸 수 있는 LLM 호출 수.
     """
     storage, http = ctx.storage, ctx.http
+    score_overrides, score_customs = get_score_rules(storage)
     done = 0
     pending = storage.deferred_articles(limit)
     # 본문 확보는 신규 수집과 동일하게 병렬로 받는다. 순차로 받으면 느린 언론사 한 곳이
@@ -4318,10 +4388,12 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             "press_id": press_id, "press_name": press_name,
             "author": extract_author(html, body, press_name),
             "content_hash": content_hash, "thumbnail_url": extract_thumbnail(html),
-            "importance_score": score_article(art["title"], body, rule_groups, press_tier),
+            "importance_score": score_article(art["title"], body, rule_groups, press_tier,
+                                              score_overrides, score_customs),
         })
         row = {"id": aid, "title": art["title"], "press_id": press_id, "press_name": press_name,
-               "importance_score": score_article(art["title"], body, rule_groups, press_tier),
+               "importance_score": score_article(art["title"], body, rule_groups, press_tier,
+                                                 score_overrides, score_customs),
                "group_companies": rule_groups}
         if analyze_and_save(ctx, aid, row, body, "fulltext") is not None:
             done += 1
@@ -4521,6 +4593,13 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         log.warning("활성 키워드가 없습니다. `python backend/main.py initdb` 를 먼저 실행하세요.")
         return {"fetched": 0, "new": 0}
 
+    # 마스터 패널에서 고친 중요도 규칙 — state 를 이미 읽었으니 여기서 같이 반영한다
+    # (get_score_rules 캐시도 이걸로 갱신돼 이후 _defer_overflow/_drain_deferred 호출에서
+    # 같은 회차 안엔 재조회하지 않는다).
+    score_overrides = jload(state.get("score_overrides"), {}) or {}
+    score_customs = jload(state.get("score_custom_rules"), []) or []
+    _score_rules_cache.update(overrides=score_overrides, customs=score_customs, at=time.monotonic())
+
     feeds = storage.enabled_feeds()
     feed_types = {f["source_type"] for f in feeds}
 
@@ -4630,7 +4709,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
 
     # 중요도 순 + 그룹사 균형. 중요도만 쓰면 포스코퓨처엠(제목 +50)이 큐를 독점해
     # 포스코DX·이앤씨 기사가 매 회차 뒤로 밀린다. 그룹사별로 번갈아 뽑는다. (PRD F4.6)
-    fresh.sort(key=lambda pair: score_article(pair[0].title, pair[0].snippet, [], 3), reverse=True)
+    fresh.sort(key=lambda pair: score_article(pair[0].title, pair[0].snippet, [], 3,
+                                              score_overrides, score_customs), reverse=True)
     overflow: list[tuple[RawItem, bool]] = []
     if fresh_available > process_cap:
         picked = interleave_by_group(fresh, process_cap)
@@ -4763,7 +4843,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             categories = ["정부/정책"] + categories
         if is_trade and "글로벌 통상환경" not in categories:
             categories = ["글로벌 통상환경"] + categories
-        score = score_article(item.title, body, rule_groups, press_tier)
+        score = score_article(item.title, body, rule_groups, press_tier, score_overrides, score_customs)
 
         article_id = new_id()
         row = {
@@ -5024,7 +5104,9 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     groups = normalize_group_list(rule_groups + llm_verified + kw_groups)
     # 그룹사로 표기된 값은 키워드에서 제외한다 — 칩 중복의 근본 원인이다.
     keywords = dedupe_chips(analysis.keywords, exclude=groups)[:6]
-    score = score_article(row["title"], body, groups, 3 if not row.get("press_id") else 1)
+    score_overrides, score_customs = get_score_rules(ctx.storage)
+    score = score_article(row["title"], body, groups, 3 if not row.get("press_id") else 1,
+                          score_overrides, score_customs)
     score = max(int(row.get("importance_score") or 0), score)
 
     # 카테고리는 제목 + 요약 + LLM 키워드로 다시 계산한다(수집 때는 스니펫만 봤다).
@@ -5163,7 +5245,8 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     groups = detect_group_companies(f"{title}\n{body[:GROUP_LEAD_CHARS]}")
     # 카테고리는 제목 기준 임시값. 아래 analyze_and_save 에서 요약으로 다시 계산된다.
     categories = detect_categories(title)
-    score = score_article(title, body, groups, press_tier)
+    score_overrides, score_customs = get_score_rules(storage)
+    score = score_article(title, body, groups, press_tier, score_overrides, score_customs)
 
     article_id = new_id()
     row = {
@@ -7347,6 +7430,7 @@ def create_app(ctx: Context):
             return err
         st = ctx.storage.get_run_state()
         n_start, n_end, n_min = effective_night(ctx, st)
+        _overrides = jload(st.get("score_overrides"), {}) or {}
         return JSONResponse({
             "ok": True,
             "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
@@ -7372,21 +7456,22 @@ def create_app(ctx: Context):
             "weekly_to": weekly_recipients(ctx),
             "weekly_env_to": list(ctx.cfg.weekly_to),
             "weekly_smtp_ready": ctx.cfg.smtp_configured,
-            # 중요도 점수 산정 규칙 — 마스터 패널에 그대로 표시한다(단일 출처).
+            # 중요도 점수 산정 규칙 — 마스터 패널에서 그대로 편집한다(단일 출처).
+            # items: 기본 항목(코드 로직에 묶여 있어 점수 수정·사용안함만 가능).
+            # custom_items: 사용자가 추가한 키워드 기반 항목(추가·수정·완전 삭제 가능).
             "score_rules": {
                 "night": {"start": n_start, "end": n_end, "min_score": n_min,
                           "tz": f"UTC{ctx.cfg.tz_offset_hours:+d}"},
                 "items": [
-                    {"label": "포스코퓨처엠이 제목에", "points": SCORE_FUTUREM_TITLE},
-                    {"label": "포스코퓨처엠이 본문에만", "points": SCORE_FUTUREM_BODY},
-                    {"label": "다른 계열사(홀딩스·DX·인터내셔널·이앤씨 등)", "points": SCORE_GROUP},
-                    {"label": "배터리 생태계(소재·셀·전기차·ESS·원료)가 제목에", "points": SCORE_BATTERY_TITLE},
-                    {"label": "배터리 생태계가 본문에만", "points": SCORE_BATTERY_BODY},
-                    {"label": "해외 통상 조치(IRA·CBAM·반덤핑 등) 신호", "points": SCORE_TRADE},
-                    {"label": "정책 키워드(전기요금·배출권·특화단지 등)", "points": SCORE_POLICY},
-                    {"label": "주요 언론사(연합·전자신문·머니투데이 등)", "points": SCORE_MAJOR_PRESS},
-                    {"label": "단순 시황·주가 기사(목표주가·코스피·투자의견)", "points": SCORE_MARKET_PENALTY},
+                    {"key": key, "label": label,
+                     "points": int(_overrides.get(key, {}).get("points", default))
+                               if isinstance(_overrides.get(key), dict) else default,
+                     "enabled": _overrides.get(key, {}).get("enabled", True)
+                                if isinstance(_overrides.get(key), dict) else True}
+                    for key, (default, label) in SCORE_RULE_DEFS.items()
                 ],
+                "custom_items": jload(st.get("score_custom_rules"), []) or [],
+                "custom_max": SCORE_CUSTOM_MAX,
             },
         })
 
@@ -7449,9 +7534,57 @@ def create_app(ctx: Context):
                                         status_code=400)
                 emails.append(e)
             patch["weekly_report_to"] = jdump(emails[:30])
+        # 중요도 기본 항목 — 점수 수정·사용안함 토글만 가능(판정 로직은 코드에 있다).
+        if "score_items" in (payload or {}):
+            raw = payload["score_items"]
+            if not isinstance(raw, list):
+                return JSONResponse({"ok": False, "error": "중요도 항목은 목록이어야 합니다."},
+                                    status_code=400)
+            overrides = jload(ctx.storage.get_run_state().get("score_overrides"), {}) or {}
+            for it in raw:
+                key = str((it or {}).get("key") or "")
+                if key not in SCORE_RULE_DEFS:
+                    return JSONResponse({"ok": False, "error": f"알 수 없는 중요도 항목: {key}"},
+                                        status_code=400)
+                try:
+                    points = int(clamp(int(it.get("points")), -100, 100))
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": f"{key} 점수는 -100~100 숫자여야 합니다."},
+                                        status_code=400)
+                overrides[key] = {"points": points, "enabled": bool(it.get("enabled", True))}
+            patch["score_overrides"] = jdump(overrides)
+        # 중요도 사용자 추가 항목 — 목록 전체를 통째로 교체한다(추가·수정·삭제 모두 이 형태).
+        if "score_custom_items" in (payload or {}):
+            raw = payload["score_custom_items"]
+            if not isinstance(raw, list):
+                return JSONResponse({"ok": False, "error": "추가 항목은 목록이어야 합니다."},
+                                    status_code=400)
+            if len(raw) > SCORE_CUSTOM_MAX:
+                return JSONResponse(
+                    {"ok": False, "error": f"추가 항목은 최대 {SCORE_CUSTOM_MAX}개까지입니다."},
+                    status_code=400)
+            customs: list[dict] = []
+            for it in raw:
+                label = str((it or {}).get("label") or "").strip()[:60]
+                kws = dedupe_chips([str(k).strip() for k in (it.get("keywords") or []) if str(k).strip()])[:10]
+                if not label or not kws:
+                    return JSONResponse(
+                        {"ok": False, "error": "추가 항목은 이름과 키워드가 최소 1개 필요합니다."},
+                        status_code=400)
+                scope = it.get("scope") if it.get("scope") in ("title", "title_or_body") else "title_or_body"
+                try:
+                    points = int(clamp(int(it.get("points")), -100, 100))
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": f"'{label}' 점수는 -100~100 숫자여야 합니다."},
+                                        status_code=400)
+                customs.append({"id": str(it.get("id") or new_id()), "label": label,
+                                "keywords": kws, "scope": scope, "points": points})
+            patch["score_custom_rules"] = jdump(customs)
         if patch:
             try:
                 ctx.storage.set_run_state(patch)
+                if "score_overrides" in patch or "score_custom_rules" in patch:
+                    _score_rules_cache["at"] = 0.0   # 다음 조회에서 바로 새 값을 반영
             except Exception as exc:
                 msg = str(exc)
                 if ("column" in msg.lower() or "PGRST204" in msg
@@ -7466,7 +7599,9 @@ def create_app(ctx: Context):
                          "  add column if not exists exclude_notify_keywords text default '[]',\n"
                          "  add column if not exists always_kw_bypass_night boolean not null default true,\n"
                          "  add column if not exists policy_exclude_keywords text default '[]',\n"
-                         "  add column if not exists trade_exclude_keywords text default '[]';"},
+                         "  add column if not exists trade_exclude_keywords text default '[]',\n"
+                         "  add column if not exists score_overrides text default '{}',\n"
+                         "  add column if not exists score_custom_rules text default '[]';"},
                         status_code=500)
                 raise
         return JSONResponse({"ok": True})
@@ -8335,6 +8470,26 @@ def cmd_selftest() -> int:
     check("통상 신호(조치명+산업어) → 가점",
           score_article("CBAM 시행에 철강업계 비상", "", [], 3) >= SCORE_TRADE, True)
     check("무관 기사는 여전히 0", score_article("아파트 청약 경쟁률", "분양시장", [], 3), 0)
+
+    print("\n[6-1] 마스터 패널 중요도 규칙 재정의 — overrides · custom_rules")
+    check("override 없으면 기존과 동일",
+          score_article("포스코퓨처엠 실적", "", [], 3),
+          score_article("포스코퓨처엠 실적", "", [], 3, {}, []))
+    check("override 로 점수 수정 반영",
+          score_article("포스코퓨처엠 실적", "", [], 3, {"futurem_title": {"points": 5, "enabled": True}}, []),
+          5)
+    check("override enabled=False 는 0점(사실상 삭제)",
+          score_article("포스코퓨처엠 실적", "", [], 3, {"futurem_title": {"points": 999, "enabled": False}}, []),
+          0)
+    _custom = [{"keywords": ["청약"], "scope": "title", "points": 30}]
+    check("사용자 추가 항목 — 제목에 키워드 있으면 가점",
+          score_article("아파트 청약 경쟁률", "분양시장", [], 3, {}, _custom), 30)
+    check("사용자 추가 항목 — 키워드 없으면 미적용",
+          score_article("아파트 매매 동향", "분양시장", [], 3, {}, _custom), 0)
+    _custom_body = [{"keywords": ["단독"], "scope": "title_or_body", "points": -10}]
+    check("사용자 추가 항목 — title_or_body 는 본문도 검사(음수 감점)",
+          score_article("포스코퓨처엠 실적", "단독 취재", ["포스코퓨처엠"], 3, {}, _custom_body),
+          50 - 10)
 
     print("\n[7] SWOT 정규화 (PRD F4.4)")
     check("전부 0 → 50", swot_total({"s": {"score": 0}, "w": {"score": 0},

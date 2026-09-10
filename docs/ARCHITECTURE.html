@@ -305,7 +305,9 @@
           <li><b>AI 분석 1회</b> — 통과한 기사는 원문을 받아 OpenAI로 <b>요약·포스코 관점·키워드·감성·SWOT</b>을 한 번에 뽑는다.
             <span class="sub">인사·부고 기사는 SWOT 없이 사람별 구조 요약만. 하루 호출 상한(<code>LLM_DAILY_LIMIT</code>)이 있다.</span></li>
           <li><b>중요도 점수 매기기 (0~100)</b> — 포스코퓨처엠 제목 언급 +50, 다른 계열사 +25, 정책·통상 신호 가점, 단순 시황 감점.
-            <span class="sub">이 점수가 알림 여부를 가른다. → 03절</span></li>
+            <span class="sub">이 점수가 알림 여부를 가른다. 기본 9개 항목의 점수·사용여부와 사용자가 추가한
+            키워드 기반 항목(2026-09-10 추가)은 마스터 패널에서 직접 고칠 수 있다(<code>run_state.score_overrides</code>·
+            <code>score_custom_rules</code>, <code>score_article()</code>가 반영). → 03절</span></li>
           <li><b>DB 저장</b> — 기사·요약·SWOT·시세를 저장소(SQLite 또는 Supabase)에 넣는다. <b>웹에는 전부 올라간다.</b>
             <span class="sub">원문 본문은 요약용으로만 임시 보관(30일)하고 지운다. → 05절</span></li>
           <li><b>알림 판정</b> — 저장과 발송은 별개다. 텔레그램 채널로는

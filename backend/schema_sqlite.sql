@@ -91,6 +91,8 @@ create table if not exists run_state (
   night_start_hour INTEGER,                 -- 야간 억제 시작 시각 (마스터 설정, null 이면 .env / 기본 23)
   night_end_hour   INTEGER,                 -- 야간 억제 종료 시각 (null 이면 .env / 기본 7)
   night_min_score  INTEGER,                 -- 야간엔 이 점수 이상만. 101=전면차단 (null 이면 .env / 기본 80)
+  score_overrides TEXT default '{}',        -- 중요도 기본 항목 재정의 {키: {points, enabled}} (마스터 설정)
+  score_custom_rules TEXT default '[]',     -- 중요도 사용자 추가 항목 [{id,label,keywords,scope,points}] (마스터 설정)
   updated_at       TEXT not null
 );
 

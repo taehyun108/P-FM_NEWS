@@ -564,6 +564,9 @@ let tradeKeywords = [];
 let tradeRequired = [];
 let tradeExclude = [];
 let weeklyTo = [];       // 주간 레포트 수신자 이메일 목록
+let scoreItems = [];       // 중요도 기본 항목 [{key,label,points,enabled}]
+let scoreCustomItems = []; // 중요도 사용자 추가 항목 [{id,label,keywords,scope,points}]
+let scoreCustomMax = 30;
 let thTimer;
 
 function masterAuth() {
@@ -685,18 +688,14 @@ async function loadMasterSettings() {
   }
 }
 
-/** 중요도 점수 산정 규칙 — /api/master/settings 의 score_rules 를 그대로 표시(단일 출처). */
+/** 중요도 점수 산정 규칙 — /api/master/settings 의 score_rules 를 불러와 편집 상태로 둔다. */
 function renderScoreRules(rules) {
-  const ul = $('scoreRules');
-  if (!ul || !rules) return;
-  ul.replaceChildren(...(rules.items || []).map((it) => {
-    const li = el('li');
-    li.append(el('span', 'sr-label', it.label));
-    const p = it.points;
-    const b = el('b', p < 0 ? 'sr-minus' : 'sr-plus', (p > 0 ? '+' : '') + p);
-    li.append(b);
-    return li;
-  }));
+  if (!rules) return;
+  scoreItems = (rules.items || []).map((it) => ({ ...it }));
+  scoreCustomItems = (rules.custom_items || []).map((it) => ({ ...it }));
+  scoreCustomMax = rules.custom_max || 30;
+  renderScoreItems();
+  renderScoreCustomItems();
   $('scoreEg').innerHTML =
     '예) "<b>포스코퓨처엠</b> 양극재 3만톤 증설"(조선일보) = 50(제목) + 10(주요 언론사) = <b>60점</b>';
   const n = rules.night || {};
@@ -709,6 +708,131 @@ function renderScoreRules(rules) {
       ? (kw ? `<b>${kw}에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다.`
             : `<b>모든 기사가 아침까지 대기</b>합니다 (야간 완전 무음).`)
       : `<b>${n.min_score ?? 80}점 이상</b>${kw ? ` 또는 ${kw}에 걸린 기사만` : ''} 즉시 나가고, 나머지는 아침에 발송됩니다.`);
+}
+
+/** 기본 중요도 항목 — 점수 입력·사용여부 체크박스. 판정 로직이 코드에 있어 완전 삭제는
+ * 안 되지만, '사용' 체크를 끄면 점수 기여가 0이 돼 사실상 삭제와 같다. */
+function renderScoreItems() {
+  const ul = $('scoreRules');
+  if (!ul) return;
+  ul.replaceChildren(...scoreItems.map((it) => {
+    const li = el('li', it.enabled === false ? 'sr-disabled' : '');
+    li.append(el('span', 'sr-label', it.label));
+
+    const enableLbl = el('label', 'sr-enable');
+    const enableCk = el('input');
+    enableCk.type = 'checkbox';
+    enableCk.checked = it.enabled !== false;
+    enableCk.addEventListener('change', () => {
+      it.enabled = enableCk.checked;
+      li.classList.toggle('sr-disabled', !it.enabled);
+    });
+    enableLbl.append(enableCk, document.createTextNode('사용'));
+    li.append(enableLbl);
+
+    const pointsInput = el('input', 'sr-points');
+    pointsInput.type = 'number';
+    pointsInput.min = '-100';
+    pointsInput.max = '100';
+    pointsInput.value = String(it.points);
+    pointsInput.addEventListener('change', () => {
+      const v = parseInt(pointsInput.value, 10);
+      it.points = Number.isFinite(v) ? Math.max(-100, Math.min(100, v)) : it.points;
+      pointsInput.value = String(it.points);
+    });
+    li.append(pointsInput);
+    return li;
+  }));
+}
+
+/** 사용자 추가 항목 — 키워드 기반. 이름·키워드·범위·점수를 자유롭게 추가·수정·삭제한다. */
+function renderScoreCustomItems() {
+  const ul = $('scoreCustomList');
+  if (!ul) return;
+  ul.replaceChildren(...scoreCustomItems.map((it) => {
+    const li = el('li', 'sc-row');
+
+    const labelInput = el('input', 'sc-label');
+    labelInput.type = 'text';
+    labelInput.placeholder = '이름';
+    labelInput.maxLength = 60;
+    labelInput.value = it.label || '';
+    labelInput.addEventListener('change', () => { it.label = labelInput.value.trim(); });
+    li.append(labelInput);
+
+    const kwInput = el('input', 'sc-kw');
+    kwInput.type = 'text';
+    kwInput.placeholder = '키워드(콤마로 구분)';
+    kwInput.value = (it.keywords || []).join(', ');
+    kwInput.addEventListener('change', () => {
+      it.keywords = kwInput.value.split(',').map((k) => k.trim()).filter(Boolean);
+    });
+    li.append(kwInput);
+
+    const scopeSel = el('select', 'sc-scope');
+    [['title_or_body', '제목+본문'], ['title', '제목만']].forEach(([v, label]) => {
+      const opt = el('option', null, label);
+      opt.value = v;
+      if ((it.scope || 'title_or_body') === v) opt.selected = true;
+      scopeSel.append(opt);
+    });
+    scopeSel.addEventListener('change', () => { it.scope = scopeSel.value; });
+    li.append(scopeSel);
+
+    const pointsInput = el('input', 'sr-points sc-points');
+    pointsInput.type = 'number';
+    pointsInput.min = '-100';
+    pointsInput.max = '100';
+    pointsInput.value = String(it.points ?? 0);
+    pointsInput.addEventListener('change', () => {
+      const v = parseInt(pointsInput.value, 10);
+      it.points = Number.isFinite(v) ? Math.max(-100, Math.min(100, v)) : (it.points || 0);
+      pointsInput.value = String(it.points);
+    });
+    li.append(pointsInput);
+
+    const del = el('button', 'sc-del', '×');
+    del.type = 'button';
+    del.addEventListener('click', () => {
+      scoreCustomItems = scoreCustomItems.filter((x) => x !== it);
+      renderScoreCustomItems();
+    });
+    li.append(del);
+    return li;
+  }));
+}
+
+function addScoreCustomItem() {
+  if (scoreCustomItems.length >= scoreCustomMax) {
+    masterMsg('err', `추가 항목은 최대 ${scoreCustomMax}개까지입니다.`);
+    return;
+  }
+  scoreCustomItems.push({ id: '', label: '', keywords: [], scope: 'title_or_body', points: 10 });
+  renderScoreCustomItems();
+}
+
+async function saveScoreRules() {
+  const msg = $('scoreSaveMsg');
+  const invalid = scoreCustomItems.find((it) => !it.label || !it.keywords || !it.keywords.length);
+  if (invalid) {
+    if (msg) { msg.textContent = '추가 항목은 이름과 키워드가 최소 1개 필요합니다.'; msg.className = 'err'; }
+    return;
+  }
+  try {
+    const res = await masterFetch('/api/master/settings', {
+      method: 'POST',
+      body: JSON.stringify({ score_items: scoreItems, score_custom_items: scoreCustomItems }),
+    });
+    const d = await res.json();
+    if (!d.ok) {
+      if (msg) { msg.textContent = d.error || '저장에 실패했습니다.'; msg.className = 'err'; }
+      return;
+    }
+    if (msg) { msg.textContent = '저장했습니다.'; msg.className = 'ok'; }
+    loadMasterSettings();
+  } catch (e) {
+    if (e.message !== 'unauthorized' && msg) { msg.textContent = '저장에 실패했습니다.'; msg.className = 'err'; }
+  }
 }
 
 /** 칩 목록 렌더 — 삭제 버튼은 arr 에서 빼고 save 콜백을 부른다. */
@@ -796,6 +920,9 @@ function initMaster() {
       masterMsg('ok', `텔레그램 발송 ${e.target.checked ? '켬' : '끔'}`);
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
+
+  $('scoreCustomAdd').addEventListener('click', addScoreCustomItem);
+  $('scoreSaveBtn').addEventListener('click', saveScoreRules);
 
   // 야간 억제 — 시각 2개(number) + 최소 점수(range). run_state 에 저장(마스터 우선).
   let nightTimer;

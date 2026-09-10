@@ -560,6 +560,43 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
   background: var(--navy-soft); font-size: 11.5px; color: var(--navy-dark); line-height: 1.6;
 }
 .score-note { margin: 8px 0 0; font-size: 11px; color: var(--ink-soft); line-height: 1.6; }
+.score-rules--edit li { gap: 8px; }
+.score-rules--edit li.sr-disabled { opacity: .45; }
+.sr-enable {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  font-size: 11px; color: var(--ink-soft); cursor: pointer;
+}
+.sr-points {
+  width: 54px; padding: 3px 6px; text-align: right; font-size: 12.5px;
+  font-variant-numeric: tabular-nums; border: 1px solid var(--navy-line); border-radius: 6px;
+  background: #fff; color: var(--ink);
+}
+.score-custom-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.sc-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sc-label { flex: 1 1 110px; }
+.sc-kw { flex: 2 1 180px; }
+.sc-label, .sc-kw {
+  padding: 6px 8px; font-size: 12px; border: 1px solid var(--line);
+  border-radius: 7px; background: #fff; color: var(--ink); font-family: inherit;
+}
+.sc-scope {
+  flex: none; padding: 5px 6px; font-size: 11.5px; border: 1px solid var(--line);
+  border-radius: 7px; background: #fff; color: var(--ink-mid);
+}
+.sc-points { flex: none; }
+.sc-del {
+  flex: none; border: 0; background: none; color: var(--neg, #c0392b);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.score-add-btn {
+  margin-top: 8px; border: 1px dashed var(--navy-line); background: none; color: var(--navy);
+  border-radius: 7px; padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: inherit;
+}
+.score-add-btn:hover { background: var(--navy-soft); }
+.score-save-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.score-save-row #scoreSaveMsg { font-size: 11.5px; color: var(--ink-soft); }
+.score-save-row #scoreSaveMsg.ok { color: var(--pos); }
+.score-save-row #scoreSaveMsg.err { color: var(--neg); }
 .url-add-confirm {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   margin: 10px 0 4px; padding: 10px 12px; border-radius: 9px;
