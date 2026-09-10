@@ -2021,9 +2021,15 @@ class SupabaseStorage(Storage):
         ).eq("domain", domain).execute()
 
     def sync_article_press_names(self) -> int:
-        names = {r["id"]: r["name"] for r in self._t("press_outlets").select("id,name").execute().data}
-        rows = (self._t("articles").select("id,press_id,press_name")
-                .not_.is_("press_id", "null").execute().data)
+        # PostgREST 는 응답을 1000행으로 자른다. .execute() 를 그냥 쓰면 기사가 1000건
+        # 넘을 때 나머지는 검사조차 안 돼 언론사명 정정이 조용히 반쪽만 반영된다
+        # (실제 사례: cmd_fixpress 가 16개 매체명을 고쳤는데 기사는 1건만 동기화됨 —
+        # 3600여 건 중 앞쪽 1000건 안에 그 매체 기사가 거의 없었다). _page 로 전부 본다.
+        names = {r["id"]: r["name"] for r in self._page(
+            lambda: self._t("press_outlets").select("id,name"), cap=20000)}
+        rows = self._page(lambda: (
+            self._t("articles").select("id,press_id,press_name").not_.is_("press_id", "null")
+        ), cap=100000)
         changed = 0
         for row in rows:
             want = names.get(row["press_id"])
@@ -2331,7 +2337,7 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "mtn.co.kr": ("머니투데이방송", 2),
     # 사용자 확인 매체 (2026-09-08) — 도메인·부제 그대로 노출되던 것 정정
     "wsobi.com": ("여성소비자신문", 3), "tbc.co.kr": ("TBC", 2),
-    "ppss.kr": ("ㅍㅍㅅㅅ", 3), "ktv.go.kr": ("KTV 국민방송", 2),
+    "ppss.kr": ("PPSS", 3), "ktv.go.kr": ("KTV 국민방송", 2),
     "kpinews.kr": ("KPI뉴스", 3), "kjdaily.com": ("광주매일신문", 3),
     "kgnews.co.kr": ("경기신문", 3), "gosiweek.com": ("피앤피뉴스", 3),
     "unn.net": ("한국대학신문", 3), "ttlnews.com": ("퍼블릭뉴스통신", 3),
@@ -3441,7 +3447,11 @@ def _canonical_from_html(html: str) -> str:
 # meta author 에 매체명을 넣는 사이트가 많아 가장 뒤에 둔다.
 AUTHOR_PATTERNS = [
     re.compile(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]{2,20})"'),
-    re.compile(r'([가-힣]{2,4})\s*기자'),
+    # '이름 기자' 뿐 아니라 '이름 인턴기자'·'이름 수습기자' 처럼 이름과 '기자' 사이에
+    # 직함 수식어가 붙는 경우도 이름을 잡는다. 수식어 없이 '인턴기자'만 있으면(이름이
+    # 없는 경우) 이 수식어 자체가 캡처되는데, _valid_author 의 NON_AUTHOR_WORDS 가
+    # 그런 수식어를 걸러낸다.
+    re.compile(r'([가-힣]{2,4})\s*(?:칼럼|시민|객원|명예|인턴|수습|선임|특약)?기자'),
     re.compile(r'<meta[^>]+(?:name|property)=["\'](?:author|article:author|dable:author)["\'][^>]+content=["\']([^"\']{2,30})["\']', re.I),
 ]
 
@@ -3512,6 +3522,11 @@ def extract_author(html: str, body: str, press_name: str = "") -> str:
     확실하지 않으면 빈 문자열을 돌려주고 '[언론사]' 만 표기하는 편이 낫다.
     """
     press_key = normalize_chip(press_name)
+    # 주석(<!-- … -->) 안에 죽은 '관련기사' 위젯 마크업을 그대로 남겨 두는 사이트가
+    # 있다(실사례: PPSS — 화면에 안 보이는 주석 속 다른 기사 3건의 '권미나 기자'가
+    # 이 기사의 실제 기자 '이승민 인턴기자'보다 더 많이 잡혀 최빈값으로 오채택됐다).
+    # 정규식은 HTML 구조를 모르므로 주석을 먼저 지워야 한다.
+    html = re.sub(r"<!--.*?-->", "", html or "", flags=re.S)
 
     # 1) JSON-LD author (보통 정확, 단일 매치)
     for source in (html, body):
@@ -3521,7 +3536,10 @@ def extract_author(html: str, body: str, press_name: str = "") -> str:
 
     # 2) 본문 서명 'OOO 기자' — 서명은 기사에 여러 번 나오므로 최빈값을 택한다.
     #    카테고리 라벨('칼럼기자', '시민기자')은 1회만 나와 자연히 밀린다.
-    for source in (html, body):
+    #    body(추출된 본문)를 html(사이드바·관련기사 위젯 포함 전체)보다 먼저 본다 —
+    #    본문에 서명이 있으면 그걸로 충분하고, 전체 html 까지 보면 이 기사와 무관한
+    #    다른 기사의 서명이 최빈값을 오염시킬 수 있다.
+    for source in (body, html):
         if not source:
             continue
         names = [n for n in (_valid_author(g, press_key)
@@ -8690,6 +8708,18 @@ def cmd_selftest() -> int:
                          '<p>이 기사는 조용우 기자가 작성했다</p>', "", "중앙이코노미뉴스"), "조용우")
     check("매체명 단독이면 기자명 아님",
           extract_author('<meta name="author" content="중앙이코노미뉴스"/>', "", "중앙뉴스"), "")
+    check("'이름 인턴기자'도 이름을 잡는다(수식어가 이름과 '기자' 사이에 붙는 경우)",
+          extract_author("", "(PPSS 이승민 인턴기자) 현대엔지니어링이...", "PPSS"), "이승민")
+    check("'이름 수습기자'도 마찬가지", extract_author("", "김철수 수습기자가 보도했다", "한국일보"), "김철수")
+    # 실사례(2026-09-10, PPSS): 화면에 안 보이는 HTML 주석 속 '관련기사' 위젯에 이
+    # 기사와 무관한 다른 기사 3건의 '권미나 기자' 서명이 남아 있어, 실제 기자
+    # '이승민 인턴기자'(본문 1회)보다 더 많이 잡혀 최빈값으로 잘못 채택됐다.
+    check("HTML 주석 속 무관한 기자명은 무시(회귀 방지)",
+          extract_author(
+              "<!-- (PPSS 권미나 기자) 관련기사1 --><!-- (PPSS 권미나 기자) 관련기사2 -->"
+              "<!-- (PPSS 권미나 기자) 관련기사3 -->",
+              "(PPSS 이승민 인턴기자) 현대엔지니어링이 발전소를 수주했다.", "PPSS"),
+          "이승민")
 
     print("\n[8-0] 언론사 도메인 폴백")
     check("매핑 없는 도메인은 전체 유지", prettify_domain("bbsi.co.kr"), "bbsi.co.kr")
@@ -8721,6 +8751,8 @@ def cmd_selftest() -> int:
     check("og:site_name 은 여전히 정상 추출", site_name_from_html(
         '<meta property="og:site_name" content="정식매체명"/><title>딴 내용</title>'), "정식매체명")
     check("SEED_PRESS 신규 매핑(여성소비자신문)", SEED_PRESS.get("wsobi.com", ("", 0))[0], "여성소비자신문")
+    check("SEED_PRESS ppss.kr 은 PPSS(초성 'ㅍㅍㅅㅅ' 아님, 사용자 지정)",
+          SEED_PRESS.get("ppss.kr", ("", 0))[0], "PPSS")
 
     # resolve_press — 신규 매체는 기사 페이지에 매체명이 없으면 홈페이지를 한 번 더 본다
     # (2026-09-10, 필터 칩에 도메인 그대로 노출되던 문제의 실제 원인)
