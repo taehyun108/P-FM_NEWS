@@ -200,6 +200,10 @@ class Config:
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
     web_password: str             # 사이트 접속 비밀번호. 비우면 잠금 없음(로컬 개발)
     tz_offset_hours: int          # 운영 기준 시간대 UTC 오프셋 (한국 = 9)
+    # 야간 억제 — 모두 '운영 기준 시간대'(APP_TZ_OFFSET, 기본 KST) 기준 시각이다.
+    night_start_hour: int         # 이 시각부터 (기본 23)
+    night_end_hour: int           # 이 시각 전까지 억제 (기본 7)
+    night_min_score: int          # 야간엔 이 점수 이상(또는 우선 기사)만 발송. 101 = 전면 차단
     # 주간 레포트 (월요일 아침 이메일)
     weekly_enabled: bool
     weekly_to: list[str]          # 수신자 이메일 (쉼표로 여러 명)
@@ -333,6 +337,10 @@ def load_config() -> Config:
         master_password=get_env("MASTER_PASSWORD"),
         web_password=get_env("WEB_PASSWORD"),
         tz_offset_hours=tz_off,
+        # 야간 억제 창 — APP_TZ_OFFSET(기본 KST) 기준 시각. 0~23.
+        night_start_hour=get_env_int("NIGHT_START_HOUR", 23, 0, 23),
+        night_end_hour=get_env_int("NIGHT_END_HOUR", 7, 0, 23),
+        night_min_score=get_env_int("NIGHT_MIN_SCORE", 80, 0, 101),
         weekly_enabled=get_env("WEEKLY_REPORT_ENABLED", "").strip().lower() in ("1", "true", "yes"),
         weekly_to=[e.strip() for e in get_env("WEEKLY_REPORT_TO", "").replace(";", ",").split(",")
                    if e.strip()],
@@ -5192,8 +5200,21 @@ def refresh_quotes(ctx: Context) -> int:
 # =====================================================================
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-NIGHT_START, NIGHT_END = 23, 7          # 야간 모드 23:00–07:00
-NIGHT_MIN_SCORE = 80
+
+
+def _in_night_window(hour: int, start: int, end: int) -> bool:
+    """hour(운영 기준 시간대 시각)가 야간 억제 창(start~end)에 드는가.
+
+    start>end 면 자정을 넘는 창(예: 23→7 = 23·0·1·…·6시). start==end 면 창 없음.
+    실제 start·end·min_score 는 Config(NIGHT_START_HOUR 등)에서 온다.
+    """
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
 RATE_LIMIT_SLEEP = 3.5                   # 채널 분당 ~20건 한도 → 건당 3초 이상 간격(여유 포함)
 PRIORITY_FLOOD_WARN = 10                 # 한 회차 우선 기사가 이 수 이상이면 경고 로그
 SEND_BATCH_PER_CYCLE = 12               # 파이프라인 한 회차에 발송할 최대 건수(백로그 폭주 완충)
@@ -5450,12 +5471,13 @@ def _send_notifications(ctx: Context, limit: int = 20) -> int:
     if not pending:
         return 0
 
-    hour = now_local().hour   # 서버 TZ 가 아니라 운영 기준(KST) 시각으로 판단
-    is_night = hour >= NIGHT_START or hour < NIGHT_END
-    if is_night:
-        # 야간에는 중요도 80 이상 또는 우선 기사만 즉시 발송, 나머지는 큐에 남긴다. (PRD F7.3)
+    # 서버 TZ 가 아니라 운영 기준 시각(APP_TZ_OFFSET · 기본 KST)으로 야간 여부를 판단한다.
+    hour = now_local().hour
+    if _in_night_window(hour, cfg.night_start_hour, cfg.night_end_hour):
+        # 야간엔 중요도 night_min_score 이상(또는 우선 기사)만 즉시 발송, 나머지는 큐에 남긴다.
+        # night_min_score=101 이면 우선 기사만 나가고 사실상 전면 억제된다. (PRD F7.3)
         pending = [p for p in pending
-                   if int(p.get("importance_score") or 0) >= NIGHT_MIN_SCORE or _is_priority(p)]
+                   if int(p.get("importance_score") or 0) >= cfg.night_min_score or _is_priority(p)]
         if not pending:
             return 0
 
@@ -7162,10 +7184,8 @@ def create_app(ctx: Context):
         return JSONResponse({
             "ok": True,
             "telegram_enabled": str(st.get("notify_paused") or "0") in ("0", "False", "false", ""),
-            "kakao_enabled": str(st.get("kakao_enabled") if st.get("kakao_enabled") is not None else 1)
-                             not in ("0", "False", "false", ""),
-            "kakao_feature_enabled": ctx.cfg.kakao_feature_enabled,   # KAKAO_ENABLED 토글 (기본 꺼짐)
-            "kakao_ready": bool(ctx.cfg.kakao_configured and st.get("kakao_refresh_token")),
+            # 카카오 발송은 기본 비활성 — 마스터 패널 UI 에서는 노출하지 않는다.
+            # 다시 쓰려면 .env KAKAO_ENABLED=true + kakao-auth (ARCHITECTURE 04절).
             "threshold": effective_threshold(ctx),
             "hard_notify_score": hard_score,          # 0 = 미사용
             "recommended_min": RECOMMENDED_MIN_SCORE,
@@ -7182,7 +7202,8 @@ def create_app(ctx: Context):
             "weekly_smtp_ready": ctx.cfg.smtp_configured,
             # 중요도 점수 산정 규칙 — 마스터 패널에 그대로 표시한다(단일 출처).
             "score_rules": {
-                "night": {"start": NIGHT_START, "end": NIGHT_END, "min_score": NIGHT_MIN_SCORE},
+                "night": {"start": ctx.cfg.night_start_hour, "end": ctx.cfg.night_end_hour,
+                          "min_score": ctx.cfg.night_min_score, "tz": f"UTC{ctx.cfg.tz_offset_hours:+d}"},
                 "items": [
                     {"label": "포스코퓨처엠이 제목에", "points": SCORE_FUTUREM_TITLE},
                     {"label": "포스코퓨처엠이 본문에만", "points": SCORE_FUTUREM_BODY},
@@ -7204,8 +7225,6 @@ def create_app(ctx: Context):
         patch: dict[str, Any] = {}
         if "telegram_enabled" in (payload or {}):
             patch["notify_paused"] = 0 if payload["telegram_enabled"] else 1
-        if "kakao_enabled" in (payload or {}):
-            patch["kakao_enabled"] = 1 if payload["kakao_enabled"] else 0
         if "threshold" in (payload or {}):
             try:
                 patch["notify_threshold"] = int(clamp(int(payload["threshold"]), 0, 100))
@@ -8763,7 +8782,8 @@ def cmd_selftest() -> int:
     _blank.update(smtp_port=587, api_port=8000, poll_interval_sec=300, naver_interval_sec=300,
                   fresh_cutoff_hours=6, backfill_cutoff_hours=72, notify_threshold=50,
                   llm_daily_limit=1500, llm_per_run=6, weekly_enabled=False, weekly_to=[],
-                  weekly_hour=7, article_retention_days=550)
+                  weekly_hour=7, article_retention_days=550, tz_offset_hours=9,
+                  night_start_hour=23, night_end_hour=7, night_min_score=80)
     _kc = Config(**{**_blank, "kakao_feature_enabled": True, "kakao_rest_api_key": "K",
                     "kakao_client_secret": "S", "kakao_redirect_uri": "https://localhost:3000/kakao"})
     check("kakao_configured — 켜짐 + 키·redirect 있으면 True", _kc.kakao_configured, True)
@@ -8822,6 +8842,15 @@ def cmd_selftest() -> int:
     set_app_tz(99)   # 범위를 벗어난 값은 잘라 낸다
     check("APP_TZ 상한 +14 로 제한", now_local().utcoffset(), timedelta(hours=14))
     globals()["APP_TZ"] = _tz_before   # 다른 검증에 영향 없도록 복원
+
+    # 야간 억제 창 — 자정을 넘는 창(23→7)과 낮 창(9→18) 양쪽
+    check("야간 23→7: 새벽 2시는 야간", _in_night_window(2, 23, 7), True)
+    check("야간 23→7: 23시는 야간", _in_night_window(23, 23, 7), True)
+    check("야간 23→7: 7시는 야간 아님(경계 제외)", _in_night_window(7, 23, 7), False)
+    check("야간 23→7: 낮 12시는 야간 아님", _in_night_window(12, 23, 7), False)
+    check("야간 22→6 으로 바꾸면 22시가 야간", _in_night_window(22, 22, 6), True)
+    check("창이 낮(9→18)이면 자정 넘지 않게 처리", _in_night_window(3, 9, 18), False)
+    check("start==end 면 창 없음", _in_night_window(5, 0, 0), False)
 
     # 웹 세션 토큰 — 비밀번호에서 파생되므로 재시작에 안전하고 변경 시 자동 무효화
     check("같은 비밀번호 → 같은 토큰",

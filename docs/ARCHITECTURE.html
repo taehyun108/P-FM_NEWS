@@ -889,7 +889,7 @@
           <thead><tr><th>설정</th><th>기본값</th><th>동작</th></tr></thead>
           <tbody>
             <tr><td>텔레그램 발송</td><td>켜짐</td><td>끄면 발송 중지(큐는 계속 쌓임). 봇 <code>/stop</code>·<code>/start</code>와 동일</td></tr>
-            <tr><td>카카오톡 발송</td><td><b>꺼짐</b></td><td>기본 비활성(텔레그램만). <code>KAKAO_ENABLED=true</code> + 최초 토큰이 있어야 켜짐</td></tr>
+            <tr><td>카카오톡 발송</td><td><b>꺼짐</b></td><td>기본 비활성 · <b>마스터 패널에서 제거됨</b>. 되살리려면 <code>KAKAO_ENABLED=true</code> + <code>kakao-auth</code></td></tr>
             <tr><td>관련도 임계값</td><td class="num">50</td><td>0–100 슬라이더. 권장 하한 40을 표시하되 자유롭게 지정</td></tr>
             <tr><td>무조건 발송 점수</td><td class="num">0</td><td>이 점수 이상이면 야간 게이트를 우회해 즉시 발송. 0=미사용</td></tr>
             <tr><td>항상 발송 키워드</td><td>비어 있음</td><td><b>제목·판정 그룹사</b>에 있으면 중요도·야간 게이트를 우회 (본문 스친 언급 제외)</td></tr>
@@ -1249,7 +1249,7 @@
             <tr><td>임베딩 상한</td><td class="num">30회/실행</td><td>유사 제목 대량 유입 시 폭주 방어</td></tr>
             <tr><td>임베딩 정리</td><td class="num">48시간</td><td>중복 판정 창 밖이면 <code>title_embedding</code> 비움 — 용량 회수</td></tr>
             <tr><td>알림 임계값</td><td class="num">50</td><td>마스터 패널에서 조절</td></tr>
-            <tr><td>야간 모드</td><td class="num">23–07시</td><td>중요도 80 이상만 발송. <b>운영 기준 시간대</b>(아래) 기준</td></tr>
+            <tr><td>야간 모드</td><td class="num">23–07시</td><td><code>NIGHT_START_HOUR</code>·<code>NIGHT_END_HOUR</code>·<code>NIGHT_MIN_SCORE</code>(기본 80) — <b>운영 기준 시간대(서울)</b>. 자정 넘는 창 지원, <code>NIGHT_MIN_SCORE=101</code> = 전면 차단</td></tr>
             <tr><td>주간 레포트</td><td class="num">월 07시</td><td><code>WEEKLY_REPORT_HOUR</code> · 이번 주 미발송이면 자동 생성·발송</td></tr>
             <tr><td>마스터 로그인</td><td class="num">24시간</td><td>서버 메모리 토큰 — 재시작 시 소멸</td></tr>
             <tr><td>웹 접속 세션</td><td class="num">30일</td><td>비밀번호 해시에서 파생 — 재시작에도 유지, 비밀번호 변경 시 일괄 무효</td></tr>
@@ -1267,6 +1267,10 @@
           <code>APP_TZ_OFFSET</code>(기본 9) 을 적용한 시각을 돌려주고, 세 판정이 모두 이 함수를 쓴다.
           저장·비교용 시각은 지금까지처럼 전부 UTC(<code>now_utc()</code>·<code>iso()</code>)다 —
           지역시간은 <b>스케줄 판단에만</b> 쓴다.
+          <br>야간 억제 창은 <code>NIGHT_START_HOUR</code>·<code>NIGHT_END_HOUR</code>(기본 23·7, 서울시간)로
+          바꿀 수 있다. <code>_in_night_window(hour, start, end)</code> 가 <code>start&gt;end</code> 면
+          자정을 넘는 창(23·0·1·…·6시)으로, <code>start&lt;end</code> 면 낮 창으로 해석한다.
+          <code>NIGHT_MIN_SCORE</code>(기본 80)를 101 로 두면 야간엔 우선 기사만 나가고 사실상 전면 억제된다.
         </p>
 
         <h3>접속 통제 (배포용)</h3>

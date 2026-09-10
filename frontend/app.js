@@ -621,13 +621,6 @@ async function loadMasterSettings() {
   try {
     const d = await (await masterFetch('/api/master/settings')).json();
     $('telegramEnabled').checked = !!d.telegram_enabled;
-    $('kakaoEnabled').checked = !!d.kakao_enabled && !!d.kakao_ready;
-    $('kakaoEnabled').disabled = !d.kakao_ready;
-    $('kakaoHint').textContent = d.kakao_ready
-      ? "텔레그램과 같은 조건으로, 내 카카오톡 '나와의 채팅'에 기사 링크가 옵니다."
-      : (d.kakao_feature_enabled
-          ? "아직 연결 안 됨 — 서버에서 python backend/main.py kakao-auth 를 1회 실행해야 켤 수 있습니다."
-          : "카카오톡 발송은 현재 비활성화되어 있습니다 (텔레그램만 사용). KAKAO_ENABLED=true 로 켤 수 있습니다.");
     $('thRange').value = d.threshold;
     $('thVal').textContent = d.threshold;
     $('thRec').textContent = d.recommended_min;
@@ -677,9 +670,12 @@ function renderScoreRules(rules) {
   $('scoreEg').innerHTML =
     '예) "<b>포스코퓨처엠</b> 양극재 3만톤 증설"(조선일보) = 50(제목) + 10(주요 언론사) = <b>60점</b>';
   const n = rules.night || {};
+  const nb = (n.min_score ?? 80) > 100;
   $('scoreNight').innerHTML =
-    `야간(밤 ${n.start ?? 23}시~오전 ${n.end ?? 7}시)에는 <b>${n.min_score ?? 80}점 이상</b> 또는 ` +
-    `위 '무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다.`;
+    `야간(${n.start ?? 23}시~${n.end ?? 7}시, ${n.tz ?? 'UTC+9'} 서울시간)에는 ` +
+    (nb
+      ? `<b>'무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만</b> 나가고, 나머지는 전부 아침에 발송됩니다.`
+      : `<b>${n.min_score ?? 80}점 이상</b> 또는 위 '무조건 발송 점수'·'항상 발송 키워드'에 걸린 기사만 즉시 나가고, 나머지는 아침에 발송됩니다.`);
 }
 
 /** 칩 목록 렌더 — 삭제 버튼은 arr 에서 빼고 save 콜백을 부른다. */
@@ -780,13 +776,6 @@ function initMaster() {
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 
-  $('kakaoEnabled').addEventListener('change', async (e) => {
-    try {
-      await masterFetch('/api/master/settings',
-        { method: 'POST', body: JSON.stringify({ kakao_enabled: e.target.checked }) });
-      masterMsg('ok', `카카오 발송 ${e.target.checked ? '켬' : '끔'}`);
-    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
-  });
 
   const wireToggle = (id, field, label) => $(id).addEventListener('change', async (e) => {
     try {
