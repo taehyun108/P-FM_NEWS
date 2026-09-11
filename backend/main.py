@@ -6343,7 +6343,7 @@ def _card_line(card: dict) -> str:
     score = int(card.get("importance_score") or 0)
     mark = "🔴" if score >= 80 else "🟠" if score >= 50 else "⚪"
     when = (card.get("published_at") or "")[:10]
-    return f'{mark} <a href="{esc(card.get("url") or "")}">{esc(card.get("title") or "")}</a>  <i>{esc(when)}</i>'
+    return f'{mark} <a href="{esc_attr(card.get("url") or "")}">{esc(card.get("title") or "")}</a>  <i>{esc(when)}</i>'
 
 
 def _card_full_text(card: dict, already: bool = False) -> str:
@@ -6364,7 +6364,7 @@ def _card_full_text(card: dict, already: bool = False) -> str:
     if kws:
         lines.append("키워드: " + esc(", ".join(kws)))
     if card.get("url"):
-        lines += ["", f'🔗 <a href="{esc(card["url"])}">원문 보기</a>']
+        lines += ["", f'🔗 <a href="{esc_attr(card["url"])}">원문 보기</a>']
     return "\n".join(lines)
 
 
@@ -6664,7 +6664,7 @@ def render_weekly_html(payload: dict) -> str:
             d = (a.get("published_at") or "")[:10]
             out.append(
                 f'<li style="margin-bottom:8px;">'
-                f'<a href="{esc(a["url"])}" style="color:#16337A;text-decoration:none;font-weight:600;">'
+                f'<a href="{esc_attr(a["url"])}" style="color:#16337A;text-decoration:none;font-weight:600;">'
                 f'{esc(a["title"])}</a>'
                 f'<br><span style="color:#98a2b3;font-size:12px;">{esc(a["press"])} · {esc(d)} · 중요도 {a["score"]}</span>'
                 f'<br><span style="color:#475467;font-size:13px;">{esc(a["summary"])}</span></li>')
@@ -9896,6 +9896,18 @@ def cmd_selftest() -> int:
         ]})
     check("HTML 렌더 + 이스케이프", "제목&lt;&amp;&gt;" in _html and "강점" in _html, True)
     check("기사 없는 섹션 안내", "이번 주 해당 기사가 없습니다" in _html, True)
+    # 실제 취약점(2026-09-11 배포 전 점검): href 속성에 esc()(따옴표 미이스케이프)를
+    # 써서, 큰따옴표가 든 URL이 속성 밖으로 튀어나가 이벤트 핸들러를 주입할 수
+    # 있었다(canonical 링크는 수동 등록 시 공격자가 통제하는 페이지에서 올 수 있다).
+    # esc_attr() 로 고쳤다 — href 는 항상 이걸 써야 한다.
+    _xss_url = 'https://evil.com/x" onmouseover="alert(1)'
+    _xss_html = render_weekly_html({
+        "period_start": "2026-08-31", "period_end": "2026-09-07", "article_count": 1,
+        "sections": [{"label": "테스트", "articles": [
+            {"title": "제목", "url": _xss_url, "press": "언론사",
+             "published_at": "2026-09-01", "score": 50, "summary": "요약"}]}]})
+    check("href 속성의 큰따옴표는 이스케이프됨(XSS 방지)",
+          'onmouseover="alert' not in _xss_html and "&quot;" in _xss_html, True)
     check("plain 대체본은 태그 제거", "<" not in _html_to_text("<p>가<b>나</b>다</p>"), True)
     _cfg_blank = Config(**{**{f: "" for f in Config.__dataclass_fields__},
                            "smtp_port": 587, "api_port": 8000, "poll_interval_sec": 300,
