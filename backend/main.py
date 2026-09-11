@@ -1682,8 +1682,11 @@ class SupabaseStorage(Storage):
 
     def deferred_articles(self, limit: int) -> list[dict]:
         # 본문이 없는 미분석 활성 기사 — article_bodies 에 있는 id 를 빼고 조회한다.
+        # 1,000건 넘게 쌓이면(디퍼드 백로그가 불어날 때) 페이지네이션 없이는
+        # 일부만 '본문 있음'으로 잡혀, 실제로는 본문이 있는 기사가 여기 잘못
+        # 섞여 들어간다. _page 로 전부 본다.
         bodies = {r["article_id"] for r in
-                  self._t("article_bodies").select("article_id").execute().data or []}
+                  self._page(lambda: self._t("article_bodies").select("article_id"), cap=20000)}
         rows = (self._t("articles")
                 .select("id,title,url_source,url_canonical,url_original,press_name,"
                         "published_at,collected_at,group_companies")
@@ -6849,6 +6852,40 @@ def _valid_master_token(tok: str) -> bool:
     return bool(exp and exp > now_utc())
 
 
+# ── 로그인 무차별 대입 방지 ───────────────────────────────────────────
+# /api/web/login·/api/master/login 은 시도 횟수 제한이 없어서, 비밀번호가
+# 짧으면(마스터는 4자 이상만 요구) 무제한 시도로 뚫릴 수 있었다. IP 별로
+# 5분 안에 5회 실패하면 5분간 잠근다(서버 메모리, 재시작 시 초기화 —
+# _MASTER_TOKENS 와 같은 성격이라 무거운 저장소를 새로 안 둔다).
+_LOGIN_FAILS: dict[str, list[float]] = {}
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW_SEC = 300.0
+
+
+def _client_ip(request: Any) -> str:
+    """리버스 프록시 뒤에 있을 수 있어 X-Forwarded-For 를 우선한다(첫 번째 값 —
+    가장 왼쪽이 원 클라이언트). 없으면 소켓 주소로 돌아간다."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_locked(key: str) -> bool:
+    now = time.time()
+    q = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
+    _LOGIN_FAILS[key] = q
+    return len(q) >= LOGIN_MAX_FAILS
+
+
+def _login_fail(key: str) -> None:
+    _LOGIN_FAILS.setdefault(key, []).append(time.time())
+
+
+def _login_reset(key: str) -> None:
+    _LOGIN_FAILS.pop(key, None)
+
+
 # ── 사이트 전체 잠금 (배포용) ────────────────────────────────────────
 # 마스터 토큰은 관리 기능만 지킨다. 배포하면 URL 만 알아도 기사 목록·URL 등록·
 # 텔레그램 직접 전송 API 를 누구나 쓸 수 있으므로, 그 앞에 세션 관문을 하나 둔다.
@@ -7079,6 +7116,14 @@ def scan_store_upsert(storage: "Storage", article_id: str) -> None:
 
 def create_app(ctx: Context):
     fastapi = _import("fastapi", "fastapi")
+    # 이 파일은 from __future__ import annotations 를 쓰므로 타입 주석이 실행되지
+    # 않고 문자열로 남는다. FastAPI 는 라우트 함수의 __globals__(이 모듈의 전역)
+    # 에서 그 문자열을 typing.get_type_hints 로 다시 풀어야 하는데, 'fastapi' 는
+    # 이 함수의 지역 변수라 전역에 없어서 'fastapi.Request' 타입 힌트를 못 풀고
+    # 그냥 쿼리 파라미터로 오인한다(로그인 무차별 대입 방지에 Request 를 주입받다
+    # 겪은 실패). 아래 한 줄로 전역에도 등록해 해결한다 — create_app 은 서버
+    # 시작 시 한 번만 호출되므로 부작용이 없다.
+    globals()["fastapi"] = fastapi
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -7551,16 +7596,23 @@ def create_app(ctx: Context):
                              "authed": _web_session_ok(pfm_web)})
 
     @app.post("/api/web/login")
-    async def api_web_login(payload: dict,
+    async def api_web_login(payload: dict, request: fastapi.Request,
                             x_forwarded_proto: str = fastapi.Header(default="")):
         """접속 비밀번호 확인 후 세션 쿠키를 심는다. 로그인 페이지가 fetch 로 호출한다."""
-        pw = (payload or {}).get("password", "")
         secret = _web_secret()
         if not secret:
             return JSONResponse({"ok": True, "locked": False})   # 잠금이 꺼져 있음
+        ip = _client_ip(request)
+        if _login_locked(ip):
+            return JSONResponse(
+                {"ok": False, "error": "너무 많이 실패했습니다. 5분 후 다시 시도하세요."},
+                status_code=429)
+        pw = (payload or {}).get("password", "")
         if not _web_verify(pw):
+            _login_fail(ip)
             return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
                                 status_code=401)
+        _login_reset(ip)
         resp = JSONResponse({"ok": True})
         # 프록시가 "https" 또는 "https,http" 처럼 넘기므로 부분 일치로 본다.
         # HttpOnly + SameSite=Lax 로 자바스크립트 탈취와 교차 사이트 POST 를 막는다.
@@ -7582,11 +7634,18 @@ def create_app(ctx: Context):
         return None
 
     @app.post("/api/master/login")
-    async def api_master_login(payload: dict):
+    async def api_master_login(payload: dict, request: fastapi.Request):
+        ip = _client_ip(request)
+        if _login_locked(ip):
+            return JSONResponse(
+                {"ok": False, "error": "너무 많이 실패했습니다. 5분 후 다시 시도하세요."},
+                status_code=429)
         pw = (payload or {}).get("password", "")
         if not isinstance(pw, str) or not check_master_password(ctx, pw):
+            _login_fail(ip)
             return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
                                 status_code=401)
+        _login_reset(ip)
         return JSONResponse({"ok": True, "token": _issue_master_token(),
                              "ttl_hours": int(MASTER_TOKEN_TTL.total_seconds() // 3600)})
 
@@ -9578,6 +9637,26 @@ def cmd_selftest() -> int:
     check("자연어 질문 rate limit: 31회째 차단", _bot_rate_ok("c1"), False)
     check("다른 chat 은 별도 카운트", _bot_rate_ok("c2"), True)
     _bot_chat_calls.clear()
+
+    print("\n[19] 로그인 무차별 대입 방지")
+    from types import SimpleNamespace
+    # /api/web/login·/api/master/login 에 시도 횟수 제한이 없어서 비밀번호를
+    # 무제한으로 시도할 수 있었다(2026-09-11 지적). IP 별 5분 슬라이딩 윈도.
+    for _ in range(LOGIN_MAX_FAILS):
+        _login_fail("1.2.3.4")
+    check("5회 실패하면 잠김", _login_locked("1.2.3.4"), True)
+    check("다른 IP 는 영향 없음", _login_locked("5.6.7.8"), False)
+    _login_reset("1.2.3.4")
+    check("성공하면(reset) 다시 시도 가능", _login_locked("1.2.3.4"), False)
+    check("X-Forwarded-For 첫 값을 클라이언트 IP 로 씀",
+          _client_ip(SimpleNamespace(
+              headers={"x-forwarded-for": "9.9.9.9, 10.0.0.1"},
+              client=SimpleNamespace(host="127.0.0.1"))),
+          "9.9.9.9")
+    check("X-Forwarded-For 없으면 소켓 주소로",
+          _client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))),
+          "127.0.0.1")
+    _LOGIN_FAILS.clear()
 
     print("\n[13-2] 알림 메시지 포맷 (PRD F7)")
     msg = format_message({"importance_score": 60, "title": "포스코퓨처엠 주가 하락",
