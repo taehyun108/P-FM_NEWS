@@ -8599,6 +8599,27 @@ def quote_loop(ctx: Context, stop: threading.Event) -> None:
         stop.wait(QUOTE_REFRESH_SEC)
 
 
+def _start_pipeline_threads(ctx: Context, stop: threading.Event) -> list[threading.Thread]:
+    """수집·시세·텔레그램봇·대외협력 스케줄러 스레드를 만들어 시작한다.
+
+    serve(--with-pipeline)와 worker 가 이 목록을 공유한다 — 두 곳에 따로
+    적어두면 한쪽만 고쳤을 때 조용히 갈라진다(PRD F6.1a filter_tagged 와
+    같은 이유의 '유일한 구현' 원칙).
+    """
+    threads: list[threading.Thread] = [
+        threading.Thread(target=pipeline_loop, args=(ctx, stop), daemon=True),
+        threading.Thread(target=quote_loop, args=(ctx, stop), daemon=True),
+    ]
+    log.info("수집 루프 시작 (%d초 주기) · 시세 갱신 %d초", ctx.cfg.poll_interval_sec, QUOTE_REFRESH_SEC)
+    if ctx.cfg.telegram_enabled:
+        threads.append(threading.Thread(target=telegram_bot_loop, args=(ctx, stop), daemon=True))
+    if ea_mod is not None and ea_mod.ea_enabled():
+        threads.append(threading.Thread(target=ea_mod.scheduler_loop, args=(ctx, stop), daemon=True))
+    for t in threads:
+        t.start()
+    return threads
+
+
 def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
     uvicorn = _import("uvicorn", "uvicorn")
     # 시드는 idempotent — 새로 추가된 RSS 피드·키워드를 기동 시 반영한다.
@@ -8608,20 +8629,41 @@ def cmd_serve(ctx: Context, with_pipeline: bool) -> None:
         log.warning("피드 시드 스킵: %s", exc)
     app = create_app(ctx)
     stop = threading.Event()
-    threads: list[threading.Thread] = []
-    if with_pipeline:
-        threads.append(threading.Thread(target=pipeline_loop, args=(ctx, stop), daemon=True))
-        threads.append(threading.Thread(target=quote_loop, args=(ctx, stop), daemon=True))
-        log.info("수집 루프 시작 (%d초 주기) · 시세 갱신 %d초", ctx.cfg.poll_interval_sec, QUOTE_REFRESH_SEC)
-        if ctx.cfg.telegram_enabled:
-            threads.append(threading.Thread(target=telegram_bot_loop, args=(ctx, stop), daemon=True))
-        if ea_mod is not None and ea_mod.ea_enabled():
-            threads.append(threading.Thread(target=ea_mod.scheduler_loop, args=(ctx, stop), daemon=True))
-    for t in threads:
-        t.start()
+    threads = _start_pipeline_threads(ctx, stop) if with_pipeline else []
     log.info("서버: http://%s:%d", ctx.cfg.api_host, ctx.cfg.api_port)
     try:
         uvicorn.run(app, host=ctx.cfg.api_host, port=ctx.cfg.api_port, log_level="warning")
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+
+def cmd_worker(ctx: Context) -> None:
+    """웹서버 없이 수집·시세·텔레그램봇·대외협력 스케줄러만 돌린다 (다중 프로세스 배포용).
+
+    지금까지는 `run` 하나가 웹서버·수집·봇을 전부 한 프로세스에 담아서, 코드
+    수정 뒤 재시작하면(수집 로직만 고쳤어도) 웹 접속도 같이 끊겼고, 어느
+    한쪽에서 처리되지 않은 예외로 프로세스 전체가 죽으면 나머지도 같이
+    멎었다(2026-09-11 구조 점검, 사용자 지정). `serve`(웹만)와 이 명령을
+    각각 별도 OS 프로세스로 띄우면 서로 DB 로만 통신하니 한쪽이 죽거나
+    재시작해도 다른 쪽은 계속 돈다.
+
+        프로세스 A: python backend/main.py serve
+        프로세스 B: python backend/main.py worker
+    """
+    try:
+        ctx.storage.seed_feeds(SEED_FEEDS)
+    except Exception as exc:   # pragma: no cover
+        log.warning("피드 시드 스킵: %s", exc)
+    stop = threading.Event()
+    threads = _start_pipeline_threads(ctx, stop)
+    log.info("worker 시작 (웹서버 없음) — Ctrl+C 로 종료")
+    try:
+        while not stop.is_set():
+            stop.wait(1.0)
+    except KeyboardInterrupt:
+        log.info("worker 종료 요청을 받았습니다.")
     finally:
         stop.set()
         for t in threads:
@@ -10024,7 +10066,9 @@ USAGE = """사용법: python backend/main.py <명령>
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
   serve      API + 프론트엔드 서버만 실행
-  run        서버 + 수집 루프 + 텔레그램 챗봇 (운영 모드)
+  worker     웹서버 없이 수집 루프 + 텔레그램 챗봇만 실행 (serve 와 별도 프로세스로
+             띄우면 한쪽이 죽거나 재시작해도 다른 쪽은 안 끊긴다)
+  run        서버 + 수집 루프 + 텔레그램 챗봇 (한 프로세스, 기존 운영 모드)
   quotes     시세만 1회 갱신
   notify     대기 중인 텔레그램 알림만 발송
   retryfailed  발송 실패로 막힌 알림을 다시 큐로 되돌림 (rate limit 등 일시 장애 복구용)
@@ -10118,6 +10162,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_serve(ctx, with_pipeline=False)
     elif command == "run":
         cmd_serve(ctx, with_pipeline=True)
+    elif command == "worker":
+        cmd_worker(ctx)
     else:
         print(f"알 수 없는 명령: {command}\n")
         print(USAGE)

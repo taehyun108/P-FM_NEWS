@@ -3,10 +3,29 @@
 이 문서는 **① 사내 PC로 처음 옮길 때** 와 **② 코드를 업데이트할 때마다** 무엇을
 확인해야 하는지 정리한 것이다. 클라우드 배포는 [DEPLOY.md](DEPLOY.md) 를 본다.
 
-> 한 줄 요약: 이 시스템은 **`python backend/main.py run` 프로세스 1개**가
-> API 서버 + 수집·시세·텔레그램봇·대외협력 스레드를 다 돌린다.
+> 한 줄 요약: `python backend/main.py run` **프로세스 1개**가 API 서버 +
+> 수집·시세·텔레그램봇·대외협력 스레드를 다 돌린다(가장 간단한 기본값).
+> **2026-09-11부터** 장애 격리가 필요하면 `serve`(웹만) + `worker`(수집·봇만)
+> 를 **별도 프로세스 2개**로 띄우는 것도 가능하다 — 한쪽이 죽거나 재시작해도
+> 다른 쪽은 안 끊긴다(§ 실행 모드 참고). `run` 과 `worker` 를 **동시에 켜면
+> 안 된다**(수집·알림이 중복된다) — always 딱 하나만.
 > 저장소는 `DB_BACKEND` 로 고른다 — **`sqlite`**(사내 배포·오프라인) 또는 **`supabase`**(현재).
 > 로컬 PC는 상태를 갖지 않는다(SQLite면 `backend/pfm_news.db` 파일이 상태).
+
+## 실행 모드 — 한 프로세스 vs 두 프로세스
+
+| 모드 | 명령 | 특징 |
+|---|---|---|
+| 기본(단일) | `python backend/main.py run` | 프로세스 1개. 가장 간단. 재시작하면 웹·수집·봇이 다 같이 끊긴다. |
+| 분리(권장, 배포 시) | `python backend/main.py serve` + `python backend/main.py worker` (별도 프로세스 2개) | 한쪽이 죽거나(버그·예외) 코드 배포로 재시작해도 다른 쪽은 계속 돈다. 둘 다 같은 DB 로만 통신하므로 서로 존재를 몰라도 된다. |
+
+분리 모드로 갈 때 주의:
+- **`run` 과 `worker` 를 동시에 켜면 안 된다** — 둘 다 수집 루프를 돌려 기사가 중복
+  수집·중복 알림된다. `serve`+`worker` 세트이거나 `run` 단독이거나 둘 중 하나만.
+- `worker` 는 웹서버를 안 띄우므로 `/healthz` 같은 헬스체크가 없다 — 살아있는지는
+  로그(`수집 루프 시작...`)나 DB 의 `collection_logs` 최신 시각으로 확인한다.
+- 둘 다 대시 만나면 재시작 후 마스터 로그인 세션(`_MASTER_TOKENS`)이 초기화되는 건
+  `serve` 프로세스에만 해당한다(그 상태를 들고 있는 쪽이라).
 
 ## 저장소 — SQLite 와 Supabase 동시 유지
 
@@ -123,7 +142,7 @@ python backend/main.py run             # 운영 모드
 | 3 | **스키마 변경?** `backend/schema*.sql` 가 diff 에 있으면 | **SQLite**: `python backend/main.py initdb` (idempotent). **Supabase**: 바뀐 `alter table` 을 SQL Editor 에서 1회. 최근: `run_state` 에 `night_start_hour·night_end_hour·night_min_score·exclude_notify_keywords` 추가 |
 | 4 | **새 환경변수?** `.env.example` 이 diff 에 있으면 | 새로 생긴 줄을 `.env` 에도 추가 (값이 필요하면 채움) |
 | 5 | **검증** | `python backend/main.py selftest` → `전체 통과` 확인 |
-| 6 | **서버 재시작** | 기존 `run` 프로세스 종료 후 다시 `python backend/main.py run` |
+| 6 | **서버 재시작** | 단일 모드: 기존 `run` 종료 후 다시 실행. 분리 모드: 고친 쪽만(예: 수집 로직만 고쳤으면 `worker` 만) 재시작 — 다른 쪽은 안 건드려도 된다 |
 | 7 | **1사이클 로그 확인** | 5분 안에 `완료: …` 이 뜨고 `[ERROR]` 가 없는지 |
 
 ### 커밋 메시지에서 3·4 를 놓치지 않으려면
@@ -209,7 +228,9 @@ OpenAI 대시보드 월 하드 리밋. `$X/월` 로 묶으려면 `LLM_DAILY_LIMI
 
 | 명령 | 용도 |
 |---|---|
-| `python backend/main.py run` | 운영 모드 (서버 + 모든 스레드) |
+| `python backend/main.py run` | 운영 모드, 단일 프로세스 (서버 + 모든 스레드) |
+| `python backend/main.py serve` | 웹/API 서버만 (분리 모드 — `worker` 와 세트) |
+| `python backend/main.py worker` | 수집·시세·텔레그램봇·대외협력만, 웹서버 없음 (분리 모드 — `serve` 와 세트, `run` 과는 동시 실행 금지) |
 | `python backend/main.py selftest` | 순수 함수 검증 (DB·키 불필요) |
 | `python backend/main.py once [N]` | 파이프라인 1회 (N = LLM 호출 상한, 검증용) |
 | `python backend/main.py notify` | 대기 중인 알림만 발송 |

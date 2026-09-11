@@ -1366,13 +1366,29 @@
           <br>덧붙여 CORS 는 <code>ALLOWED_ORIGINS</code> 에 적은 주소만 허용한다(기본: 교차 오리진 차단).
           수동 URL 등록은 <code>is_public_http_url()</code> 로 사설망·루프백·클라우드 메타데이터
           (169.254.169.254) 주소를 막아 서버가 내부망을 대신 긁는 <b>SSRF</b> 를 차단한다.
+          <b>로그인 무차별 대입 방지(2026-09-11)</b>: <code>/api/web/login</code>·
+          <code>/api/master/login</code> 은 IP 별 5분에 5회 실패하면 5분간 429 로 잠근다
+          (서버 메모리, <code>_LOGIN_FAILS</code>). 같은 날, <code>&lt;a href&gt;</code> 에 기사
+          URL을 넣을 때 따옴표를 안 지우는 <code>esc()</code> 를 쓴 저장형 XSS 도 고쳤다
+          (주간 리포트·텔레그램 포맷 — canonical 링크는 원문 페이지가 값을 정하므로
+          외부가 내용을 통제할 수 있었다). <code>esc_attr()</code>(속성 전용, 따옴표까지
+          이스케이프)로 교체.
         </p>
 
         <div class="note">
-          <b>인스턴스는 반드시 1개.</b> <code>run</code> 한 프로세스 안에서 API 와 함께
-          수집·시세·텔레그램봇·대외협력 스레드가 돈다. 2개로 늘리면 수집·LLM·알림이 두 벌 나간다.
-          텔레그램은 <code>(기사, 채널, 채팅방)</code> UNIQUE 가 일부 막아 주지만 카카오는 막히지 않는다.
-          오토스케일은 최소=최대=1 로 고정한다. 자세한 절차는 <code>DEPLOY.md</code>.
+          <b>실행 모드 — 단일 프로세스(기본) vs 분리(권장, 배포 시).</b>
+          기본은 <code>run</code> 한 프로세스 안에서 API + 수집·시세·텔레그램봇·대외협력
+          스레드가 다 돈다 — 가장 간단하지만, 재시작하면(코드 배포 등) 전부 같이 끊긴다.
+          <b>2026-09-11부터</b> <code>serve</code>(API/프론트만) + <code>worker</code>(수집·봇만,
+          웹서버 없음) 를 <b>별도 OS 프로세스 2개</b>로 띄우는 선택지가 생겼다 — 둘은 DB 로만
+          통신해 서로 존재를 모르고, 한쪽이 죽거나 재시작해도 다른 쪽은 계속 돈다(실사용
+          검증: <code>worker</code> 를 강제 종료해도 <code>serve</code> 는 계속 200 응답했다).
+          <b>인스턴스는 항상 1개.</b> <code>run</code> 이든 <code>serve</code>+<code>worker</code>
+          세트든, 수집 루프를 도는 프로세스가 2개 이상 동시에 뜨면(예: <code>run</code> 과
+          <code>worker</code> 를 같이 켜면) 수집·LLM·알림이 두 벌 나간다.
+          텔레그램은 <code>(기사, 채널, 채팅방)</code> UNIQUE 가 일부 막아 주지만 카카오는
+          막히지 않는다. 오토스케일은 최소=최대=1 로 고정한다. 자세한 절차는 <code>DEPLOY.md</code>·
+          <code>RUNBOOK.md</code>.
         </div>
 
         <h3>일회성 정리 명령</h3>
