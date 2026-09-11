@@ -162,19 +162,22 @@ async function loadStats() {
   try {
     const s = await getJSON('/api/stats');
     // detail: 눌렀을 때 열어 볼 목록의 종류 (0건이면 볼 게 없으니 버튼으로 만들지 않는다)
+    // slug: 화면 녹화 자동화(demo-video 스킬 등)가 라벨 텍스트에 기대지 않고
+    // 고정된 값으로 각 통계 카드를 찾을 수 있도록 하는 data-testid 용 값이다.
     const cards = [
-      ['전체 기사', s.total.toLocaleString('ko-KR'), false, null],
-      ['오늘 수집', s.today.toLocaleString('ko-KR'), false, null],
-      ['최근 수집', s.last_collected_at ? formatDate(s.last_collected_at) : '—', true, null],
+      ['전체 기사', s.total.toLocaleString('ko-KR'), false, null, 'total'],
+      ['오늘 수집', s.today.toLocaleString('ko-KR'), false, null, 'today'],
+      ['최근 수집', s.last_collected_at ? formatDate(s.last_collected_at) : '—', true, null, 'last-collected'],
       ['분석 대기', s.analysis_pending.toLocaleString('ko-KR'), false,
-        s.analysis_pending > 0 ? 'analysis' : null],
+        s.analysis_pending > 0 ? 'analysis' : null, 'analysis-pending'],
       ['발송 실패', s.notify_failed.toLocaleString('ko-KR'), false,
-        s.notify_failed > 0 ? 'notify' : null],
+        s.notify_failed > 0 ? 'notify' : null, 'notify-failed'],
       // 봇으로 나간 메시지 전문 — 0건이어도 눌러서 확인할 수 있게 항상 버튼으로 둔다.
-      ['발송 로그', (s.telegram_log_total ?? 0).toLocaleString('ko-KR'), false, 'tglog'],
+      ['발송 로그', (s.telegram_log_total ?? 0).toLocaleString('ko-KR'), false, 'tglog', 'send-log'],
     ];
-    $('stats').replaceChildren(...cards.map(([label, value, small, detail]) => {
+    $('stats').replaceChildren(...cards.map(([label, value, small, detail, slug]) => {
       const box = el(detail ? 'button' : 'div', 'stat');
+      box.dataset.testid = `stat-${slug}`;
       if (detail) {
         box.type = 'button';
         box.title = `${label} ${value}건 — 눌러서 목록 보기`;
