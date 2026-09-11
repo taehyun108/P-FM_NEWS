@@ -7233,6 +7233,31 @@ def create_app(ctx: Context):
         return bool(token) and bool(secret) and hmac.compare_digest(
             token, web_session_token(secret))
 
+    _WEB_LOGIN_SCRIPT = (
+        "var f=document.getElementById('f'),b=document.getElementById('b'),"
+        "e=document.getElementById('e');"
+        "f.addEventListener('submit',async function(ev){ev.preventDefault();"
+        "b.disabled=true;e.textContent='';try{"
+        "var r=await fetch('/api/web/login',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({password:document.getElementById('pw').value})});"
+        "var d=await r.json();"
+        "if(d.ok){location.replace('/');return;}"
+        "e.textContent=d.error||'로그인에 실패했습니다.';}"
+        "catch(err){e.textContent='서버에 연결하지 못했습니다.';}"
+        "b.disabled=false;});"
+    )
+
+    def _csp_hash(script_text: str) -> str:
+        """CSP script-src 에 넣을 'sha256-...' 해시 토큰. 인라인 스크립트 원문 그대로 넣어야 한다."""
+        import base64
+        digest = hashlib.sha256(script_text.encode("utf-8")).digest()
+        return "'sha256-" + base64.b64encode(digest).decode() + "'"
+
+    # CSP 가 허용할 인라인 스크립트 해시 목록. [0]은 로그인 페이지(고정 문자열)용,
+    # 그 뒤는 _index_html() 이 index.html/app.js 를 합칠 때마다 다시 채운다.
+    _csp_script_hashes: list[str] = [_csp_hash(_WEB_LOGIN_SCRIPT)]
+
     def _web_login_page() -> str:
         """잠금 상태에서 화면 대신 내주는 로그인 페이지. 외부 파일 없이 자립한다."""
         return (
@@ -7256,20 +7281,8 @@ def create_app(ctx: Context):
             "<input id='pw' type='password' name='password' placeholder='비밀번호' "
             "autocomplete='current-password' autofocus required>"
             "<button id='b' type='submit'>들어가기</button>"
-            "<div class='e' id='e'></div></form><script>"
-            "var f=document.getElementById('f'),b=document.getElementById('b'),"
-            "e=document.getElementById('e');"
-            "f.addEventListener('submit',async function(ev){ev.preventDefault();"
-            "b.disabled=true;e.textContent='';try{"
-            "var r=await fetch('/api/web/login',{method:'POST',"
-            "headers:{'Content-Type':'application/json'},"
-            "body:JSON.stringify({password:document.getElementById('pw').value})});"
-            "var d=await r.json();"
-            "if(d.ok){location.replace('/');return;}"
-            "e.textContent=d.error||'로그인에 실패했습니다.';}"
-            "catch(err){e.textContent='서버에 연결하지 못했습니다.';}"
-            "b.disabled=false;});"
-            "</script></body></html>"
+            "<div class='e' id='e'></div></form>"
+            f"<script>{_WEB_LOGIN_SCRIPT}</script></body></html>"
         )
 
     @app.middleware("http")
@@ -7279,16 +7292,18 @@ def create_app(ctx: Context):
         지금까지 이런 헤더가 하나도 없었다 — 특히 clickjacking(다른 사이트가
         이 화면을 투명 iframe 으로 씌워 '텔레그램 전송'·'URL 등록' 같은 버튼을
         몰래 클릭시키는 공격)에 무방비였다. CSP 는 이 프런트가 쓰는 리소스만
-        허용한다(외부 인라인 스크립트 없음·로컬 style.css 하나·기사 썸네일은
-        언론사 도메인에서 온다).
+        허용한다. app.js 는 캐싱 프록시 대응으로 index.html 에 인라인되므로
+        (아래 _render_index) 'unsafe-inline' 대신 정확한 스크립트 해시만 허용해
+        외부에서 주입된 스크립트는 여전히 막는다.
         """
         resp = await call_next(request)
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        script_src = "script-src 'self' " + " ".join(_csp_script_hashes)
         resp.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: https:; connect-src 'self'; "
+            f"default-src 'self'; {script_src}; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https: http:; connect-src 'self'; "
             "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         )
         return resp
@@ -8069,7 +8084,7 @@ def create_app(ctx: Context):
                         for n in ("index.html", "style.css", "app.js",
                                   "external_affairs.css", "external_affairs.js")]
 
-        def _render_index() -> str:
+        def _render_index() -> tuple[str, list[str]]:
             # JS·CSS 를 HTML 에 인라인해서 내보낸다. 별도 정적 요청이 없으므로
             # 쿼리스트링을 무시하는 프록시가 있어도 옛 파일을 내줄 수 없다.
             html, css, js, ea_css, ea_js = (
@@ -8077,13 +8092,19 @@ def create_app(ctx: Context):
             # 리터럴 치환만 한다(re.sub 은 repl 의 \s 등을 이스케이프로 해석해 깨진다).
             html = html.replace('<link rel="stylesheet" href="./style.css">',
                                 f"<style>\n{css}\n{ea_css}\n</style>")
-            return html.replace('<script src="./app.js"></script>',
+            html = html.replace('<script src="./app.js"></script>',
                                 f"<script>\n{js}\n</script>\n<script>\n{ea_js}\n</script>")
+            # CSP script-src 는 'unsafe-inline' 을 안 쓰므로, 방금 인라인한 두 스크립트의
+            # 해시를 매번 다시 계산해 허용 목록에 넣어야 브라우저가 실행을 막지 않는다.
+            hashes = [_csp_hash(f"\n{js}\n"), _csp_hash(f"\n{ea_js}\n")]
+            return html, hashes
 
         def _index_html() -> str:
             sig = tuple(os.path.getmtime(p) for p in _index_files)
             if _index_cache["sig"] != sig:
-                _index_cache.update(sig=sig, html=_render_index())
+                html, hashes = _render_index()
+                _index_cache.update(sig=sig, html=html)
+                _csp_script_hashes[1:] = hashes
             return _index_cache["html"]
 
         @app.get("/")
