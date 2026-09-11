@@ -6905,7 +6905,7 @@ def _valid_master_token(tok: str) -> bool:
 
 # ── 로그인 무차별 대입 방지 ───────────────────────────────────────────
 # /api/web/login·/api/master/login 은 시도 횟수 제한이 없어서, 비밀번호가
-# 짧으면(마스터는 4자 이상만 요구) 무제한 시도로 뚫릴 수 있었다. IP 별로
+# 짧으면(마스터는 8자 이상만 요구) 무제한 시도로 뚫릴 수 있었다. IP 별로
 # 5분 안에 5회 실패하면 5분간 잠근다(서버 메모리, 재시작 시 초기화 —
 # _MASTER_TOKENS 와 같은 성격이라 무거운 저장소를 새로 안 둔다).
 _LOGIN_FAILS: dict[str, list[float]] = {}
@@ -7271,6 +7271,27 @@ def create_app(ctx: Context):
             "b.disabled=false;});"
             "</script></body></html>"
         )
+
+    @app.middleware("http")
+    async def _security_headers(request, call_next):
+        """모든 응답에 기본 보안 헤더를 붙인다 (배포 전 점검, 2026-09-11).
+
+        지금까지 이런 헤더가 하나도 없었다 — 특히 clickjacking(다른 사이트가
+        이 화면을 투명 iframe 으로 씌워 '텔레그램 전송'·'URL 등록' 같은 버튼을
+        몰래 클릭시키는 공격)에 무방비였다. CSP 는 이 프런트가 쓰는 리소스만
+        허용한다(외부 인라인 스크립트 없음·로컬 style.css 하나·기사 썸네일은
+        언론사 도메인에서 온다).
+        """
+        resp = await call_next(request)
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        )
+        return resp
 
     @app.middleware("http")
     async def _web_gate(request, call_next):
@@ -7891,8 +7912,8 @@ def create_app(ctx: Context):
         if target not in ("master", "web"):
             return JSONResponse({"ok": False, "error": "target 은 master 또는 web 이어야 합니다."},
                                 status_code=400)
-        if not isinstance(new_pw, str) or len(new_pw) < 4:
-            return JSONResponse({"ok": False, "error": "새 비밀번호는 4자 이상이어야 합니다."},
+        if not isinstance(new_pw, str) or len(new_pw) < 8:
+            return JSONResponse({"ok": False, "error": "새 비밀번호는 8자 이상이어야 합니다."},
                                 status_code=400)
         if target == "master":
             cur = (payload or {}).get("current_password", "")
