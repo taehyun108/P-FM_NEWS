@@ -30,3 +30,16 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=40s --retries=3 \
 
 # run = API 서버 + 수집/시세/텔레그램봇/대외협력 스레드. 인스턴스는 반드시 1개.
 CMD ["python", "backend/main.py", "run"]
+
+# ── serve + worker 로 나눠 띄울 때 (2026-09-11, 권장 — 한쪽이 죽거나
+#    재시작해도 다른 쪽은 안 끊긴다. 자세한 내용은 docs/RUNBOOK.md) ──────
+# 이 이미지 그대로 컨테이너(ECS 태스크 등)를 2개 만들고 command 만 바꾼다:
+#   서버 컨테이너: command = ["python", "backend/main.py", "serve"]
+#                  → 위 HEALTHCHECK(=/healthz) 그대로 쓴다.
+#   worker 컨테이너: command = ["python", "backend/main.py", "worker"]
+#                  → 웹서버가 없어 위 HEALTHCHECK(/healthz)가 항상 실패한다.
+#                    ECS 태스크 정의(또는 `docker run --health-cmd`)에서
+#                    healthCheck 를 아래로 **반드시** 덮어써야 한다:
+#                      command: ["CMD", "python", "backend/main.py", "healthcheck"]
+#    둘 다 desiredCount=1 로 고정한다 — 수집 루프가 도는 프로세스가
+#    동시에 2개 이상 뜨면 수집·알림이 중복된다(run 과 worker 도 동시 금지).

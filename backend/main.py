@@ -27,8 +27,10 @@ import logging
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -646,6 +648,13 @@ class Storage(ABC):
     def set_run_state(self, patch: dict) -> None: ...
 
     @abstractmethod
+    def try_acquire_pipeline_lock(self, owner: str, stale_after_sec: float) -> bool:
+        """파이프라인 실행권을 얻으면 True. AWS 등에서 실수로 인스턴스가 2개
+        떠도(정상 운영은 항상 1개) 수집·알림이 중복되지 않게 하는 안전장치다.
+        락 소유자가 없거나, 소유자가 자신이거나(같은 프로세스의 다음 회차),
+        마지막 갱신이 stale_after_sec 보다 오래됐으면(죽은 소유자로 간주) 얻는다."""
+
+    @abstractmethod
     def log_collection(self, row: dict) -> None: ...
 
     @abstractmethod
@@ -845,6 +854,8 @@ class SqliteStorage(Storage):
             "alter table run_state add column trade_exclude_keywords TEXT default '[]'",
             "alter table run_state add column score_overrides TEXT default '{}'",
             "alter table run_state add column score_custom_rules TEXT default '[]'",
+            "alter table run_state add column pipeline_lock_owner TEXT",
+            "alter table run_state add column pipeline_lock_at TEXT",
         ]
         for sql in migrations:
             try:
@@ -1286,6 +1297,19 @@ class SqliteStorage(Storage):
         data = self._encode({**patch, "updated_at": iso(now_utc())})
         sets = ",".join(f"{k}=?" for k in data)
         self._exec(f"update run_state set {sets} where key='pipeline'", list(data.values()))
+
+    def try_acquire_pipeline_lock(self, owner: str, stale_after_sec: float) -> bool:
+        self.get_run_state()
+        stale_before = iso(now_utc() - timedelta(seconds=stale_after_sec))
+        now = iso(now_utc())
+        cur = self._exec(
+            "update run_state set pipeline_lock_owner=?, pipeline_lock_at=?"
+            " where key='pipeline' and ("
+            "  pipeline_lock_owner is null or pipeline_lock_owner=?"
+            "  or pipeline_lock_at is null or pipeline_lock_at < ?)",
+            (owner, now, owner, stale_before),
+        )
+        return bool(cur.rowcount and cur.rowcount > 0)
 
     def log_collection(self, row: dict) -> None:
         data = self._encode(row)
@@ -1966,6 +1990,20 @@ class SupabaseStorage(Storage):
     def set_run_state(self, patch: dict) -> None:
         self.get_run_state()
         self._t("run_state").update({**patch, "updated_at": iso(now_utc())}).eq("key", "pipeline").execute()
+
+    def try_acquire_pipeline_lock(self, owner: str, stale_after_sec: float) -> bool:
+        self.get_run_state()
+        stale_before = iso(now_utc() - timedelta(seconds=stale_after_sec))
+        now = iso(now_utc())
+        # UPDATE 는 Postgres 행 잠금으로 원자적이다 — 두 프로세스가 동시에 보내도
+        # 하나가 먼저 커밋되면 owner 가 바뀌어 다른 하나의 WHERE 조건이 깨진다.
+        rows = (self._t("run_state")
+                .update({"pipeline_lock_owner": owner, "pipeline_lock_at": now})
+                .eq("key", "pipeline")
+                .or_(f"pipeline_lock_owner.is.null,pipeline_lock_owner.eq.{owner},"
+                     f"pipeline_lock_at.is.null,pipeline_lock_at.lt.{stale_before}")
+                .execute().data) or []
+        return len(rows) > 0
 
     def log_collection(self, row: dict) -> None:
         self._t("collection_logs").insert(row).execute()
@@ -4738,6 +4776,19 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     started = time.monotonic()
     cfg, storage, http = ctx.cfg, ctx.storage, ctx.http
     http.reset()
+
+    # 다중 인스턴스 오배포 안전장치 — 실행권을 못 얻으면 이번 회차는 건너뛴다.
+    # 컬럼이 아직 없는 기존 DB(Supabase 수동 마이그레이션 전)에서도 파이프라인이
+    # 멈추면 안 되므로, 락 자체가 실패하면(예외) '락 없이 진행'으로 폴백한다 —
+    # 이건 필수 기능이 아니라 사고를 줄이는 안전장치일 뿐이다.
+    try:
+        stale_after = max(60, cfg.poll_interval_sec * PIPELINE_LOCK_STALE_MULT)
+        if not storage.try_acquire_pipeline_lock(_INSTANCE_ID, stale_after):
+            log.warning("다른 인스턴스(%s)가 파이프라인을 실행 중입니다 — 이번 회차는 건너뜁니다.",
+                        _INSTANCE_ID)
+            return {"fetched": 0, "new": 0, "skipped_locked": True}
+    except Exception as exc:
+        log.debug("파이프라인 락 확인 실패(무시하고 진행): %s", exc)
 
     state = storage.get_run_state()
     last_success = parse_dt(state.get("last_success_at"))
@@ -8568,6 +8619,49 @@ def cmd_once(ctx: Context, max_llm: int | None) -> None:
 QUOTE_REFRESH_SEC = 60   # 시세는 수집 주기와 무관하게 항상 60초로 갱신한다. (PRD F9.2)
 
 
+# worker(웹서버 없이 수집만 도는 모드)는 /healthz 가 없다. AWS ECS 등 컨테이너
+# 플랫폼이 "살아있는지"를 물을 방법이 필요해서, 수집 루프가 사이클마다 로컬
+# 파일에 시각을 남기고 `healthcheck` 명령이 그 최신성으로 판정한다.
+_HEARTBEAT_PATH = os.path.join(tempfile.gettempdir(), "pfm_news_heartbeat")
+
+# 이 프로세스를 run_state.pipeline_lock_owner 에 식별하는 값. 정상 운영은 항상
+# 인스턴스 1개지만, AWS 등에서 desiredCount 를 잘못 설정하거나 배포 중 잠깐
+# 신·구 인스턴스가 겹치면 수집·알림이 중복된다 — run_once() 가 매 회차 이
+# 값으로 실행권(락)을 얻으려 시도해 그런 사고를 막는다.
+_INSTANCE_ID = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
+PIPELINE_LOCK_STALE_MULT = 3   # 락 유효시간 = poll_interval_sec 의 이 배수 (죽은 소유자 회수용)
+
+
+def _touch_heartbeat() -> None:
+    try:
+        with open(_HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+            f.write(iso(now_utc()))
+    except OSError as exc:   # 헬스체크 실패는 치명적이지 않다 — 다음 사이클에 재시도
+        log.debug("heartbeat 기록 실패: %s", exc)
+
+
+def cmd_healthcheck(max_age_sec: int) -> int:
+    """worker 컨테이너용 헬스체크. Docker/ECS 헬스체크 CMD 로 등록한다:
+    `python backend/main.py healthcheck` (기본 상한 poll_interval_sec 의 3배).
+    DB·API 키가 필요 없어 컨테이너가 자주 불러도 가볍다.
+    """
+    try:
+        with open(_HEARTBEAT_PATH, encoding="utf-8") as f:
+            ts = parse_dt(f.read().strip())
+    except OSError:
+        print("unhealthy: heartbeat 파일이 없습니다(첫 사이클 전이거나 worker 가 아닙니다).")
+        return 1
+    if ts is None:
+        print("unhealthy: heartbeat 파일을 읽을 수 없습니다.")
+        return 1
+    age = (now_utc() - ts).total_seconds()
+    if age > max_age_sec:
+        print(f"unhealthy: 마지막 수집이 {age:.0f}초 전 (기준 {max_age_sec}초).")
+        return 1
+    print(f"healthy: 마지막 수집 {age:.0f}초 전.")
+    return 0
+
+
 def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
     """수집·분석·알림 루프. 시세는 quote_loop 가 따로 돈다."""
     while not stop.is_set():
@@ -8581,6 +8675,11 @@ def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
             refresh_scan_store(ctx.storage)
         except Exception as exc:
             log.exception("파이프라인 실행 중 오류: %s", exc)
+        # 예외가 나도 사이클이 '끝나긴' 했다는 신호로 찍는다 — worker(웹서버 없음)는
+        # /healthz 가 없어 컨테이너 헬스체크가 이걸로 대신 판단한다(cmd_healthcheck).
+        # 사이클이 진짜로 멎으면(네트워크 요청이 행 걸리는 등) 여기까지 못 와서
+        # heartbeat 가 오래된 채로 남고, 헬스체크가 정확히 그걸 감지한다.
+        _touch_heartbeat()
 
         elapsed = time.monotonic() - started
         if elapsed > ctx.cfg.poll_interval_sec:
@@ -9550,6 +9649,16 @@ def cmd_selftest() -> int:
     check("30일 넘은 발송 로그 1건 정리", _tmp.prune_telegram_log(30), 1)
     check("최근 로그는 남는다", len(_tmp.recent_telegram_logs(10)), 1)
 
+    print("\n[11-5b] 파이프라인 락 — 다중 인스턴스 오배포 방지 (AWS 배포 전 점검, 2026-09-11)")
+    check("아무도 없으면 얻는다", _tmp.try_acquire_pipeline_lock("me", 300), True)
+    check("내가 이미 쥐고 있으면 다시 얻는다(재갱신)", _tmp.try_acquire_pipeline_lock("me", 300), True)
+    check("남이 쥐고 있고 신선하면 못 얻는다", _tmp.try_acquire_pipeline_lock("other", 300), False)
+    # iso() 는 초 단위까지만 기록해서(SQLite 문자열 정렬용) 같은 초 안의 연속
+    # 호출은 lock_at 이 다 똑같다 — stale_after_sec 를 음수로 줘서 '만료 기준
+    # 시각'을 미래로 만들면, 방금 갱신한 락도 확실히 '오래된 것'으로 취급된다.
+    check("남이 쥐고 있어도 오래됐으면(죽은 소유자) 얻는다",
+          _tmp.try_acquire_pipeline_lock("other", -60), True)
+
     print("\n[11-6] cmd_fixcategories — 인사·부고 태그는 재태깅에서 보호 (회귀 방지)")
     # 2026-09-10 발견: detect_categories 는 인사·부고를 모르는데 cmd_fixcategories 가
     # 전체 기사의 categories 를 그걸로 덮어써, 실행 시점마다 인사·부고 태그가 지워지고
@@ -10068,6 +10177,8 @@ USAGE = """사용법: python backend/main.py <명령>
   serve      API + 프론트엔드 서버만 실행
   worker     웹서버 없이 수집 루프 + 텔레그램 챗봇만 실행 (serve 와 별도 프로세스로
              띄우면 한쪽이 죽거나 재시작해도 다른 쪽은 안 끊긴다)
+  healthcheck [N]  worker 컨테이너 헬스체크 — 마지막 수집이 N초(기본 poll 주기의 3배)
+             이내면 healthy. DB 연결 없이 즉시 끝난다(Docker/ECS 헬스체크 CMD 용)
   run        서버 + 수집 루프 + 텔레그램 챗봇 (한 프로세스, 기존 운영 모드)
   quotes     시세만 1회 갱신
   notify     대기 중인 텔레그램 알림만 발송
@@ -10091,6 +10202,11 @@ def main(argv: Sequence[str]) -> int:
         return 0
     if command == "selftest":
         return cmd_selftest()
+    if command == "healthcheck":
+        # DB 연결 없이 가볍게 — 컨테이너 플랫폼이 자주(예: 60초마다) 호출한다.
+        default_max_age = load_config().poll_interval_sec * 3
+        max_age = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else default_max_age
+        return cmd_healthcheck(max_age)
 
     cfg = load_config()
     storage = make_storage(cfg)

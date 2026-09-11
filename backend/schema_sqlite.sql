@@ -93,6 +93,8 @@ create table if not exists run_state (
   night_min_score  INTEGER,                 -- 야간엔 이 점수 이상만. 101=전면차단 (null 이면 .env / 기본 80)
   score_overrides TEXT default '{}',        -- 중요도 기본 항목 재정의 {키: {points, enabled}} (마스터 설정)
   score_custom_rules TEXT default '[]',     -- 중요도 사용자 추가 항목 [{id,label,keywords,scope,points}] (마스터 설정)
+  pipeline_lock_owner TEXT,                 -- 파이프라인 실행권을 쥔 인스턴스 ID (다중 인스턴스 오배포 방지)
+  pipeline_lock_at TEXT,                    -- 위 락을 마지막으로 갱신한 시각
   updated_at       TEXT not null
 );
 

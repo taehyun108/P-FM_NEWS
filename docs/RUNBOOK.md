@@ -22,10 +22,33 @@
 분리 모드로 갈 때 주의:
 - **`run` 과 `worker` 를 동시에 켜면 안 된다** — 둘 다 수집 루프를 돌려 기사가 중복
   수집·중복 알림된다. `serve`+`worker` 세트이거나 `run` 단독이거나 둘 중 하나만.
-- `worker` 는 웹서버를 안 띄우므로 `/healthz` 같은 헬스체크가 없다 — 살아있는지는
-  로그(`수집 루프 시작...`)나 DB 의 `collection_logs` 최신 시각으로 확인한다.
+  (2026-09-11부터 실수로 겹쳐도 `pipeline_lock_owner` 안전장치가 있지만, 이건
+  '사고를 줄이는 것'이지 의도적으로 2개를 켜도 된다는 뜻이 아니다 — 아래 참고.)
+- `worker` 는 웹서버를 안 띄우므로 `/healthz` 를 못 쓴다 — 대신
+  `python backend/main.py healthcheck` 로 살아있는지 확인한다(마지막 수집이
+  `poll_interval_sec` 의 3배 이내면 healthy). AWS ECS 등 컨테이너로 띄울 때
+  `worker` 태스크의 헬스체크를 **반드시 이 명령으로 덮어써야** 한다 — 이미지
+  기본 `HEALTHCHECK` 는 `/healthz` 라 `worker` 에서는 항상 실패한다.
 - 둘 다 대시 만나면 재시작 후 마스터 로그인 세션(`_MASTER_TOKENS`)이 초기화되는 건
   `serve` 프로세스에만 해당한다(그 상태를 들고 있는 쪽이라).
+
+### 다중 인스턴스 안전장치 (2026-09-11, AWS 배포 전 점검)
+
+정상 운영은 항상 인스턴스 1개다. 그래도 배포 실수(desiredCount 오설정, 롤링
+업데이트 중 신·구 인스턴스가 잠깐 겹치는 것 등)로 파이프라인이 2개 뜨면
+수집·텔레그램 알림이 중복된다 — `run_once()` 가 매 회차 `run_state` 의
+`pipeline_lock_owner`/`pipeline_lock_at` 로 실행권을 얻으려 시도해 이를 막는다.
+소유자가 없거나·나 자신이거나·오래됐으면(죽은 소유자로 간주) 얻고, 다른
+인스턴스가 신선하게 쥐고 있으면 그 회차를 건너뛴다.
+
+**Supabase 사용자는 아래를 SQL Editor 에서 1회 실행해야 한다** (안 하면 락 없이
+그냥 진행하도록 예외를 삼키므로 파이프라인이 멈추진 않지만, 안전장치가 없는
+상태가 된다):
+```sql
+alter table run_state
+  add column if not exists pipeline_lock_owner text,
+  add column if not exists pipeline_lock_at timestamptz;
+```
 
 ## 저장소 — SQLite 와 Supabase 동시 유지
 

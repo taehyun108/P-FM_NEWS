@@ -1383,12 +1383,27 @@
           웹서버 없음) 를 <b>별도 OS 프로세스 2개</b>로 띄우는 선택지가 생겼다 — 둘은 DB 로만
           통신해 서로 존재를 모르고, 한쪽이 죽거나 재시작해도 다른 쪽은 계속 돈다(실사용
           검증: <code>worker</code> 를 강제 종료해도 <code>serve</code> 는 계속 200 응답했다).
+          <code>worker</code> 는 웹서버가 없어 <code>/healthz</code> 를 못 쓰는데, 수집 루프가
+          사이클마다 로컬 파일(임시 디렉터리)에 시각을 남기고 <code>python backend/main.py
+          healthcheck</code> 가 그 최신성(기본 <code>poll_interval_sec</code> 의 3배 이내)
+          으로 판정한다 — DB 연결 없이 즉시 끝나 컨테이너 플랫폼이 자주 불러도 가볍다.
+          ECS 등에서 <code>worker</code> 컨테이너는 이 명령으로 헬스체크를 <b>반드시
+          덮어써야</b> 한다(이미지 기본 <code>HEALTHCHECK</code> 는 <code>/healthz</code>
+          라 <code>worker</code> 에서는 항상 실패한다).
           <b>인스턴스는 항상 1개.</b> <code>run</code> 이든 <code>serve</code>+<code>worker</code>
           세트든, 수집 루프를 도는 프로세스가 2개 이상 동시에 뜨면(예: <code>run</code> 과
           <code>worker</code> 를 같이 켜면) 수집·LLM·알림이 두 벌 나간다.
           텔레그램은 <code>(기사, 채널, 채팅방)</code> UNIQUE 가 일부 막아 주지만 카카오는
           막히지 않는다. 오토스케일은 최소=최대=1 로 고정한다. 자세한 절차는 <code>DEPLOY.md</code>·
           <code>RUNBOOK.md</code>.
+          <br><b>안전장치(2026-09-11, AWS 배포 전 점검)</b>: 그래도 실수로(배포 중 롤링
+          업데이트가 신·구 인스턴스를 잠깐 겹치게 하는 경우 등) 파이프라인이 2개 뜨면,
+          <code>run_once()</code> 가 매 회차 <code>run_state.pipeline_lock_owner</code> 에
+          이 프로세스 ID(호스트명+PID+난수)로 실행권을 얻으려 시도한다. 다른 인스턴스가
+          이미 쥐고 있고(<code>pipeline_lock_at</code> 이 <code>poll_interval_sec</code>
+          의 3배 이내로 신선하면) 그 회차는 건너뛴다 — 소유자가 죽으면(그 시간이 지나도
+          안 갱신되면) 자동으로 회수된다. 필수 기능이 아니라 안전장치라, 컬럼이 아직 없는
+          Supabase(수동 마이그레이션 전)에서는 예외를 삼키고 락 없이 그냥 진행한다.
         </div>
 
         <h3>일회성 정리 명령</h3>
