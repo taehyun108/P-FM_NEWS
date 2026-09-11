@@ -7526,8 +7526,10 @@ def create_app(ctx: Context):
         return JSONResponse(build_card(row))
 
     @app.post("/api/articles/{article_id}/telegram")
-    async def api_share_telegram(article_id: str):
+    async def api_share_telegram(article_id: str, x_master_token: str = fastapi.Header(default="")):
         """카드의 전송 버튼 — 이 기사 요약을 설정된 텔레그램 채팅으로 보낸다."""
+        if (err := _master_guard(x_master_token)):
+            return err
         if not ctx.cfg.telegram_enabled:
             return JSONResponse({"ok": False, "error": "텔레그램이 설정되지 않았습니다."},
                                 status_code=400)
@@ -7955,8 +7957,10 @@ def create_app(ctx: Context):
         return JSONResponse(result, status_code=code)
 
     @app.post("/api/articles/{article_id}/confirm")
-    def api_confirm_draft(article_id: str):
+    def api_confirm_draft(article_id: str, x_master_token: str = fastapi.Header(default="")):
         """미리보기(draft) 기사를 목록에 등록한다."""
+        if (err := _master_guard(x_master_token)):
+            return err
         row = ctx.storage.article_detail(article_id)
         if row is None:
             return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
@@ -7972,8 +7976,10 @@ def create_app(ctx: Context):
         return JSONResponse({"ok": True, "notified": notified})
 
     @app.post("/api/articles/{article_id}/discard")
-    def api_discard_draft(article_id: str):
+    def api_discard_draft(article_id: str, x_master_token: str = fastapi.Header(default="")):
         """미리보기(draft) 기사를 등록하지 않고 버린다(보관 처리)."""
+        if (err := _master_guard(x_master_token)):
+            return err
         row = ctx.storage.article_detail(article_id)
         if row is None:
             return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)

@@ -534,17 +534,18 @@ function buildCard(item) {
 /* ── 텔레그램 공유 ─────────────────────────────────────────────── */
 
 async function shareToTelegram(articleId, btn) {
+  if (!masterAuth()) { showMasterLogin(); return; }
   const original = btn.textContent;
   btn.disabled = true;
   btn.textContent = '…';
   try {
-    const res = await fetch(`${API}/api/articles/${articleId}/telegram`, { method: 'POST' });
+    const res = await masterFetch(`/api/articles/${articleId}/telegram`, { method: 'POST' });
     const data = await res.json().catch(() => ({}));
     btn.textContent = data.ok ? '✓' : '✗';
     btn.title = data.ok ? '전송했습니다' : (data.error || '전송 실패');
-  } catch {
+  } catch (err) {
     btn.textContent = '✗';
-    btn.title = '서버에 연결하지 못했습니다';
+    btn.title = err.message === 'unauthorized' ? '마스터 인증이 필요합니다' : '서버에 연결하지 못했습니다';
   }
   setTimeout(() => {
     btn.textContent = original;
@@ -1469,20 +1470,24 @@ async function submitUrl(e) {
 
 async function confirmDraft() {
   if (!pendingDraft) return;
+  if (!masterAuth()) { showMasterLogin(); return; }
   try {
-    const res = await fetch(`${API}/api/articles/${pendingDraft.id}/confirm`, { method: 'POST' });
+    const res = await masterFetch(`/api/articles/${pendingDraft.id}/confirm`, { method: 'POST' });
     if (!(await res.json()).ok) throw new Error();
     $('grid').prepend(buildCard(pendingDraft.card));   // 목록 맨 위에 추가
     $('urlAddInput').value = '';
     urlMsg('ok', '목록에 등록했습니다.');
     clearUrlPreview();
-  } catch { urlMsg('err', '등록에 실패했습니다.'); }
+  } catch (err) {
+    if (err.message !== 'unauthorized') urlMsg('err', '등록에 실패했습니다.');
+  }
 }
 
 async function discardDraft() {
   if (!pendingDraft) return;
+  if (!masterAuth()) { showMasterLogin(); return; }
   try {
-    await fetch(`${API}/api/articles/${pendingDraft.id}/discard`, { method: 'POST' });
+    await masterFetch(`/api/articles/${pendingDraft.id}/discard`, { method: 'POST' });
   } catch { /* 실패해도 24시간 뒤 자동 정리된다 */ }
   urlMsg('info', '등록하지 않았습니다.');
   clearUrlPreview();
