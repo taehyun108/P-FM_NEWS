@@ -169,6 +169,10 @@ class Config:
     openai_api_key: str
     llm_model: str
     embedding_model: str
+    # 임베딩 대체 공급자 (선택) — OpenAI 임베딩 호출이 실패하면 이 키가 있을 때만 시도한다.
+    # NVIDIA NIM 은 OpenAI 호환 엔드포인트라 openai 라이브러리를 base_url 만 바꿔 그대로 쓴다.
+    nvidia_embed_api_key: str
+    nvidia_embed_model: str
     # DB
     db_backend: str
     sqlite_path: str
@@ -303,6 +307,9 @@ def load_config() -> Config:
         openai_api_key=openai_key,
         llm_model=get_env("LLM_MODEL", "gpt-5.6-luna"),
         embedding_model=get_env("EMBEDDING_MODEL", "text-embedding-3-small"),
+        # 선택 항목 — 비어 있으면 대체 없이 기존처럼 OpenAI 임베딩 실패를 그냥 넘어간다.
+        nvidia_embed_api_key=get_env("NVIDIA_EMBED_API_KEY", ""),
+        nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nemotron-3-embed-1b"),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
@@ -4016,12 +4023,29 @@ def _make_openai_client(api_key: str):
     return client
 
 
+NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+
+def _make_nvidia_client(api_key: str):
+    """NVIDIA NIM 클라이언트. OpenAI 호환 엔드포인트라 openai 라이브러리를 그대로 쓴다."""
+    openai = _import("openai", "openai")
+    return openai.OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
+
+
 class LLMClient:
     def __init__(self, cfg: Config) -> None:
         _hush_libraries()  # openai/httpx 가 import 시 로깅을 다시 켜는 경우 대비
         self.client = _make_openai_client(cfg.openai_api_key)
         self.model = cfg.llm_model
         self.embedding_model = cfg.embedding_model
+        # OpenAI 임베딩이 실패할 때만 쓰는 대체 경로. 키가 없으면 그대로 None — 기존처럼
+        # 실패를 삼키고 넘어간다(4단계 임베딩 유사도 판정 생략, 3단계까지만 적용).
+        # 서로 다른 임베딩 모델 벡터는 차원·벡터공간이 달라 직접 비교할 수 없지만,
+        # cosine() 이 차원이 다르면 0.0 을 돌려주도록 이미 방어돼 있어 오작동 없이
+        # '유사하지 않음'으로만 처리된다 — 대체가 걸린 동안 중복 탐지 정확도만 낮아진다.
+        self.nvidia_embed_client = (
+            _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
+        self.nvidia_embed_model = cfg.nvidia_embed_model
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
         self._supports_json_mode = True
         # 중복 판정 4단계의 임베딩 호출을 1회 실행당 이 수로 제한한다.
@@ -4147,8 +4171,17 @@ class LLMClient:
             resp = self.client.embeddings.create(model=self.embedding_model, input=text[:2000])
             return list(resp.data[0].embedding)
         except Exception as exc:
-            log.warning("임베딩 생성 실패: %s", exc)
-            return None
+            log.warning("OpenAI 임베딩 생성 실패: %s", exc)
+            if self.nvidia_embed_client is None:
+                return None
+            try:
+                resp = self.nvidia_embed_client.embeddings.create(
+                    model=self.nvidia_embed_model, input=text[:2000])
+                log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
+                return list(resp.data[0].embedding)
+            except Exception as exc2:
+                log.warning("NVIDIA 임베딩도 실패: %s", exc2)
+                return None
 
 
 def _parse_json_object(content: str) -> dict | None:
@@ -9576,6 +9609,41 @@ def cmd_selftest() -> int:
            refresh_scan_store(_tmp),
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
     _reset_store()
+
+    print("\n[11-2f] 임베딩 대체 공급자(NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11)")
+    _llm_blank = {f: "" for f in Config.__dataclass_fields__}
+    _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
+                                     "llm_model": "m", "embedding_model": "e",
+                                     "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n"})
+    _lcfg_no_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
+                                   "llm_model": "m", "embedding_model": "e",
+                                   "nvidia_embed_api_key": "", "nvidia_embed_model": "n"})
+
+    class _FakeEmbData:
+        def __init__(self, vec: list[float]) -> None:
+            self.embedding = vec
+
+    class _FakeEmbResp:
+        def __init__(self, vec: list[float]) -> None:
+            self.data = [_FakeEmbData(vec)]
+
+    def _openai_down(**_kw: Any) -> Any:
+        raise RuntimeError("OpenAI 인증 실패(시뮬레이션)")
+
+    _llm1 = LLMClient(_lcfg_with_fallback)
+    _llm1.client.embeddings.create = _openai_down
+    _llm1.nvidia_embed_client.embeddings.create = lambda **_kw: _FakeEmbResp([0.4, 0.5, 0.6])
+    check("OpenAI 임베딩 실패 → NVIDIA 로 대체", _llm1.embed("테스트"), [0.4, 0.5, 0.6])
+
+    _llm2 = LLMClient(_lcfg_no_fallback)
+    check("NVIDIA 키 없으면 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
+    _llm2.client.embeddings.create = _openai_down
+    check("대체 키 없이 OpenAI 도 실패하면 None (기존과 동일)", _llm2.embed("테스트"), None)
+
+    _llm3 = LLMClient(_lcfg_with_fallback)
+    _llm3.client.embeddings.create = _openai_down
+    _llm3.nvidia_embed_client.embeddings.create = _openai_down
+    check("OpenAI·NVIDIA 둘 다 실패하면 None", _llm3.embed("테스트"), None)
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
