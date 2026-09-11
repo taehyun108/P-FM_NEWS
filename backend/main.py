@@ -169,10 +169,12 @@ class Config:
     openai_api_key: str
     llm_model: str
     embedding_model: str
-    # 임베딩 대체 공급자 (선택) — OpenAI 임베딩 호출이 실패하면 이 키가 있을 때만 시도한다.
+    # 대체 공급자 (선택) — OpenAI 호출이 실패하면 이 키가 있을 때만 시도한다.
     # NVIDIA NIM 은 OpenAI 호환 엔드포인트라 openai 라이브러리를 base_url 만 바꿔 그대로 쓴다.
     nvidia_embed_api_key: str
     nvidia_embed_model: str
+    nvidia_llm_api_key: str
+    nvidia_llm_model: str
     # DB
     db_backend: str
     sqlite_path: str
@@ -307,9 +309,11 @@ def load_config() -> Config:
         openai_api_key=openai_key,
         llm_model=get_env("LLM_MODEL", "gpt-5.6-luna"),
         embedding_model=get_env("EMBEDDING_MODEL", "text-embedding-3-small"),
-        # 선택 항목 — 비어 있으면 대체 없이 기존처럼 OpenAI 임베딩 실패를 그냥 넘어간다.
+        # 선택 항목 — 비어 있으면 대체 없이 기존처럼 OpenAI 실패를 그냥 넘어간다.
         nvidia_embed_api_key=get_env("NVIDIA_EMBED_API_KEY", ""),
         nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nemotron-3-embed-1b"),
+        nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
+        nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "meta/llama-3.2-90b-vision-instruct"),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
@@ -4046,8 +4050,15 @@ class LLMClient:
         self.nvidia_embed_client = (
             _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
         self.nvidia_embed_model = cfg.nvidia_embed_model
+        # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로. 마찬가지로
+        # 키가 없으면 그대로 None — OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        self.nvidia_llm_client = (
+            _make_nvidia_client(cfg.nvidia_llm_api_key) if cfg.nvidia_llm_api_key else None)
+        self.nvidia_llm_model = cfg.nvidia_llm_model
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
+        # OpenAI·NVIDIA 는 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
         self._supports_json_mode = True
+        self._nvidia_supports_json_mode = True
         # 중복 판정 4단계의 임베딩 호출을 1회 실행당 이 수로 제한한다.
         # 네이버 수집 시 유사 제목이 대량으로 들어와 임베딩 폭주가 발생할 수 있다.
         self.max_embed_per_run = MAX_EMBED_PER_RUN
@@ -4056,22 +4067,23 @@ class LLMClient:
     def reset_run(self) -> None:
         self._embed_calls = 0
 
-    def _chat(self, system: str, user: str) -> tuple[str, dict]:
+    def _chat_once(self, client: Any, model: str, supports_json_attr: str,
+                    system: str, user: str) -> tuple[str, dict]:
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
-        if self._supports_json_mode:
+        if getattr(self, supports_json_attr):
             kwargs["response_format"] = {"type": "json_object"}
         try:
-            resp = self.client.chat.completions.create(**kwargs)
+            resp = client.chat.completions.create(**kwargs)
         except Exception as exc:
             # response_format 미지원 모델이면 한 번만 빼고 재시도한다.
-            if self._supports_json_mode and "response_format" in str(exc):
+            if getattr(self, supports_json_attr) and "response_format" in str(exc):
                 log.info("모델이 JSON 모드를 지원하지 않아 일반 모드로 전환합니다.")
-                self._supports_json_mode = False
+                setattr(self, supports_json_attr, False)
                 kwargs.pop("response_format", None)
-                resp = self.client.chat.completions.create(**kwargs)
+                resp = client.chat.completions.create(**kwargs)
             else:
                 raise
         usage = {}
@@ -4079,6 +4091,16 @@ class LLMClient:
             usage = {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens,
                      "total": resp.usage.total_tokens}
         return (resp.choices[0].message.content or ""), usage
+
+    def _chat(self, system: str, user: str) -> tuple[str, dict]:
+        try:
+            return self._chat_once(self.client, self.model, "_supports_json_mode", system, user)
+        except Exception as exc:
+            if self.nvidia_llm_client is None:
+                raise
+            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
+            return self._chat_once(self.nvidia_llm_client, self.nvidia_llm_model,
+                                    "_nvidia_supports_json_mode", system, user)
 
     def analyze(self, title: str, press: str, body: str) -> Analysis:
         prompt = ANALYSIS_PROMPT.format(title=title, press=press or "미상", body=body[:MAX_BODY_CHARS])
@@ -4124,10 +4146,15 @@ class LLMClient:
 
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            resp = self.client.chat.completions.create(model=self.model, messages=messages)
+        except Exception as exc:
+            if self.nvidia_llm_client is None:
+                raise
+            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
+            resp = self.nvidia_llm_client.chat.completions.create(
+                model=self.nvidia_llm_model, messages=messages)
         return resp.choices[0].message.content or ""
 
     def weekly_brief(self, kind: str, name: str, articles: list[dict]) -> dict:
@@ -9610,14 +9637,16 @@ def cmd_selftest() -> int:
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
     _reset_store()
 
-    print("\n[11-2f] 임베딩 대체 공급자(NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11)")
+    print("\n[11-2f] 대체 공급자(NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11)")
     _llm_blank = {f: "" for f in Config.__dataclass_fields__}
     _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                      "llm_model": "m", "embedding_model": "e",
-                                     "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n"})
+                                     "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n",
+                                     "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm"})
     _lcfg_no_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                    "llm_model": "m", "embedding_model": "e",
-                                   "nvidia_embed_api_key": "", "nvidia_embed_model": "n"})
+                                   "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
+                                   "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm"})
 
     class _FakeEmbData:
         def __init__(self, vec: list[float]) -> None:
@@ -9627,6 +9656,19 @@ def cmd_selftest() -> int:
         def __init__(self, vec: list[float]) -> None:
             self.data = [_FakeEmbData(vec)]
 
+    class _FakeMsg:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _FakeChoice:
+        def __init__(self, content: str) -> None:
+            self.message = _FakeMsg(content)
+
+    class _FakeChatResp:
+        def __init__(self, content: str) -> None:
+            self.choices = [_FakeChoice(content)]
+            self.usage = None
+
     def _openai_down(**_kw: Any) -> Any:
         raise RuntimeError("OpenAI 인증 실패(시뮬레이션)")
 
@@ -9634,11 +9676,24 @@ def cmd_selftest() -> int:
     _llm1.client.embeddings.create = _openai_down
     _llm1.nvidia_embed_client.embeddings.create = lambda **_kw: _FakeEmbResp([0.4, 0.5, 0.6])
     check("OpenAI 임베딩 실패 → NVIDIA 로 대체", _llm1.embed("테스트"), [0.4, 0.5, 0.6])
+    _llm1.client.chat.completions.create = _openai_down
+    _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":true}')
+    check("OpenAI 채팅 실패 → NVIDIA 로 대체 (_chat)",
+          _llm1._chat("s", "u"), ('{"ok":true}', {}))
+    check("chat_text 도 동일하게 대체", _llm1.chat_text("s", "u"), '{"ok":true}')
 
     _llm2 = LLMClient(_lcfg_no_fallback)
-    check("NVIDIA 키 없으면 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
+    check("NVIDIA 키 없으면 임베딩 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
+    check("NVIDIA 키 없으면 채팅 대체 클라이언트도 없다", _llm2.nvidia_llm_client, None)
     _llm2.client.embeddings.create = _openai_down
     check("대체 키 없이 OpenAI 도 실패하면 None (기존과 동일)", _llm2.embed("테스트"), None)
+    _llm2.client.chat.completions.create = _openai_down
+    try:
+        _llm2._chat("s", "u")
+        _raised = False
+    except RuntimeError:
+        _raised = True
+    check("채팅도 대체 없으면 예외가 그대로 올라온다(기존과 동일)", _raised, True)
 
     _llm3 = LLMClient(_lcfg_with_fallback)
     _llm3.client.embeddings.create = _openai_down
