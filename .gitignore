@@ -23,6 +23,7 @@ venv/
 # docs/make_decks.py 로 언제든 다시 만든다: python docs/make_decks.py <템플릿.pptx>
 docs/P-FM_NEWS_실무자_발표_10분.pptx
 docs/P-FM_NEWS_임원_발표_10분.pptx
+docs/P-FM_NEWS_교육과정_최종발표.pptx
 
 # demo-video 스킬 — npm 의존성과 결과 영상은 커밋하지 않는다.
 # bash .claude/skills/demo-video/scripts/setup.sh 로 언제든 다시 설치한다.
