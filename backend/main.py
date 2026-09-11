@@ -311,9 +311,9 @@ def load_config() -> Config:
         embedding_model=get_env("EMBEDDING_MODEL", "text-embedding-3-small"),
         # 선택 항목 — 비어 있으면 대체 없이 기존처럼 OpenAI 실패를 그냥 넘어간다.
         nvidia_embed_api_key=get_env("NVIDIA_EMBED_API_KEY", ""),
-        nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nemotron-3-embed-1b"),
+        nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
-        nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "meta/llama-3.2-90b-vision-instruct"),
+        nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
