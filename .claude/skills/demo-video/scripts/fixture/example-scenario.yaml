@@ -1,0 +1,52 @@
+# demo-video 스킬 동작 확인용 예시 시나리오.
+# 서버 없이도 바로 돌려볼 수 있도록 baseUrl 대신 이 파일과 같은 폴더의
+# 정적 HTML(demo-page.html)을 상대 경로로 연다.
+#
+# 실행: node scripts/run_scenario.js --scenario scripts/fixture/example-scenario.yaml
+
+title: "데모 페이지 둘러보기 (동작 확인용)"
+viewport: { width: 1920, height: 1080 }
+output: "example-demo"          # out/example-demo.mp4 로 저장된다
+
+startUrl: "demo-page.html"      # baseUrl 이 없으므로 이 시나리오 파일 기준 상대 경로(파일)로 연다
+
+steps:
+  - chapter: "1. 로그인 화면"
+    subtitle: "아이디와 비밀번호를 입력하고 로그인합니다"
+    duration: 2000
+
+  - highlight: ".card"
+    caption: "로그인 카드가 화면 중앙에 있습니다"
+    duration: 1500
+
+  - click: "#username"
+    caption: "아이디 입력란을 클릭합니다"
+
+  - type:
+      selector: "#username"
+      text: "demo_user"
+
+  - click: "#password"
+    caption: "비밀번호 입력란을 클릭합니다"
+
+  - type:
+      selector: "#password"
+      text: "demo_pass_1234"
+
+  - click: "#submit"
+    caption: "로그인 버튼을 클릭합니다"
+
+  - wait: 400
+
+  - chapter: "2. 요약 화면"
+    subtitle: "로그인 후 오늘의 요약이 표시됩니다"
+    duration: 2000
+
+  - highlight: "#summary"
+    caption: "오늘의 요약 — 수집·발송·실패 건수를 한눈에 확인합니다"
+    duration: 2000
+
+  - scroll: "#footer"
+
+  - clearCaption: true
+  - wait: 600

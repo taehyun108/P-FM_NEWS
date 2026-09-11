@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>데모 페이지</title>
+<style>
+  body { margin:0; font-family:-apple-system,"맑은 고딕",sans-serif; background:#f4f6fb; color:#1b1f2a; }
+  header { background:#16337a; color:#fff; padding:28px 48px; font-size:28px; font-weight:800; }
+  main { max-width:720px; margin:60px auto; padding:0 24px; }
+  .card { background:#fff; border:1px solid #dbe2f3; border-radius:14px; padding:32px; box-shadow:0 6px 18px rgba(20,30,60,.06); }
+  label { display:block; font-weight:600; margin:18px 0 8px; }
+  input { width:100%; box-sizing:border-box; padding:12px 14px; font-size:16px; border:1px solid #c8d6f0; border-radius:8px; }
+  button { margin-top:26px; width:100%; padding:14px; font-size:17px; font-weight:700; color:#fff;
+           background:#16337a; border:none; border-radius:8px; cursor:pointer; }
+  #summary { display:none; margin-top:60px; background:#eaf0fb; border-radius:14px; padding:28px; }
+  #summary h2 { margin-top:0; }
+  footer { text-align:center; color:#9aa3b2; padding:40px 0; font-size:13px; }
+</style>
+</head>
+<body>
+  <header>데모 대시보드</header>
+  <main>
+    <div class="card">
+      <h1>로그인</h1>
+      <label for="username">아이디</label>
+      <input id="username" type="text" placeholder="아이디를 입력하세요">
+      <label for="password">비밀번호</label>
+      <input id="password" type="password" placeholder="비밀번호를 입력하세요">
+      <button id="submit" type="button" onclick="document.getElementById('summary').style.display='block'">로그인</button>
+    </div>
+    <div id="summary">
+      <h2>오늘의 요약</h2>
+      <p>수집 367건 · 발송 58건 · 실패 0건</p>
+    </div>
+  </main>
+  <footer id="footer">데모용 정적 페이지 — demo-video 스킬 테스트 픽스처</footer>
+</body>
+</html>
