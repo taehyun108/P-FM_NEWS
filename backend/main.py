@@ -1297,10 +1297,15 @@ class SqliteStorage(Storage):
         if row is None:
             row = {"key": "pipeline", "last_success_at": None, "notify_mode": "suppressed",
                    "updated_at": iso(now_utc())}
-            self._exec(
-                "insert into run_state (key,last_success_at,notify_mode,updated_at) values (?,?,?,?)",
-                ("pipeline", None, "suppressed", row["updated_at"]),
-            )
+            try:
+                self._exec(
+                    "insert into run_state (key,last_success_at,notify_mode,updated_at) values (?,?,?,?)",
+                    ("pipeline", None, "suppressed", row["updated_at"]),
+                )
+            except sqlite3.IntegrityError:
+                # 병렬 분석(2026-09-14)으로 여러 스레드가 동시에 처음 조회하면
+                # 먼저 끝난 쪽이 이미 만들었을 수 있다 — 그 값을 그대로 쓴다.
+                row = self._one("select * from run_state where key='pipeline'") or row
         return row
 
     def set_run_state(self, patch: dict) -> None:
@@ -1995,7 +2000,15 @@ class SupabaseStorage(Storage):
             return rows[0]
         row = {"key": "pipeline", "last_success_at": None, "notify_mode": "suppressed",
                "updated_at": iso(now_utc())}
-        self._t("run_state").insert(row).execute()
+        try:
+            self._t("run_state").insert(row).execute()
+        except Exception:
+            # 병렬 분석(2026-09-14)으로 여러 스레드가 동시에 처음 조회하면
+            # 먼저 끝난 쪽이 이미 만들었을 수 있다 — 그 값을 다시 읽어 쓴다.
+            rows = self._t("run_state").select("*").eq("key", "pipeline").execute().data
+            if rows:
+                return rows[0]
+            raise
         return row
 
     def set_run_state(self, patch: dict) -> None:
@@ -4315,18 +4328,27 @@ def find_duplicate(
     content_hash: str,
     url_canonical: str,
     candidates: Sequence[dict],
+    exclude_id: str = "",
 ) -> dict | None:
-    """중복이면 기존 대표 기사 행을, 아니면 None 을 돌려준다."""
+    """중복이면 기존 대표 기사 행을, 아니면 None 을 돌려준다.
+
+    exclude_id: 이미 DB에 존재하는 자기 자신의 id(예: _drain_deferred 가 재검증하는
+    deferred 기사 — url_canonical 이 아직 자기 자신의 url_source 그대로다). 없으면
+    무시하지만, 있으면 1·2단계에서 '자기 자신'과의 매칭은 건너뛰고 다음 단계로
+    넘어간다 — 안 그러면 캐노니컬이 자기 자신으로 남아 있는 한 1단계가 항상
+    자기 자신을 찾아 반환해버려 정작 다른 진짜 중복 기사(2단계 본문 해시 등)까지는
+    확인이 안 된다(2026-09-14, 병렬화 검증 중 발견 — 순차 실행에서도 있던 버그).
+    """
     # 1단계 — 정규화 URL 완전 일치
     if url_canonical:
         hit = storage.find_by_canonical(url_canonical)
-        if hit:
+        if hit and hit["id"] != exclude_id:
             return hit
 
     # 2단계 — 본문 해시 일치
     if content_hash:
         hit = storage.find_by_content_hash(content_hash)
-        if hit:
+        if hit and hit["id"] != exclude_id:
             return hit
 
     window = timedelta(hours=DEDUP_WINDOW_HOURS)
@@ -4335,6 +4357,8 @@ def find_duplicate(
     # 3단계 — 제목 유사도 AND 발행 시각 차이. 두 조건의 AND 다.
     # 유사도만 보면 연재·기획 기사가 잘못 묶인다.
     for cand in candidates:
+        if cand.get("id") == exclude_id:
+            continue
         cand_dt = parse_dt(cand.get("published_at"))
         if cand_dt is None or abs(cand_dt - published_at) > window:
             continue
@@ -4527,6 +4551,8 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
     storage, http = ctx.storage, ctx.http
     score_overrides, score_customs = get_score_rules(storage)
     done = 0
+    # 중복 판정을 통과한 항목만 모아 뒀다가 LLM 분석만 병렬로 보낸다(아래 참고).
+    to_analyze: list[tuple[str, dict, str]] = []
     pending = storage.deferred_articles(limit)
     # 본문 확보는 신규 수집과 동일하게 병렬로 받는다. 순차로 받으면 느린 언론사 한 곳이
     # 회차 전체를 붙잡아 사이클 시간이 수십 초씩 늘어난다.
@@ -4580,7 +4606,8 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
         # 본문 도착 후 중복 재판정 — 그새 정식 수집된 기사와 겹치면 흡수한다
         content_hash = sha256(body)
         dup = find_duplicate(storage, ctx.llm, art["title"], parse_dt(art["published_at"]),
-                             content_hash, canonical or art["url_canonical"], dedup_candidates)
+                             content_hash, canonical or art["url_canonical"], dedup_candidates,
+                             exclude_id=aid)
         if dup and dup["id"] != aid:
             storage.append_alias(dup["id"], art["url_source"])
             storage.update_article(aid, {"status": "archived"})
@@ -4600,11 +4627,29 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
                "importance_score": score_article(art["title"], body, rule_groups, press_tier,
                                                  score_overrides, score_customs),
                "group_companies": rule_groups}
-        if analyze_and_save(ctx, aid, row, body, "fulltext") is not None:
-            done += 1
-        else:
-            # 분석 실패(3회 재시도해도 동일) — 링크·제목 카드로 확정해 deferred 큐에서 뺀다.
-            storage.update_article(aid, {"analyzed_at": iso(now_utc())})
+        # 중복 판정(find_duplicate)까지는 반드시 여기서 순차로 끝낸다 — 같은 배치 안의
+        # 두 기사가 서로 중복이면, 먼저 처리된 쪽이 저장한 content_hash·canonical URL을
+        # DB에서 바로 조회해 뒤 항목이 중복으로 잡아낸다. 이 시점부터는 서로 독립적인
+        # LLM 호출만 남으므로(2026-09-14) 병렬로 보낸다.
+        to_analyze.append((aid, row, body))
+
+    if to_analyze:
+        def _analyze_one(item: tuple[str, dict, str]) -> tuple[str, bool]:
+            aid, row, body = item
+            try:
+                ok = analyze_and_save(ctx, aid, row, body, "fulltext") is not None
+            except Exception as exc:
+                log.warning("드레인 분석 실패(개별 항목, 나머지는 계속): %s — %s", aid, exc)
+                ok = False
+            return aid, ok
+
+        with ThreadPoolExecutor(max_workers=min(LLM_ANALYZE_WORKERS, len(to_analyze))) as pool:
+            for aid, ok in pool.map(_analyze_one, to_analyze):
+                if ok:
+                    done += 1
+                else:
+                    # 분석 실패(3회 재시도해도 동일) — 링크·제목 카드로 확정해 deferred 큐에서 뺀다.
+                    storage.update_article(aid, {"analyzed_at": iso(now_utc())})
     return done
 
 
@@ -9761,6 +9806,61 @@ def cmd_selftest() -> int:
         " join summaries s on s.article_id=a.id where a.id like 'par-%'")}
     check("기사마다 자기 제목에 맞는 요약을 받았다(교차오염 없음)",
           len(_par_summaries) == 8 and all(v == f"요약:{k}" for k, v in _par_summaries.items()), True)
+
+    print("\n[11-2h] _drain_deferred 병렬화 — 중복판정은 순차 유지 검증 (2026-09-14)")
+    # LLM 호출만 병렬화하고 find_duplicate 는 여전히 한 항목씩 순서대로 돈다는 것을
+    # 확인한다 — 같은 배치 안의 두 '중복' 기사 중 하나만 분석되고 나머지는 archived.
+    _tmp._exec("delete from articles"); _tmp._exec("delete from article_bodies")
+    _tmp._exec("delete from summaries")
+    _now_iso = iso(now_utc())
+    _dup_html = ("<html><body><article><p>" + ("포스코퓨처엠 중복 테스트 본문입니다. " * 12)
+                + "</p></article></body></html>")
+    _uniq_html = ("<html><body><article><p>" + ("포스코퓨처엠 단독 테스트 본문입니다. " * 12)
+                 + "</p></article></body></html>")
+    _pages = {
+        "http://x.test/dup-a": _dup_html,
+        "http://x.test/dup-b": _dup_html,
+        "http://x.test/uniq-c": _uniq_html,
+    }
+
+    class _FakeDrainResp:
+        def __init__(self, url: str, html: str) -> None:
+            self.url = url
+            self.content = html.encode("utf-8")
+            self.encoding = "utf-8"
+        def raise_for_status(self) -> None:
+            pass
+
+    class _FakeHttpDrain:
+        def __init__(self, pages: dict[str, str]) -> None:
+            self.pages = pages
+        def get(self, url: str, allow_redirects: bool = True, timeout: float = 8) -> Any:
+            return _FakeDrainResp(url, self.pages.get(url, "<html><body></body></html>"))
+
+    for did, durl, dtitle in [
+        ("dd-a", "http://x.test/dup-a", "포스코퓨처엠 중복기사A"),
+        ("dd-b", "http://x.test/dup-b", "포스코퓨처엠 중복기사B"),
+        ("dd-c", "http://x.test/uniq-c", "포스코퓨처엠 단독기사C"),
+    ]:
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+            " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (did, durl, durl, durl, dtitle, _now_iso, _now_iso, "search", 50, "[]", "[]", "",
+             None, "active", 1))
+
+    _dctx = Context(cfg=_pcfg, storage=_tmp, http=_FakeHttpDrain(_pages))
+    _dctx._llm = _StubAnalyzeLLM()
+    _drained = _drain_deferred(_dctx, 10, [])
+    check("드레인 처리 건수 — 중복 1건은 걸러지고 2건만 분석", _drained, 2)
+    _final_status = {r["id"]: r["status"] for r in
+                     _tmp._rows("select id, status from articles where id like 'dd-%'")}
+    check("중복 쌍 중 하나는 archived, 나머지는 active 그대로",
+          sorted(_final_status.values()) == ["active", "active", "archived"], True)
+    _analyzed_ids = {r["id"] for r in _tmp._rows(
+        "select id from articles where id like 'dd-%' and analyzed_at is not null")}
+    check("실제로 분석 완료된 건 정확히 2건(중복 제외, 병렬 실행에도 안전)",
+          len(_analyzed_ids), 2)
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
