@@ -1,0 +1,23 @@
+version: 0.2
+
+# AWS CodeBuild 전용 — 로컬 Docker 없이 AWS 서버에서 이미지를 빌드해 ECR로 푸시한다.
+# (2026-09-14: 로컬 PC 네트워크가 너무 느려 Docker Desktop 설치가 사실상 불가능했음)
+phases:
+  pre_build:
+    commands:
+      - echo "ECR 로그인 중..."
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - AWS_REGION=${AWS_DEFAULT_REGION:-ap-northeast-2}
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/pfm-news
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+  build:
+    commands:
+      - echo "이미지 빌드 시작 $(date)"
+      - docker build -t $REPOSITORY_URI:latest -t $REPOSITORY_URI:$IMAGE_TAG .
+  post_build:
+    commands:
+      - echo "ECR로 푸시 중..."
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo "완료 — $REPOSITORY_URI:latest / :$IMAGE_TAG"
