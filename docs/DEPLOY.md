@@ -9,6 +9,18 @@ ECS 배포 전제로 만들어 두었기 때문이다(§ 왜 Fargate인가 참�
 DB는 이미 Supabase(외부 클라우드)를 쓰고 있으므로 **AWS에 DB를 새로
 준비할 필요가 없다** — 컨테이너는 완전히 무상태(stateless)다.
 
+> **현재 실제 운영 방식 (2026-09-14)**: 아래 §1~§10은 ECS Fargate 기준
+> 참고 가이드다. 실제로는 비용(ALB+Fargate 2태스크 ≈ 월 $40대)과 사내
+> PC 네트워크 제약(로컬 Docker/WSL2 설치 불가) 때문에 더 저렴한 **EC2
+> 단일 인스턴스**(§11) 방식으로 운영 중이다 — 이미지는 로컬 Docker
+> 없이 **AWS CodeBuild**가 빌드해 ECR로 푸시하고, EC2(`i-0eb37f241ecbba234`,
+> `3.38.148.194`)에서 `serve`+`worker` 컨테이너 2개를 직접 띄운다.
+> 접속은 SSH 대신 **SSM(Session Manager)**을 쓴다(키 관리·포트 22
+> 노출이 없다). 코드를 고친 뒤 재배포는 `deploy/redeploy.sh` 한 번이면
+> 끝난다(CodeBuild 빌드 대기 → ECR 푸시 → EC2 pull·컨테이너 재시작까지
+> 자동). 비밀값은 SSM Parameter Store(`pfm-news-env`, SecureString)에
+> 저장해 두고 인스턴스가 시작할 때 `/opt/pfm-news/.env`로 받아 온다.
+
 ## 0. 왜 이 구조인가
 
 - **컨테이너 2개, 인스턴스는 각 1개**: `serve`(API·웹) + `worker`(수집·텔레그램봇·대외협력).

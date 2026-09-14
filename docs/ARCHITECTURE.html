@@ -1397,7 +1397,10 @@
           막히지 않는다. 오토스케일은 최소=최대=1 로 고정한다. 자세한 절차는 <code>DEPLOY.md</code>·
           <code>RUNBOOK.md</code>. <b>2026-09-14:</b> <code>DEPLOY.md</code> 에 ECS Fargate
           기준 실제 배포 절차(ECR·Secrets Manager·ALB·태스크 정의·비용 개요·EC2 대안)를
-          단계별로 정리했다.
+          단계별로 정리했다. <b>실제 운영은 비용·사내 네트워크 제약으로 EC2 단일
+          인스턴스</b>를 쓴다 — 로컬 Docker 없이 AWS CodeBuild 가 이미지를 빌드해
+          ECR로 푸시하고, EC2 는 SSM(Session Manager)으로만 접근한다(SSH 키 불필요,
+          포트 22 미노출). 재배포는 <code>deploy/redeploy.sh</code> 한 번으로 끝난다.
           <br><b>안전장치(2026-09-11, AWS 배포 전 점검)</b>: 그래도 실수로(배포 중 롤링
           업데이트가 신·구 인스턴스를 잠깐 겹치게 하는 경우 등) 파이프라인이 2개 뜨면,
           <code>run_once()</code> 가 매 회차 <code>run_state.pipeline_lock_owner</code> 에
