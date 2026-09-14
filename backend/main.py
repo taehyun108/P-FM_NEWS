@@ -4385,6 +4385,10 @@ DEFER_DRAIN_PER_RUN = 16
 DEFER_MAX_AGE_HOURS = 24
 # 1회 실행에서 처리할 인사·부고 최대 건수 (점수 경쟁 없이 항상 처리)
 PEOPLE_PER_RUN = 30
+# 분석 백로그 드레인의 LLM 호출 동시 실행 수 (2026-09-14). 항목끼리 서로
+# 참조하지 않는 독립 호출이라 prefetch_articles 와 같은 이유로 병렬화한다 —
+# 순차 처리하면 20건에 100초 넘게 걸려 PRD §6(1회 실행 20초 목표)를 크게 넘긴다.
+LLM_ANALYZE_WORKERS = 5
 # 그 중 사람별 구조 요약(LLM)에 쓸 수 있는 최대 호출 수. 나머지는 규칙 기반으로 저장되고
 # 나중에 `repeople` 로 채울 수 있다. 일일 상한(LLM_DAILY_LIMIT)도 함께 적용된다.
 PEOPLE_LLM_PER_RUN = get_env_int("PEOPLE_LLM_PER_RUN", 12, 0)
@@ -5217,22 +5221,35 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         if deferred:
             log.info("메타데이터만 저장 %d건 (다음 회차부터 본문 확보·분석)", deferred)
 
-    # ── 분석 백로그 드레인 ───────────────────────────────────────────
+    # ── 분석 백로그 드레인 (병렬, 2026-09-14) ────────────────────────
     # 이전 실행에서 본문까지 저장되고 분석만 밀린 기사를 예산 안에서 처리한다.
+    # 항목끼리 서로 참조하지 않는 독립적인 LLM 호출이라 병렬로 돌려도 안전하다
+    # (dedup 판정이 껴 있는 _drain_deferred 와 달리 여긴 순서 의존이 없다).
     analyzed_backlog = 0
     if llm_budget > 0:
-        for pending in storage.unanalyzed_with_body(llm_budget):
+        pendings = storage.unanalyzed_with_body(llm_budget)
+
+        def _analyze_pending(pending: dict) -> bool:
             row = {
                 "id": pending["id"], "title": pending["title"],
                 "press_id": pending.get("press_id"), "press_name": pending.get("press_name"),
                 "importance_score": pending.get("importance_score") or 0,
                 "group_companies": jload(pending.get("group_companies"), []),
             }
-            if analyze_and_save(ctx, pending["id"], row, pending["body"], pending["summary_source"]) is not None:
-                analyzed_backlog += 1
-            llm_budget -= 1
+            try:
+                return analyze_and_save(
+                    ctx, pending["id"], row, pending["body"], pending["summary_source"]) is not None
+            except Exception as exc:
+                log.warning("백로그 분석 실패(개별 항목, 나머지는 계속): %s — %s",
+                           pending.get("id"), exc)
+                return False
+
+        if pendings:
+            with ThreadPoolExecutor(max_workers=min(LLM_ANALYZE_WORKERS, len(pendings))) as pool:
+                analyzed_backlog = sum(1 for ok in pool.map(_analyze_pending, pendings) if ok)
+            llm_budget -= len(pendings)
     if analyzed_backlog:
-        log.info("분석 백로그 %d건 처리", analyzed_backlog)
+        log.info("분석 백로그 %d건 처리(병렬)", analyzed_backlog)
 
     # ── 메타만 저장된(deferred) 기사 드레인 — 본문 확보 → 관련성 재검 → 분석 ──
     # 예약해 둔 defer_budget + 앞 단계에서 남은 예산을 함께 쓴다.
@@ -9699,6 +9716,51 @@ def cmd_selftest() -> int:
     _llm3.client.embeddings.create = _openai_down
     _llm3.nvidia_embed_client.embeddings.create = _openai_down
     check("OpenAI·NVIDIA 둘 다 실패하면 None", _llm3.embed("테스트"), None)
+
+    print("\n[11-2g] 분석 백로그 드레인 병렬화 — 동시 실행 정합성 (2026-09-14)")
+    _tmp._exec("delete from articles"); _tmp._exec("delete from article_bodies")
+    _tmp._exec("delete from summaries")
+    _par_ids = [f"par-{i}" for i in range(8)]
+    for i, pid in enumerate(_par_ids):
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+            " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, f"h/{pid}", f"h/{pid}", f"h/{pid}", f"제목-{i}", iso(now_utc()), iso(now_utc()),
+             "search", 50, "[]", "[]", "한경", None, "active", 1))
+        _tmp.save_body(pid, f"본문 내용 {i}", "fulltext")
+
+    class _StubAnalyzeLLM:
+        def analyze(self, title: str, press: str, body: str) -> Analysis:
+            return Analysis(summary_sentences=[f"요약:{title}"], perspective="", keywords=[],
+                            group_companies=[], sentiment="중립", ok=True)
+
+    _pcfg = Config(**{**_llm_blank, "openai_api_key": "x", "llm_model": "m", "embedding_model": "e",
+                      "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
+                      "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm"})
+    _pctx = Context(cfg=_pcfg, storage=_tmp, http=HttpClient())
+    _pctx._llm = _StubAnalyzeLLM()
+
+    _par_pendings = _tmp.unanalyzed_with_body(20)
+    check("병렬 테스트 대상 8건 조회", len(_par_pendings), 8)
+
+    def _analyze_pending_test(pending: dict) -> bool:
+        row = {"id": pending["id"], "title": pending["title"], "press_id": pending.get("press_id"),
+               "press_name": pending.get("press_name"),
+               "importance_score": pending.get("importance_score") or 0,
+               "group_companies": jload(pending.get("group_companies"), [])}
+        return analyze_and_save(
+            _pctx, pending["id"], row, pending["body"], pending["summary_source"]) is not None
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        _par_results = list(pool.map(_analyze_pending_test, _par_pendings))
+    check("8건 모두 성공(병렬 실행)", _par_results, [True] * 8)
+    check("동시 실행 후 분석 대기 0건(전부 처리됨)", len(_tmp.unanalyzed_with_body(20)), 0)
+    _par_summaries = {r["title"]: r.get("summary_text") for r in _tmp._rows(
+        "select a.title, s.summary_text from articles a"
+        " join summaries s on s.article_id=a.id where a.id like 'par-%'")}
+    check("기사마다 자기 제목에 맞는 요약을 받았다(교차오염 없음)",
+          len(_par_summaries) == 8 and all(v == f"요약:{k}" for k, v in _par_summaries.items()), True)
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
