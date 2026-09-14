@@ -3307,6 +3307,9 @@ def _naver_item_relevant(title: str, category: str, keyword: str = "",
     return is_battery_scope(t, "") or _kw_hit_any(t, _NAVER_BATTERY_TITLE_KW)
 
 
+SOURCE_FETCH_WORKERS = 10   # 키워드·피드별 조회 동시 실행 수 (2026-09-14, 아래 참고)
+
+
 def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -> list[RawItem]:
     """NAVER API HUB 뉴스 검색. 직접 크롤링은 약관 위반이므로 하지 않는다. (PRD §7-4)
 
@@ -3314,16 +3317,25 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
     키워드 29개를 1분마다 조회하면 하루 41,760회로 한도를 넘는다.
     → run_once 에서 `NAVER_INTERVAL_SEC`(기본 300초) 간격으로만 호출한다.
 
+    키워드마다 독립적인 API 호출이라 병렬로 보낸다(2026-09-14) — 활성 키워드가
+    100개를 넘어가면서 순차 처리 시 이 단계만으로 사이클 시간의 대부분(실측
+    118개 키워드 기준 100초 이상)을 써버리는 게 확인됐다. HttpClient 는 이미
+    커넥션 풀 16개로 병렬 사용을 전제해 뒀다(§ prefetch_articles).
+    401/403(인증 실패)·429(한도 초과)는 여전히 감지하되, 병렬 실행에서는
+    '연속 3회 실패 시 즉시 중단' 같은 순차 전용 최적화는 의미가 없어 빠졌다
+    — 대신 전체 실패율로 설정 문제를 사후 판단한다.
+
     keyword_rows: [{"keyword": ..., "category": ...}, ...]
     """
     if not cfg.naver_enabled:
         return []
     headers = {"X-NCP-APIGW-API-KEY-ID": cfg.naver_client_id,
                "X-NCP-APIGW-API-KEY": cfg.naver_client_secret}
-    items: list[RawItem] = []
-    fail_count = 0
-    dropped = 0
-    for row in keyword_rows:
+    stop_event = threading.Event()   # 429 한 번 보면 아직 안 나간 요청은 건너뛴다
+
+    def _fetch_one(row: Any) -> tuple[list[RawItem], int, bool]:
+        if stop_event.is_set():
+            return [], 0, False
         keyword = row["keyword"] if isinstance(row, dict) else row
         category = row.get("category", "") if isinstance(row, dict) else ""
         try:
@@ -3340,18 +3352,17 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
                     "NAVER API HUB 의 Client ID/Secret 인지 확인하세요."
                 )
             if resp.status_code == 429:
+                stop_event.set()
                 log.warning("Naver API 호출 한도 초과(429). 이번 실행의 네이버 수집을 중단합니다.")
-                break
+                return [], 0, True
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            fail_count += 1
             log.warning("Naver API 조회 실패 (%s): %s", keyword, exc)
-            # 첫 3개 키워드가 연속 실패하면 설정 문제다. 나머지를 시도할 필요가 없다.
-            if fail_count >= 3 and not items:
-                log.error("Naver API 연속 실패 — 설정을 점검하세요. 이번 실행 네이버 수집 중단.")
-                break
-            continue
+            return [], 0, True
+
+        local_items: list[RawItem] = []
+        local_dropped = 0
         for entry in data.get("items", []):
             link = entry.get("originallink") or entry.get("link", "")
             if not link:
@@ -3359,43 +3370,59 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
             title = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("title", ""))).strip()
             snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("description", ""))).strip()
             if not _naver_item_relevant(title, category, keyword, snippet):
-                dropped += 1
+                local_dropped += 1
                 continue
             published = parse_feed_datetime(entry.get("pubDate"))
-            items.append(RawItem(
-                url_source=normalize_url(link),
-                url_original=link,
-                title=title,
-                published_at=published,
-                source_type="naver_api",
-                snippet=snippet,
+            local_items.append(RawItem(
+                url_source=normalize_url(link), url_original=link, title=title,
+                published_at=published, source_type="naver_api", snippet=snippet,
             ))
+        return local_items, local_dropped, False
+
+    items: list[RawItem] = []
+    dropped = 0
+    fail_count = 0
+    if keyword_rows:
+        with ThreadPoolExecutor(max_workers=min(SOURCE_FETCH_WORKERS, len(keyword_rows))) as pool:
+            for its, drp, failed in pool.map(_fetch_one, keyword_rows):
+                items.extend(its)
+                dropped += drp
+                if failed:
+                    fail_count += 1
+    if fail_count >= 3 and not items:
+        log.error("Naver API 다수 실패(%d/%d건) — 설정을 점검하세요. 이번 실행 네이버 수집분 없음.",
+                  fail_count, len(keyword_rows))
     if dropped:
         log.info("네이버 무관 기사 %d건 제외 (제목에 관련성 신호 없음)", dropped)
     return items
 
 
 def collect_rss_feeds(http: HttpClient, feeds: Sequence[dict]) -> list[RawItem]:
-    """언론사 자체 RSS. DB(feed_sources)로 추가하며 코드 수정이 필요 없다. (§6 확장성)"""
+    """언론사 자체 RSS. DB(feed_sources)로 추가하며 코드 수정이 필요 없다. (§6 확장성)
+
+    피드마다 독립적인 요청이라 병렬로 받는다(2026-09-14) — 느린·응답 없는 피드
+    하나가 나머지 전체를 붙잡지 않는다(§ collect_naver 와 같은 근거).
+    """
     feedparser = _import("feedparser", "feedparser")
-    items: list[RawItem] = []
-    for feed_row in feeds:
+
+    def _fetch_one(feed_row: dict) -> list[RawItem]:
         url = feed_row.get("url") or ""
         if not url:
-            continue
+            return []
         try:
             resp = http.get(url)
             resp.raise_for_status()
         except Exception as exc:
             log.warning("RSS 조회 실패 (%s): %s", feed_row.get("name"), exc)
-            continue
+            return []
+        local_items: list[RawItem] = []
         for entry in feedparser.parse(resp.content).entries:
             link = entry.get("link", "")
             if not link:
                 continue
             published = parse_feed_datetime(entry.get("published") or entry.get("updated"),
                                             entry.get("published_parsed") or entry.get("updated_parsed"))
-            items.append(RawItem(
+            local_items.append(RawItem(
                 url_source=normalize_url(link),
                 url_original=link,
                 title=html_mod.unescape(entry.get("title", "")).strip(),
@@ -3404,6 +3431,13 @@ def collect_rss_feeds(http: HttpClient, feeds: Sequence[dict]) -> list[RawItem]:
                 press_hint=feed_row.get("name", ""),
                 snippet=html_mod.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))).strip(),
             ))
+        return local_items
+
+    items: list[RawItem] = []
+    if feeds:
+        with ThreadPoolExecutor(max_workers=min(SOURCE_FETCH_WORKERS, len(feeds))) as pool:
+            for its in pool.map(_fetch_one, feeds):
+                items.extend(its)
     return items
 
 
@@ -9861,6 +9895,76 @@ def cmd_selftest() -> int:
         "select id from articles where id like 'dd-%' and analyzed_at is not null")}
     check("실제로 분석 완료된 건 정확히 2건(중복 제외, 병렬 실행에도 안전)",
           len(_analyzed_ids), 2)
+
+    print("\n[7-2] 수집 소스 조회 병렬화 — collect_naver · collect_rss_feeds (2026-09-14)")
+    # 활성 키워드가 100개를 넘어가며 순차 조회가 사이클 시간의 대부분을 차지하는
+    # 것을 실측으로 확인했다 — 키워드·피드마다 독립 호출이라 병렬로 바꿨다.
+    class _FakeNaverResp:
+        def __init__(self, status_code: int, items: list[dict]) -> None:
+            self.status_code = status_code
+            self._items = items
+        def raise_for_status(self) -> None:
+            pass
+        def json(self) -> dict:
+            return {"items": self._items}
+
+    class _FakeNaverHttp:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+        def get(self, url: str, params: dict | None = None, headers: dict | None = None,
+               **kw: Any) -> Any:
+            kw_ = (params or {}).get("query", "")
+            self.calls.append(kw_)
+            return _FakeNaverResp(200, [{
+                "originallink": f"http://n.test/{kw_}", "title": f"포스코퓨처엠 {kw_} 소식",
+                "description": "설명", "pubDate": "Mon, 14 Sep 2026 00:00:00 +0900",
+            }])
+
+    _nblank = {f: "" for f in Config.__dataclass_fields__}
+    _ncfg2 = Config(**{**_nblank, "naver_client_id": "id", "naver_client_secret": "sec"})
+    _nhttp = _FakeNaverHttp()
+    _nkw_rows = [{"keyword": f"kw{i}", "category": "산업"} for i in range(12)]
+    _nitems = collect_naver(_nhttp, _ncfg2, _nkw_rows)
+    check("12개 키워드 전부 조회됨(병렬 실행)", len(_nhttp.calls), 12)
+    check("키워드마다 결과 1건씩 총 12건 수집", len(_nitems), 12)
+    check("결과가 키워드별로 정확히 대응(교차오염 없음)",
+          sorted(it.url_original for it in _nitems)
+          == sorted(f"http://n.test/kw{i}" for i in range(12)), True)
+
+    class _FakeNaver429Http:
+        def get(self, url: str, params: dict | None = None, headers: dict | None = None,
+               **kw: Any) -> Any:
+            return _FakeNaverResp(429, [])
+    check("429 응답이면 예외 없이 빈 결과", collect_naver(_FakeNaver429Http(), _ncfg2, _nkw_rows), [])
+
+    def _rss_xml(title: str, link: str) -> str:
+        return (
+            '<?xml version="1.0"?><rss version="2.0"><channel><item>'
+            f"<title>{title}</title><link>{link}</link>"
+            "<pubDate>Mon, 14 Sep 2026 00:00:00 +0900</pubDate>"
+            "<description>desc</description></item></channel></rss>"
+        )
+
+    class _FakeRssResp:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+        def raise_for_status(self) -> None:
+            pass
+
+    class _FakeRssHttp:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+        def get(self, url: str, **kw: Any) -> Any:
+            self.calls.append(url)
+            idx = url.rsplit("/", 1)[-1]
+            xml = _rss_xml(f"포스코퓨처엠 피드{idx}", f"http://r.test/{idx}")
+            return _FakeRssResp(xml.encode("utf-8"))
+
+    _feed_rows = [{"name": f"feed{i}", "url": f"http://f.test/{i}"} for i in range(6)]
+    _rhttp = _FakeRssHttp()
+    _ritems = collect_rss_feeds(_rhttp, _feed_rows)
+    check("6개 피드 전부 조회됨(병렬 실행)", len(_rhttp.calls), 6)
+    check("피드마다 결과 1건씩 총 6건 수집", len(_ritems), 6)
 
     print("\n[11-2b] 보존 정책 — 오래된 기사·로그·원장 정리")
     _tmp._exec("delete from articles")
