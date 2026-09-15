@@ -175,8 +175,10 @@ class Config:
     nvidia_embed_model: str
     nvidia_llm_api_key: str
     nvidia_llm_model: str
-    # xAI(Grok) — 채팅 대체 순서는 OpenAI → Grok → NVIDIA. xAI 는 임베딩 API 가
-    # 없어 채팅(분석·요약·주간레포트·챗봇)에만 쓴다.
+    # 채팅 대체 순서: OpenAI → Gemini → Grok → NVIDIA. 임베딩 API 가 없는
+    # 공급자(Gemini·xAI)는 채팅(분석·요약·주간레포트·챗봇)에만 쓴다.
+    gemini_api_key: str
+    gemini_llm_model: str
     xai_api_key: str
     xai_llm_model: str
     # DB
@@ -318,6 +320,8 @@ def load_config() -> Config:
         nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
         nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
+        gemini_api_key=get_env("GEMINI_API_KEY", ""),
+        gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-2.5-flash-lite"),
         xai_api_key=get_env("XAI_API_KEY", ""),
         xai_llm_model=get_env("XAI_LLM_MODEL", "grok-4-fast"),
         db_backend=backend,
@@ -4117,6 +4121,7 @@ def _make_openai_client(api_key: str):
 
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 XAI_BASE_URL = "https://api.x.ai/v1"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 def _make_nvidia_client(api_key: str):
@@ -4129,6 +4134,12 @@ def _make_xai_client(api_key: str):
     """xAI(Grok) 클라이언트. 마찬가지로 OpenAI 호환 엔드포인트다."""
     openai = _import("openai", "openai")
     return openai.OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+
+
+def _make_gemini_client(api_key: str):
+    """Gemini 클라이언트. 구글이 제공하는 OpenAI 호환 엔드포인트를 그대로 쓴다."""
+    openai = _import("openai", "openai")
+    return openai.OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
 
 
 class LLMClient:
@@ -4146,8 +4157,11 @@ class LLMClient:
             _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
         self.nvidia_embed_model = cfg.nvidia_embed_model
         # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로들.
-        # 순서: OpenAI(기본) → Grok(xAI) → NVIDIA — 키가 없는 단계는 건너뛴다.
+        # 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA — 키가 없는 단계는 건너뛴다.
         # 마찬가지로 전부 실패하면 OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        self.gemini_llm_client = (
+            _make_gemini_client(cfg.gemini_api_key) if cfg.gemini_api_key else None)
+        self.gemini_llm_model = cfg.gemini_llm_model
         self.xai_llm_client = (
             _make_xai_client(cfg.xai_api_key) if cfg.xai_api_key else None)
         self.xai_llm_model = cfg.xai_llm_model
@@ -4157,6 +4171,7 @@ class LLMClient:
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
         # 공급자마다 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
         self._supports_json_mode = True
+        self._gemini_supports_json_mode = True
         self._xai_supports_json_mode = True
         self._nvidia_supports_json_mode = True
         # 중복 판정 4단계의 임베딩 호출을 1회 실행당 이 수로 제한한다.
@@ -4193,8 +4208,11 @@ class LLMClient:
         return (resp.choices[0].message.content or ""), usage
 
     def _chat_chain(self) -> list[tuple[Any, str, str, str]]:
-        """채팅 대체 순서: OpenAI(기본) → Grok(xAI) → NVIDIA. 키 없는 단계는 뺀다."""
+        """채팅 대체 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA. 키 없는 단계는 뺀다."""
         chain = [(self.client, self.model, "_supports_json_mode", "OpenAI")]
+        if self.gemini_llm_client is not None:
+            chain.append((self.gemini_llm_client, self.gemini_llm_model,
+                          "_gemini_supports_json_mode", f"Gemini({self.gemini_llm_model})"))
         if self.xai_llm_client is not None:
             chain.append((self.xai_llm_client, self.xai_llm_model,
                           "_xai_supports_json_mode", f"Grok({self.xai_llm_model})"))
@@ -9852,17 +9870,19 @@ def cmd_selftest() -> int:
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
     _reset_store()
 
-    print("\n[11-2f] 대체 공급자(Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")
+    print("\n[11-2f] 대체 공급자(Gemini·Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")
     _llm_blank = {f: "" for f in Config.__dataclass_fields__}
     _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                      "llm_model": "m", "embedding_model": "e",
                                      "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n",
                                      "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm",
+                                     "gemini_api_key": "gm-test", "gemini_llm_model": "gemini-test",
                                      "xai_api_key": "xai-test", "xai_llm_model": "grok-test"})
     _lcfg_no_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                    "llm_model": "m", "embedding_model": "e",
                                    "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
                                    "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm",
+                                   "gemini_api_key": "", "gemini_llm_model": "gemini-test",
                                    "xai_api_key": "", "xai_llm_model": "grok-test"})
 
     class _FakeEmbData:
@@ -9893,23 +9913,28 @@ def cmd_selftest() -> int:
     _llm1.client.embeddings.create = _openai_down
     _llm1.nvidia_embed_client.embeddings.create = lambda **_kw: _FakeEmbResp([0.4, 0.5, 0.6])
     check("OpenAI 임베딩 실패 → NVIDIA 로 대체", _llm1.embed("테스트"), [0.4, 0.5, 0.6])
-    check("채팅 대체 순서는 OpenAI→Grok→NVIDIA",
+    check("채팅 대체 순서는 OpenAI→Gemini→Grok→NVIDIA",
           [c[3] for c in _llm1._chat_chain()],
-          ["OpenAI", "Grok(grok-test)", "NVIDIA(nvm)"])
+          ["OpenAI", "Gemini(gemini-test)", "Grok(grok-test)", "NVIDIA(nvm)"])
     _llm1.client.chat.completions.create = _openai_down
+    _llm1.gemini_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"gemini"}')
+    check("OpenAI 채팅 실패 → Gemini 로 대체 (_chat)",
+          _llm1._chat("s", "u"), ('{"ok":"gemini"}', {}))
+    check("chat_text 도 동일하게 Gemini 로 대체", _llm1.chat_text("s", "u"), '{"ok":"gemini"}')
+    _llm1.gemini_llm_client.chat.completions.create = _openai_down
     _llm1.xai_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"grok"}')
-    check("OpenAI 채팅 실패 → Grok 로 대체 (_chat)",
+    check("OpenAI·Gemini 둘 다 실패 → Grok 로 대체",
           _llm1._chat("s", "u"), ('{"ok":"grok"}', {}))
-    check("chat_text 도 동일하게 Grok 로 대체", _llm1.chat_text("s", "u"), '{"ok":"grok"}')
     _llm1.xai_llm_client.chat.completions.create = _openai_down
     _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
-    check("OpenAI·Grok 둘 다 실패 → NVIDIA 로 대체(3단계 체인)",
+    check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
           _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
 
     _llm2 = LLMClient(_lcfg_no_fallback)
     check("NVIDIA 키 없으면 임베딩 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
     check("NVIDIA 키 없으면 채팅 대체 클라이언트도 없다", _llm2.nvidia_llm_client, None)
     check("xAI 키 없으면 Grok 대체 클라이언트도 없다", _llm2.xai_llm_client, None)
+    check("Gemini 키 없으면 대체 클라이언트도 없다", _llm2.gemini_llm_client, None)
     _llm2.client.embeddings.create = _openai_down
     check("대체 키 없이 OpenAI 도 실패하면 None (기존과 동일)", _llm2.embed("테스트"), None)
     _llm2.client.chat.completions.create = _openai_down
@@ -9925,6 +9950,7 @@ def cmd_selftest() -> int:
     _llm3.nvidia_embed_client.embeddings.create = _openai_down
     check("OpenAI·NVIDIA 둘 다 실패하면 None", _llm3.embed("테스트"), None)
     _llm3.client.chat.completions.create = _openai_down
+    _llm3.gemini_llm_client.chat.completions.create = _openai_down
     _llm3.xai_llm_client.chat.completions.create = _openai_down
     _llm3.nvidia_llm_client.chat.completions.create = _openai_down
     try:
@@ -9932,7 +9958,7 @@ def cmd_selftest() -> int:
         _raised = False
     except RuntimeError:
         _raised = True
-    check("채팅 3곳(OpenAI·Grok·NVIDIA) 전부 실패하면 예외가 올라온다", _raised, True)
+    check("채팅 4곳(OpenAI·Gemini·Grok·NVIDIA) 전부 실패하면 예외가 올라온다", _raised, True)
 
     print("\n[11-2g] 분석 백로그 드레인 병렬화 — 동시 실행 정합성 (2026-09-14)")
     _tmp._exec("delete from articles"); _tmp._exec("delete from article_bodies")
