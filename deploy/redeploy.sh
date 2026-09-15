@@ -43,7 +43,7 @@ CMD_ID=$(aws ssm send-command \
     \"docker pull $ECR_URI:latest\",
     \"docker rm -f pfm-serve pfm-worker 2>/dev/null || true\",
     \"docker run -d --name pfm-serve --restart unless-stopped -p 80:8000 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py serve\",
-    \"docker run -d --name pfm-worker --restart unless-stopped --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py worker\",
+    \"docker run -d --name pfm-worker --restart unless-stopped --health-cmd='python backend/main.py healthcheck' --health-interval=60s --health-timeout=10s --health-start-period=40s --health-retries=3 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py worker\",
     \"sleep 5\",
     \"docker ps\"
   ]" \
