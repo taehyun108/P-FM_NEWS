@@ -42,7 +42,7 @@
     <!-- 로그인 -->
     <form class="modal-body" id="masterLogin">
       <p class="modal-desc">마스터 비밀번호를 입력하세요. 인증은 24시간 유지됩니다.</p>
-      <input type="password" id="masterPw" class="url-add-input" placeholder="비밀번호" autocomplete="current-password" required>
+      <input type="text" id="masterPw" class="url-add-input" placeholder="비밀번호" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
       <p class="url-add-msg err" id="masterLoginMsg" hidden></p>
       <button type="submit" class="url-add-btn">로그인</button>
     </form>
@@ -214,7 +214,9 @@
           <button type="submit" class="url-add-btn">마스터 비밀번호 변경</button>
         </form>
         <p class="master-current">현재 웹페이지 비밀번호: <b id="webPwNow">—</b>
-          <small>웹 접속 잠금은 아직 미적용(값만 보관).</small></p>
+          <small style="color:#c0392b">⚠ 지금 바로 적용됩니다 — 바꾸면 사이트 전체(기사 목록 화면)가
+            새 비밀번호로 즉시 잠깁니다. 잊어버리면 화면 자체를 못 보게 되니 꼭 기억할 수 있는
+            값으로만 바꾸세요.</small></p>
         <form class="master-pwform" id="pwWebForm">
           <input type="password" id="pwWebNew" class="url-add-input" placeholder="새 웹페이지 비밀번호 (8자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">웹페이지 비밀번호 변경</button>

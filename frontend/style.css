@@ -477,6 +477,10 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 }
 .modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
 .modal-body[hidden] { display: none; }
+/* modal-body 는 세로(column) flex라 .url-add-input의 flex-basis(320px)가
+   세로 높이로 적용돼 입력칸이 거대해지는 문제가 있었다 — 세로 방향에서는
+   내용 크기만큼만 차지하도록 되돌린다(2026-09-15). */
+.modal-body > .url-add-input { flex: 0 0 auto; }
 .modal-desc { margin: 0; font-size: 12.5px; color: var(--ink-soft); }
 
 .master-section { border-top: 1px solid var(--line); padding-top: 14px; }

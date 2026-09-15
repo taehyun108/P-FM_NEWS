@@ -212,6 +212,7 @@ class Config:
     api_host: str
     api_port: int
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
+    master_pw_recovery_to: list[str]  # 마스터 로그인 3회 이상 실패 시 복구 메일 받을 주소
     web_password: str             # 사이트 접속 비밀번호. 비우면 잠금 없음(로컬 개발)
     tz_offset_hours: int          # 운영 기준 시간대 UTC 오프셋 (한국 = 9)
     # 야간 억제 — 모두 '운영 기준 시간대'(APP_TZ_OFFSET, 기본 KST) 기준 시각이다.
@@ -358,6 +359,10 @@ def load_config() -> Config:
         # PORT 가 있으면 그것을 우선한다 — 없으면 기존 API_PORT.
         api_port=get_env_int("PORT", 0, 0, 65535) or get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
+        master_pw_recovery_to=[e.strip() for e in get_env(
+            "MASTER_PW_RECOVERY_EMAILS",
+            "taehyun931008@naver.com,taehyun108@poscofuturem.com",
+        ).replace(";", ",").split(",") if e.strip()],
         web_password=get_env("WEB_PASSWORD"),
         tz_offset_hours=tz_off,
         # 야간 억제 창 — APP_TZ_OFFSET(기본 KST) 기준 시각. 0~23.
@@ -7261,13 +7266,73 @@ def _login_reset(key: str) -> None:
     _LOGIN_FAILS.pop(key, None)
 
 
+# ── 마스터 비밀번호 복구 (2026-09-15) ────────────────────────────────
+# 마스터 비밀번호는 바뀐 뒤엔 해시로만 저장되어 원문을 알 수 없다. 그래서
+# "잘못 바꾼 뒤 잊어버림"에서 복구하는 유일한 방법은, DB에 저장된 변경
+# 이력(해시)을 지워 .env 의 원래 값으로 되돌리는 것뿐이다 — 같은 IP에서
+# 마스터 로그인이 연속 3회 이상 실패하면 자동으로 이렇게 되돌리고, 그
+# 결과(.env 값)를 정해둔 이메일로 보낸다.
+_MASTER_LOGIN_FAILS: dict[str, list[float]] = {}
+MASTER_LOGIN_FAIL_THRESHOLD = 3
+
+
+def _master_login_fail(key: str) -> int:
+    now = time.time()
+    q = [t for t in _MASTER_LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
+    q.append(now)
+    _MASTER_LOGIN_FAILS[key] = q
+    return len(q)
+
+
+def _master_login_reset(key: str) -> None:
+    _MASTER_LOGIN_FAILS.pop(key, None)
+
+
+def _recover_master_password(ctx: Context) -> None:
+    """마스터 로그인 3회 이상 연속 실패 시 호출된다.
+
+    DB에 저장된 master_pw_hash(변경 이력)를 지워 .env MASTER_PASSWORD 로
+    되돌리고, 그 값을 복구 메일 수신자에게 보낸다. .env 값 자체가 바뀐
+    적이 없다면(해시가 원래 없었다면) 이 함수는 사실상 아무 것도 바꾸지
+    않고 안내 메일만 다시 보내는 셈이 된다.
+    """
+    try:
+        ctx.storage.set_run_state({"master_pw_hash": ""})
+    except Exception as exc:
+        log.warning("마스터 비밀번호 복구(초기화) 실패: %s", exc)
+        return
+    to_list = ctx.cfg.master_pw_recovery_to
+    pw = ctx.cfg.master_password
+    if not to_list or not pw:
+        log.warning("마스터 비밀번호 복구: 수신자 또는 .env 비밀번호가 없어 메일 생략")
+        return
+    if not ctx.cfg.smtp_configured:
+        log.warning("마스터 비밀번호 복구: SMTP 미설정이라 메일 생략 (비밀번호는 초기화됨)")
+        return
+    html = (
+        "<p>마스터 비밀번호를 3회 이상 잘못 입력해서, 안전을 위해 "
+        ".env 에 저장된 기본 비밀번호로 되돌렸습니다.</p>"
+        f"<p>새로 로그인할 마스터 비밀번호: <b>{esc(pw)}</b></p>"
+        "<p>본인이 시도한 게 아니라면 즉시 서버 관리자에게 알려주세요.</p>"
+    )
+    ok, err = send_report_email(ctx.cfg, "[P-FM NEWS] 마스터 비밀번호 복구 안내", html, to_list)
+    if not ok:
+        log.warning("마스터 비밀번호 복구 메일 발송 실패: %s", err)
+
+
 # ── 사이트 전체 잠금 (배포용) ────────────────────────────────────────
 # 마스터 토큰은 관리 기능만 지킨다. 배포하면 URL 만 알아도 기사 목록·URL 등록·
 # 텔레그램 직접 전송 API 를 누구나 쓸 수 있으므로, 그 앞에 세션 관문을 하나 둔다.
 WEB_COOKIE = "pfm_web"
 WEB_SESSION_DAYS = 30
 # 잠금 대상에서 빼는 경로 — 로그인 자체, 헬스체크, 카카오 OAuth 착지점.
+# /api/master/login 도 여기 넣어야 한다 — 안 그러면 '웹 접속 비밀번호를 잊어버려
+# 사이트 전체가 잠긴' 상황에서 마스터 비밀번호를 알아도 복구 API 자체에 도달할
+# 수 없어 영영 못 들어가는 사고가 난다(2026-09-15, 실제로 발생). 마스터 로그인은
+# 시도 횟수 제한(_login_locked)과 비밀번호 자체 검증이 그대로 지켜주므로 공개해도
+# 안전하다.
 WEB_PUBLIC_PATHS = frozenset({"/api/web/login", "/api/web/logout", "/api/web/status",
+                              "/api/master/login",
                               "/healthz", "/kakao/callback", "/kakao"})
 _WEB_PW_CACHE: dict[str, Any] = {"at": 0.0, "pw": ""}
 WEB_PW_TTL_SEC = 60.0   # run_state 조회가 요청마다 DB 를 때리지 않게
@@ -8084,9 +8149,13 @@ def create_app(ctx: Context):
         pw = (payload or {}).get("password", "")
         if not isinstance(pw, str) or not check_master_password(ctx, pw):
             _login_fail(ip)
+            if _master_login_fail(ip) >= MASTER_LOGIN_FAIL_THRESHOLD:
+                _recover_master_password(ctx)
+                _master_login_reset(ip)
             return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
                                 status_code=401)
         _login_reset(ip)
+        _master_login_reset(ip)
         return JSONResponse({"ok": True, "token": _issue_master_token(),
                              "ttl_hours": int(MASTER_TOKEN_TTL.total_seconds() // 3600)})
 
@@ -10575,6 +10644,30 @@ def cmd_selftest() -> int:
           _client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))),
           "127.0.0.1")
     _LOGIN_FAILS.clear()
+
+    print("\n[19-2] 마스터 비밀번호 자동 복구 (2026-09-15)")
+    check("/api/master/login 은 사이트 잠금과 무관하게 항상 열려 있어야 함",
+          "/api/master/login" in WEB_PUBLIC_PATHS, True)
+    _MASTER_LOGIN_FAILS.clear()
+    for _i in range(MASTER_LOGIN_FAIL_THRESHOLD - 1):
+        check(f"{_i + 1}회째는 아직 임계치 미만",
+              _master_login_fail("9.9.9.9") >= MASTER_LOGIN_FAIL_THRESHOLD, False)
+    check("임계치(3회)째 도달", _master_login_fail("9.9.9.9") >= MASTER_LOGIN_FAIL_THRESHOLD, True)
+    _master_login_reset("9.9.9.9")
+    check("reset 후 다시 0부터", _master_login_fail("9.9.9.9"), 1)
+    _MASTER_LOGIN_FAILS.clear()
+
+    _rec_cfg = replace(_pcfg, master_password="testpw123", master_pw_recovery_to=["r@x.com"],
+                       smtp_user="", smtp_app_password="")
+    _rec_ctx = Context(cfg=_rec_cfg, storage=_tmp, http=HttpClient())
+    _tmp.set_run_state({"master_pw_hash": "이전에-바뀐-해시"})
+    check("복구 전: DB 해시가 남아 있음", bool(_tmp.get_run_state().get("master_pw_hash")), True)
+    _recover_master_password(_rec_ctx)
+    check("복구 후: DB 해시가 지워져 .env 값으로 돌아감",
+          bool(_tmp.get_run_state().get("master_pw_hash")), False)
+    check("check_master_password: 복구 후 .env 값으로 로그인 성공",
+          check_master_password(_rec_ctx, "testpw123"), True)
+    _tmp.set_run_state({"master_pw_hash": ""})
 
     print("\n[13-2] 알림 메시지 포맷 (PRD F7)")
     msg = format_message({"importance_score": 60, "title": "포스코퓨처엠 주가 하락",
