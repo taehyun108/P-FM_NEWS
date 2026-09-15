@@ -2477,6 +2477,16 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "kgnews.co.kr": ("경기신문", 3), "gosiweek.com": ("피앤피뉴스", 3),
     "unn.net": ("한국대학신문", 3), "ttlnews.com": ("퍼블릭뉴스통신", 3),
     "the-stock.kr": ("더스탁", 3), "apnews.kr": ("AP신문", 3),
+    # 홈페이지가 영문/도메인만 노출해 자동 복구가 안 되던 매체 (2026-09-16)
+    "osen.co.kr": ("OSEN", 2), "spotvnews.co.kr": ("스포티비뉴스", 2),
+    "medigatenews.com": ("메디게이트뉴스", 3), "ilyosisa.co.kr": ("일요시사", 3),
+    "journalist.or.kr": ("기자협회보", 3), "bntnews.co.kr": ("bnt뉴스", 3),
+    "fashionbiz.co.kr": ("패션비즈", 3), "apparelnews.co.kr": ("어패럴뉴스", 3),
+    "elle.co.kr": ("엘르", 3), "wkorea.com": ("더블유코리아", 3),
+    "kwangju.co.kr": ("광주일보", 2), "cjb.co.kr": ("CJB청주방송", 3),
+    "mbcgn.kr": ("MBC경남", 3), "yakup.com": ("약업신문", 3),
+    "besteleven.com": ("베스트일레븐", 3), "ddanzi.com": ("딴지일보", 3),
+    "voakorea.com": ("VOA 한국어", 3), "g1tv.co.kr": ("G1방송", 3),
 }
 
 # 다음·네이버 뉴스 래퍼 도메인 — 그 자체가 언론사가 아니다.
@@ -2820,6 +2830,10 @@ def domain_of(url: str) -> str:
         return host
     # co.kr / or.kr / go.kr 같은 2단계 국가 도메인 처리
     if len(parts) >= 3 and parts[-2] in ("co", "or", "go", "ne", "re", "pe", "ac") and parts[-1] == "kr":
+        return ".".join(parts[-3:])
+    # 중국 도메인도 co.kr 처럼 2단계 SLD 를 쓴다(예: news.xinhuanet.com.cn). 이걸
+    # 못 접으면 뒤 두 조각만 남아 'com.cn'으로 뭉개져 매체를 특정할 수 없게 된다.
+    if len(parts) >= 3 and parts[-2] in ("com", "net", "org", "gov", "edu") and parts[-1] == "cn":
         return ".".join(parts[-3:])
     return ".".join(parts[-2:])
 
@@ -5034,11 +5048,13 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     seed = SEED_PRESS.get(domain)
     og_name = site_name_from_html(html, domain)
     # 이 매체를 처음 보는데(row is None) 기사 페이지에서 이름을 못 찾았으면, 홈페이지를
-    # 한 번 더 본다(신규 매체당 1회뿐이라 부담이 작다). 기사 페이지는 SEO 상 기사
-    # 제목만 <title>에 넣는 경우가 많아 실패하기 쉬운데, 홈페이지는 거의 항상
-    # 매체명을 담는다. 이렇게 안 하면 언론사명이 도메인 그대로('skyedaily.com')
-    # 굳어 화면 필터 칩에 그대로 노출된다.
-    if not og_name and http is not None and row is None and not seed and (
+    # 한 번 더 본다. 기사 페이지는 SEO 상 기사 제목만 <title>에 넣는 경우가 많아
+    # 실패하기 쉬운데, 홈페이지는 거의 항상 매체명을 담는다.
+    # 기존에 등록된 매체라도 이름이 아직 도메인 그대로('mdilbo.com')면 계속 재시도
+    # 한다 — 예전엔 row is None 일 때 딱 1회만 시도해서, 그 1회가 실패하면 화면
+    # 필터 칩에 도메인이 영구히 그대로 노출됐다(2026-09-16 지적: 실제 다수 발견).
+    if not og_name and http is not None and not seed and (
+            row is None or _looks_like_domain(row.get("name", ""))) and (
             not hint or _looks_like_domain(hint)):
         og_name = _homepage_site_name(http, domain, urlsplit(url).hostname or "")
 
