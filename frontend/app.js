@@ -758,6 +758,8 @@ async function loadMasterSettings() {
     $('thRec').textContent = d.recommended_min;
     applyNightSettings(d);
     $('webPwNow').textContent = d.web_password || '(미설정)';
+    $('webLockEnabled').checked = !!d.web_lock_enabled;
+    $('masterLockEnabled').checked = d.master_lock_enabled !== false;
     $('alwaysKwBypassNight').checked = d.always_kw_bypass_night !== false;
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
@@ -1022,6 +1024,55 @@ function initMaster() {
         { method: 'POST', body: JSON.stringify({ telegram_enabled: e.target.checked }) });
       masterMsg('ok', `텔레그램 발송 ${e.target.checked ? '켬' : '끔'}`);
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
+  });
+
+  $('webLockEnabled').addEventListener('change', async (e) => {
+    try {
+      const res = await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ web_lock_enabled: e.target.checked }) });
+      const d = await res.json();
+      if (!d.ok) { e.target.checked = !e.target.checked; masterMsg('err', d.error || '저장 실패'); return; }
+      masterMsg('ok', e.target.checked ? '웹 접속 비밀번호 사용 켬' : '웹 접속 비밀번호 사용 끔 (누구나 접속 가능)');
+    } catch (err) {
+      if (err.message !== 'unauthorized') { e.target.checked = !e.target.checked; masterMsg('err', '저장 실패'); }
+    }
+  });
+
+  $('masterLockEnabled').addEventListener('change', async (e) => {
+    if (e.target.checked) {
+      try {
+        const res = await masterFetch('/api/master/lock',
+          { method: 'POST', body: JSON.stringify({ enabled: true }) });
+        const d = await res.json();
+        if (!d.ok) { e.target.checked = false; masterMsg('err', d.error || '저장 실패'); return; }
+        masterMsg('ok', '마스터 비밀번호 사용 켬');
+      } catch (err) { if (err.message !== 'unauthorized') { e.target.checked = false; masterMsg('err', '저장 실패'); } }
+      return;
+    }
+    // 끄는 건 위험하므로 체크는 도로 켜 두고, 현재 비밀번호 확인을 먼저 받는다.
+    e.target.checked = true;
+    $('masterLockOffConfirm').hidden = false;
+    $('masterLockOffPw').value = '';
+    $('masterLockOffPw').focus();
+  });
+
+  $('masterLockOffCancel').addEventListener('click', () => {
+    $('masterLockOffConfirm').hidden = true;
+    $('masterLockOffPw').value = '';
+  });
+
+  $('masterLockOffApply').addEventListener('click', async () => {
+    const pw = $('masterLockOffPw').value;
+    try {
+      const res = await masterFetch('/api/master/lock',
+        { method: 'POST', body: JSON.stringify({ enabled: false, current_password: pw }) });
+      const d = await res.json();
+      if (!d.ok) { masterMsg('err', d.error || '끄기 실패'); return; }
+      $('masterLockEnabled').checked = false;
+      $('masterLockOffConfirm').hidden = true;
+      $('masterLockOffPw').value = '';
+      masterMsg('ok', '마스터 비밀번호 사용 끔');
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '끄기 실패'); }
   });
 
   $('scoreCustomAdd').addEventListener('click', addScoreCustomItem);

@@ -896,6 +896,10 @@ class SqliteStorage(Storage):
             "alter table run_state add column score_custom_rules TEXT default '[]'",
             "alter table run_state add column pipeline_lock_owner TEXT",
             "alter table run_state add column pipeline_lock_at TEXT",
+            # 잠금 사용 여부 (2026-09-16) — NULL = 기존 방식(비밀번호 값이 있으면
+            # 잠금, 없으면 해제)을 그대로 따름. 0/1 이면 그 값을 명시적으로 따름.
+            "alter table run_state add column web_lock_enabled INTEGER",
+            "alter table run_state add column master_lock_enabled INTEGER",
         ]
         for sql in migrations:
             try:
@@ -2487,6 +2491,8 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "mbcgn.kr": ("MBC경남", 3), "yakup.com": ("약업신문", 3),
     "besteleven.com": ("베스트일레븐", 3), "ddanzi.com": ("딴지일보", 3),
     "voakorea.com": ("VOA 한국어", 3), "g1tv.co.kr": ("G1방송", 3),
+    "gamefocus.co.kr": ("게임포커스", 3), "mstoday.co.kr": ("MS투데이", 3),
+    "swtvnews.com": ("SWTV", 3),
 }
 
 # 다음·네이버 뉴스 래퍼 도메인 — 그 자체가 언론사가 아니다.
@@ -2619,6 +2625,12 @@ def _is_company_list_sentence(sentence: str) -> bool:
     for item in parts[1:-1]:
         if len(item) > _LIST_ITEM_MAX_CHARS or _NOT_LIST_ITEM_END_RE.search(item):
             return False
+    # '후원(하고 있는) A, B, C가 참여' 처럼 스포츠·공연 등 제3자 행사의 후원사를
+    # 나열하는 문장은 실제 사업 소식이 아니라 단순 협찬 언급이라 그룹사로 치지
+    # 않는다. (실사례: e스포츠 대회 후원사 명단에 '포스코'가 있어 무관 기사가
+    # 걸림 — LCK 결승전 기사, 2026-09-16)
+    if re.search(r"후원(하[고는]|사)", sentence):
+        return False
     return True
 
 
@@ -7379,14 +7391,25 @@ def _rate_ok(bucket: list[float], limit: int, window: float = 3600.0) -> bool:
 
 
 def check_master_password(ctx: Context, pw: str) -> bool:
-    """DB 에 변경된 해시가 있으면 그것을, 없으면 .env 의 MASTER_PASSWORD 를 쓴다."""
+    """DB 에 변경된 해시가 있으면 그것을, 없으면 .env 의 MASTER_PASSWORD 를 쓴다.
+
+    master_lock_enabled 를 명시적으로 꺼뒀으면(마스터 패널 "마스터 비밀번호 사용
+    안 함") 아무 값이나(빈 값 포함) 통과시킨다 — 위험을 알고 켠 선택이므로
+    존중한다(2026-09-16).
+    """
+    st = ctx.storage.get_run_state()
+    flag = st.get("master_lock_enabled")
+    if flag is not None and str(flag) in ("0", "False", "false"):
+        return True
     if not pw:
         return False
-    stored = ctx.storage.get_run_state().get("master_pw_hash")
+    stored = st.get("master_pw_hash")
     if stored:
         return verify_password(pw, stored)
     env_pw = ctx.cfg.master_password
-    return bool(env_pw) and hmac.compare_digest(pw, env_pw)
+    # compare_digest 는 비-ASCII 문자열을 못 받는다(TypeError) — 한글 등을 쳐 넣으면
+    # 그냥 '틀렸다'로 처리돼야지 서버 오류가 나면 안 되므로 바이트로 비교한다.
+    return bool(env_pw) and hmac.compare_digest(pw.encode("utf-8"), env_pw.encode("utf-8"))
 
 
 def card_tags(row: dict) -> tuple[list[str], list[str], str]:
@@ -7634,6 +7657,12 @@ def create_app(ctx: Context):
         secret = ""
         try:
             st = ctx.storage.get_run_state()
+            flag = st.get("web_lock_enabled")
+            if flag is not None and str(flag) in ("0", "False", "false"):
+                # 마스터 패널에서 "웹 접속 비밀번호 사용 안 함"을 명시적으로 골랐다.
+                # 저장된 비밀번호 값은 나중에 다시 켤 때 쓰려고 그대로 둔다(2026-09-16).
+                _WEB_PW_CACHE.update(at=now, pw="")
+                return ""
             if (st.get("web_password") or "").strip():        # 패널에서 지정함 = 잠금 on
                 secret = (st.get("web_pw_hash") or "").strip() or st["web_password"].strip()
         except Exception as exc:   # DB 장애 때 사이트를 통째로 잠가 버리지 않는다
@@ -7654,7 +7683,9 @@ def create_app(ctx: Context):
             return False
         if secret.count("$") >= 3:      # pbkdf2$iters$salt$hash 형태 = 저장된 해시
             return verify_password(pw, secret)
-        return hmac.compare_digest(pw, secret)
+        # compare_digest 는 비-ASCII 문자열을 못 받는다 — 바이트로 비교해 한글
+        # 비밀번호를 입력해도 서버 오류 없이 '틀렸다'로 처리되게 한다.
+        return hmac.compare_digest(pw.encode("utf-8"), secret.encode("utf-8"))
 
     def _web_session_ok(token: str) -> bool:
         secret = _web_secret()
@@ -7743,9 +7774,17 @@ def create_app(ctx: Context):
         비밀번호가 비어 있으면(로컬 개발) 아무 것도 막지 않는다. 설정돼 있으면
         쿠키에 든 세션 토큰이 맞아야 화면·API 를 내준다 — 배포 후 URL 만 알면
         누구나 기사·발송 API 를 쓸 수 있는 상태를 막는 것이 목적이다.
+
+        유효한 마스터 토큰(X-Master-Token)이 있으면 이 잠금을 통과시킨다 — 마스터
+        권한이 웹 접속 잠금보다 상위이기 때문. 이게 없으면 '웹 접속 비밀번호를
+        잊어 사이트가 잠긴' 상황에서 마스터 비밀번호를 알아도 마스터 패널
+        API(/api/master/settings 등)에 도달할 수 없어 웹 잠금을 끄러 들어갈
+        방법조차 없어진다(2026-09-16). 마스터 토큰은 자체 로그인·시도 횟수
+        제한으로 보호되므로 안전하다.
         """
         if _web_password() and request.url.path not in WEB_PUBLIC_PATHS:
-            if not _web_session_ok(request.cookies.get(WEB_COOKIE, "")):
+            if not _web_session_ok(request.cookies.get(WEB_COOKIE, "")) and not _valid_master_token(
+                    request.headers.get("x-master-token", "")):
                 accept = request.headers.get("accept", "")
                 if request.url.path.startswith("/api/"):
                     return JSONResponse({"ok": False, "error": "로그인이 필요합니다."},
@@ -8196,6 +8235,11 @@ def create_app(ctx: Context):
             "always_kw_bypass_night": str(st.get("always_kw_bypass_night", 1) or 0)
                                       not in ("0", "False", "false", ""),
             "web_password": st.get("web_password") or "",
+            # 잠금 사용 여부 — 마스터 패널 토글용. NULL(미지정)이면 '비밀번호 값이
+            # 있으면 켜짐'으로 해석해 보여준다(레거시 호환). (2026-09-16)
+            "web_lock_enabled": bool(_web_password()),
+            "master_lock_enabled": str(st.get("master_lock_enabled", 1) or 0)
+                                   not in ("0", "False", "false"),
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
             "policy_keywords": jload(st.get("policy_notify_keywords"), []),
             "policy_required": jload(st.get("policy_required_keywords"), []),
@@ -8239,6 +8283,11 @@ def create_app(ctx: Context):
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
                                     status_code=400)
+        if "web_lock_enabled" in (payload or {}):
+            # 마스터 비밀번호는 여기서 안 받는다 — 껐다 켜도 마스터 패널
+            # 자체는 항상 마스터 비밀번호로 보호되므로 별도 확인 없이 바꿀 수
+            # 있다(위험도가 낮다: 사이트 화면·API 노출 여부만 바뀜).
+            patch["web_lock_enabled"] = 1 if payload["web_lock_enabled"] else 0
         # 야간 억제 — 시각은 0~23(운영 기준 시간대), 점수는 0~101(101=전면 차단)
         for key, col, lo, hi, label in (
             ("night_start", "night_start_hour", 0, 23, "야간 시작 시각"),
@@ -8352,9 +8401,13 @@ def create_app(ctx: Context):
                          "  add column if not exists policy_exclude_keywords text default '[]',\n"
                          "  add column if not exists trade_exclude_keywords text default '[]',\n"
                          "  add column if not exists score_overrides text default '{}',\n"
-                         "  add column if not exists score_custom_rules text default '[]';"},
+                         "  add column if not exists score_custom_rules text default '[]',\n"
+                         "  add column if not exists web_lock_enabled boolean,\n"
+                         "  add column if not exists master_lock_enabled boolean;"},
                         status_code=500)
                 raise
+        if "web_lock_enabled" in patch:
+            _WEB_PW_CACHE.update(at=0.0, pw="")   # 다음 요청부터 바로 새 값 반영
         return JSONResponse({"ok": True})
 
     @app.post("/api/master/password")
@@ -8383,6 +8436,35 @@ def create_app(ctx: Context):
             # 세션 토큰은 비밀번호에서 파생되므로 바꾸는 즉시 기존 쿠키가 무효가 된다.
             # 캐시를 비워 다음 요청부터 새 값을 쓰게 한다.
             _WEB_PW_CACHE.update(at=0.0, pw="")
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/master/lock")
+    async def api_master_lock(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        """마스터 비밀번호 자체를 쓸지 말지 켜고 끈다 (2026-09-16).
+
+        끄면 마스터 패널이 비밀번호 없이 열린다 — 모든 마스터 전용 API(텔레그램
+        발송·키워드 관리 등)의 유일한 보호막이 사라지는 것이므로, 현재 마스터
+        비밀번호를 다시 입력해 확인해야만 끌 수 있다(잠금 켜는 건 확인 없이 가능).
+        """
+        if (err := _master_guard(x_master_token)):
+            return err
+        enabled = bool((payload or {}).get("enabled", True))
+        if not enabled:
+            cur = (payload or {}).get("current_password", "")
+            if not check_master_password(ctx, cur):
+                return JSONResponse({"ok": False, "error": "현재 비밀번호가 올바르지 않습니다."},
+                                    status_code=401)
+        try:
+            ctx.storage.set_run_state({"master_lock_enabled": 1 if enabled else 0})
+        except Exception as exc:
+            msg = str(exc)
+            if "column" in msg.lower() or "PGRST204" in msg or "schema cache" in msg.lower():
+                return JSONResponse(
+                    {"ok": False, "error": "저장소(run_state)에 master_lock_enabled 컬럼이 아직 "
+                     "없습니다. Supabase SQL Editor 에서 아래를 1회 실행하세요:\n"
+                     "alter table run_state add column if not exists master_lock_enabled boolean;"},
+                    status_code=500)
+            raise
         return JSONResponse({"ok": True})
 
     # ── 수집 키워드 관리 (마스터 패널, 2026-09-15) ───────────────────────
@@ -9448,6 +9530,15 @@ def cmd_selftest() -> int:
           detect_group_companies(group_lead_text(_narrative_comma_body)), ["포스코"])
     check("group_lead_text — 긴 기사(원래 사례)는 여전히 700자로 잘라 주체 유지",
           detect_group_companies(group_lead_text(_lead + "\n" + _tail)), ["포스코"])
+
+    # 실제 오탐 사례(2026-09-16): e스포츠 대회 후원사 명단에 '포스코'가 있어
+    # 무관 기사(LCK 결승전 소식)가 그룹사로 걸렸다. "후원(하고 있는) A, B, C가
+    # 참여" 형태는 나열문 조건은 만족하지만 실제 사업 소식이 아니므로 뺀다.
+    _sponsor_body = (
+        "ㅁ" * 700 + " 현장에는 LCK를 후원하고 있는 우리은행, 치지직, 업비트, 포스코,"
+        " 카스, JW중외제약, 골든듀, 로지텍G와 국가보훈부가 참여해 다양한 이벤트를 펼친다.")
+    check("group_lead_text — 제3자 행사 후원사 나열은 그룹사로 안 침",
+          detect_group_companies(group_lead_text(_sponsor_body)), [])
 
     check("카테고리에 '그룹사' 없음", "그룹사" in detect_categories("포스코퓨처엠 양극재 증설"), False)
     check("병합 시 상위 개념 제거",
@@ -10684,6 +10775,30 @@ def cmd_selftest() -> int:
     check("check_master_password: 복구 후 .env 값으로 로그인 성공",
           check_master_password(_rec_ctx, "testpw123"), True)
     _tmp.set_run_state({"master_pw_hash": ""})
+
+    print("\n[19-3] 웹/마스터 잠금 사용 여부 선택 (2026-09-16)")
+    _tmp.set_run_state({"web_lock_enabled": None, "web_password": "abcd1234", "web_pw_hash": ""})
+    check("web_lock_enabled 미지정 + 비밀번호 있음 → 레거시대로 잠금 켜짐",
+          bool(_rec_ctx.storage.get_run_state().get("web_password")), True)
+    _tmp.set_run_state({"web_lock_enabled": 0})
+    check("web_lock_enabled=0 이면 비밀번호가 있어도 명시적으로 꺼짐",
+          str(_tmp.get_run_state().get("web_lock_enabled")) in ("0", "False", "false"), True)
+    _tmp.set_run_state({"web_lock_enabled": 1})
+    check("web_lock_enabled=1 로 다시 켤 수 있음",
+          str(_tmp.get_run_state().get("web_lock_enabled")) not in ("0", "False", "false"), True)
+    _tmp.set_run_state({"web_lock_enabled": None, "web_password": "", "web_pw_hash": ""})
+
+    check("master_lock_enabled 끄기 전에는 빈 값이 여전히 거부됨",
+          check_master_password(_rec_ctx, ""), False)
+    _tmp.set_run_state({"master_lock_enabled": 0})
+    check("master_lock_enabled=0 이면 빈 값도 통과(잠금 해제)",
+          check_master_password(_rec_ctx, ""), True)
+    check("master_lock_enabled=0 이면 아무 문자열이나 통과",
+          check_master_password(_rec_ctx, "아무거나"), True)
+    _tmp.set_run_state({"master_lock_enabled": 1})
+    check("master_lock_enabled=1 로 되돌리면 다시 검증함",
+          check_master_password(_rec_ctx, "틀린값"), False)
+    _tmp.set_run_state({"master_lock_enabled": None})
 
     print("\n[13-2] 알림 메시지 포맷 (PRD F7)")
     msg = format_message({"importance_score": 60, "title": "포스코퓨처엠 주가 하락",

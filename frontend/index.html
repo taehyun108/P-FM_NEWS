@@ -208,6 +208,13 @@
 
       <section class="master-section">
         <h3><span class="ms-step">7</span> 운영자 설정 — 비밀번호</h3>
+        <label class="master-toggle">
+          <input type="checkbox" id="webLockEnabled">
+          <span>웹페이지 접속 비밀번호를 사용한다</span>
+        </label>
+        <small><b>끄면</b> 누구나 URL만 알면 사이트를 볼 수 있습니다(로그인 화면 없이 바로 진입).
+          비밀번호 값은 지우지 않고 그대로 두니, 나중에 다시 켜면 마지막에 쓰던 값이 그대로
+          돌아옵니다.</small>
         <form class="master-pwform" id="pwMasterForm">
           <input type="password" id="pwMasterCur" class="url-add-input" placeholder="현재 마스터 비밀번호" autocomplete="current-password">
           <input type="password" id="pwMasterNew" class="url-add-input" placeholder="새 마스터 비밀번호 (8자 이상)" autocomplete="new-password">
@@ -221,6 +228,19 @@
           <input type="password" id="pwWebNew" class="url-add-input" placeholder="새 웹페이지 비밀번호 (8자 이상)" autocomplete="new-password">
           <button type="submit" class="url-add-btn">웹페이지 비밀번호 변경</button>
         </form>
+        <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+        <label class="master-toggle">
+          <input type="checkbox" id="masterLockEnabled">
+          <span>마스터 비밀번호를 사용한다</span>
+        </label>
+        <small style="color:#c0392b">⚠ <b>끄면</b> 이 마스터 패널(텔레그램 발송·키워드 관리 등
+          모든 관리 기능)이 비밀번호 없이 누구나 열립니다. 끌 때는 안전을 위해 현재 마스터
+          비밀번호를 다시 입력해야 합니다(켜는 건 바로 됩니다).</small>
+        <div class="kw-input" id="masterLockOffConfirm" hidden>
+          <input type="password" id="masterLockOffPw" class="url-add-input" placeholder="현재 마스터 비밀번호 확인">
+          <button type="button" class="url-add-btn" id="masterLockOffApply">끄기 확인</button>
+          <button type="button" class="url-add-btn" id="masterLockOffCancel">취소</button>
+        </div>
       </section>
 
       <section class="master-section">
