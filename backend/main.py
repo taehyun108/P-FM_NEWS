@@ -3309,6 +3309,41 @@ def _naver_item_relevant(title: str, category: str, keyword: str = "",
 
 SOURCE_FETCH_WORKERS = 10   # 키워드·피드별 조회 동시 실행 수 (2026-09-14, 아래 참고)
 
+# 네이버 무료 한도(하루 25,000회) 대응 — 키워드 전부를 매 회차 조회하면 한도를 넘는다.
+# 실측(2026-09-15): 활성 키워드 118개 × 하루 288회차 = 33,984회 → 한도의 1.4배.
+# 한도를 넘기면 그날 남은 시간 내내 429 로 네이버 수집이 통째로 막혀 기사를 놓친다.
+# 그래서 '그룹사'(포스코 계열사명) 키워드만 매 회차 조회하고, 나머지(산업·정책·통상)는
+# 아래 수만큼 나눠 교대로 조회한다. 그룹사 7 + 나머지 111/2 ≈ 63개/회차 → 하루 약 18,100회.
+NAVER_ALWAYS_CATEGORY = "그룹사"
+NAVER_ROTATE_SLOTS_DEFAULT = 2
+
+
+def naver_rotate_slots() -> int:
+    """회차 분할 수. **호출 시점에** 환경변수를 읽는다.
+
+    모듈 상단 상수로 두면 안 된다 — .env 는 load_config() 안에서 읽는데 그건
+    모듈 import 보다 나중이라, 도커(--env-file 로 진짜 환경변수)에서는 반영되고
+    로컬 실행에서는 무시되는 식으로 **실행 방식에 따라 동작이 갈린다.**
+    """
+    return get_env_int("NAVER_ROTATE_SLOTS", NAVER_ROTATE_SLOTS_DEFAULT, 1, 12)
+
+
+def select_naver_keywords(keyword_rows: Sequence[dict], cycle: int) -> list[dict]:
+    """이번 회차에 조회할 키워드만 고른다. (일일 한도 대응 — 위 상수 설명 참고)
+
+    '그룹사'는 매 회차 전부, 나머지는 cycle 을 슬롯 수로 나눈 몫의 것만 낸다.
+    슬롯이 1이면 기존처럼 전부 조회한다(끄고 싶을 때 .env 로 조절).
+    """
+    slots = naver_rotate_slots()
+    always = [r for r in keyword_rows
+              if (r.get("category") if isinstance(r, dict) else "") == NAVER_ALWAYS_CATEGORY]
+    rotating = [r for r in keyword_rows
+                if (r.get("category") if isinstance(r, dict) else "") != NAVER_ALWAYS_CATEGORY]
+    if slots <= 1 or not rotating:
+        return list(keyword_rows)
+    slot = cycle % slots
+    return always + [r for i, r in enumerate(rotating) if i % slots == slot]
+
 
 def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -> list[RawItem]:
     """NAVER API HUB 뉴스 검색. 직접 크롤링은 약관 위반이므로 하지 않는다. (PRD §7-4)
@@ -4736,6 +4771,7 @@ class Context:
     http: HttpClient
     seen_cache: set[str] = field(default_factory=set)
     last_naver_fetch: float = 0.0
+    naver_cycle: int = 0        # 키워드 교대 조회 회차 (select_naver_keywords)
     _llm: LLMClient | None = None
 
     @property
@@ -4934,8 +4970,18 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     try:
         stale_after = max(60, cfg.poll_interval_sec * PIPELINE_LOCK_STALE_MULT)
         if not storage.try_acquire_pipeline_lock(_INSTANCE_ID, stale_after):
-            log.warning("다른 인스턴스(%s)가 파이프라인을 실행 중입니다 — 이번 회차는 건너뜁니다.",
-                        _INSTANCE_ID)
+            # 예전엔 여기서 '내' id 를 찍어 놓고 남의 것처럼 표시해 원인 추적이 어려웠다.
+            # 실제 락 주인을 DB 에서 읽어 함께 남긴다(충돌 회차에만 1회 조회).
+            owner = ""
+            try:
+                owner = str(storage.get_run_state().get("pipeline_lock_owner") or "")
+            except Exception:
+                pass
+            log.warning(
+                "다른 인스턴스(%s)가 파이프라인을 실행 중입니다 — 이번 회차는 건너뜁니다."
+                " (내 id=%s) 기사 중복은 이 락이 막지만 네이버·LLM 같은 외부 API 의"
+                " 일일 한도는 인스턴스끼리 공유되므로, 안 쓰는 쪽은 꼭 내려 주세요.",
+                owner or "알 수 없음", _INSTANCE_ID)
             return {"fetched": 0, "new": 0, "skipped_locked": True}
     except Exception as exc:
         log.debug("파이프라인 락 확인 실패(무시하고 진행): %s", exc)
@@ -4981,7 +5027,13 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 하루 25,000회 한도 때문에 매 실행이 아니라 일정 간격으로만 호출한다.
         due = force_naver or (time.monotonic() - ctx.last_naver_fetch) >= cfg.naver_interval_sec
         if due:
-            raw += collect_naver(http, cfg, keyword_rows)
+            # 일일 무료 한도(25,000회)를 넘지 않도록 이번 회차 몫만 고른다.
+            picked = select_naver_keywords(keyword_rows, ctx.naver_cycle)
+            ctx.naver_cycle += 1
+            if len(picked) < len(keyword_rows):
+                log.info("네이버 키워드 교대 조회: %d/%d개 (회차 %d, 일일 한도 대응)",
+                         len(picked), len(keyword_rows), ctx.naver_cycle)
+            raw += collect_naver(http, cfg, picked)
             ctx.last_naver_fetch = time.monotonic()
     rss_feeds = [f for f in feeds if f["source_type"] == "rss"]
     if rss_feeds:
@@ -7273,7 +7325,21 @@ def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses:
 # ── 목록 스캔 스토어 ────────────────────────────────────────────────
 # /api/articles·/api/filters 는 활성·분석완료 기사 수천~수만 행을 훑어 필터한다.
 # 요청마다 DB 를 다시 읽으면 Supabase 이관 후 무료 대역폭(5GB/월)을 금방 넘긴다.
-# 태그가 붙은 행을 메모리에 두고, 파이프라인이 사이클마다 '바뀐 것만' 델타로 갱신한다.
+# 태그가 붙은 행을 메모리에 두고, '바뀐 것만' 델타로 갱신한다.
+#
+# ⚠ 프로세스 경계 주의 (serve + worker 분리 배포, 2026-09-11~):
+#   이 스토어는 **프로세스마다 따로** 존재한다. worker 가 새 기사를 넣어도 serve 의
+#   메모리에는 안 들어온다 — serve 는 _scan_tagged 가 요청 때마다 호출하는
+#   refresh_scan_store 로 **자기 스토어를 스스로** 델타 갱신한다(그래서 동작한다).
+#   새 전역 캐시를 추가할 땐 "누가 쓰고 누가 읽는가"를 반드시 따져라. 한쪽 프로세스만
+#   쓰고 다른 쪽이 읽는 구조면 배포 후에 조용히 깨진다.
+#
+# ⚠ 정렬 불변식 (2026-09-15 실장애):
+#   by_id 는 dict 라 **삽입 순서**가 곧 반환 순서인데, 델타로 새로 들어온 기사는
+#   항상 맨 뒤에 붙는다. api_articles 의 'recent' 정렬은 이 반환 순서를 그대로
+#   믿고 쓰므로, refresh_scan_store 는 **반환 직전에 반드시 발행일 최신순으로
+#   재정렬**한다. 이걸 빼면 신규 기사가 마지막 페이지로 밀려 화면에서 사라진다.
+#   (회귀 방지: selftest [11-2e] "델타로 들어온 최신 기사가 정렬 후 맨 앞에 온다")
 _SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0}
 _SCAN_STORE_LOCK = threading.Lock()
 SCAN_STORE_CAP = 40000            # 메모리 상한(≈100일치). 넘으면 발행일 오래된 것부터 버린다.
@@ -7569,7 +7635,9 @@ def create_app(ctx: Context):
                                 {normalize_chip(x) for x in _split_multi(group)},
                                 {normalize_chip(x) for x in _split_multi(cat)},
                                 {normalize_chip(x) for x in _split_multi(press)})
-        # 정렬 — 기본(recent)은 SQL 이 이미 발행일 최신순으로 준 순서를 그대로 쓴다.
+        # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
+        # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
+        # 순서에 기대다가 신규 기사가 마지막 페이지로 밀리는 장애가 있었다).
         # 'score' 는 사용자가 직접 등록한 기사·중요도 높은 기사를 위로 올린다.
         if sort == "score":
             matched = sorted(matched, key=lambda t: (
@@ -7727,6 +7795,9 @@ def create_app(ctx: Context):
         api_url = TELEGRAM_API.format(token=ctx.cfg.telegram_bot_token)
 
         def _work():
+            # 카드의 ↗ 버튼도 알림 큐와 '같은 채널'로 나가므로 분당 한도를 함께 지킨다.
+            # (이 경로만 _rate_gate 를 안 거쳐서, 큐 발송이 몰릴 때 겹치면 429 를 맞았다)
+            _rate_gate()
             return _telegram_send(ctx, api_url, clamp_message(format_message(row)),
                                   kind="직접 전송", article_id=article_id)
 
@@ -9908,6 +9979,35 @@ def cmd_selftest() -> int:
         "select id from articles where id like 'dd-%' and analyzed_at is not null")}
     check("실제로 분석 완료된 건 정확히 2건(중복 제외, 병렬 실행에도 안전)",
           len(_analyzed_ids), 2)
+
+    print("\n[7-3] 네이버 키워드 교대 조회 — 일일 무료 한도 대응 (2026-09-15)")
+    # 활성 키워드 118개를 매 회차 전부 조회하면 하루 33,984회로 무료 한도(25,000)를
+    # 1.4배 초과해, 매일 중간부터 429 로 네이버 수집이 통째로 막혔다.
+    _rot_rows = ([{"keyword": f"g{i}", "category": "그룹사"} for i in range(7)]
+                 + [{"keyword": f"a{i}", "category": "산업"} for i in range(48)]
+                 + [{"keyword": f"p{i}", "category": "정책"} for i in range(38)]
+                 + [{"keyword": f"t{i}", "category": "통상"} for i in range(25)])
+    check("테스트 입력은 실제와 같은 118개", len(_rot_rows), 118)
+    _slot0 = select_naver_keywords(_rot_rows, 0)
+    _slot1 = select_naver_keywords(_rot_rows, 1)
+    check("한 회차 조회량이 절반 수준으로 준다", len(_slot0) < 70 and len(_slot1) < 70, True)
+    check("그룹사 7개는 매 회차 전부 조회한다",
+          (sum(1 for r in _slot0 if r["category"] == "그룹사"),
+           sum(1 for r in _slot1 if r["category"] == "그룹사")), (7, 7))
+    # 한 바퀴(NAVER_ROTATE_SLOTS 회차) 돌면 모든 키워드가 빠짐없이 조회돼야 한다
+    _seen = set()
+    for _c in range(naver_rotate_slots()):
+        _seen |= {r["keyword"] for r in select_naver_keywords(_rot_rows, _c)}
+    check("한 바퀴 돌면 모든 키워드가 빠짐없이 조회된다",
+          _seen, {r["keyword"] for r in _rot_rows})
+    check("회차가 한 바퀴 넘어가면 처음 슬롯으로 돌아온다",
+          [r["keyword"] for r in select_naver_keywords(_rot_rows, naver_rotate_slots())],
+          [r["keyword"] for r in _slot0])
+    check("슬롯이 1이면 기존처럼 전부 조회(끄기 옵션)",
+          len(select_naver_keywords(_rot_rows, 0)) if naver_rotate_slots() > 1 else 118,
+          len(_slot0))
+    check("키워드가 그룹사뿐이면 그대로 전부",
+          len(select_naver_keywords([{"keyword": "g", "category": "그룹사"}], 3)), 1)
 
     print("\n[7-2] 수집 소스 조회 병렬화 — collect_naver · collect_rss_feeds (2026-09-14)")
     # 활성 키워드가 100개를 넘어가며 순차 조회가 사이클 시간의 대부분을 차지하는
