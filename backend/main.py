@@ -7294,7 +7294,15 @@ def _store_put(st: dict, r: dict) -> None:
 
 
 def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
-    """태그가 붙은 활성·분석완료 행 목록. 최초/하루 1회만 전체, 그 외엔 델타만 읽는다."""
+    """태그가 붙은 활성·분석완료 행 목록. 최초/하루 1회만 전체, 그 외엔 델타만 읽는다.
+
+    반환은 항상 발행일 최신순으로 정렬해서 준다 — dict 삽입 순서에 기대면 안 된다.
+    델타로 새로 들어온(기존에 없던 id) 기사는 파이썬 dict 특성상 삽입 순서상
+    맨 뒤에 붙는데, api_articles 의 'recent' 정렬은 이 반환 순서를 그대로 믿고
+    쓰기 때문에, 정렬을 안 하면 신규 기사가 항상 마지막 페이지로 밀려 화면에
+    '최신 기사가 안 보이는' 것처럼 보인다(2026-09-15, 실사용 중 발견 — serve
+    컨테이너가 델타로 계속 갱신은 하고 있었지만 순서가 틀어져 있었다).
+    """
     now = time.monotonic()
     with _SCAN_STORE_LOCK:
         st = _SCAN_STORE
@@ -7315,7 +7323,8 @@ def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
                 keep = sorted(st["by_id"].values(),
                               key=lambda t: t["row"].get("published_at") or "", reverse=True)
                 st["by_id"] = {t["row"]["id"]: t for t in keep[:SCAN_STORE_CAP]}
-        return list(st["by_id"].values())
+        return sorted(st["by_id"].values(),
+                      key=lambda t: t["row"].get("published_at") or "", reverse=True)
 
 
 def scan_store_upsert(storage: "Storage", article_id: str) -> None:
@@ -9718,6 +9727,10 @@ def cmd_selftest() -> int:
     _SCAN_STORE["delta_at"] = 0.0   # 델타 조회 최소 간격(60초) 우회 — 테스트라 바로 확인
     rows = refresh_scan_store(_tmp)
     check("델타 — 신규 1건 반영", "st-c" in {t["row"]["id"] for t in rows}, True)
+    # 회귀 방지(2026-09-15): 델타로 새로 들어온 기사가 dict 삽입 순서상 맨
+    # 뒤에 붙어도, 반환은 발행일 최신순으로 재정렬돼 있어야 한다 — 안 그러면
+    # api_articles 의 'recent' 정렬이 신규 기사를 마지막 페이지로 밀어버린다.
+    check("델타로 들어온 최신 기사가 정렬 후 맨 앞에 온다", rows[0]["row"]["id"], "st-c")
     # st-a 를 보관 처리 → 델타가 스토어에서 제거
     _tmp._exec("update articles set status='archived', collected_at=? where id='st-a'",
                (iso(now_utc()),))
