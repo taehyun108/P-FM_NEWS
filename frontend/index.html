@@ -221,6 +221,22 @@
         </form>
       </section>
 
+      <section class="master-section">
+        <h3><span class="ms-step">8</span> 수집 키워드 관리</h3>
+        <small class="ms-lead">여기서 켜고 끄는 건 알림이 아니라 <b>수집 자체</b>입니다 — 꺼진
+          키워드는 구글·네이버 검색에서 아예 빠집니다(화면·알림 둘 다 영향).
+          <b>그룹사</b>는 회사명 키워드로 매 수집 주기(5분)마다 조회되고, 그 외 분류는
+          네이버 일일 호출 한도 때문에 여러 회차로 나눠 교대로 조회됩니다. 칩을
+          클릭하면 켜기/끄기, ×를 누르면 완전히 삭제합니다.</small>
+        <div class="kw-input">
+          <select id="kwCollectCategory" class="url-add-input" style="flex:0 0 92px"></select>
+          <input type="text" id="kwCollectNew" class="url-add-input" placeholder="키워드 입력 후 Enter 또는 추가">
+          <button type="button" class="url-add-btn" id="kwCollectAdd">추가</button>
+        </div>
+        <p class="url-add-msg" id="kwCollectMsg" hidden></p>
+        <div id="kwCollectGroups"><p class="score-eg">불러오는 중…</p></div>
+      </section>
+
       <p class="url-add-msg" id="masterMsg" hidden></p>
     </div>
   </div>

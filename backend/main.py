@@ -685,6 +685,20 @@ class Storage(ABC):
     def seed_keywords(self, rows: Sequence[tuple[str, str]]) -> None: ...
 
     @abstractmethod
+    def all_keywords(self) -> list[dict]:
+        """마스터 패널 '수집 키워드 관리'용 — 켜짐·꺼짐 전부 돌려준다."""
+
+    @abstractmethod
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        """새 수집 키워드를 추가한다. 같은 (분류, 키워드)가 이미 있으면 None."""
+
+    @abstractmethod
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None: ...
+
+    @abstractmethod
+    def delete_keyword(self, keyword_id: str) -> None: ...
+
+    @abstractmethod
     def enabled_feeds(self) -> list[dict]: ...
 
     @abstractmethod
@@ -1352,6 +1366,26 @@ class SqliteStorage(Storage):
                 "insert or ignore into keyword_sets (id,category,keyword,enabled) values (?,?,?,1)",
                 (new_id(), category, keyword),
             )
+
+    def all_keywords(self) -> list[dict]:
+        return self._rows("select * from keyword_sets order by category, keyword")
+
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        existing = self._one(
+            "select id from keyword_sets where category=? and keyword=?", (category, keyword))
+        if existing:
+            return None
+        kid = new_id()
+        self._exec(
+            "insert into keyword_sets (id,category,keyword,enabled) values (?,?,?,1)",
+            (kid, category, keyword))
+        return {"id": kid, "category": category, "keyword": keyword, "enabled": 1}
+
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None:
+        self._exec("update keyword_sets set enabled=? where id=?", (1 if enabled else 0, keyword_id))
+
+    def delete_keyword(self, keyword_id: str) -> None:
+        self._exec("delete from keyword_sets where id=?", (keyword_id,))
 
     def enabled_feeds(self) -> list[dict]:
         return self._rows("select * from feed_sources where enabled=1")
@@ -2049,6 +2083,24 @@ class SupabaseStorage(Storage):
         payload = [{"category": c, "keyword": k, "enabled": True} for c, k in rows]
         if payload:
             self._t("keyword_sets").upsert(payload, on_conflict="category,keyword").execute()
+
+    def all_keywords(self) -> list[dict]:
+        return self._t("keyword_sets").select("*").order("category").order("keyword").execute().data
+
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        existing = (self._t("keyword_sets").select("id")
+                    .eq("category", category).eq("keyword", keyword).execute().data)
+        if existing:
+            return None
+        row = {"category": category, "keyword": keyword, "enabled": True}
+        res = self._t("keyword_sets").insert(row).execute().data
+        return res[0] if res else row
+
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None:
+        self._t("keyword_sets").update({"enabled": enabled}).eq("id", keyword_id).execute()
+
+    def delete_keyword(self, keyword_id: str) -> None:
+        self._t("keyword_sets").delete().eq("id", keyword_id).execute()
 
     def enabled_feeds(self) -> list[dict]:
         return self._t("feed_sources").select("*").eq("enabled", True).execute().data
@@ -3326,6 +3378,10 @@ SOURCE_FETCH_WORKERS = 10   # 키워드·피드별 조회 동시 실행 수 (202
 # 아래 수만큼 나눠 교대로 조회한다. 그룹사 7 + 나머지 111/2 ≈ 63개/회차 → 하루 약 18,100회.
 NAVER_ALWAYS_CATEGORY = "그룹사"
 NAVER_ROTATE_SLOTS_DEFAULT = 2
+# 마스터 패널 '수집 키워드 관리'에서 고를 수 있는 분류. _naver_item_relevant 가
+# 이 값으로 느슨한 신호 종류를 나누므로(그룹사=고정밀만, 정책/통상=전용 키워드,
+# 그 외=산업으로 취급) 목록에 없는 값은 만들지 않는다.
+KEYWORD_CATEGORIES = [NAVER_ALWAYS_CATEGORY, "산업", "정책", "통상"]
 
 
 def naver_rotate_slots() -> int:
@@ -8244,6 +8300,61 @@ def create_app(ctx: Context):
             _WEB_PW_CACHE.update(at=0.0, pw="")
         return JSONResponse({"ok": True})
 
+    # ── 수집 키워드 관리 (마스터 패널, 2026-09-15) ───────────────────────
+    # keyword_sets 는 collect_naver/collect_google_rss 가 매 회차 읽는 표라,
+    # 여기서 켜고 끄거나 추가·삭제하면 다음 수집 사이클부터 바로 반영된다.
+    @app.get("/api/master/keywords")
+    async def api_master_keywords_get(x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        items = ctx.storage.all_keywords()
+        return JSONResponse({
+            "ok": True,
+            "categories": KEYWORD_CATEGORIES,
+            "always_category": NAVER_ALWAYS_CATEGORY,
+            "items": [{
+                "id": r["id"], "category": r["category"], "keyword": r["keyword"],
+                "enabled": bool(r.get("enabled")),
+            } for r in items],
+        })
+
+    @app.post("/api/master/keywords")
+    async def api_master_keywords_add(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        category = str((payload or {}).get("category") or "").strip()
+        keyword = str((payload or {}).get("keyword") or "").strip()
+        if category not in KEYWORD_CATEGORIES:
+            return JSONResponse(
+                {"ok": False, "error": f"분류는 {'/'.join(KEYWORD_CATEGORIES)} 중 하나여야 합니다."},
+                status_code=400)
+        if not keyword or len(keyword) > 50:
+            return JSONResponse({"ok": False, "error": "키워드는 1~50자여야 합니다."}, status_code=400)
+        row = ctx.storage.add_keyword(category, keyword)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "이미 같은 분류에 같은 키워드가 있습니다."},
+                                status_code=409)
+        return JSONResponse({"ok": True, "item": {
+            "id": row["id"], "category": row["category"], "keyword": row["keyword"], "enabled": True,
+        }})
+
+    @app.post("/api/master/keywords/{keyword_id}/toggle")
+    async def api_master_keywords_toggle(keyword_id: str, payload: dict,
+                                         x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        enabled = bool((payload or {}).get("enabled", True))
+        ctx.storage.set_keyword_enabled(keyword_id, enabled)
+        return JSONResponse({"ok": True})
+
+    @app.delete("/api/master/keywords/{keyword_id}")
+    async def api_master_keywords_delete(keyword_id: str,
+                                         x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        ctx.storage.delete_keyword(keyword_id)
+        return JSONResponse({"ok": True})
+
     @app.post("/api/analyze-url")
     async def api_analyze_url(payload: dict):
         """URL 하나를 분석해 미리보기 카드를 만든다. status='draft' 로만 저장하고,
@@ -10088,6 +10199,25 @@ def cmd_selftest() -> int:
           len(_slot0))
     check("키워드가 그룹사뿐이면 그대로 전부",
           len(select_naver_keywords([{"keyword": "g", "category": "그룹사"}], 3)), 1)
+
+    print("\n[7-4] 수집 키워드 관리 CRUD (마스터 패널, 2026-09-15)")
+    _tmp._exec("delete from keyword_sets")
+    _kw_added = _tmp.add_keyword("산업", "테스트키워드")
+    check("추가 성공 — 분류·키워드 반환", (_kw_added or {}).get("keyword"), "테스트키워드")
+    check("추가 직후 켜짐(enabled) 상태", bool((_kw_added or {}).get("enabled")), True)
+    check("같은 분류+키워드 중복 추가는 None(중복 방지)",
+          _tmp.add_keyword("산업", "테스트키워드"), None)
+    check("다른 분류면 같은 키워드도 별개로 추가된다",
+          (_tmp.add_keyword("정책", "테스트키워드") or {}).get("keyword"), "테스트키워드")
+    check("all_keywords 는 켜짐·꺼짐 상관없이 전부(방금 2건)", len(_tmp.all_keywords()), 2)
+    _tmp.set_keyword_enabled(_kw_added["id"], False)
+    check("끄면 enabled_keywords 에서 빠진다(1건만 남음)", len(_tmp.enabled_keywords()), 1)
+    check("all_keywords 에는 꺼진 채로 계속 남는다", len(_tmp.all_keywords()), 2)
+    _tmp.set_keyword_enabled(_kw_added["id"], True)
+    check("다시 켜면 enabled_keywords 에 복귀한다", len(_tmp.enabled_keywords()), 2)
+    _tmp.delete_keyword(_kw_added["id"])
+    check("삭제하면 all_keywords 에서도 완전히 빠진다", len(_tmp.all_keywords()), 1)
+    _tmp._exec("delete from keyword_sets")
 
     print("\n[7-2] 수집 소스 조회 병렬화 — collect_naver · collect_rss_feeds (2026-09-14)")
     # 활성 키워드가 100개를 넘어가며 순차 조회가 사이클 시간의 대부분을 차지하는

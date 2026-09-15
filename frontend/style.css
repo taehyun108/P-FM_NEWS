@@ -504,6 +504,13 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   border: 0; background: none; color: var(--navy); cursor: pointer;
   font-size: 14px; line-height: 1; padding: 0 2px;
 }
+.kw-chip--toggle { cursor: pointer; border: 0; }
+.kw-chip--off { background: var(--line); color: var(--ink-soft); text-decoration: line-through; opacity: .7; }
+.kw-group-head {
+  display: flex; align-items: center; gap: 6px; margin: 12px 0 5px;
+  font-size: 12px; font-weight: 700; color: var(--navy);
+}
+.kw-group-head .kw-count { font-weight: 400; color: var(--ink-soft); }
 .master-pwform { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .master-current {
   margin: 12px 0 0; font-size: 12.5px; color: var(--ink-mid);
