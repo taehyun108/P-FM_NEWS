@@ -175,6 +175,10 @@ class Config:
     nvidia_embed_model: str
     nvidia_llm_api_key: str
     nvidia_llm_model: str
+    # xAI(Grok) — 채팅 대체 순서는 OpenAI → Grok → NVIDIA. xAI 는 임베딩 API 가
+    # 없어 채팅(분석·요약·주간레포트·챗봇)에만 쓴다.
+    xai_api_key: str
+    xai_llm_model: str
     # DB
     db_backend: str
     sqlite_path: str
@@ -314,6 +318,8 @@ def load_config() -> Config:
         nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
         nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
+        xai_api_key=get_env("XAI_API_KEY", ""),
+        xai_llm_model=get_env("XAI_LLM_MODEL", "grok-4-fast"),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
@@ -4110,12 +4116,19 @@ def _make_openai_client(api_key: str):
 
 
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+XAI_BASE_URL = "https://api.x.ai/v1"
 
 
 def _make_nvidia_client(api_key: str):
     """NVIDIA NIM 클라이언트. OpenAI 호환 엔드포인트라 openai 라이브러리를 그대로 쓴다."""
     openai = _import("openai", "openai")
     return openai.OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
+
+
+def _make_xai_client(api_key: str):
+    """xAI(Grok) 클라이언트. 마찬가지로 OpenAI 호환 엔드포인트다."""
+    openai = _import("openai", "openai")
+    return openai.OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
 
 
 class LLMClient:
@@ -4132,14 +4145,19 @@ class LLMClient:
         self.nvidia_embed_client = (
             _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
         self.nvidia_embed_model = cfg.nvidia_embed_model
-        # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로. 마찬가지로
-        # 키가 없으면 그대로 None — OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로들.
+        # 순서: OpenAI(기본) → Grok(xAI) → NVIDIA — 키가 없는 단계는 건너뛴다.
+        # 마찬가지로 전부 실패하면 OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        self.xai_llm_client = (
+            _make_xai_client(cfg.xai_api_key) if cfg.xai_api_key else None)
+        self.xai_llm_model = cfg.xai_llm_model
         self.nvidia_llm_client = (
             _make_nvidia_client(cfg.nvidia_llm_api_key) if cfg.nvidia_llm_api_key else None)
         self.nvidia_llm_model = cfg.nvidia_llm_model
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
-        # OpenAI·NVIDIA 는 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
+        # 공급자마다 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
         self._supports_json_mode = True
+        self._xai_supports_json_mode = True
         self._nvidia_supports_json_mode = True
         # 중복 판정 4단계의 임베딩 호출을 1회 실행당 이 수로 제한한다.
         # 네이버 수집 시 유사 제목이 대량으로 들어와 임베딩 폭주가 발생할 수 있다.
@@ -4174,15 +4192,29 @@ class LLMClient:
                      "total": resp.usage.total_tokens}
         return (resp.choices[0].message.content or ""), usage
 
+    def _chat_chain(self) -> list[tuple[Any, str, str, str]]:
+        """채팅 대체 순서: OpenAI(기본) → Grok(xAI) → NVIDIA. 키 없는 단계는 뺀다."""
+        chain = [(self.client, self.model, "_supports_json_mode", "OpenAI")]
+        if self.xai_llm_client is not None:
+            chain.append((self.xai_llm_client, self.xai_llm_model,
+                          "_xai_supports_json_mode", f"Grok({self.xai_llm_model})"))
+        if self.nvidia_llm_client is not None:
+            chain.append((self.nvidia_llm_client, self.nvidia_llm_model,
+                          "_nvidia_supports_json_mode", f"NVIDIA({self.nvidia_llm_model})"))
+        return chain
+
     def _chat(self, system: str, user: str) -> tuple[str, dict]:
-        try:
-            return self._chat_once(self.client, self.model, "_supports_json_mode", system, user)
-        except Exception as exc:
-            if self.nvidia_llm_client is None:
-                raise
-            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
-            return self._chat_once(self.nvidia_llm_client, self.nvidia_llm_model,
-                                    "_nvidia_supports_json_mode", system, user)
+        chain = self._chat_chain()
+        last_exc: Exception | None = None
+        for i, (client, model, flag, label) in enumerate(chain):
+            try:
+                return self._chat_once(client, model, flag, system, user)
+            except Exception as exc:
+                last_exc = exc
+                if i + 1 < len(chain):
+                    log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
+        assert last_exc is not None
+        raise last_exc
 
     def analyze(self, title: str, press: str, body: str) -> Analysis:
         prompt = ANALYSIS_PROMPT.format(title=title, press=press or "미상", body=body[:MAX_BODY_CHARS])
@@ -4229,15 +4261,18 @@ class LLMClient:
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        try:
-            resp = self.client.chat.completions.create(model=self.model, messages=messages)
-        except Exception as exc:
-            if self.nvidia_llm_client is None:
-                raise
-            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
-            resp = self.nvidia_llm_client.chat.completions.create(
-                model=self.nvidia_llm_model, messages=messages)
-        return resp.choices[0].message.content or ""
+        chain = self._chat_chain()
+        last_exc: Exception | None = None
+        for i, (client, model, _flag, label) in enumerate(chain):
+            try:
+                resp = client.chat.completions.create(model=model, messages=messages)
+                return resp.choices[0].message.content or ""
+            except Exception as exc:
+                last_exc = exc
+                if i + 1 < len(chain):
+                    log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
+        assert last_exc is not None
+        raise last_exc
 
     def weekly_brief(self, kind: str, name: str, articles: list[dict]) -> dict:
         """주간 레포트 섹션 1건을 합성한다.
@@ -9817,16 +9852,18 @@ def cmd_selftest() -> int:
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
     _reset_store()
 
-    print("\n[11-2f] 대체 공급자(NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11)")
+    print("\n[11-2f] 대체 공급자(Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")
     _llm_blank = {f: "" for f in Config.__dataclass_fields__}
     _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                      "llm_model": "m", "embedding_model": "e",
                                      "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n",
-                                     "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm"})
+                                     "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm",
+                                     "xai_api_key": "xai-test", "xai_llm_model": "grok-test"})
     _lcfg_no_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                    "llm_model": "m", "embedding_model": "e",
                                    "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
-                                   "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm"})
+                                   "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm",
+                                   "xai_api_key": "", "xai_llm_model": "grok-test"})
 
     class _FakeEmbData:
         def __init__(self, vec: list[float]) -> None:
@@ -9856,15 +9893,23 @@ def cmd_selftest() -> int:
     _llm1.client.embeddings.create = _openai_down
     _llm1.nvidia_embed_client.embeddings.create = lambda **_kw: _FakeEmbResp([0.4, 0.5, 0.6])
     check("OpenAI 임베딩 실패 → NVIDIA 로 대체", _llm1.embed("테스트"), [0.4, 0.5, 0.6])
+    check("채팅 대체 순서는 OpenAI→Grok→NVIDIA",
+          [c[3] for c in _llm1._chat_chain()],
+          ["OpenAI", "Grok(grok-test)", "NVIDIA(nvm)"])
     _llm1.client.chat.completions.create = _openai_down
-    _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":true}')
-    check("OpenAI 채팅 실패 → NVIDIA 로 대체 (_chat)",
-          _llm1._chat("s", "u"), ('{"ok":true}', {}))
-    check("chat_text 도 동일하게 대체", _llm1.chat_text("s", "u"), '{"ok":true}')
+    _llm1.xai_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"grok"}')
+    check("OpenAI 채팅 실패 → Grok 로 대체 (_chat)",
+          _llm1._chat("s", "u"), ('{"ok":"grok"}', {}))
+    check("chat_text 도 동일하게 Grok 로 대체", _llm1.chat_text("s", "u"), '{"ok":"grok"}')
+    _llm1.xai_llm_client.chat.completions.create = _openai_down
+    _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
+    check("OpenAI·Grok 둘 다 실패 → NVIDIA 로 대체(3단계 체인)",
+          _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
 
     _llm2 = LLMClient(_lcfg_no_fallback)
     check("NVIDIA 키 없으면 임베딩 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
     check("NVIDIA 키 없으면 채팅 대체 클라이언트도 없다", _llm2.nvidia_llm_client, None)
+    check("xAI 키 없으면 Grok 대체 클라이언트도 없다", _llm2.xai_llm_client, None)
     _llm2.client.embeddings.create = _openai_down
     check("대체 키 없이 OpenAI 도 실패하면 None (기존과 동일)", _llm2.embed("테스트"), None)
     _llm2.client.chat.completions.create = _openai_down
@@ -9879,6 +9924,15 @@ def cmd_selftest() -> int:
     _llm3.client.embeddings.create = _openai_down
     _llm3.nvidia_embed_client.embeddings.create = _openai_down
     check("OpenAI·NVIDIA 둘 다 실패하면 None", _llm3.embed("테스트"), None)
+    _llm3.client.chat.completions.create = _openai_down
+    _llm3.xai_llm_client.chat.completions.create = _openai_down
+    _llm3.nvidia_llm_client.chat.completions.create = _openai_down
+    try:
+        _llm3._chat("s", "u")
+        _raised = False
+    except RuntimeError:
+        _raised = True
+    check("채팅 3곳(OpenAI·Grok·NVIDIA) 전부 실패하면 예외가 올라온다", _raised, True)
 
     print("\n[11-2g] 분석 백로그 드레인 병렬화 — 동시 실행 정합성 (2026-09-14)")
     _tmp._exec("delete from articles"); _tmp._exec("delete from article_bodies")
