@@ -1,14 +1,14 @@
 [나와 일하는 방식]
 - 항상 한국어로 답할 것
 - 확실하지 않은 것은 추측하지 말고 나에게 질문할 것
-- 코드를 만들기 전에 먼저 계획을 보여줄 것
+- 여러 파일을 건드리거나 되돌리기 어려운 작업은 코드를 만들기 전에 먼저 계획을 보여줄 것
 
 [개발 규칙]
-- 파이썬 파일 하나로 만들 것
+- 백엔드는 backend/app/ 패키지로 나눠져 있다. 새 코드는 성격이 맞는 모듈에 넣을 것
+  (core 설정·유틸 / storage DB / collect 수집 / analyze 분석 / notify 알림 /
+   view 표시가공 / auth 로그인 / web 라우트 / cli 운영커맨드)
 - 주석은 한글로 알아보기 쉽게 쓸 것
 - 새 라이브러리는 쓰기 전에 먼저 물어볼 것
-- 작업을 진행하면 3회 이상 검증하고 답변 할 것
-- 오류의 원인도 최소 5회 이상 확인하고 수정하고 검증도 3회 이상 실시할 것
 - Supabase 테이블에 새 컬럼(alter table)이 필요한 변경을 할 때는, 실행할
   SQL과 함께 Supabase SQL Editor 주소(https://supabase.com/dashboard/project/
   <프로젝트 ref>/sql/new, .env 의 SUPABASE_URL에서 프로젝트 ref 추출)를
@@ -22,3 +22,4 @@
 
 [참고]
 - 자세한 기획 내용은 PRD.md 를 참고할 것
+- 백엔드 검증은 `python backend/main.py selftest` (DB·API 키 불필요)
