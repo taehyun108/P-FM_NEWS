@@ -8,6 +8,7 @@ import secrets
 import time
 
 from .core import (
+    recent_hits,
     Context,
     esc,
     log,
@@ -90,9 +91,7 @@ def _client_ip(request: Any) -> str:
 
 
 def _login_locked(key: str) -> bool:
-    now = time.time()
-    q = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
-    _LOGIN_FAILS[key] = q
+    q = recent_hits(_LOGIN_FAILS.setdefault(key, []), LOGIN_WINDOW_SEC)
     return len(q) >= LOGIN_MAX_FAILS
 
 
@@ -125,10 +124,8 @@ MASTER_LOGIN_FAIL_THRESHOLD = 3
 
 
 def _master_login_fail(key: str) -> int:
-    now = time.time()
-    q = [t for t in _MASTER_LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
-    q.append(now)
-    _MASTER_LOGIN_FAILS[key] = q
+    q = recent_hits(_MASTER_LOGIN_FAILS.setdefault(key, []), LOGIN_WINDOW_SEC)
+    q.append(time.time())
     return len(q)
 
 
@@ -222,14 +219,6 @@ ANALYZE_MAX_PER_HOUR = 30   # 정상 사용(하루 몇 건)에는 걸리지 않�
 
 
 
-def _rate_ok(bucket: list[float], limit: int, window: float = 3600.0) -> bool:
-    """window 초 안에서 limit 회까지 허용. 통과하면 호출 시각을 기록한다."""
-    now = time.time()
-    bucket[:] = [t for t in bucket if now - t < window]
-    if len(bucket) >= limit:
-        return False
-    bucket.append(now)
-    return True
 
 
 

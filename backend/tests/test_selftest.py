@@ -48,7 +48,6 @@ from app.auth import (
     _login_reset,
     _master_login_fail,
     _master_login_reset,
-    _rate_ok,
     _recover_master_password,
     check_master_password,
     hash_password,
@@ -103,6 +102,7 @@ from app.collect import (
     select_naver_keywords,
 )
 from app.core import (
+    rate_ok,
     APP_TZ,
     Config,
     Context,
@@ -1737,9 +1737,9 @@ def cmd_selftest() -> int:
 
     # URL 등록 시간당 상한 — 요청 1건이 LLM 호출 1건(과금)이라 비용을 묶어 둔다
     _rl: list[float] = []
-    check("상한까지는 허용", all(_rate_ok(_rl, 3) for _ in range(3)), True)
-    check("상한 초과는 차단", _rate_ok(_rl, 3), False)
-    check("창(window)이 지나면 다시 허용", _rate_ok(_rl, 3, window=0.0), True)
+    check("상한까지는 허용", all(rate_ok(_rl, 3) for _ in range(3)), True)
+    check("상한 초과는 차단", rate_ok(_rl, 3), False)
+    check("창(window)이 지나면 다시 허용", rate_ok(_rl, 3, window=0.0), True)
 
     print("\n[13-2b] 무조건 발송 점수 (hard_notify_score) — 우선 판정")
     # run_once 와 같은 판정: 우선 = 항상발송키워드 매칭 OR (hard>0 AND score>=hard)

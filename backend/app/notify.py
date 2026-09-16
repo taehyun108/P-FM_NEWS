@@ -19,6 +19,7 @@ from .collect import (
     normalize_group_list,
 )
 from .core import (
+    rate_ok,
     Config,
     Context,
     HttpClient,
@@ -887,14 +888,7 @@ TG_QA_PROMPT = """사용자 질문: {question}
 
 
 def _bot_rate_ok(chat_id: str) -> bool:
-    now = time.time()
-    q = [t for t in _bot_chat_calls.get(chat_id, []) if now - t < 3600]
-    if len(q) >= BOT_CHAT_MAX_PER_HOUR:
-        _bot_chat_calls[chat_id] = q
-        return False
-    q.append(now)
-    _bot_chat_calls[chat_id] = q
-    return True
+    return rate_ok(_bot_chat_calls.setdefault(chat_id, []), BOT_CHAT_MAX_PER_HOUR)
 
 
 

@@ -34,7 +34,6 @@ from .auth import (
     _login_reset,
     _master_login_fail,
     _master_login_reset,
-    _rate_ok,
     _recover_master_password,
     _valid_master_token,
     check_master_password,
@@ -51,6 +50,7 @@ from .collect import (
     _score_rules_cache,
 )
 from .core import (
+    rate_ok,
     ea_mod,
     Context,
     FRONTEND_DIR,
@@ -1011,7 +1011,7 @@ def create_app(ctx: Context):
             return JSONResponse({"ok": False, "error": "URL 형식이 올바르지 않습니다."}, status_code=400)
         # 이 경로는 요청 1건이 곧 LLM 호출 1건(과금)이다. 실수·악용으로 비용이
         # 새지 않게 시간당 상한을 둔다. 정상 사용(하루 몇 건)에는 걸리지 않는다.
-        if not _rate_ok(_analyze_calls, ANALYZE_MAX_PER_HOUR):
+        if not rate_ok(_analyze_calls, ANALYZE_MAX_PER_HOUR):
             return JSONResponse(
                 {"ok": False, "error": f"URL 등록은 시간당 {ANALYZE_MAX_PER_HOUR}건까지입니다."
                                        " 잠시 후 다시 시도해 주세요."}, status_code=429)

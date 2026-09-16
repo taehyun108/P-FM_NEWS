@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl
 import re
 import sys
 import threading
+import time
 from datetime import timedelta
 from datetime import timezone
 import unicodedata
@@ -668,6 +669,25 @@ def title_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, na, nb).ratio()
 
 
+
+
+def recent_hits(bucket: list[float], window: float) -> list[float]:
+    """window 초 안의 호출 시각만 남기고 그 목록을 돌려준다(제자리 수정).
+
+    로그인 잠금·봇 질문 한도·수동 분석 한도가 모두 이 방식으로 세므로
+    창을 자르는 규칙은 여기 한 곳에만 둔다.
+    """
+    now = time.time()
+    bucket[:] = [t for t in bucket if now - t < window]
+    return bucket
+
+
+def rate_ok(bucket: list[float], limit: int, window: float = 3600.0) -> bool:
+    """window 초 안에서 limit 회까지 허용. 통과하면 호출 시각을 기록한다."""
+    if len(recent_hits(bucket, window)) >= limit:
+        return False
+    bucket.append(time.time())
+    return True
 
 
 def cosine(a: Sequence[float] | None, b: Sequence[float] | None) -> float:
