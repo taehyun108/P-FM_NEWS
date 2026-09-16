@@ -14,6 +14,7 @@ import html as html_mod
 import importlib
 import json
 import logging
+import math
 import os
 from urllib.parse import parse_qsl
 import re
@@ -672,12 +673,10 @@ def title_similarity(a: str, b: str) -> float:
 def cosine(a: Sequence[float] | None, b: Sequence[float] | None) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
+    na, nb = math.hypot(*a), math.hypot(*b)
     if na == 0 or nb == 0:
         return 0.0
-    return dot / (na * nb)
+    return math.sumprod(a, b) / (na * nb)
 
 
 

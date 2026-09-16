@@ -8,7 +8,6 @@ feedparser>=6.0,<7
 beautifulsoup4>=4.12,<5
 readability-lxml>=0.8,<1
 openai>=1.40,<4
-python-dotenv>=1.0,<2
 fastapi>=0.110,<1
 uvicorn>=0.29,<1
 # DB_BACKEND=supabase 로 전환할 때만 필요

@@ -63,14 +63,16 @@ function dedupeChips(items, exclude = []) {
   return out;
 }
 
+const RELATIVE_KO = new Intl.RelativeTimeFormat('ko', { numeric: 'always' });
+
 function formatDate(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
   if (diffMin < 1) return '방금';
-  if (diffMin < 60) return `${diffMin}분 전`;
-  if (diffMin < 60 * 24) return `${Math.floor(diffMin / 60)}시간 전`;
+  if (diffMin < 60) return RELATIVE_KO.format(-diffMin, 'minute');
+  if (diffMin < 60 * 24) return RELATIVE_KO.format(-Math.floor(diffMin / 60), 'hour');
   const p = (n) => String(n).padStart(2, '0');
   return `${String(d.getFullYear()).slice(2)}.${p(d.getMonth() + 1)}.${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }

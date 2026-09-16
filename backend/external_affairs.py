@@ -1942,16 +1942,6 @@ EA_SORTS = [
 # 영향도 정렬 순위 — 큰 값이 위로. 미분석(빈 문자열)은 맨 아래.
 _IMPACT_RANK = {"high": 4, "medium": 3, "low": 2, "none": 1, "": 0}
 
-_EA_ORDER_SQL = {
-    # 마감일 오름차순, 마감일 없는 항목은 뒤로 (기존 동작 그대로)
-    "deadline": " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc",
-    # 공고 시작일이 최신인 순 → 없으면 수집 시각
-    "recent": " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc,"
-              " p.collected_at desc",
-    # 영향도는 파이썬에서 정렬한다(_IMPACT_RANK). SQL 은 2차 키만 준비.
-    "impact": " order by (p.notice_end is null), p.notice_end asc, p.collected_at desc",
-}
-
 
 def register_api(app: Any, ctx: Any) -> None:
     """main.create_app 에서 한 줄로 호출된다. 기존 라우트는 건드리지 않는다."""
