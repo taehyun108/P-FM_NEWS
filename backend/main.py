@@ -3492,7 +3492,9 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
         resp = http.get(url, allow_redirects=True, timeout=8)
         resp.raise_for_status()
     except Exception as exc:
-        log.debug("리다이렉트 해제 실패 %s: %s", url, exc)
+        # WARNING 레벨로 남긴다 — 수동 URL 등록(F8) 실패 시 정확한 원인
+        # (타임아웃/상태코드/차단 등)을 기본 로그 레벨(INFO)에서도 바로 볼 수 있어야 한다.
+        log.warning("리다이렉트 해제 실패 %s: %s", url, exc)
         return "", ""
 
     final_url = resp.url
