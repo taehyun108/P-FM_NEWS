@@ -50,7 +50,6 @@ from .collect import (
     resolve_canonical,
 )
 from .core import (
-    ea_mod,
     Context,
     HttpClient,
     _has_hangul,
@@ -93,6 +92,12 @@ from .view import (
 from .web import (
     create_app,
 )
+
+try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
+#      (external_affairs 가 app.core 를 쓰므로 core 가 아니라 여기서 받는다)
+    import external_affairs as ea_mod
+except Exception:   # pragma: no cover
+    ea_mod = None
 
 
 

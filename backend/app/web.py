@@ -51,7 +51,6 @@ from .collect import (
 )
 from .core import (
     rate_ok,
-    ea_mod,
     Context,
     FRONTEND_DIR,
     _import,
@@ -92,6 +91,12 @@ from .view import (
     send_report_email,
     weekly_recipients,
 )
+
+try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
+#      (external_affairs 가 app.core 를 쓰므로 core 가 아니라 여기서 받는다)
+    import external_affairs as ea_mod
+except Exception:   # pragma: no cover
+    ea_mod = None
 
 
 

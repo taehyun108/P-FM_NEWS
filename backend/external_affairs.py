@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import sqlite3
 import threading
@@ -23,41 +22,19 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
+# 공용 유틸은 app.core 한 곳에서 가져온다. 예전엔 main.py 가 단일 파일이라
+# import 하면 순환이 생겨 복제했지만, core 로 분리된 뒤로는 단방향이다.
+from app.core import get_env as _env, get_env_int as _env_int, jdump, jload
+
 log = logging.getLogger("pfm.ea")
 
 # ── 설정 (.env) ──────────────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
 
 
-def _env(name: str, default: str = "") -> str:
-    """main.load_dotenv_file 이 이미 os.environ 에 넣어 둔 값을 읽는다."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    # 인라인 주석 제거 (기존 .env 표기 규약과 동일)
-    text = raw.strip()
-    if text and not text.startswith(('"', "'")):
-        text = text.split("#", 1)[0].strip()
-    return text or default
-
-
-def _env_int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
-    try:
-        val = int(_env(name, str(default)))
-    except ValueError:
-        return default
-    if lo is not None:
-        val = max(lo, val)
-    if hi is not None:
-        val = min(hi, val)
-    return val
-
-
 def _env_on(name: str, default: bool) -> bool:
     raw = _env(name, "").lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on")
+    return raw in ("1", "true", "yes", "on") if raw else default
 
 
 def app_tz() -> timezone:
@@ -114,21 +91,6 @@ def iso(dt: datetime) -> str:
 
 def new_id() -> str:
     return str(uuid.uuid4())
-
-
-def jdump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def jload(value: Any, default: Any) -> Any:
-    if value is None or value == "":
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return default
 
 
 def parse_date(value: Any) -> str | None:

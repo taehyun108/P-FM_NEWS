@@ -38,10 +38,6 @@ if TYPE_CHECKING:
         Storage,
     )
 
-try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
-    import external_affairs as ea_mod
-except Exception:   # pragma: no cover
-    ea_mod = None
 
 
 
