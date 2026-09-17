@@ -1224,6 +1224,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     dedup_candidates = storage.recent_articles_for_dedup(now - timedelta(hours=DEDUP_WINDOW_HOURS + 1))
     ctx.llm.reset_run()  # 이번 실행의 임베딩 호출 카운터 초기화
 
+    # ── LLM 예산 배분 (일일·회차 상한, 이월분 예약) ────────────────────
     daily_left = max(0, cfg.llm_daily_limit - storage.llm_calls_today())
     # max_llm 이 주어지면(수동 실행) 그 값이 1회 상한을 대신한다. 아니면 설정값.
     per_run_cap = max_llm if max_llm is not None else cfg.llm_per_run
@@ -1241,6 +1242,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     defer_budget = min(6, defer_pending, max(1, llm_budget // 4)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
 
+    # ── 인사·부고 분리 (점수 경쟁에서 제외) ─────────────────────────────
     # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — 제목 점수가 0이라 일반 큐에 두면
     # 영원히 상한에 밀린다. (사용자 지정) 사람별 구조 요약은 LLM 을 쓰되, 이번 회차·오늘
     # 남은 예산 안에서만 한다. 예산 밖은 규칙 기반으로 저장되고 `repeople` 로 채운다.
@@ -1249,6 +1251,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     fresh = [p for p in fresh if p[0].url_source not in people_urls]
     people_llm_left = min(PEOPLE_LLM_PER_RUN, max(0, daily_left - llm_budget - defer_budget))
 
+    # ── 처리 상한 · 중요도 정렬 · 그룹사 균형 인터리브 ──────────────────
     # 저장 상한은 LLM 예산과 분리한다. 저장(본문 확보+중복판정)은 비용이 작고,
     # 여기서 조이면 관련 기사가 큐에서 굶어 72시간 뒤 stale 로 사라진다.
     # 넘친 후보는 _defer_overflow 가 메타만 저장해 두므로 '수집'은 무엇도 잃지 않는다.
@@ -1274,6 +1277,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     if people:
         log.info("인사·부고 %d건 처리", len(people))
 
+    # ── 처리 루프 준비: 카운터 · 알림 판정 키워드 ───────────────────────
     new_count = 0
     dup_count = 0
     # 알림 판정에 필요한 항목만 담는다. {id, score, is_backfill, published_at, priority,
