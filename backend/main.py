@@ -5756,6 +5756,25 @@ def is_public_http_url(raw_url: str) -> bool:
     return True
 
 
+# analyze_url() 의 본문 추출(Readability)은 '기사 문단'을 전제로 한다. 동영상 페이지는
+# <article> 이 없고 플레이어·JSON 데이터뿐이라 본문이 사실상 비어 있게 되는데, 그때
+# og:title 은 대개 성공해 "제목·본문 둘 다 없음" 체크를 통과해 버린다 — 에러 없이
+# 텅 빈 카드가 만들어지는 게 실제 증상이었다(2026-09 유튜브 링크 문의).
+_UNSUPPORTED_MEDIA_HOSTS = (
+    "youtube.com", "youtu.be", "m.youtube.com",
+    "vimeo.com", "twitch.tv", "tiktok.com",
+)
+
+
+def _unsupported_media_host(raw_url: str) -> str | None:
+    """뉴스 기사가 아닌, 지원 대상 밖 동영상 호스트면 호스트명을 돌려준다."""
+    host = (urlsplit(raw_url).hostname or "").lower()
+    for bad in _UNSUPPORTED_MEDIA_HOSTS:
+        if host == bad or host.endswith("." + bad):
+            return host
+    return None
+
+
 def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     """사용자가 직접 붙여넣은 URL 하나를 포토카드로 만든다. (PRD F8 수동 등록)
 
@@ -5771,6 +5790,18 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     if not is_public_http_url(raw_url):
         # 사설망·로컬 주소를 넣어 서버가 내부망을 대신 긁게 만드는 SSRF 를 막는다.
         return {"ok": False, "error": "외부에 공개된 뉴스 주소만 등록할 수 있습니다."}
+
+    # 이 기능은 '기사 본문'을 Readability 로 뽑는 방식이라 영상 페이지는 원천적으로
+    # 지원 대상이 아니다. 그런데 예전에는 여기서 걸러내지 않아, 유튜브 링크를 넣으면
+    # 제목만 (og:title 로) 뽑히고 본문은 비다시피 한 채로 "성공"해 버렸다 — 에러도
+    # 없이 텅 빈 요약 카드가 그대로 만들어지는 게 가장 혼란스러운 실패 형태였다.
+    # URL 형식만 보고 미리 걸러 원인을 바로 알 수 있게 한다.
+    unsupported_host = _unsupported_media_host(raw_url)
+    if unsupported_host:
+        return {"ok": False, "error": (
+            f"이 기능은 뉴스 기사 링크 전용입니다. '{unsupported_host}' 은(는) "
+            "동영상 페이지라 본문을 추출할 수 없습니다. 뉴스 기사 URL을 입력해 주세요."
+        )}
 
     url_source = normalize_url(raw_url)
 
