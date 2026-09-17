@@ -3481,10 +3481,35 @@ def decode_html(resp: Any) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
+def _describe_fetch_error(exc: Exception) -> str:
+    """예외를 화면에 보여줘도 되는 짧은 원인 문구로 바꾼다. (F8 수동 URL 등록 진단용)
+
+    원격지에서 서버 로그를 볼 수 없을 때도 실패 이유(타임아웃/차단/상태코드)를
+    바로 알 수 있게, 사용자에게 보이는 에러 메시지에 이 문구를 덧붙인다.
+    """
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status:
+        return f"HTTP {status}"
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return "연결 시간 초과"
+    if "SSLError" in name:
+        return "SSL 오류"
+    if "ConnectionError" in name:
+        return "연결 실패(사이트 차단 또는 DNS 오류일 수 있음)"
+    if "TooManyRedirects" in name:
+        return "리다이렉트 과다"
+    text = str(exc).strip()
+    return (text[:80] + "…") if len(text) > 80 else (text or name)
+
+
+def resolve_canonical(http: HttpClient, url: str, error_out: list[str] | None = None) -> tuple[str, str]:
     """리다이렉트를 해제해 최종 원문 URL 과 HTML 을 돌려준다.
 
     반환: (정규화된 canonical URL, HTML 본문). 실패 시 ("", "").
+    error_out 을 주면 실패 원인 문구를 그 리스트에 담아 준다. (F8 수동 등록 전용 — 기존
+    호출부(파이프라인 prefetch 등)는 안 넘기면 동작이 그대로다.)
     """
     try:
         # 본문 페이지는 8초 안에 응답 없으면 포기한다. 느린 사이트 하나가
@@ -3495,6 +3520,8 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
         # WARNING 레벨로 남긴다 — 수동 URL 등록(F8) 실패 시 정확한 원인
         # (타임아웃/상태코드/차단 등)을 기본 로그 레벨(INFO)에서도 바로 볼 수 있어야 한다.
         log.warning("리다이렉트 해제 실패 %s: %s", url, exc)
+        if error_out is not None:
+            error_out.append(_describe_fetch_error(exc))
         return "", ""
 
     final_url = resp.url
@@ -3513,6 +3540,8 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
                 final_url = found
                 text = ""
         else:
+            if error_out is not None:
+                error_out.append("구글 뉴스 원문 링크를 찾지 못함")
             return "", ""
 
     # canonical(HTML) → 리다이렉트 최종 URL → 최초 요청 URL 순으로 신뢰한다.
@@ -5598,9 +5627,14 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
         return _existing_result(existing["id"])
 
     # ── G3: 리다이렉트 해제 + HTML ──────────────────────────────────
-    canonical, html = resolve_canonical(http, raw_url)
+    fetch_errors: list[str] = []
+    canonical, html = resolve_canonical(http, raw_url, fetch_errors)
     if not canonical or not html:
-        return {"ok": False, "error": "페이지를 가져오지 못했습니다. 링크를 확인해 주세요."}
+        msg = "페이지를 가져오지 못했습니다. 링크를 확인해 주세요."
+        if fetch_errors:
+            # 원격지에서 서버 로그를 볼 수 없어도 원인을 바로 알 수 있게 화면에 덧붙인다.
+            msg += f" (원인: {fetch_errors[0]})"
+        return {"ok": False, "error": msg}
 
     existing = _find_article_by_any_url(storage, canonical, "")
     if existing:
