@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -2918,6 +2919,7 @@ def dedupe_chips(items: Iterable[str], exclude: Iterable[str] = ()) -> list[str]
 #    측정 가능하게 만드는 것이 목적이다.
 # =====================================================================
 
+@lru_cache(maxsize=None)
 def _import(module: str, pip_name: str):
     try:
         return importlib.import_module(module)
@@ -5046,6 +5048,65 @@ def _homepage_site_name(http: "HttpClient", domain: str, source_host: str = "") 
     return ""
 
 
+# ── 언론사 조회 캐시 ────────────────────────────────────────────────
+# 기사 1건마다 press_by_domain 을, 중복 1건마다 press_tier_by_id 를 부른다.
+# Supabase 에서는 이게 그대로 HTTP 왕복이라 수집 1사이클에 수십~수백 번 나가는데,
+# 언론사는 몇백 개뿐이라 같은 값을 계속 다시 받아오고 있었다.
+#
+# ⚠ 이름이 아직 도메인 그대로인 행(예: 'mdilbo.com')은 캐시하지 않는다 —
+#   resolve_press 가 매번 다시 시도해서 정식 매체명으로 고쳐야 하기 때문이다.
+#   (캐시하면 '언론사명이 도메인 그대로 굳어버리는' 예전 버그가 되살아난다.)
+# ⚠ 캐시는 저장소 인스턴스마다 따로 둔다 — 셀프테스트가 임시 DB 를 계속 새로 만든다.
+PRESS_MEMO_MAX = 5000
+
+
+def _press_memo(storage: Storage) -> dict:
+    memo = getattr(storage, "_press_memo_map", None)
+    if memo is None:
+        memo = {"by_domain": {}, "tier_by_id": {}}
+        storage._press_memo_map = memo   # type: ignore[attr-defined]
+    return memo
+
+
+def press_row_cached(storage: Storage, domain: str) -> dict | None:
+    """press_by_domain 의 캐시판. 이름이 확정된 행만 기억한다."""
+    memo = _press_memo(storage)
+    row = memo["by_domain"].get(domain)
+    if row is not None:
+        return row
+    row = storage.press_by_domain(domain)
+    if row and not _looks_like_domain(row.get("name", "")):
+        if len(memo["by_domain"]) >= PRESS_MEMO_MAX:
+            memo["by_domain"].clear()
+        memo["by_domain"][domain] = row
+        if row.get("id"):
+            memo["tier_by_id"][row["id"]] = int(row.get("tier") or 3)
+    return row
+
+
+def press_memo_forget(storage: Storage, domain: str, press_id: str | None = None) -> None:
+    """이름·tier 를 고쳐 쓴 직후 호출한다. 다음 조회가 DB 를 다시 읽는다."""
+    memo = _press_memo(storage)
+    dropped = memo["by_domain"].pop(domain, None)
+    for pid in (press_id, (dropped or {}).get("id")):
+        if pid:
+            memo["tier_by_id"].pop(pid, None)
+
+
+def press_tier_cached(storage: Storage, press_id: str | None) -> int:
+    """press_tier_by_id 의 캐시판. tier 는 거의 바뀌지 않는다."""
+    if not press_id:
+        return 3
+    memo = _press_memo(storage)["tier_by_id"]
+    tier = memo.get(press_id)
+    if tier is None:
+        tier = storage.press_tier_by_id(press_id)
+        if len(memo) >= PRESS_MEMO_MAX:
+            memo.clear()
+        memo[press_id] = tier
+    return tier
+
+
 def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
                   http: "HttpClient | None" = None) -> tuple[str, str | None, int]:
     """도메인으로 언론사를 식별한다. 미등록이면 pending 으로 적재하고 수집을 막지 않는다. (F2.3)
@@ -5056,7 +5117,7 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     if not domain:
         return (hint if hint and not _looks_like_domain(hint) else ""), None, 3
 
-    row = storage.press_by_domain(domain)
+    row = press_row_cached(storage, domain)
     seed = SEED_PRESS.get(domain)
     og_name = site_name_from_html(html, domain)
     # 이 매체를 처음 보는데(row is None) 기사 페이지에서 이름을 못 찾았으면, 홈페이지를
@@ -5083,11 +5144,13 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     elif seed and row.get("name") != seed[0] and _looks_like_domain(row.get("name", "")):
         # 예전에 도메인 그대로 저장됐던 행을 SEED 정식 이름으로 교체한다.
         storage.update_press_name(domain, seed[0], seed[1])
-        row = storage.press_by_domain(domain) or row
+        press_memo_forget(storage, domain, row.get("id"))
+        row = press_row_cached(storage, domain) or row
     elif not seed and og_name and _looks_like_domain(row.get("name", "")):
         # SEED 에 없고 도메인으로만 저장돼 있던 행을 og:site_name 으로 교체한다.
         storage.update_press_name(domain, og_name, int(row.get("tier") or 3))
-        row = storage.press_by_domain(domain) or row
+        press_memo_forget(storage, domain, row.get("id"))
+        row = press_row_cached(storage, domain) or row
 
     name = row.get("name") or ""
     if _looks_like_domain(name):
@@ -5348,7 +5411,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             # 더 상위 언론사에서 온 중복이면 카드의 표시 정보(제목·링크·언론사·
             # 기자·썸네일)를 그쪽으로 승격한다. 요약·SWOT·키워드 등 분석 결과는
             # 같은 사건이라 그대로 두고, 재정렬을 피하려 발행시각도 유지한다.
-            if press_tier < storage.press_tier_by_id(existing.get("press_id")):
+            if press_tier < press_tier_cached(storage, existing.get("press_id")):
                 promo = {
                     "title": item.title,
                     "url_canonical": canonical,
@@ -7584,7 +7647,8 @@ def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses:
 #   믿고 쓰므로, refresh_scan_store 는 **반환 직전에 반드시 발행일 최신순으로
 #   재정렬**한다. 이걸 빼면 신규 기사가 마지막 페이지로 밀려 화면에서 사라진다.
 #   (회귀 방지: selftest [11-2e] "델타로 들어온 최신 기사가 정렬 후 맨 앞에 온다")
-_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0}
+_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0,
+                               "sorted": None}
 _SCAN_STORE_LOCK = threading.Lock()
 SCAN_STORE_CAP = 40000            # 메모리 상한(≈100일치). 넘으면 발행일 오래된 것부터 버린다.
 SCAN_FULL_RELOAD_SEC = 20 * 3600  # 삭제·상태변경 반영: 하루 1회 전체 재적재
@@ -7616,12 +7680,14 @@ def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
     now = time.monotonic()
     with _SCAN_STORE_LOCK:
         st = _SCAN_STORE
+        changed = False
         if full or not st["by_id"] or (now - st["full_at"]) > SCAN_FULL_RELOAD_SEC:
             rows = storage.scan_articles(SCAN_STORE_CAP, None, "")
             st["by_id"] = {r["id"]: tag_row(r) for r in rows}
             st["cursor"] = max((_row_ts(r) for r in rows), default="")
             st["full_at"] = now
             st["delta_at"] = now
+            changed = True
         elif st["cursor"] and now - st["delta_at"] >= SCAN_DELTA_MIN_SEC:
             st["delta_at"] = now
             fresh = storage.changed_articles_since(st["cursor"])
@@ -7629,12 +7695,18 @@ def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
                 _store_put(st, r)
             if fresh:
                 st["cursor"] = max([st["cursor"]] + [_row_ts(r) for r in fresh])
+                changed = True
             if len(st["by_id"]) > SCAN_STORE_CAP * 1.15:
                 keep = sorted(st["by_id"].values(),
                               key=lambda t: t["row"].get("published_at") or "", reverse=True)
                 st["by_id"] = {t["row"]["id"]: t for t in keep[:SCAN_STORE_CAP]}
-        return sorted(st["by_id"].values(),
-                      key=lambda t: t["row"].get("published_at") or "", reverse=True)
+                changed = True
+        # 정렬 결과를 들고 있다가 스토어가 바뀐 경우에만 다시 만든다. 델타는 60초에
+        # 한 번뿐이라 대부분의 요청은 이 캐시를 그대로 쓴다(최대 4만 건 재정렬 회피).
+        if changed or st["sorted"] is None:
+            st["sorted"] = sorted(st["by_id"].values(),
+                                  key=lambda t: t["row"].get("published_at") or "", reverse=True)
+        return st["sorted"]   # 공유 리스트다 — 받는 쪽에서 절대 제자리 수정하지 말 것
 
 
 def scan_store_upsert(storage: "Storage", article_id: str) -> None:
@@ -7645,6 +7717,7 @@ def scan_store_upsert(storage: "Storage", article_id: str) -> None:
             _store_put(_SCAN_STORE, row)
         else:
             _SCAN_STORE["by_id"].pop(article_id, None)
+        _SCAN_STORE["sorted"] = None   # by_id 를 직접 건드렸으니 정렬 캐시를 버린다
 
 
 def create_app(ctx: Context):
@@ -9738,6 +9811,62 @@ def cmd_selftest() -> int:
           resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=2", "", "", None)[0],
           "스카이데일리")
 
+    # ── 언론사 조회 캐시 (2026-09-22) ────────────────────────────────
+    # 기사 1건마다 press_by_domain 을 부르는데 Supabase 에선 그대로 HTTP 왕복이다.
+    # 다만 이름이 아직 도메인 그대로인 행을 캐시해 버리면 '언론사명이 도메인
+    # 그대로 굳어버리는' 예전 버그가 되살아난다 — 그래서 확정된 이름만 기억한다.
+    _pbd_hits = {"n": 0}
+    _real_pbd = _pstore.press_by_domain
+
+    def _counting_pbd(domain, _f=_real_pbd):
+        _pbd_hits["n"] += 1
+        return _f(domain)
+
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=3", "", "", None)
+    check("이름이 확정된 매체는 DB 를 다시 읽지 않는다", _pbd_hits["n"], 0)
+
+    _pstore.press_by_domain = _real_pbd          # 셋업 중 내부 호출은 세지 않는다
+    _pstore.upsert_press("testpress.kr", "testpress.kr", 3, "pending")
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    resolve_press(_pstore, "https://testpress.kr/a", "", "", None)
+    resolve_press(_pstore, "https://testpress.kr/b", "", "", None)
+    check("이름이 도메인 그대로면 캐시하지 않고 매번 다시 읽는다", _pbd_hits["n"], 2)
+
+    _pstore.press_by_domain = _real_pbd
+    _pstore.update_press_name("testpress.kr", "테스트신문", 3)
+    press_memo_forget(_pstore, "testpress.kr")
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    check("이름 정정 후 한 번만 다시 읽고 그 뒤로는 캐시",
+          (resolve_press(_pstore, "https://testpress.kr/c", "", "", None)[0],
+           resolve_press(_pstore, "https://testpress.kr/d", "", "", None)[0],
+           _pbd_hits["n"]), ("테스트신문", "테스트신문", 1))
+    _pstore.press_by_domain = _real_pbd
+
+    # tier 캐시 — 같은 press_id 를 두 번 물어도 DB 는 한 번만 읽는다.
+    _tier_hits = {"n": 0}
+    _real_tier = _pstore.press_tier_by_id
+
+    def _counting_tier(pid, _f=_real_tier):
+        _tier_hits["n"] += 1
+        return _f(pid)
+
+    _tp_id = (_pstore.press_by_domain("testpress.kr") or {}).get("id")
+    _pstore.press_tier_by_id = _counting_tier
+    check("행을 캐시할 때 tier 도 같이 담아 둔다 — tier 조회는 DB 를 안 친다",
+          (press_tier_cached(_pstore, _tp_id), _tier_hits["n"]), (3, 0))
+    press_memo_forget(_pstore, "testpress.kr", _tp_id)
+    _tier_hits["n"] = 0
+    check("캐시를 버린 뒤엔 첫 조회만 DB, 두 번째는 캐시",
+          (press_tier_cached(_pstore, _tp_id), press_tier_cached(_pstore, _tp_id),
+           _tier_hits["n"]), (3, 3, 1))
+    check("press_tier_cached — id 가 없으면 DB 안 치고 기본 tier 3",
+          (press_tier_cached(_pstore, None), _tier_hits["n"]), (3, 1))
+    _pstore.press_tier_by_id = _real_tier
+
     class _FakeHttpComma:
         """홈페이지 title 이 '매체명 - 슬로건' 도 아니고 og:site_name 도 없어서
         _homepage_site_name 의 쉼표 최후 수단까지 가는 실사례(weeklytrade.co.kr)."""
@@ -10145,7 +10274,7 @@ def cmd_selftest() -> int:
 
     print("\n[11-2e] 스캔 스토어 델타 갱신 (changed_articles_since · refresh_scan_store)")
     def _reset_store():
-        _SCAN_STORE.update(by_id={}, cursor="", full_at=0.0, delta_at=0.0)
+        _SCAN_STORE.update(by_id={}, cursor="", full_at=0.0, delta_at=0.0, sorted=None)
     _reset_store()
     _tmp._exec("delete from articles"); _tmp._exec("delete from summaries")
     _t0 = iso(now_utc() - timedelta(hours=2))
@@ -10186,6 +10315,18 @@ def cmd_selftest() -> int:
            _tmp._exec("update articles set title='X' where id='st-b'"),
            refresh_scan_store(_tmp),
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
+    # 정렬 캐시(2026-09-22) — 스토어가 안 바뀌면 최대 4만 건을 다시 정렬하지 않는다.
+    _SCAN_STORE["delta_at"] = time.monotonic()
+    check("스토어가 그대로면 정렬 결과를 재사용한다",
+          refresh_scan_store(_tmp) is refresh_scan_store(_tmp), True)
+    # 한 건만 직접 반영해도(수동 등록 경로) 정렬 캐시는 버려야 한다.
+    _before = refresh_scan_store(_tmp)
+    scan_store_upsert(_tmp, "st-b")
+    _SCAN_STORE["delta_at"] = time.monotonic()
+    check("scan_store_upsert 뒤에는 정렬을 다시 한다",
+          refresh_scan_store(_tmp) is not _before, True)
+    check("정렬 캐시를 써도 발행일 최신순은 그대로",
+          [t["row"]["id"] for t in refresh_scan_store(_tmp)][0], "st-c")
     _reset_store()
 
     print("\n[11-2f] 대체 공급자(Gemini·Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")

@@ -16,11 +16,6 @@
 .ea-head h2 { margin: 0; font-size: 17px; color: var(--navy); }
 .ea-meta { margin: 4px 0 0; font-size: 12px; color: var(--ink-soft); }
 .ea-head-main { display: flex; flex-direction: column; gap: 2px; }
-.ea-back {
-  align-self: flex-start; font-size: 12px; font-weight: 600; color: var(--ink-mid);
-  text-decoration: none; margin-bottom: 4px;
-}
-.ea-back:hover { color: var(--navy); }
 
 /* 마감 임박 배너 — D-7 이내 '예고중'이 있을 때만 */
 .ea-alert {
