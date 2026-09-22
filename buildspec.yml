@@ -21,3 +21,41 @@ phases:
       - docker push $REPOSITORY_URI:latest
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - echo "완료 — $REPOSITORY_URI:latest / :$IMAGE_TAG"
+      # 배포 브랜치(claude/prd-skills-setup-yqehgi)로의 웹훅 빌드(=PR 머지)일 때만
+      # EC2까지 자동 배포한다. 그 외(수동 start-build 등)는 이미지만 만들고 끝낸다 —
+      # deploy/redeploy.sh 로 수동 배포할 때 중복 배포되지 않게 하기 위함이다.
+      - |
+        if [ "${CODEBUILD_WEBHOOK_HEAD_REF:-}" = "refs/heads/claude/prd-skills-setup-yqehgi" ]; then
+          echo "배포 브랜치 반영 감지 — EC2에 자동 배포합니다."
+          INSTANCE_ID="i-0eb37f241ecbba234"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              \"aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${REPOSITORY_URI%/*}\",
+              \"docker pull $REPOSITORY_URI:latest\",
+              \"aws ssm get-parameter --name pfm-news-env --with-decryption --region $AWS_REGION --query Parameter.Value --output text > /opt/pfm-news/.env\",
+              \"docker rm -f pfm-serve pfm-worker 2>/dev/null || true\",
+              \"docker run -d --name pfm-serve --restart unless-stopped -p 127.0.0.1:8000:8000 --env-file /opt/pfm-news/.env $REPOSITORY_URI:latest python backend/main.py serve\",
+              \"docker run -d --name pfm-worker --restart unless-stopped --health-cmd='python backend/main.py healthcheck' --health-interval=60s --health-timeout=10s --health-start-period=40s --health-retries=3 --env-file /opt/pfm-news/.env $REPOSITORY_URI:latest python backend/main.py worker\",
+              \"sleep 5\",
+              \"docker ps\"
+            ]" \
+            --region "$AWS_REGION" --query 'Command.CommandId' --output text)
+          echo "SSM 명령 ID: $CMD_ID — 완료 대기 중..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "InProgress")
+            if [ "$STATUS" != "InProgress" ] && [ "$STATUS" != "Pending" ]; then break; fi
+            sleep 10
+          done
+          if [ "$STATUS" != "Success" ]; then
+            echo "EC2 배포 실패: $STATUS"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" --query 'StandardErrorContent' --output text
+            exit 1
+          fi
+          echo "EC2 배포 완료 — https://pfm-news.duckdns.org/"
+        else
+          echo "배포 브랜치 웹훅이 아니라 이미지만 만들고 종료합니다 (head_ref: ${CODEBUILD_WEBHOOK_HEAD_REF:-없음})."
+        fi
