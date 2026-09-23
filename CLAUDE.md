@@ -9,6 +9,11 @@
 - 새 라이브러리는 쓰기 전에 먼저 물어볼 것
 - 작업을 진행하면 3회 이상 검증하고 답변 할 것
 - 오류의 원인도 최소 5회 이상 확인하고 수정하고 검증도 3회 이상 실시할 것
+- Supabase 테이블에 새 컬럼(alter table)이 필요한 변경을 할 때는, 실행할
+  SQL과 함께 Supabase SQL Editor 주소(https://supabase.com/dashboard/project/
+  <프로젝트 ref>/sql/new, .env 의 SUPABASE_URL에서 프로젝트 ref 추출)를
+  반드시 같이 알려줄 것 — REST API로는 DDL을 실행할 수 없어 사용자가 직접
+  SQL Editor에서 1회 실행해야 하기 때문.
 
 [보안]
 - API 키는 반드시 .env 에서 읽어올 것

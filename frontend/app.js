@@ -622,6 +622,108 @@ async function showMasterPanel() {
   $('masterLogin').hidden = true;
   $('masterPanel').hidden = false;
   await loadMasterSettings();
+  loadCollectKeywords();
+}
+
+/* ── 수집 키워드 관리 (마스터 패널 8번, 2026-09-15) ───────────────────
+   알림 필터 키워드(kwList 등)와는 완전히 별개 — 이건 구글·네이버 검색 자체를
+   무엇으로 돌릴지 정하는 목록(keyword_sets)이다. */
+let collectKwCategories = [];
+
+async function loadCollectKeywords() {
+  try {
+    const d = await (await masterFetch('/api/master/keywords')).json();
+    if (!d.ok) return;
+    collectKwCategories = d.categories || [];
+    const sel = $('kwCollectCategory');
+    sel.replaceChildren(...collectKwCategories.map((c) => {
+      const opt = document.createElement('option');
+      opt.value = c; opt.textContent = c;
+      return opt;
+    }));
+    renderCollectKeywordGroups(d.items || [], d.always_category);
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      $('kwCollectGroups').replaceChildren(el('p', 'score-eg', '불러오지 못했습니다.'));
+    }
+  }
+}
+
+function renderCollectKeywordGroups(items, alwaysCategory) {
+  const byCategory = new Map(collectKwCategories.map((c) => [c, []]));
+  items.forEach((it) => {
+    if (!byCategory.has(it.category)) byCategory.set(it.category, []);
+    byCategory.get(it.category).push(it);
+  });
+  const groups = [...byCategory.entries()].map(([category, list]) => {
+    const onCount = list.filter((it) => it.enabled).length;
+    const head = el('div', 'kw-group-head');
+    head.append(
+      document.createTextNode(category === alwaysCategory ? `${category} (매 회차 조회)` : category),
+      el('span', 'kw-count', ` — 켜짐 ${onCount}/${list.length}`),
+    );
+    const listEl = el('div', 'kw-list');
+    listEl.replaceChildren(...list.map((it) => {
+      const chip = el('span', `kw-chip kw-chip--toggle${it.enabled ? '' : ' kw-chip--off'}`);
+      chip.type = 'button';
+      chip.title = it.enabled ? '클릭하면 끕니다(수집 중단)' : '클릭하면 켭니다(수집 재개)';
+      chip.append(document.createTextNode(it.keyword));
+      chip.addEventListener('click', (e) => {
+        if (e.target.closest('button.kw-del')) return;
+        toggleCollectKeyword(it);
+      });
+      const del = el('button', 'kw-del', '×');
+      del.type = 'button';
+      del.title = '완전히 삭제';
+      del.addEventListener('click', (e) => { e.stopPropagation(); deleteCollectKeyword(it); });
+      chip.append(del);
+      return chip;
+    }));
+    const wrap = document.createDocumentFragment();
+    wrap.append(head, listEl);
+    return wrap;
+  });
+  $('kwCollectGroups').replaceChildren(...groups.length ? groups : [el('p', 'score-eg', '등록된 키워드가 없습니다.')]);
+}
+
+async function toggleCollectKeyword(item) {
+  try {
+    await masterFetch(`/api/master/keywords/${item.id}/toggle`,
+      { method: 'POST', body: JSON.stringify({ enabled: !item.enabled }) });
+    loadCollectKeywords();
+  } catch (e) { if (e.message !== 'unauthorized') masterMsg('err', '변경에 실패했습니다.'); }
+}
+
+async function deleteCollectKeyword(item) {
+  if (!confirm(`"${item.keyword}" 키워드를 완전히 삭제할까요? (되돌릴 수 없습니다)`)) return;
+  try {
+    await masterFetch(`/api/master/keywords/${item.id}`, { method: 'DELETE' });
+    loadCollectKeywords();
+  } catch (e) { if (e.message !== 'unauthorized') masterMsg('err', '삭제에 실패했습니다.'); }
+}
+
+async function addCollectKeyword() {
+  const category = $('kwCollectCategory').value;
+  const input = $('kwCollectNew');
+  const keyword = input.value.trim();
+  const msg = $('kwCollectMsg');
+  if (!keyword) return;
+  try {
+    const res = await masterFetch('/api/master/keywords',
+      { method: 'POST', body: JSON.stringify({ category, keyword }) });
+    const d = await res.json();
+    if (!d.ok) {
+      msg.textContent = d.error || '추가에 실패했습니다.'; msg.className = 'url-add-msg err'; msg.hidden = false;
+      return;
+    }
+    input.value = '';
+    msg.hidden = true;
+    loadCollectKeywords();
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      msg.textContent = '추가에 실패했습니다.'; msg.className = 'url-add-msg err'; msg.hidden = false;
+    }
+  }
 }
 
 // 야간 억제 표시 — 시간대 창 문구와 최소 점수 상태
@@ -656,6 +758,8 @@ async function loadMasterSettings() {
     $('thRec').textContent = d.recommended_min;
     applyNightSettings(d);
     $('webPwNow').textContent = d.web_password || '(미설정)';
+    $('webLockEnabled').checked = !!d.web_lock_enabled;
+    $('masterLockEnabled').checked = d.master_lock_enabled !== false;
     $('alwaysKwBypassNight').checked = d.always_kw_bypass_night !== false;
     $('notifyPolicy').checked = !!d.notify_policy;
     $('notifyTrade').checked = !!d.notify_trade;
@@ -922,6 +1026,55 @@ function initMaster() {
     } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '저장 실패'); }
   });
 
+  $('webLockEnabled').addEventListener('change', async (e) => {
+    try {
+      const res = await masterFetch('/api/master/settings',
+        { method: 'POST', body: JSON.stringify({ web_lock_enabled: e.target.checked }) });
+      const d = await res.json();
+      if (!d.ok) { e.target.checked = !e.target.checked; masterMsg('err', d.error || '저장 실패'); return; }
+      masterMsg('ok', e.target.checked ? '웹 접속 비밀번호 사용 켬' : '웹 접속 비밀번호 사용 끔 (누구나 접속 가능)');
+    } catch (err) {
+      if (err.message !== 'unauthorized') { e.target.checked = !e.target.checked; masterMsg('err', '저장 실패'); }
+    }
+  });
+
+  $('masterLockEnabled').addEventListener('change', async (e) => {
+    if (e.target.checked) {
+      try {
+        const res = await masterFetch('/api/master/lock',
+          { method: 'POST', body: JSON.stringify({ enabled: true }) });
+        const d = await res.json();
+        if (!d.ok) { e.target.checked = false; masterMsg('err', d.error || '저장 실패'); return; }
+        masterMsg('ok', '마스터 비밀번호 사용 켬');
+      } catch (err) { if (err.message !== 'unauthorized') { e.target.checked = false; masterMsg('err', '저장 실패'); } }
+      return;
+    }
+    // 끄는 건 위험하므로 체크는 도로 켜 두고, 현재 비밀번호 확인을 먼저 받는다.
+    e.target.checked = true;
+    $('masterLockOffConfirm').hidden = false;
+    $('masterLockOffPw').value = '';
+    $('masterLockOffPw').focus();
+  });
+
+  $('masterLockOffCancel').addEventListener('click', () => {
+    $('masterLockOffConfirm').hidden = true;
+    $('masterLockOffPw').value = '';
+  });
+
+  $('masterLockOffApply').addEventListener('click', async () => {
+    const pw = $('masterLockOffPw').value;
+    try {
+      const res = await masterFetch('/api/master/lock',
+        { method: 'POST', body: JSON.stringify({ enabled: false, current_password: pw }) });
+      const d = await res.json();
+      if (!d.ok) { masterMsg('err', d.error || '끄기 실패'); return; }
+      $('masterLockEnabled').checked = false;
+      $('masterLockOffConfirm').hidden = true;
+      $('masterLockOffPw').value = '';
+      masterMsg('ok', '마스터 비밀번호 사용 끔');
+    } catch (err) { if (err.message !== 'unauthorized') masterMsg('err', '끄기 실패'); }
+  });
+
   $('scoreCustomAdd').addEventListener('click', addScoreCustomItem);
   $('scoreSaveBtn').addEventListener('click', saveScoreRules);
 
@@ -995,6 +1148,11 @@ function initMaster() {
   wireKwAdd('tradeReqAdd', 'tradeReqNew', () => tradeRequired, (a) => { tradeRequired = a; }, renderTradeReqList, 'trade_required');
   wireKwAdd('tradeExAdd', 'tradeExNew', () => tradeExclude, (a) => { tradeExclude = a; }, renderTradeExList, 'trade_exclude');
   wireKwAdd('weeklyToAdd', 'weeklyToNew', () => weeklyTo, (a) => { weeklyTo = a; }, renderWeeklyToList, 'weekly_to');
+
+  $('kwCollectAdd').addEventListener('click', addCollectKeyword);
+  $('kwCollectNew').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addCollectKeyword(); }
+  });
 
   $('pwMasterForm').addEventListener('submit', async (e) => {
     e.preventDefault();

@@ -123,20 +123,6 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 /* 포토카드 그리드일 때는 넓게 — 2열 이상 보이도록 */
 .detail-modal:has(.detail-list--cards) { max-width: 900px; }
 .detail-list { display: flex; flex-direction: column; gap: 10px; max-height: 62vh; overflow-y: auto; }
-.detail-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-.detail-item h4 { margin: 0 0 6px; font-size: 13.5px; line-height: 1.45; color: var(--navy); }
-.detail-item h4 a { color: inherit; }
-.detail-meta { font-size: 11.5px; color: var(--ink-soft); display: flex; flex-wrap: wrap; gap: 4px 10px; }
-.detail-err {
-  margin-top: 8px; padding: 8px 10px; border-radius: 8px;
-  background: #fdf2f2; color: #96323b; font-size: 12px; line-height: 1.5;
-  word-break: break-word;
-}
-.detail-err b { color: #7a252d; }
-.detail-tag {
-  display: inline-block; font-size: 10.5px; font-weight: 700; padding: 2px 7px;
-  border-radius: 999px; background: #fdece9; color: #a1372c; margin-left: 6px;
-}
 .detail-empty { padding: 26px 0; text-align: center; color: var(--ink-soft); font-size: 13px; }
 
 /* 상세 모달을 포토카드 그리드로 — '분석 대기'·'발송 실패' */
@@ -477,6 +463,10 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 }
 .modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
 .modal-body[hidden] { display: none; }
+/* modal-body 는 세로(column) flex라 .url-add-input의 flex-basis(320px)가
+   세로 높이로 적용돼 입력칸이 거대해지는 문제가 있었다 — 세로 방향에서는
+   내용 크기만큼만 차지하도록 되돌린다(2026-09-15). */
+.modal-body > .url-add-input { flex: 0 0 auto; }
 .modal-desc { margin: 0; font-size: 12.5px; color: var(--ink-soft); }
 
 .master-section { border-top: 1px solid var(--line); padding-top: 14px; }
@@ -504,6 +494,13 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   border: 0; background: none; color: var(--navy); cursor: pointer;
   font-size: 14px; line-height: 1; padding: 0 2px;
 }
+.kw-chip--toggle { cursor: pointer; border: 0; }
+.kw-chip--off { background: var(--line); color: var(--ink-soft); text-decoration: line-through; opacity: .7; }
+.kw-group-head {
+  display: flex; align-items: center; gap: 6px; margin: 12px 0 5px;
+  font-size: 12px; font-weight: 700; color: var(--navy);
+}
+.kw-group-head .kw-count { font-weight: 400; color: var(--ink-soft); }
 .master-pwform { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .master-current {
   margin: 12px 0 0; font-size: 12.5px; color: var(--ink-mid);
@@ -553,8 +550,6 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .score-rules li:last-child { border-bottom: 0; }
 .sr-label { flex: 1; }
 .score-rules b { font-variant-numeric: tabular-nums; font-size: 12.5px; flex: none; }
-.sr-plus { color: var(--navy); }
-.sr-minus { color: var(--neg, #c0392b); }
 .score-eg {
   margin: 10px 0 0; padding: 8px 10px; border-radius: 7px;
   background: var(--navy-soft); font-size: 11.5px; color: var(--navy-dark); line-height: 1.6;

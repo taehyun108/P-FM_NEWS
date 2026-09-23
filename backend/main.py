@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -175,6 +176,12 @@ class Config:
     nvidia_embed_model: str
     nvidia_llm_api_key: str
     nvidia_llm_model: str
+    # 채팅 대체 순서: OpenAI → Gemini → Grok → NVIDIA. 임베딩 API 가 없는
+    # 공급자(Gemini·xAI)는 채팅(분석·요약·주간레포트·챗봇)에만 쓴다.
+    gemini_api_key: str
+    gemini_llm_model: str
+    xai_api_key: str
+    xai_llm_model: str
     # DB
     db_backend: str
     sqlite_path: str
@@ -206,6 +213,7 @@ class Config:
     api_host: str
     api_port: int
     master_password: str          # 마스터 패널 초기 비밀번호 (변경 시 DB 해시가 우선)
+    master_pw_recovery_to: list[str]  # 마스터 로그인 3회 이상 실패 시 복구 메일 받을 주소
     web_password: str             # 사이트 접속 비밀번호. 비우면 잠금 없음(로컬 개발)
     tz_offset_hours: int          # 운영 기준 시간대 UTC 오프셋 (한국 = 9)
     # 야간 억제 — 모두 '운영 기준 시간대'(APP_TZ_OFFSET, 기본 KST) 기준 시각이다.
@@ -314,6 +322,10 @@ def load_config() -> Config:
         nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
         nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
+        gemini_api_key=get_env("GEMINI_API_KEY", ""),
+        gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-2.5-flash-lite"),
+        xai_api_key=get_env("XAI_API_KEY", ""),
+        xai_llm_model=get_env("XAI_LLM_MODEL", "grok-4-fast"),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
@@ -348,6 +360,10 @@ def load_config() -> Config:
         # PORT 가 있으면 그것을 우선한다 — 없으면 기존 API_PORT.
         api_port=get_env_int("PORT", 0, 0, 65535) or get_env_int("API_PORT", 8000, 1, 65535),
         master_password=get_env("MASTER_PASSWORD"),
+        master_pw_recovery_to=[e.strip() for e in get_env(
+            "MASTER_PW_RECOVERY_EMAILS",
+            "taehyun931008@naver.com,taehyun108@poscofuturem.com",
+        ).replace(";", ",").split(",") if e.strip()],
         web_password=get_env("WEB_PASSWORD"),
         tz_offset_hours=tz_off,
         # 야간 억제 창 — APP_TZ_OFFSET(기본 KST) 기준 시각. 0~23.
@@ -675,6 +691,20 @@ class Storage(ABC):
     def seed_keywords(self, rows: Sequence[tuple[str, str]]) -> None: ...
 
     @abstractmethod
+    def all_keywords(self) -> list[dict]:
+        """마스터 패널 '수집 키워드 관리'용 — 켜짐·꺼짐 전부 돌려준다."""
+
+    @abstractmethod
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        """새 수집 키워드를 추가한다. 같은 (분류, 키워드)가 이미 있으면 None."""
+
+    @abstractmethod
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None: ...
+
+    @abstractmethod
+    def delete_keyword(self, keyword_id: str) -> None: ...
+
+    @abstractmethod
     def enabled_feeds(self) -> list[dict]: ...
 
     @abstractmethod
@@ -867,6 +897,10 @@ class SqliteStorage(Storage):
             "alter table run_state add column score_custom_rules TEXT default '[]'",
             "alter table run_state add column pipeline_lock_owner TEXT",
             "alter table run_state add column pipeline_lock_at TEXT",
+            # 잠금 사용 여부 (2026-09-16) — NULL = 기존 방식(비밀번호 값이 있으면
+            # 잠금, 없으면 해제)을 그대로 따름. 0/1 이면 그 값을 명시적으로 따름.
+            "alter table run_state add column web_lock_enabled INTEGER",
+            "alter table run_state add column master_lock_enabled INTEGER",
         ]
         for sql in migrations:
             try:
@@ -1342,6 +1376,26 @@ class SqliteStorage(Storage):
                 "insert or ignore into keyword_sets (id,category,keyword,enabled) values (?,?,?,1)",
                 (new_id(), category, keyword),
             )
+
+    def all_keywords(self) -> list[dict]:
+        return self._rows("select * from keyword_sets order by category, keyword")
+
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        existing = self._one(
+            "select id from keyword_sets where category=? and keyword=?", (category, keyword))
+        if existing:
+            return None
+        kid = new_id()
+        self._exec(
+            "insert into keyword_sets (id,category,keyword,enabled) values (?,?,?,1)",
+            (kid, category, keyword))
+        return {"id": kid, "category": category, "keyword": keyword, "enabled": 1}
+
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None:
+        self._exec("update keyword_sets set enabled=? where id=?", (1 if enabled else 0, keyword_id))
+
+    def delete_keyword(self, keyword_id: str) -> None:
+        self._exec("delete from keyword_sets where id=?", (keyword_id,))
 
     def enabled_feeds(self) -> list[dict]:
         return self._rows("select * from feed_sources where enabled=1")
@@ -2040,6 +2094,24 @@ class SupabaseStorage(Storage):
         if payload:
             self._t("keyword_sets").upsert(payload, on_conflict="category,keyword").execute()
 
+    def all_keywords(self) -> list[dict]:
+        return self._t("keyword_sets").select("*").order("category").order("keyword").execute().data
+
+    def add_keyword(self, category: str, keyword: str) -> dict | None:
+        existing = (self._t("keyword_sets").select("id")
+                    .eq("category", category).eq("keyword", keyword).execute().data)
+        if existing:
+            return None
+        row = {"category": category, "keyword": keyword, "enabled": True}
+        res = self._t("keyword_sets").insert(row).execute().data
+        return res[0] if res else row
+
+    def set_keyword_enabled(self, keyword_id: str, enabled: bool) -> None:
+        self._t("keyword_sets").update({"enabled": enabled}).eq("id", keyword_id).execute()
+
+    def delete_keyword(self, keyword_id: str) -> None:
+        self._t("keyword_sets").delete().eq("id", keyword_id).execute()
+
     def enabled_feeds(self) -> list[dict]:
         return self._t("feed_sources").select("*").eq("enabled", True).execute().data
 
@@ -2410,6 +2482,18 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "kgnews.co.kr": ("경기신문", 3), "gosiweek.com": ("피앤피뉴스", 3),
     "unn.net": ("한국대학신문", 3), "ttlnews.com": ("퍼블릭뉴스통신", 3),
     "the-stock.kr": ("더스탁", 3), "apnews.kr": ("AP신문", 3),
+    # 홈페이지가 영문/도메인만 노출해 자동 복구가 안 되던 매체 (2026-09-16)
+    "osen.co.kr": ("OSEN", 2), "spotvnews.co.kr": ("스포티비뉴스", 2),
+    "medigatenews.com": ("메디게이트뉴스", 3), "ilyosisa.co.kr": ("일요시사", 3),
+    "journalist.or.kr": ("기자협회보", 3), "bntnews.co.kr": ("bnt뉴스", 3),
+    "fashionbiz.co.kr": ("패션비즈", 3), "apparelnews.co.kr": ("어패럴뉴스", 3),
+    "elle.co.kr": ("엘르", 3), "wkorea.com": ("더블유코리아", 3),
+    "kwangju.co.kr": ("광주일보", 2), "cjb.co.kr": ("CJB청주방송", 3),
+    "mbcgn.kr": ("MBC경남", 3), "yakup.com": ("약업신문", 3),
+    "besteleven.com": ("베스트일레븐", 3), "ddanzi.com": ("딴지일보", 3),
+    "voakorea.com": ("VOA 한국어", 3), "g1tv.co.kr": ("G1방송", 3),
+    "gamefocus.co.kr": ("게임포커스", 3), "mstoday.co.kr": ("MS투데이", 3),
+    "swtvnews.com": ("SWTV", 3),
 }
 
 # 다음·네이버 뉴스 래퍼 도메인 — 그 자체가 언론사가 아니다.
@@ -2542,6 +2626,12 @@ def _is_company_list_sentence(sentence: str) -> bool:
     for item in parts[1:-1]:
         if len(item) > _LIST_ITEM_MAX_CHARS or _NOT_LIST_ITEM_END_RE.search(item):
             return False
+    # '후원(하고 있는) A, B, C가 참여' 처럼 스포츠·공연 등 제3자 행사의 후원사를
+    # 나열하는 문장은 실제 사업 소식이 아니라 단순 협찬 언급이라 그룹사로 치지
+    # 않는다. (실사례: e스포츠 대회 후원사 명단에 '포스코'가 있어 무관 기사가
+    # 걸림 — LCK 결승전 기사, 2026-09-16)
+    if re.search(r"후원(하[고는]|사)", sentence):
+        return False
     return True
 
 
@@ -2754,6 +2844,10 @@ def domain_of(url: str) -> str:
     # co.kr / or.kr / go.kr 같은 2단계 국가 도메인 처리
     if len(parts) >= 3 and parts[-2] in ("co", "or", "go", "ne", "re", "pe", "ac") and parts[-1] == "kr":
         return ".".join(parts[-3:])
+    # 중국 도메인도 co.kr 처럼 2단계 SLD 를 쓴다(예: news.xinhuanet.com.cn). 이걸
+    # 못 접으면 뒤 두 조각만 남아 'com.cn'으로 뭉개져 매체를 특정할 수 없게 된다.
+    if len(parts) >= 3 and parts[-2] in ("com", "net", "org", "gov", "edu") and parts[-1] == "cn":
+        return ".".join(parts[-3:])
     return ".".join(parts[-2:])
 
 
@@ -2825,6 +2919,7 @@ def dedupe_chips(items: Iterable[str], exclude: Iterable[str] = ()) -> list[str]
 #    측정 가능하게 만드는 것이 목적이다.
 # =====================================================================
 
+@lru_cache(maxsize=None)
 def _import(module: str, pip_name: str):
     try:
         return importlib.import_module(module)
@@ -3308,6 +3403,45 @@ def _naver_item_relevant(title: str, category: str, keyword: str = "",
 
 
 SOURCE_FETCH_WORKERS = 10   # 키워드·피드별 조회 동시 실행 수 (2026-09-14, 아래 참고)
+
+# 네이버 무료 한도(하루 25,000회) 대응 — 키워드 전부를 매 회차 조회하면 한도를 넘는다.
+# 실측(2026-09-15): 활성 키워드 118개 × 하루 288회차 = 33,984회 → 한도의 1.4배.
+# 한도를 넘기면 그날 남은 시간 내내 429 로 네이버 수집이 통째로 막혀 기사를 놓친다.
+# 그래서 '그룹사'(포스코 계열사명) 키워드만 매 회차 조회하고, 나머지(산업·정책·통상)는
+# 아래 수만큼 나눠 교대로 조회한다. 그룹사 7 + 나머지 111/2 ≈ 63개/회차 → 하루 약 18,100회.
+NAVER_ALWAYS_CATEGORY = "그룹사"
+NAVER_ROTATE_SLOTS_DEFAULT = 2
+# 마스터 패널 '수집 키워드 관리'에서 고를 수 있는 분류. _naver_item_relevant 가
+# 이 값으로 느슨한 신호 종류를 나누므로(그룹사=고정밀만, 정책/통상=전용 키워드,
+# 그 외=산업으로 취급) 목록에 없는 값은 만들지 않는다.
+KEYWORD_CATEGORIES = [NAVER_ALWAYS_CATEGORY, "산업", "정책", "통상"]
+
+
+def naver_rotate_slots() -> int:
+    """회차 분할 수. **호출 시점에** 환경변수를 읽는다.
+
+    모듈 상단 상수로 두면 안 된다 — .env 는 load_config() 안에서 읽는데 그건
+    모듈 import 보다 나중이라, 도커(--env-file 로 진짜 환경변수)에서는 반영되고
+    로컬 실행에서는 무시되는 식으로 **실행 방식에 따라 동작이 갈린다.**
+    """
+    return get_env_int("NAVER_ROTATE_SLOTS", NAVER_ROTATE_SLOTS_DEFAULT, 1, 12)
+
+
+def select_naver_keywords(keyword_rows: Sequence[dict], cycle: int) -> list[dict]:
+    """이번 회차에 조회할 키워드만 고른다. (일일 한도 대응 — 위 상수 설명 참고)
+
+    '그룹사'는 매 회차 전부, 나머지는 cycle 을 슬롯 수로 나눈 몫의 것만 낸다.
+    슬롯이 1이면 기존처럼 전부 조회한다(끄고 싶을 때 .env 로 조절).
+    """
+    slots = naver_rotate_slots()
+    always = [r for r in keyword_rows
+              if (r.get("category") if isinstance(r, dict) else "") == NAVER_ALWAYS_CATEGORY]
+    rotating = [r for r in keyword_rows
+                if (r.get("category") if isinstance(r, dict) else "") != NAVER_ALWAYS_CATEGORY]
+    if slots <= 1 or not rotating:
+        return list(keyword_rows)
+    slot = cycle % slots
+    return always + [r for i, r in enumerate(rotating) if i % slots == slot]
 
 
 def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -> list[RawItem]:
@@ -4106,12 +4240,26 @@ def _make_openai_client(api_key: str):
 
 
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+XAI_BASE_URL = "https://api.x.ai/v1"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 def _make_nvidia_client(api_key: str):
     """NVIDIA NIM 클라이언트. OpenAI 호환 엔드포인트라 openai 라이브러리를 그대로 쓴다."""
     openai = _import("openai", "openai")
     return openai.OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
+
+
+def _make_xai_client(api_key: str):
+    """xAI(Grok) 클라이언트. 마찬가지로 OpenAI 호환 엔드포인트다."""
+    openai = _import("openai", "openai")
+    return openai.OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+
+
+def _make_gemini_client(api_key: str):
+    """Gemini 클라이언트. 구글이 제공하는 OpenAI 호환 엔드포인트를 그대로 쓴다."""
+    openai = _import("openai", "openai")
+    return openai.OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
 
 
 class LLMClient:
@@ -4128,14 +4276,23 @@ class LLMClient:
         self.nvidia_embed_client = (
             _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
         self.nvidia_embed_model = cfg.nvidia_embed_model
-        # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로. 마찬가지로
-        # 키가 없으면 그대로 None — OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로들.
+        # 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA — 키가 없는 단계는 건너뛴다.
+        # 마찬가지로 전부 실패하면 OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
+        self.gemini_llm_client = (
+            _make_gemini_client(cfg.gemini_api_key) if cfg.gemini_api_key else None)
+        self.gemini_llm_model = cfg.gemini_llm_model
+        self.xai_llm_client = (
+            _make_xai_client(cfg.xai_api_key) if cfg.xai_api_key else None)
+        self.xai_llm_model = cfg.xai_llm_model
         self.nvidia_llm_client = (
             _make_nvidia_client(cfg.nvidia_llm_api_key) if cfg.nvidia_llm_api_key else None)
         self.nvidia_llm_model = cfg.nvidia_llm_model
         # 모델별로 지원하는 파라미터가 다르다. 첫 호출에서 학습해 이후 재시도를 줄인다.
-        # OpenAI·NVIDIA 는 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
+        # 공급자마다 서로 다른 모델이라 지원 여부도 따로 학습해야 한다.
         self._supports_json_mode = True
+        self._gemini_supports_json_mode = True
+        self._xai_supports_json_mode = True
         self._nvidia_supports_json_mode = True
         # 중복 판정 4단계의 임베딩 호출을 1회 실행당 이 수로 제한한다.
         # 네이버 수집 시 유사 제목이 대량으로 들어와 임베딩 폭주가 발생할 수 있다.
@@ -4170,15 +4327,32 @@ class LLMClient:
                      "total": resp.usage.total_tokens}
         return (resp.choices[0].message.content or ""), usage
 
+    def _chat_chain(self) -> list[tuple[Any, str, str, str]]:
+        """채팅 대체 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA. 키 없는 단계는 뺀다."""
+        chain = [(self.client, self.model, "_supports_json_mode", "OpenAI")]
+        if self.gemini_llm_client is not None:
+            chain.append((self.gemini_llm_client, self.gemini_llm_model,
+                          "_gemini_supports_json_mode", f"Gemini({self.gemini_llm_model})"))
+        if self.xai_llm_client is not None:
+            chain.append((self.xai_llm_client, self.xai_llm_model,
+                          "_xai_supports_json_mode", f"Grok({self.xai_llm_model})"))
+        if self.nvidia_llm_client is not None:
+            chain.append((self.nvidia_llm_client, self.nvidia_llm_model,
+                          "_nvidia_supports_json_mode", f"NVIDIA({self.nvidia_llm_model})"))
+        return chain
+
     def _chat(self, system: str, user: str) -> tuple[str, dict]:
-        try:
-            return self._chat_once(self.client, self.model, "_supports_json_mode", system, user)
-        except Exception as exc:
-            if self.nvidia_llm_client is None:
-                raise
-            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
-            return self._chat_once(self.nvidia_llm_client, self.nvidia_llm_model,
-                                    "_nvidia_supports_json_mode", system, user)
+        chain = self._chat_chain()
+        last_exc: Exception | None = None
+        for i, (client, model, flag, label) in enumerate(chain):
+            try:
+                return self._chat_once(client, model, flag, system, user)
+            except Exception as exc:
+                last_exc = exc
+                if i + 1 < len(chain):
+                    log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
+        assert last_exc is not None
+        raise last_exc
 
     def analyze(self, title: str, press: str, body: str) -> Analysis:
         prompt = ANALYSIS_PROMPT.format(title=title, press=press or "미상", body=body[:MAX_BODY_CHARS])
@@ -4225,15 +4399,18 @@ class LLMClient:
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        try:
-            resp = self.client.chat.completions.create(model=self.model, messages=messages)
-        except Exception as exc:
-            if self.nvidia_llm_client is None:
-                raise
-            log.warning("OpenAI 채팅 호출 실패, NVIDIA(%s)로 대체: %s", self.nvidia_llm_model, exc)
-            resp = self.nvidia_llm_client.chat.completions.create(
-                model=self.nvidia_llm_model, messages=messages)
-        return resp.choices[0].message.content or ""
+        chain = self._chat_chain()
+        last_exc: Exception | None = None
+        for i, (client, model, _flag, label) in enumerate(chain):
+            try:
+                resp = client.chat.completions.create(model=model, messages=messages)
+                return resp.choices[0].message.content or ""
+            except Exception as exc:
+                last_exc = exc
+                if i + 1 < len(chain):
+                    log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
+        assert last_exc is not None
+        raise last_exc
 
     def weekly_brief(self, kind: str, name: str, articles: list[dict]) -> dict:
         """주간 레포트 섹션 1건을 합성한다.
@@ -4767,6 +4944,7 @@ class Context:
     http: HttpClient
     seen_cache: set[str] = field(default_factory=set)
     last_naver_fetch: float = 0.0
+    naver_cycle: int = 0        # 키워드 교대 조회 회차 (select_naver_keywords)
     _llm: LLMClient | None = None
 
     @property
@@ -4901,6 +5079,65 @@ def _homepage_site_name(http: "HttpClient", domain: str, source_host: str = "") 
     return ""
 
 
+# ── 언론사 조회 캐시 ────────────────────────────────────────────────
+# 기사 1건마다 press_by_domain 을, 중복 1건마다 press_tier_by_id 를 부른다.
+# Supabase 에서는 이게 그대로 HTTP 왕복이라 수집 1사이클에 수십~수백 번 나가는데,
+# 언론사는 몇백 개뿐이라 같은 값을 계속 다시 받아오고 있었다.
+#
+# ⚠ 이름이 아직 도메인 그대로인 행(예: 'mdilbo.com')은 캐시하지 않는다 —
+#   resolve_press 가 매번 다시 시도해서 정식 매체명으로 고쳐야 하기 때문이다.
+#   (캐시하면 '언론사명이 도메인 그대로 굳어버리는' 예전 버그가 되살아난다.)
+# ⚠ 캐시는 저장소 인스턴스마다 따로 둔다 — 셀프테스트가 임시 DB 를 계속 새로 만든다.
+PRESS_MEMO_MAX = 5000
+
+
+def _press_memo(storage: Storage) -> dict:
+    memo = getattr(storage, "_press_memo_map", None)
+    if memo is None:
+        memo = {"by_domain": {}, "tier_by_id": {}}
+        storage._press_memo_map = memo   # type: ignore[attr-defined]
+    return memo
+
+
+def press_row_cached(storage: Storage, domain: str) -> dict | None:
+    """press_by_domain 의 캐시판. 이름이 확정된 행만 기억한다."""
+    memo = _press_memo(storage)
+    row = memo["by_domain"].get(domain)
+    if row is not None:
+        return row
+    row = storage.press_by_domain(domain)
+    if row and not _looks_like_domain(row.get("name", "")):
+        if len(memo["by_domain"]) >= PRESS_MEMO_MAX:
+            memo["by_domain"].clear()
+        memo["by_domain"][domain] = row
+        if row.get("id"):
+            memo["tier_by_id"][row["id"]] = int(row.get("tier") or 3)
+    return row
+
+
+def press_memo_forget(storage: Storage, domain: str, press_id: str | None = None) -> None:
+    """이름·tier 를 고쳐 쓴 직후 호출한다. 다음 조회가 DB 를 다시 읽는다."""
+    memo = _press_memo(storage)
+    dropped = memo["by_domain"].pop(domain, None)
+    for pid in (press_id, (dropped or {}).get("id")):
+        if pid:
+            memo["tier_by_id"].pop(pid, None)
+
+
+def press_tier_cached(storage: Storage, press_id: str | None) -> int:
+    """press_tier_by_id 의 캐시판. tier 는 거의 바뀌지 않는다."""
+    if not press_id:
+        return 3
+    memo = _press_memo(storage)["tier_by_id"]
+    tier = memo.get(press_id)
+    if tier is None:
+        tier = storage.press_tier_by_id(press_id)
+        if len(memo) >= PRESS_MEMO_MAX:
+            memo.clear()
+        memo[press_id] = tier
+    return tier
+
+
 def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
                   http: "HttpClient | None" = None) -> tuple[str, str | None, int]:
     """도메인으로 언론사를 식별한다. 미등록이면 pending 으로 적재하고 수집을 막지 않는다. (F2.3)
@@ -4911,15 +5148,17 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     if not domain:
         return (hint if hint and not _looks_like_domain(hint) else ""), None, 3
 
-    row = storage.press_by_domain(domain)
+    row = press_row_cached(storage, domain)
     seed = SEED_PRESS.get(domain)
     og_name = site_name_from_html(html, domain)
     # 이 매체를 처음 보는데(row is None) 기사 페이지에서 이름을 못 찾았으면, 홈페이지를
-    # 한 번 더 본다(신규 매체당 1회뿐이라 부담이 작다). 기사 페이지는 SEO 상 기사
-    # 제목만 <title>에 넣는 경우가 많아 실패하기 쉬운데, 홈페이지는 거의 항상
-    # 매체명을 담는다. 이렇게 안 하면 언론사명이 도메인 그대로('skyedaily.com')
-    # 굳어 화면 필터 칩에 그대로 노출된다.
-    if not og_name and http is not None and row is None and not seed and (
+    # 한 번 더 본다. 기사 페이지는 SEO 상 기사 제목만 <title>에 넣는 경우가 많아
+    # 실패하기 쉬운데, 홈페이지는 거의 항상 매체명을 담는다.
+    # 기존에 등록된 매체라도 이름이 아직 도메인 그대로('mdilbo.com')면 계속 재시도
+    # 한다 — 예전엔 row is None 일 때 딱 1회만 시도해서, 그 1회가 실패하면 화면
+    # 필터 칩에 도메인이 영구히 그대로 노출됐다(2026-09-16 지적: 실제 다수 발견).
+    if not og_name and http is not None and not seed and (
+            row is None or _looks_like_domain(row.get("name", ""))) and (
             not hint or _looks_like_domain(hint)):
         og_name = _homepage_site_name(http, domain, urlsplit(url).hostname or "")
 
@@ -4936,11 +5175,13 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     elif seed and row.get("name") != seed[0] and _looks_like_domain(row.get("name", "")):
         # 예전에 도메인 그대로 저장됐던 행을 SEED 정식 이름으로 교체한다.
         storage.update_press_name(domain, seed[0], seed[1])
-        row = storage.press_by_domain(domain) or row
+        press_memo_forget(storage, domain, row.get("id"))
+        row = press_row_cached(storage, domain) or row
     elif not seed and og_name and _looks_like_domain(row.get("name", "")):
         # SEED 에 없고 도메인으로만 저장돼 있던 행을 og:site_name 으로 교체한다.
         storage.update_press_name(domain, og_name, int(row.get("tier") or 3))
-        row = storage.press_by_domain(domain) or row
+        press_memo_forget(storage, domain, row.get("id"))
+        row = press_row_cached(storage, domain) or row
 
     name = row.get("name") or ""
     if _looks_like_domain(name):
@@ -4965,8 +5206,18 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     try:
         stale_after = max(60, cfg.poll_interval_sec * PIPELINE_LOCK_STALE_MULT)
         if not storage.try_acquire_pipeline_lock(_INSTANCE_ID, stale_after):
-            log.warning("다른 인스턴스(%s)가 파이프라인을 실행 중입니다 — 이번 회차는 건너뜁니다.",
-                        _INSTANCE_ID)
+            # 예전엔 여기서 '내' id 를 찍어 놓고 남의 것처럼 표시해 원인 추적이 어려웠다.
+            # 실제 락 주인을 DB 에서 읽어 함께 남긴다(충돌 회차에만 1회 조회).
+            owner = ""
+            try:
+                owner = str(storage.get_run_state().get("pipeline_lock_owner") or "")
+            except Exception:
+                pass
+            log.warning(
+                "다른 인스턴스(%s)가 파이프라인을 실행 중입니다 — 이번 회차는 건너뜁니다."
+                " (내 id=%s) 기사 중복은 이 락이 막지만 네이버·LLM 같은 외부 API 의"
+                " 일일 한도는 인스턴스끼리 공유되므로, 안 쓰는 쪽은 꼭 내려 주세요.",
+                owner or "알 수 없음", _INSTANCE_ID)
             return {"fetched": 0, "new": 0, "skipped_locked": True}
     except Exception as exc:
         log.debug("파이프라인 락 확인 실패(무시하고 진행): %s", exc)
@@ -5012,7 +5263,13 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 하루 25,000회 한도 때문에 매 실행이 아니라 일정 간격으로만 호출한다.
         due = force_naver or (time.monotonic() - ctx.last_naver_fetch) >= cfg.naver_interval_sec
         if due:
-            raw += collect_naver(http, cfg, keyword_rows)
+            # 일일 무료 한도(25,000회)를 넘지 않도록 이번 회차 몫만 고른다.
+            picked = select_naver_keywords(keyword_rows, ctx.naver_cycle)
+            ctx.naver_cycle += 1
+            if len(picked) < len(keyword_rows):
+                log.info("네이버 키워드 교대 조회: %d/%d개 (회차 %d, 일일 한도 대응)",
+                         len(picked), len(keyword_rows), ctx.naver_cycle)
+            raw += collect_naver(http, cfg, picked)
             ctx.last_naver_fetch = time.monotonic()
     rss_feeds = [f for f in feeds if f["source_type"] == "rss"]
     if rss_feeds:
@@ -5185,7 +5442,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             # 더 상위 언론사에서 온 중복이면 카드의 표시 정보(제목·링크·언론사·
             # 기자·썸네일)를 그쪽으로 승격한다. 요약·SWOT·키워드 등 분석 결과는
             # 같은 사건이라 그대로 두고, 재정렬을 피하려 발행시각도 유지한다.
-            if press_tier < storage.press_tier_by_id(existing.get("press_id")):
+            if press_tier < press_tier_cached(storage, existing.get("press_id")):
                 promo = {
                     "title": item.title,
                     "url_canonical": canonical,
@@ -5593,6 +5850,25 @@ def is_public_http_url(raw_url: str) -> bool:
     return True
 
 
+# analyze_url() 의 본문 추출(Readability)은 '기사 문단'을 전제로 한다. 동영상 페이지는
+# <article> 이 없고 플레이어·JSON 데이터뿐이라 본문이 사실상 비어 있게 되는데, 그때
+# og:title 은 대개 성공해 "제목·본문 둘 다 없음" 체크를 통과해 버린다 — 에러 없이
+# 텅 빈 카드가 만들어지는 게 실제 증상이었다(2026-09 유튜브 링크 문의).
+_UNSUPPORTED_MEDIA_HOSTS = (
+    "youtube.com", "youtu.be", "m.youtube.com",
+    "vimeo.com", "twitch.tv", "tiktok.com",
+)
+
+
+def _unsupported_media_host(raw_url: str) -> str | None:
+    """뉴스 기사가 아닌, 지원 대상 밖 동영상 호스트면 호스트명을 돌려준다."""
+    host = (urlsplit(raw_url).hostname or "").lower()
+    for bad in _UNSUPPORTED_MEDIA_HOSTS:
+        if host == bad or host.endswith("." + bad):
+            return host
+    return None
+
+
 def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     """사용자가 직접 붙여넣은 URL 하나를 포토카드로 만든다. (PRD F8 수동 등록)
 
@@ -5608,6 +5884,18 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
     if not is_public_http_url(raw_url):
         # 사설망·로컬 주소를 넣어 서버가 내부망을 대신 긁게 만드는 SSRF 를 막는다.
         return {"ok": False, "error": "외부에 공개된 뉴스 주소만 등록할 수 있습니다."}
+
+    # 이 기능은 '기사 본문'을 Readability 로 뽑는 방식이라 영상 페이지는 원천적으로
+    # 지원 대상이 아니다. 그런데 예전에는 여기서 걸러내지 않아, 유튜브 링크를 넣으면
+    # 제목만 (og:title 로) 뽑히고 본문은 비다시피 한 채로 "성공"해 버렸다 — 에러도
+    # 없이 텅 빈 요약 카드가 그대로 만들어지는 게 가장 혼란스러운 실패 형태였다.
+    # URL 형식만 보고 미리 걸러 원인을 바로 알 수 있게 한다.
+    unsupported_host = _unsupported_media_host(raw_url)
+    if unsupported_host:
+        return {"ok": False, "error": (
+            f"이 기능은 뉴스 기사 링크 전용입니다. '{unsupported_host}' 은(는) "
+            "동영상 페이지라 본문을 추출할 수 없습니다. 뉴스 기사 URL을 입력해 주세요."
+        )}
 
     url_source = normalize_url(raw_url)
 
@@ -7136,13 +7424,73 @@ def _login_reset(key: str) -> None:
     _LOGIN_FAILS.pop(key, None)
 
 
+# ── 마스터 비밀번호 복구 (2026-09-15) ────────────────────────────────
+# 마스터 비밀번호는 바뀐 뒤엔 해시로만 저장되어 원문을 알 수 없다. 그래서
+# "잘못 바꾼 뒤 잊어버림"에서 복구하는 유일한 방법은, DB에 저장된 변경
+# 이력(해시)을 지워 .env 의 원래 값으로 되돌리는 것뿐이다 — 같은 IP에서
+# 마스터 로그인이 연속 3회 이상 실패하면 자동으로 이렇게 되돌리고, 그
+# 결과(.env 값)를 정해둔 이메일로 보낸다.
+_MASTER_LOGIN_FAILS: dict[str, list[float]] = {}
+MASTER_LOGIN_FAIL_THRESHOLD = 3
+
+
+def _master_login_fail(key: str) -> int:
+    now = time.time()
+    q = [t for t in _MASTER_LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
+    q.append(now)
+    _MASTER_LOGIN_FAILS[key] = q
+    return len(q)
+
+
+def _master_login_reset(key: str) -> None:
+    _MASTER_LOGIN_FAILS.pop(key, None)
+
+
+def _recover_master_password(ctx: Context) -> None:
+    """마스터 로그인 3회 이상 연속 실패 시 호출된다.
+
+    DB에 저장된 master_pw_hash(변경 이력)를 지워 .env MASTER_PASSWORD 로
+    되돌리고, 그 값을 복구 메일 수신자에게 보낸다. .env 값 자체가 바뀐
+    적이 없다면(해시가 원래 없었다면) 이 함수는 사실상 아무 것도 바꾸지
+    않고 안내 메일만 다시 보내는 셈이 된다.
+    """
+    try:
+        ctx.storage.set_run_state({"master_pw_hash": ""})
+    except Exception as exc:
+        log.warning("마스터 비밀번호 복구(초기화) 실패: %s", exc)
+        return
+    to_list = ctx.cfg.master_pw_recovery_to
+    pw = ctx.cfg.master_password
+    if not to_list or not pw:
+        log.warning("마스터 비밀번호 복구: 수신자 또는 .env 비밀번호가 없어 메일 생략")
+        return
+    if not ctx.cfg.smtp_configured:
+        log.warning("마스터 비밀번호 복구: SMTP 미설정이라 메일 생략 (비밀번호는 초기화됨)")
+        return
+    html = (
+        "<p>마스터 비밀번호를 3회 이상 잘못 입력해서, 안전을 위해 "
+        ".env 에 저장된 기본 비밀번호로 되돌렸습니다.</p>"
+        f"<p>새로 로그인할 마스터 비밀번호: <b>{esc(pw)}</b></p>"
+        "<p>본인이 시도한 게 아니라면 즉시 서버 관리자에게 알려주세요.</p>"
+    )
+    ok, err = send_report_email(ctx.cfg, "[P-FM NEWS] 마스터 비밀번호 복구 안내", html, to_list)
+    if not ok:
+        log.warning("마스터 비밀번호 복구 메일 발송 실패: %s", err)
+
+
 # ── 사이트 전체 잠금 (배포용) ────────────────────────────────────────
 # 마스터 토큰은 관리 기능만 지킨다. 배포하면 URL 만 알아도 기사 목록·URL 등록·
 # 텔레그램 직접 전송 API 를 누구나 쓸 수 있으므로, 그 앞에 세션 관문을 하나 둔다.
 WEB_COOKIE = "pfm_web"
 WEB_SESSION_DAYS = 30
 # 잠금 대상에서 빼는 경로 — 로그인 자체, 헬스체크, 카카오 OAuth 착지점.
+# /api/master/login 도 여기 넣어야 한다 — 안 그러면 '웹 접속 비밀번호를 잊어버려
+# 사이트 전체가 잠긴' 상황에서 마스터 비밀번호를 알아도 복구 API 자체에 도달할
+# 수 없어 영영 못 들어가는 사고가 난다(2026-09-15, 실제로 발생). 마스터 로그인은
+# 시도 횟수 제한(_login_locked)과 비밀번호 자체 검증이 그대로 지켜주므로 공개해도
+# 안전하다.
 WEB_PUBLIC_PATHS = frozenset({"/api/web/login", "/api/web/logout", "/api/web/status",
+                              "/api/master/login",
                               "/healthz", "/kakao/callback", "/kakao"})
 _WEB_PW_CACHE: dict[str, Any] = {"at": 0.0, "pw": ""}
 WEB_PW_TTL_SEC = 60.0   # run_state 조회가 요청마다 DB 를 때리지 않게
@@ -7173,14 +7521,25 @@ def _rate_ok(bucket: list[float], limit: int, window: float = 3600.0) -> bool:
 
 
 def check_master_password(ctx: Context, pw: str) -> bool:
-    """DB 에 변경된 해시가 있으면 그것을, 없으면 .env 의 MASTER_PASSWORD 를 쓴다."""
+    """DB 에 변경된 해시가 있으면 그것을, 없으면 .env 의 MASTER_PASSWORD 를 쓴다.
+
+    master_lock_enabled 를 명시적으로 꺼뒀으면(마스터 패널 "마스터 비밀번호 사용
+    안 함") 아무 값이나(빈 값 포함) 통과시킨다 — 위험을 알고 켠 선택이므로
+    존중한다(2026-09-16).
+    """
+    st = ctx.storage.get_run_state()
+    flag = st.get("master_lock_enabled")
+    if flag is not None and str(flag) in ("0", "False", "false"):
+        return True
     if not pw:
         return False
-    stored = ctx.storage.get_run_state().get("master_pw_hash")
+    stored = st.get("master_pw_hash")
     if stored:
         return verify_password(pw, stored)
     env_pw = ctx.cfg.master_password
-    return bool(env_pw) and hmac.compare_digest(pw, env_pw)
+    # compare_digest 는 비-ASCII 문자열을 못 받는다(TypeError) — 한글 등을 쳐 넣으면
+    # 그냥 '틀렸다'로 처리돼야지 서버 오류가 나면 안 되므로 바이트로 비교한다.
+    return bool(env_pw) and hmac.compare_digest(pw.encode("utf-8"), env_pw.encode("utf-8"))
 
 
 def card_tags(row: dict) -> tuple[list[str], list[str], str]:
@@ -7309,8 +7668,23 @@ def apply_filters(rows: list[dict], groups: list[str], cats: list[str], presses:
 # ── 목록 스캔 스토어 ────────────────────────────────────────────────
 # /api/articles·/api/filters 는 활성·분석완료 기사 수천~수만 행을 훑어 필터한다.
 # 요청마다 DB 를 다시 읽으면 Supabase 이관 후 무료 대역폭(5GB/월)을 금방 넘긴다.
-# 태그가 붙은 행을 메모리에 두고, 파이프라인이 사이클마다 '바뀐 것만' 델타로 갱신한다.
-_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0}
+# 태그가 붙은 행을 메모리에 두고, '바뀐 것만' 델타로 갱신한다.
+#
+# ⚠ 프로세스 경계 주의 (serve + worker 분리 배포, 2026-09-11~):
+#   이 스토어는 **프로세스마다 따로** 존재한다. worker 가 새 기사를 넣어도 serve 의
+#   메모리에는 안 들어온다 — serve 는 _scan_tagged 가 요청 때마다 호출하는
+#   refresh_scan_store 로 **자기 스토어를 스스로** 델타 갱신한다(그래서 동작한다).
+#   새 전역 캐시를 추가할 땐 "누가 쓰고 누가 읽는가"를 반드시 따져라. 한쪽 프로세스만
+#   쓰고 다른 쪽이 읽는 구조면 배포 후에 조용히 깨진다.
+#
+# ⚠ 정렬 불변식 (2026-09-15 실장애):
+#   by_id 는 dict 라 **삽입 순서**가 곧 반환 순서인데, 델타로 새로 들어온 기사는
+#   항상 맨 뒤에 붙는다. api_articles 의 'recent' 정렬은 이 반환 순서를 그대로
+#   믿고 쓰므로, refresh_scan_store 는 **반환 직전에 반드시 발행일 최신순으로
+#   재정렬**한다. 이걸 빼면 신규 기사가 마지막 페이지로 밀려 화면에서 사라진다.
+#   (회귀 방지: selftest [11-2e] "델타로 들어온 최신 기사가 정렬 후 맨 앞에 온다")
+_SCAN_STORE: dict[str, Any] = {"by_id": {}, "cursor": "", "full_at": 0.0, "delta_at": 0.0,
+                               "sorted": None}
 _SCAN_STORE_LOCK = threading.Lock()
 SCAN_STORE_CAP = 40000            # 메모리 상한(≈100일치). 넘으면 발행일 오래된 것부터 버린다.
 SCAN_FULL_RELOAD_SEC = 20 * 3600  # 삭제·상태변경 반영: 하루 1회 전체 재적재
@@ -7330,16 +7704,26 @@ def _store_put(st: dict, r: dict) -> None:
 
 
 def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
-    """태그가 붙은 활성·분석완료 행 목록. 최초/하루 1회만 전체, 그 외엔 델타만 읽는다."""
+    """태그가 붙은 활성·분석완료 행 목록. 최초/하루 1회만 전체, 그 외엔 델타만 읽는다.
+
+    반환은 항상 발행일 최신순으로 정렬해서 준다 — dict 삽입 순서에 기대면 안 된다.
+    델타로 새로 들어온(기존에 없던 id) 기사는 파이썬 dict 특성상 삽입 순서상
+    맨 뒤에 붙는데, api_articles 의 'recent' 정렬은 이 반환 순서를 그대로 믿고
+    쓰기 때문에, 정렬을 안 하면 신규 기사가 항상 마지막 페이지로 밀려 화면에
+    '최신 기사가 안 보이는' 것처럼 보인다(2026-09-15, 실사용 중 발견 — serve
+    컨테이너가 델타로 계속 갱신은 하고 있었지만 순서가 틀어져 있었다).
+    """
     now = time.monotonic()
     with _SCAN_STORE_LOCK:
         st = _SCAN_STORE
+        changed = False
         if full or not st["by_id"] or (now - st["full_at"]) > SCAN_FULL_RELOAD_SEC:
             rows = storage.scan_articles(SCAN_STORE_CAP, None, "")
             st["by_id"] = {r["id"]: tag_row(r) for r in rows}
             st["cursor"] = max((_row_ts(r) for r in rows), default="")
             st["full_at"] = now
             st["delta_at"] = now
+            changed = True
         elif st["cursor"] and now - st["delta_at"] >= SCAN_DELTA_MIN_SEC:
             st["delta_at"] = now
             fresh = storage.changed_articles_since(st["cursor"])
@@ -7347,11 +7731,18 @@ def refresh_scan_store(storage: "Storage", full: bool = False) -> list[dict]:
                 _store_put(st, r)
             if fresh:
                 st["cursor"] = max([st["cursor"]] + [_row_ts(r) for r in fresh])
+                changed = True
             if len(st["by_id"]) > SCAN_STORE_CAP * 1.15:
                 keep = sorted(st["by_id"].values(),
                               key=lambda t: t["row"].get("published_at") or "", reverse=True)
                 st["by_id"] = {t["row"]["id"]: t for t in keep[:SCAN_STORE_CAP]}
-        return list(st["by_id"].values())
+                changed = True
+        # 정렬 결과를 들고 있다가 스토어가 바뀐 경우에만 다시 만든다. 델타는 60초에
+        # 한 번뿐이라 대부분의 요청은 이 캐시를 그대로 쓴다(최대 4만 건 재정렬 회피).
+        if changed or st["sorted"] is None:
+            st["sorted"] = sorted(st["by_id"].values(),
+                                  key=lambda t: t["row"].get("published_at") or "", reverse=True)
+        return st["sorted"]   # 공유 리스트다 — 받는 쪽에서 절대 제자리 수정하지 말 것
 
 
 def scan_store_upsert(storage: "Storage", article_id: str) -> None:
@@ -7362,6 +7753,7 @@ def scan_store_upsert(storage: "Storage", article_id: str) -> None:
             _store_put(_SCAN_STORE, row)
         else:
             _SCAN_STORE["by_id"].pop(article_id, None)
+        _SCAN_STORE["sorted"] = None   # by_id 를 직접 건드렸으니 정렬 캐시를 버린다
 
 
 def create_app(ctx: Context):
@@ -7405,6 +7797,12 @@ def create_app(ctx: Context):
         secret = ""
         try:
             st = ctx.storage.get_run_state()
+            flag = st.get("web_lock_enabled")
+            if flag is not None and str(flag) in ("0", "False", "false"):
+                # 마스터 패널에서 "웹 접속 비밀번호 사용 안 함"을 명시적으로 골랐다.
+                # 저장된 비밀번호 값은 나중에 다시 켤 때 쓰려고 그대로 둔다(2026-09-16).
+                _WEB_PW_CACHE.update(at=now, pw="")
+                return ""
             if (st.get("web_password") or "").strip():        # 패널에서 지정함 = 잠금 on
                 secret = (st.get("web_pw_hash") or "").strip() or st["web_password"].strip()
         except Exception as exc:   # DB 장애 때 사이트를 통째로 잠가 버리지 않는다
@@ -7425,7 +7823,9 @@ def create_app(ctx: Context):
             return False
         if secret.count("$") >= 3:      # pbkdf2$iters$salt$hash 형태 = 저장된 해시
             return verify_password(pw, secret)
-        return hmac.compare_digest(pw, secret)
+        # compare_digest 는 비-ASCII 문자열을 못 받는다 — 바이트로 비교해 한글
+        # 비밀번호를 입력해도 서버 오류 없이 '틀렸다'로 처리되게 한다.
+        return hmac.compare_digest(pw.encode("utf-8"), secret.encode("utf-8"))
 
     def _web_session_ok(token: str) -> bool:
         secret = _web_secret()
@@ -7514,9 +7914,17 @@ def create_app(ctx: Context):
         비밀번호가 비어 있으면(로컬 개발) 아무 것도 막지 않는다. 설정돼 있으면
         쿠키에 든 세션 토큰이 맞아야 화면·API 를 내준다 — 배포 후 URL 만 알면
         누구나 기사·발송 API 를 쓸 수 있는 상태를 막는 것이 목적이다.
+
+        유효한 마스터 토큰(X-Master-Token)이 있으면 이 잠금을 통과시킨다 — 마스터
+        권한이 웹 접속 잠금보다 상위이기 때문. 이게 없으면 '웹 접속 비밀번호를
+        잊어 사이트가 잠긴' 상황에서 마스터 비밀번호를 알아도 마스터 패널
+        API(/api/master/settings 등)에 도달할 수 없어 웹 잠금을 끄러 들어갈
+        방법조차 없어진다(2026-09-16). 마스터 토큰은 자체 로그인·시도 횟수
+        제한으로 보호되므로 안전하다.
         """
         if _web_password() and request.url.path not in WEB_PUBLIC_PATHS:
-            if not _web_session_ok(request.cookies.get(WEB_COOKIE, "")):
+            if not _web_session_ok(request.cookies.get(WEB_COOKIE, "")) and not _valid_master_token(
+                    request.headers.get("x-master-token", "")):
                 accept = request.headers.get("accept", "")
                 if request.url.path.startswith("/api/"):
                     return JSONResponse({"ok": False, "error": "로그인이 필요합니다."},
@@ -7596,7 +8004,9 @@ def create_app(ctx: Context):
                                 {normalize_chip(x) for x in _split_multi(group)},
                                 {normalize_chip(x) for x in _split_multi(cat)},
                                 {normalize_chip(x) for x in _split_multi(press)})
-        # 정렬 — 기본(recent)은 SQL 이 이미 발행일 최신순으로 준 순서를 그대로 쓴다.
+        # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
+        # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
+        # 순서에 기대다가 신규 기사가 마지막 페이지로 밀리는 장애가 있었다).
         # 'score' 는 사용자가 직접 등록한 기사·중요도 높은 기사를 위로 올린다.
         if sort == "score":
             matched = sorted(matched, key=lambda t: (
@@ -7754,6 +8164,9 @@ def create_app(ctx: Context):
         api_url = TELEGRAM_API.format(token=ctx.cfg.telegram_bot_token)
 
         def _work():
+            # 카드의 ↗ 버튼도 알림 큐와 '같은 채널'로 나가므로 분당 한도를 함께 지킨다.
+            # (이 경로만 _rate_gate 를 안 거쳐서, 큐 발송이 몰릴 때 겹치면 429 를 맞았다)
+            _rate_gate()
             return _telegram_send(ctx, api_url, clamp_message(format_message(row)),
                                   kind="직접 전송", article_id=article_id)
 
@@ -7931,9 +8344,13 @@ def create_app(ctx: Context):
         pw = (payload or {}).get("password", "")
         if not isinstance(pw, str) or not check_master_password(ctx, pw):
             _login_fail(ip)
+            if _master_login_fail(ip) >= MASTER_LOGIN_FAIL_THRESHOLD:
+                _recover_master_password(ctx)
+                _master_login_reset(ip)
             return JSONResponse({"ok": False, "error": "비밀번호가 올바르지 않습니다."},
                                 status_code=401)
         _login_reset(ip)
+        _master_login_reset(ip)
         return JSONResponse({"ok": True, "token": _issue_master_token(),
                              "ttl_hours": int(MASTER_TOKEN_TTL.total_seconds() // 3600)})
 
@@ -7958,6 +8375,11 @@ def create_app(ctx: Context):
             "always_kw_bypass_night": str(st.get("always_kw_bypass_night", 1) or 0)
                                       not in ("0", "False", "false", ""),
             "web_password": st.get("web_password") or "",
+            # 잠금 사용 여부 — 마스터 패널 토글용. NULL(미지정)이면 '비밀번호 값이
+            # 있으면 켜짐'으로 해석해 보여준다(레거시 호환). (2026-09-16)
+            "web_lock_enabled": bool(_web_password()),
+            "master_lock_enabled": str(st.get("master_lock_enabled", 1) or 0)
+                                   not in ("0", "False", "false"),
             "notify_policy": str(st.get("notify_policy") or "0") not in ("0", "False", "false", ""),
             "policy_keywords": jload(st.get("policy_notify_keywords"), []),
             "policy_required": jload(st.get("policy_required_keywords"), []),
@@ -8001,6 +8423,11 @@ def create_app(ctx: Context):
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "임계값은 0~100 숫자여야 합니다."},
                                     status_code=400)
+        if "web_lock_enabled" in (payload or {}):
+            # 마스터 비밀번호는 여기서 안 받는다 — 껐다 켜도 마스터 패널
+            # 자체는 항상 마스터 비밀번호로 보호되므로 별도 확인 없이 바꿀 수
+            # 있다(위험도가 낮다: 사이트 화면·API 노출 여부만 바뀜).
+            patch["web_lock_enabled"] = 1 if payload["web_lock_enabled"] else 0
         # 야간 억제 — 시각은 0~23(운영 기준 시간대), 점수는 0~101(101=전면 차단)
         for key, col, lo, hi, label in (
             ("night_start", "night_start_hour", 0, 23, "야간 시작 시각"),
@@ -8114,9 +8541,13 @@ def create_app(ctx: Context):
                          "  add column if not exists policy_exclude_keywords text default '[]',\n"
                          "  add column if not exists trade_exclude_keywords text default '[]',\n"
                          "  add column if not exists score_overrides text default '{}',\n"
-                         "  add column if not exists score_custom_rules text default '[]';"},
+                         "  add column if not exists score_custom_rules text default '[]',\n"
+                         "  add column if not exists web_lock_enabled boolean,\n"
+                         "  add column if not exists master_lock_enabled boolean;"},
                         status_code=500)
                 raise
+        if "web_lock_enabled" in patch:
+            _WEB_PW_CACHE.update(at=0.0, pw="")   # 다음 요청부터 바로 새 값 반영
         return JSONResponse({"ok": True})
 
     @app.post("/api/master/password")
@@ -8145,6 +8576,90 @@ def create_app(ctx: Context):
             # 세션 토큰은 비밀번호에서 파생되므로 바꾸는 즉시 기존 쿠키가 무효가 된다.
             # 캐시를 비워 다음 요청부터 새 값을 쓰게 한다.
             _WEB_PW_CACHE.update(at=0.0, pw="")
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/master/lock")
+    async def api_master_lock(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        """마스터 비밀번호 자체를 쓸지 말지 켜고 끈다 (2026-09-16).
+
+        끄면 마스터 패널이 비밀번호 없이 열린다 — 모든 마스터 전용 API(텔레그램
+        발송·키워드 관리 등)의 유일한 보호막이 사라지는 것이므로, 현재 마스터
+        비밀번호를 다시 입력해 확인해야만 끌 수 있다(잠금 켜는 건 확인 없이 가능).
+        """
+        if (err := _master_guard(x_master_token)):
+            return err
+        enabled = bool((payload or {}).get("enabled", True))
+        if not enabled:
+            cur = (payload or {}).get("current_password", "")
+            if not check_master_password(ctx, cur):
+                return JSONResponse({"ok": False, "error": "현재 비밀번호가 올바르지 않습니다."},
+                                    status_code=401)
+        try:
+            ctx.storage.set_run_state({"master_lock_enabled": 1 if enabled else 0})
+        except Exception as exc:
+            msg = str(exc)
+            if "column" in msg.lower() or "PGRST204" in msg or "schema cache" in msg.lower():
+                return JSONResponse(
+                    {"ok": False, "error": "저장소(run_state)에 master_lock_enabled 컬럼이 아직 "
+                     "없습니다. Supabase SQL Editor 에서 아래를 1회 실행하세요:\n"
+                     "alter table run_state add column if not exists master_lock_enabled boolean;"},
+                    status_code=500)
+            raise
+        return JSONResponse({"ok": True})
+
+    # ── 수집 키워드 관리 (마스터 패널, 2026-09-15) ───────────────────────
+    # keyword_sets 는 collect_naver/collect_google_rss 가 매 회차 읽는 표라,
+    # 여기서 켜고 끄거나 추가·삭제하면 다음 수집 사이클부터 바로 반영된다.
+    @app.get("/api/master/keywords")
+    async def api_master_keywords_get(x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        items = ctx.storage.all_keywords()
+        return JSONResponse({
+            "ok": True,
+            "categories": KEYWORD_CATEGORIES,
+            "always_category": NAVER_ALWAYS_CATEGORY,
+            "items": [{
+                "id": r["id"], "category": r["category"], "keyword": r["keyword"],
+                "enabled": bool(r.get("enabled")),
+            } for r in items],
+        })
+
+    @app.post("/api/master/keywords")
+    async def api_master_keywords_add(payload: dict, x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        category = str((payload or {}).get("category") or "").strip()
+        keyword = str((payload or {}).get("keyword") or "").strip()
+        if category not in KEYWORD_CATEGORIES:
+            return JSONResponse(
+                {"ok": False, "error": f"분류는 {'/'.join(KEYWORD_CATEGORIES)} 중 하나여야 합니다."},
+                status_code=400)
+        if not keyword or len(keyword) > 50:
+            return JSONResponse({"ok": False, "error": "키워드는 1~50자여야 합니다."}, status_code=400)
+        row = ctx.storage.add_keyword(category, keyword)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "이미 같은 분류에 같은 키워드가 있습니다."},
+                                status_code=409)
+        return JSONResponse({"ok": True, "item": {
+            "id": row["id"], "category": row["category"], "keyword": row["keyword"], "enabled": True,
+        }})
+
+    @app.post("/api/master/keywords/{keyword_id}/toggle")
+    async def api_master_keywords_toggle(keyword_id: str, payload: dict,
+                                         x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        enabled = bool((payload or {}).get("enabled", True))
+        ctx.storage.set_keyword_enabled(keyword_id, enabled)
+        return JSONResponse({"ok": True})
+
+    @app.delete("/api/master/keywords/{keyword_id}")
+    async def api_master_keywords_delete(keyword_id: str,
+                                         x_master_token: str = fastapi.Header(default="")):
+        if (err := _master_guard(x_master_token)):
+            return err
+        ctx.storage.delete_keyword(keyword_id)
         return JSONResponse({"ok": True})
 
     @app.post("/api/analyze-url")
@@ -9156,6 +9671,15 @@ def cmd_selftest() -> int:
     check("group_lead_text — 긴 기사(원래 사례)는 여전히 700자로 잘라 주체 유지",
           detect_group_companies(group_lead_text(_lead + "\n" + _tail)), ["포스코"])
 
+    # 실제 오탐 사례(2026-09-16): e스포츠 대회 후원사 명단에 '포스코'가 있어
+    # 무관 기사(LCK 결승전 소식)가 그룹사로 걸렸다. "후원(하고 있는) A, B, C가
+    # 참여" 형태는 나열문 조건은 만족하지만 실제 사업 소식이 아니므로 뺀다.
+    _sponsor_body = (
+        "ㅁ" * 700 + " 현장에는 LCK를 후원하고 있는 우리은행, 치지직, 업비트, 포스코,"
+        " 카스, JW중외제약, 골든듀, 로지텍G와 국가보훈부가 참여해 다양한 이벤트를 펼친다.")
+    check("group_lead_text — 제3자 행사 후원사 나열은 그룹사로 안 침",
+          detect_group_companies(group_lead_text(_sponsor_body)), [])
+
     check("카테고리에 '그룹사' 없음", "그룹사" in detect_categories("포스코퓨처엠 양극재 증설"), False)
     check("병합 시 상위 개념 제거",
           normalize_group_list(["포스코홀딩스", "포스코", "포스코퓨처엠"]),
@@ -9322,6 +9846,62 @@ def cmd_selftest() -> int:
     check("두 번째 호출은 이미 저장된 이름을 그대로 씀(재조회 안 함)",
           resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=2", "", "", None)[0],
           "스카이데일리")
+
+    # ── 언론사 조회 캐시 (2026-09-22) ────────────────────────────────
+    # 기사 1건마다 press_by_domain 을 부르는데 Supabase 에선 그대로 HTTP 왕복이다.
+    # 다만 이름이 아직 도메인 그대로인 행을 캐시해 버리면 '언론사명이 도메인
+    # 그대로 굳어버리는' 예전 버그가 되살아난다 — 그래서 확정된 이름만 기억한다.
+    _pbd_hits = {"n": 0}
+    _real_pbd = _pstore.press_by_domain
+
+    def _counting_pbd(domain, _f=_real_pbd):
+        _pbd_hits["n"] += 1
+        return _f(domain)
+
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    resolve_press(_pstore, "https://skyedaily.com/news_view.html?ID=3", "", "", None)
+    check("이름이 확정된 매체는 DB 를 다시 읽지 않는다", _pbd_hits["n"], 0)
+
+    _pstore.press_by_domain = _real_pbd          # 셋업 중 내부 호출은 세지 않는다
+    _pstore.upsert_press("testpress.kr", "testpress.kr", 3, "pending")
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    resolve_press(_pstore, "https://testpress.kr/a", "", "", None)
+    resolve_press(_pstore, "https://testpress.kr/b", "", "", None)
+    check("이름이 도메인 그대로면 캐시하지 않고 매번 다시 읽는다", _pbd_hits["n"], 2)
+
+    _pstore.press_by_domain = _real_pbd
+    _pstore.update_press_name("testpress.kr", "테스트신문", 3)
+    press_memo_forget(_pstore, "testpress.kr")
+    _pstore.press_by_domain = _counting_pbd
+    _pbd_hits["n"] = 0
+    check("이름 정정 후 한 번만 다시 읽고 그 뒤로는 캐시",
+          (resolve_press(_pstore, "https://testpress.kr/c", "", "", None)[0],
+           resolve_press(_pstore, "https://testpress.kr/d", "", "", None)[0],
+           _pbd_hits["n"]), ("테스트신문", "테스트신문", 1))
+    _pstore.press_by_domain = _real_pbd
+
+    # tier 캐시 — 같은 press_id 를 두 번 물어도 DB 는 한 번만 읽는다.
+    _tier_hits = {"n": 0}
+    _real_tier = _pstore.press_tier_by_id
+
+    def _counting_tier(pid, _f=_real_tier):
+        _tier_hits["n"] += 1
+        return _f(pid)
+
+    _tp_id = (_pstore.press_by_domain("testpress.kr") or {}).get("id")
+    _pstore.press_tier_by_id = _counting_tier
+    check("행을 캐시할 때 tier 도 같이 담아 둔다 — tier 조회는 DB 를 안 친다",
+          (press_tier_cached(_pstore, _tp_id), _tier_hits["n"]), (3, 0))
+    press_memo_forget(_pstore, "testpress.kr", _tp_id)
+    _tier_hits["n"] = 0
+    check("캐시를 버린 뒤엔 첫 조회만 DB, 두 번째는 캐시",
+          (press_tier_cached(_pstore, _tp_id), press_tier_cached(_pstore, _tp_id),
+           _tier_hits["n"]), (3, 3, 1))
+    check("press_tier_cached — id 가 없으면 DB 안 치고 기본 tier 3",
+          (press_tier_cached(_pstore, None), _tier_hits["n"]), (3, 1))
+    _pstore.press_tier_by_id = _real_tier
 
     class _FakeHttpComma:
         """홈페이지 title 이 '매체명 - 슬로건' 도 아니고 og:site_name 도 없어서
@@ -9730,7 +10310,7 @@ def cmd_selftest() -> int:
 
     print("\n[11-2e] 스캔 스토어 델타 갱신 (changed_articles_since · refresh_scan_store)")
     def _reset_store():
-        _SCAN_STORE.update(by_id={}, cursor="", full_at=0.0, delta_at=0.0)
+        _SCAN_STORE.update(by_id={}, cursor="", full_at=0.0, delta_at=0.0, sorted=None)
     _reset_store()
     _tmp._exec("delete from articles"); _tmp._exec("delete from summaries")
     _t0 = iso(now_utc() - timedelta(hours=2))
@@ -9754,6 +10334,10 @@ def cmd_selftest() -> int:
     _SCAN_STORE["delta_at"] = 0.0   # 델타 조회 최소 간격(60초) 우회 — 테스트라 바로 확인
     rows = refresh_scan_store(_tmp)
     check("델타 — 신규 1건 반영", "st-c" in {t["row"]["id"] for t in rows}, True)
+    # 회귀 방지(2026-09-15): 델타로 새로 들어온 기사가 dict 삽입 순서상 맨
+    # 뒤에 붙어도, 반환은 발행일 최신순으로 재정렬돼 있어야 한다 — 안 그러면
+    # api_articles 의 'recent' 정렬이 신규 기사를 마지막 페이지로 밀어버린다.
+    check("델타로 들어온 최신 기사가 정렬 후 맨 앞에 온다", rows[0]["row"]["id"], "st-c")
     # st-a 를 보관 처리 → 델타가 스토어에서 제거
     _tmp._exec("update articles set status='archived', collected_at=? where id='st-a'",
                (iso(now_utc()),))
@@ -9767,18 +10351,34 @@ def cmd_selftest() -> int:
            _tmp._exec("update articles set title='X' where id='st-b'"),
            refresh_scan_store(_tmp),
            _SCAN_STORE["by_id"].get("st-b", {}).get("row", {}).get("title"))[-1] != "X", True)
+    # 정렬 캐시(2026-09-22) — 스토어가 안 바뀌면 최대 4만 건을 다시 정렬하지 않는다.
+    _SCAN_STORE["delta_at"] = time.monotonic()
+    check("스토어가 그대로면 정렬 결과를 재사용한다",
+          refresh_scan_store(_tmp) is refresh_scan_store(_tmp), True)
+    # 한 건만 직접 반영해도(수동 등록 경로) 정렬 캐시는 버려야 한다.
+    _before = refresh_scan_store(_tmp)
+    scan_store_upsert(_tmp, "st-b")
+    _SCAN_STORE["delta_at"] = time.monotonic()
+    check("scan_store_upsert 뒤에는 정렬을 다시 한다",
+          refresh_scan_store(_tmp) is not _before, True)
+    check("정렬 캐시를 써도 발행일 최신순은 그대로",
+          [t["row"]["id"] for t in refresh_scan_store(_tmp)][0], "st-c")
     _reset_store()
 
-    print("\n[11-2f] 대체 공급자(NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11)")
+    print("\n[11-2f] 대체 공급자(Gemini·Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")
     _llm_blank = {f: "" for f in Config.__dataclass_fields__}
     _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                      "llm_model": "m", "embedding_model": "e",
                                      "nvidia_embed_api_key": "nv-test", "nvidia_embed_model": "n",
-                                     "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm"})
+                                     "nvidia_llm_api_key": "nv-llm-test", "nvidia_llm_model": "nvm",
+                                     "gemini_api_key": "gm-test", "gemini_llm_model": "gemini-test",
+                                     "xai_api_key": "xai-test", "xai_llm_model": "grok-test"})
     _lcfg_no_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
                                    "llm_model": "m", "embedding_model": "e",
                                    "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
-                                   "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm"})
+                                   "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm",
+                                   "gemini_api_key": "", "gemini_llm_model": "gemini-test",
+                                   "xai_api_key": "", "xai_llm_model": "grok-test"})
 
     class _FakeEmbData:
         def __init__(self, vec: list[float]) -> None:
@@ -9808,15 +10408,28 @@ def cmd_selftest() -> int:
     _llm1.client.embeddings.create = _openai_down
     _llm1.nvidia_embed_client.embeddings.create = lambda **_kw: _FakeEmbResp([0.4, 0.5, 0.6])
     check("OpenAI 임베딩 실패 → NVIDIA 로 대체", _llm1.embed("테스트"), [0.4, 0.5, 0.6])
+    check("채팅 대체 순서는 OpenAI→Gemini→Grok→NVIDIA",
+          [c[3] for c in _llm1._chat_chain()],
+          ["OpenAI", "Gemini(gemini-test)", "Grok(grok-test)", "NVIDIA(nvm)"])
     _llm1.client.chat.completions.create = _openai_down
-    _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":true}')
-    check("OpenAI 채팅 실패 → NVIDIA 로 대체 (_chat)",
-          _llm1._chat("s", "u"), ('{"ok":true}', {}))
-    check("chat_text 도 동일하게 대체", _llm1.chat_text("s", "u"), '{"ok":true}')
+    _llm1.gemini_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"gemini"}')
+    check("OpenAI 채팅 실패 → Gemini 로 대체 (_chat)",
+          _llm1._chat("s", "u"), ('{"ok":"gemini"}', {}))
+    check("chat_text 도 동일하게 Gemini 로 대체", _llm1.chat_text("s", "u"), '{"ok":"gemini"}')
+    _llm1.gemini_llm_client.chat.completions.create = _openai_down
+    _llm1.xai_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"grok"}')
+    check("OpenAI·Gemini 둘 다 실패 → Grok 로 대체",
+          _llm1._chat("s", "u"), ('{"ok":"grok"}', {}))
+    _llm1.xai_llm_client.chat.completions.create = _openai_down
+    _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
+    check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
+          _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
 
     _llm2 = LLMClient(_lcfg_no_fallback)
     check("NVIDIA 키 없으면 임베딩 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
     check("NVIDIA 키 없으면 채팅 대체 클라이언트도 없다", _llm2.nvidia_llm_client, None)
+    check("xAI 키 없으면 Grok 대체 클라이언트도 없다", _llm2.xai_llm_client, None)
+    check("Gemini 키 없으면 대체 클라이언트도 없다", _llm2.gemini_llm_client, None)
     _llm2.client.embeddings.create = _openai_down
     check("대체 키 없이 OpenAI 도 실패하면 None (기존과 동일)", _llm2.embed("테스트"), None)
     _llm2.client.chat.completions.create = _openai_down
@@ -9831,6 +10444,16 @@ def cmd_selftest() -> int:
     _llm3.client.embeddings.create = _openai_down
     _llm3.nvidia_embed_client.embeddings.create = _openai_down
     check("OpenAI·NVIDIA 둘 다 실패하면 None", _llm3.embed("테스트"), None)
+    _llm3.client.chat.completions.create = _openai_down
+    _llm3.gemini_llm_client.chat.completions.create = _openai_down
+    _llm3.xai_llm_client.chat.completions.create = _openai_down
+    _llm3.nvidia_llm_client.chat.completions.create = _openai_down
+    try:
+        _llm3._chat("s", "u")
+        _raised = False
+    except RuntimeError:
+        _raised = True
+    check("채팅 4곳(OpenAI·Gemini·Grok·NVIDIA) 전부 실패하면 예외가 올라온다", _raised, True)
 
     print("\n[11-2g] 분석 백로그 드레인 병렬화 — 동시 실행 정합성 (2026-09-14)")
     _tmp._exec("delete from articles"); _tmp._exec("delete from article_bodies")
@@ -9931,6 +10554,54 @@ def cmd_selftest() -> int:
         "select id from articles where id like 'dd-%' and analyzed_at is not null")}
     check("실제로 분석 완료된 건 정확히 2건(중복 제외, 병렬 실행에도 안전)",
           len(_analyzed_ids), 2)
+
+    print("\n[7-3] 네이버 키워드 교대 조회 — 일일 무료 한도 대응 (2026-09-15)")
+    # 활성 키워드 118개를 매 회차 전부 조회하면 하루 33,984회로 무료 한도(25,000)를
+    # 1.4배 초과해, 매일 중간부터 429 로 네이버 수집이 통째로 막혔다.
+    _rot_rows = ([{"keyword": f"g{i}", "category": "그룹사"} for i in range(7)]
+                 + [{"keyword": f"a{i}", "category": "산업"} for i in range(48)]
+                 + [{"keyword": f"p{i}", "category": "정책"} for i in range(38)]
+                 + [{"keyword": f"t{i}", "category": "통상"} for i in range(25)])
+    check("테스트 입력은 실제와 같은 118개", len(_rot_rows), 118)
+    _slot0 = select_naver_keywords(_rot_rows, 0)
+    _slot1 = select_naver_keywords(_rot_rows, 1)
+    check("한 회차 조회량이 절반 수준으로 준다", len(_slot0) < 70 and len(_slot1) < 70, True)
+    check("그룹사 7개는 매 회차 전부 조회한다",
+          (sum(1 for r in _slot0 if r["category"] == "그룹사"),
+           sum(1 for r in _slot1 if r["category"] == "그룹사")), (7, 7))
+    # 한 바퀴(NAVER_ROTATE_SLOTS 회차) 돌면 모든 키워드가 빠짐없이 조회돼야 한다
+    _seen = set()
+    for _c in range(naver_rotate_slots()):
+        _seen |= {r["keyword"] for r in select_naver_keywords(_rot_rows, _c)}
+    check("한 바퀴 돌면 모든 키워드가 빠짐없이 조회된다",
+          _seen, {r["keyword"] for r in _rot_rows})
+    check("회차가 한 바퀴 넘어가면 처음 슬롯으로 돌아온다",
+          [r["keyword"] for r in select_naver_keywords(_rot_rows, naver_rotate_slots())],
+          [r["keyword"] for r in _slot0])
+    check("슬롯이 1이면 기존처럼 전부 조회(끄기 옵션)",
+          len(select_naver_keywords(_rot_rows, 0)) if naver_rotate_slots() > 1 else 118,
+          len(_slot0))
+    check("키워드가 그룹사뿐이면 그대로 전부",
+          len(select_naver_keywords([{"keyword": "g", "category": "그룹사"}], 3)), 1)
+
+    print("\n[7-4] 수집 키워드 관리 CRUD (마스터 패널, 2026-09-15)")
+    _tmp._exec("delete from keyword_sets")
+    _kw_added = _tmp.add_keyword("산업", "테스트키워드")
+    check("추가 성공 — 분류·키워드 반환", (_kw_added or {}).get("keyword"), "테스트키워드")
+    check("추가 직후 켜짐(enabled) 상태", bool((_kw_added or {}).get("enabled")), True)
+    check("같은 분류+키워드 중복 추가는 None(중복 방지)",
+          _tmp.add_keyword("산업", "테스트키워드"), None)
+    check("다른 분류면 같은 키워드도 별개로 추가된다",
+          (_tmp.add_keyword("정책", "테스트키워드") or {}).get("keyword"), "테스트키워드")
+    check("all_keywords 는 켜짐·꺼짐 상관없이 전부(방금 2건)", len(_tmp.all_keywords()), 2)
+    _tmp.set_keyword_enabled(_kw_added["id"], False)
+    check("끄면 enabled_keywords 에서 빠진다(1건만 남음)", len(_tmp.enabled_keywords()), 1)
+    check("all_keywords 에는 꺼진 채로 계속 남는다", len(_tmp.all_keywords()), 2)
+    _tmp.set_keyword_enabled(_kw_added["id"], True)
+    check("다시 켜면 enabled_keywords 에 복귀한다", len(_tmp.enabled_keywords()), 2)
+    _tmp.delete_keyword(_kw_added["id"])
+    check("삭제하면 all_keywords 에서도 완전히 빠진다", len(_tmp.all_keywords()), 1)
+    _tmp._exec("delete from keyword_sets")
 
     print("\n[7-2] 수집 소스 조회 병렬화 — collect_naver · collect_rss_feeds (2026-09-14)")
     # 활성 키워드가 100개를 넘어가며 순차 조회가 사이클 시간의 대부분을 차지하는
@@ -10288,6 +10959,54 @@ def cmd_selftest() -> int:
           _client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))),
           "127.0.0.1")
     _LOGIN_FAILS.clear()
+
+    print("\n[19-2] 마스터 비밀번호 자동 복구 (2026-09-15)")
+    check("/api/master/login 은 사이트 잠금과 무관하게 항상 열려 있어야 함",
+          "/api/master/login" in WEB_PUBLIC_PATHS, True)
+    _MASTER_LOGIN_FAILS.clear()
+    for _i in range(MASTER_LOGIN_FAIL_THRESHOLD - 1):
+        check(f"{_i + 1}회째는 아직 임계치 미만",
+              _master_login_fail("9.9.9.9") >= MASTER_LOGIN_FAIL_THRESHOLD, False)
+    check("임계치(3회)째 도달", _master_login_fail("9.9.9.9") >= MASTER_LOGIN_FAIL_THRESHOLD, True)
+    _master_login_reset("9.9.9.9")
+    check("reset 후 다시 0부터", _master_login_fail("9.9.9.9"), 1)
+    _MASTER_LOGIN_FAILS.clear()
+
+    _rec_cfg = replace(_pcfg, master_password="testpw123", master_pw_recovery_to=["r@x.com"],
+                       smtp_user="", smtp_app_password="")
+    _rec_ctx = Context(cfg=_rec_cfg, storage=_tmp, http=HttpClient())
+    _tmp.set_run_state({"master_pw_hash": "이전에-바뀐-해시"})
+    check("복구 전: DB 해시가 남아 있음", bool(_tmp.get_run_state().get("master_pw_hash")), True)
+    _recover_master_password(_rec_ctx)
+    check("복구 후: DB 해시가 지워져 .env 값으로 돌아감",
+          bool(_tmp.get_run_state().get("master_pw_hash")), False)
+    check("check_master_password: 복구 후 .env 값으로 로그인 성공",
+          check_master_password(_rec_ctx, "testpw123"), True)
+    _tmp.set_run_state({"master_pw_hash": ""})
+
+    print("\n[19-3] 웹/마스터 잠금 사용 여부 선택 (2026-09-16)")
+    _tmp.set_run_state({"web_lock_enabled": None, "web_password": "abcd1234", "web_pw_hash": ""})
+    check("web_lock_enabled 미지정 + 비밀번호 있음 → 레거시대로 잠금 켜짐",
+          bool(_rec_ctx.storage.get_run_state().get("web_password")), True)
+    _tmp.set_run_state({"web_lock_enabled": 0})
+    check("web_lock_enabled=0 이면 비밀번호가 있어도 명시적으로 꺼짐",
+          str(_tmp.get_run_state().get("web_lock_enabled")) in ("0", "False", "false"), True)
+    _tmp.set_run_state({"web_lock_enabled": 1})
+    check("web_lock_enabled=1 로 다시 켤 수 있음",
+          str(_tmp.get_run_state().get("web_lock_enabled")) not in ("0", "False", "false"), True)
+    _tmp.set_run_state({"web_lock_enabled": None, "web_password": "", "web_pw_hash": ""})
+
+    check("master_lock_enabled 끄기 전에는 빈 값이 여전히 거부됨",
+          check_master_password(_rec_ctx, ""), False)
+    _tmp.set_run_state({"master_lock_enabled": 0})
+    check("master_lock_enabled=0 이면 빈 값도 통과(잠금 해제)",
+          check_master_password(_rec_ctx, ""), True)
+    check("master_lock_enabled=0 이면 아무 문자열이나 통과",
+          check_master_password(_rec_ctx, "아무거나"), True)
+    _tmp.set_run_state({"master_lock_enabled": 1})
+    check("master_lock_enabled=1 로 되돌리면 다시 검증함",
+          check_master_password(_rec_ctx, "틀린값"), False)
+    _tmp.set_run_state({"master_lock_enabled": None})
 
     print("\n[13-2] 알림 메시지 포맷 (PRD F7)")
     msg = format_message({"importance_score": 60, "title": "포스코퓨처엠 주가 하락",
