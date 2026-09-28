@@ -3208,24 +3208,77 @@ _NOTICE_TAIL_RE = re.compile(
     r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고).*$")
 
 
+# 이름으로 오인하기 쉬운 흔한 직함 — 항목 끝 토큰이 이 단어면 이름이 아니라 직함이다
+# (예: "정치부 부장" 처럼 이름 없이 직함만 있는 항목이 "부장"을 이름으로 잘못 떼어가지 않게).
+_TITLE_SUFFIXES = frozenset({
+    "부장", "차장", "과장", "국장", "실장", "이사", "사장", "회장", "대표", "단장", "팀장",
+    "본부장", "센터장", "원장", "총장", "학장", "청장", "처장", "장관", "차관", "수석", "특보",
+})
+_PERSON_NAME_RE = re.compile(r"^(.*\S)\s+([가-힣]{2,4})$")
+
+
+def _split_person_item(item: str) -> tuple[str, str]:
+    """'정치사회부/생활산업부장 김경태' → ('정치사회부/생활산업부장', '김경태').
+
+    끝 토큰이 이름처럼 안 생겼거나(흔한 직함) 애초에 못 나누면 ('', 원문) 을 돌려준다.
+    """
+    m = _PERSON_NAME_RE.match(item)
+    if m and m.group(2) not in _TITLE_SUFFIXES:
+        return m.group(1).strip(), m.group(2)
+    return "", ""
+
+
+def _split_people_sections(text: str) -> list[tuple[str, str]]:
+    """'◇ 헤더 ▲ 항목 ▲ 항목 ◇ 헤더2 ▲ 항목' → [(헤더, 항목), …]."""
+    pairs: list[tuple[str, str]] = []
+    for section in re.split(r"◇\s*", text):
+        section = section.strip()
+        if not section:
+            continue
+        parts = section.split("▲")
+        header = parts[0].strip()
+        for raw_item in parts[1:]:
+            item = raw_item.strip(" ·,;")
+            if item:
+                pairs.append((header, item))
+    return pairs
+
+
 def format_people_notice(body: str, kind: str) -> str:
     """인사·부고 공지에서 핵심 블록만 남긴다. LLM 을 쓰지 않는다.
 
-    부고:  '▲ 별세·상주 … = 빈소, 발인, 장지 ☎ 전화'
-    인사:  '◇ 부서 ▲ 직책 이름 …'
+    LLM 예산이 바닥나면(PEOPLE_LLM_PER_RUN) 이 함수가 그대로 카드 요약이 되므로,
+    원문을 잘라 붙이기만 하면 '요약'이 아니라 '원문'으로 보인다(사용자 지적
+    2026-09-28 — [인사] 프라임경제 기사가 원문 그대로 노출됨). 그래서 사람별로
+    한 줄씩 나눠 LLM 구조화 결과(format_people_llm)와 비슷한 모양으로 만든다.
+
+    부고:  '▲ 별세·상주 … = 빈소, 발인, 장지 ☎ 전화' — 여러 명이면 ▲ 단위로 나눈다.
+    인사:  '◇ 부서 ▲ 직책 이름 …' — (직책, 이름)을 갈라 'ㆍ직책 이름 (헤더)' 로 만든다.
     """
     text = re.sub(r"\s+", " ", (body or "").strip())
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
     text = _NOTICE_TAIL_RE.sub("", text).strip()
     if kind == "obituary":
-        m = re.search(r"▲.*?☎[\s\d\-()]+", text) or re.search(r"▲.*", text)
-        if m:
-            text = m.group(0).strip()
-    else:
-        m = re.search(r"[◇▲■].*", text)
-        if m:
-            text = m.group(0).strip()
-    return text[:800]
+        blocks = [b.strip() for b in
+                  re.findall(r"▲.*?(?:☎[\s\d\-()]+|(?=▲)|$)", text)]
+        blocks = [b for b in blocks if b]
+        if blocks:
+            return "\n".join(blocks)[:1600]
+        return text[:800]
+    m = re.search(r"[◇▲■].*", text)
+    if not m:
+        return text[:800]
+    pairs = _split_people_sections(m.group(0))
+    if not pairs:
+        return m.group(0).strip()[:800]
+    lines = []
+    for header, item in pairs:
+        pos, name = _split_person_item(item)
+        line = f"ㆍ{pos} {name}" if name else f"ㆍ{item}"
+        if header:
+            line += f" ({header})"
+        lines.append(line)
+    return "\n".join(lines)[:1600]
 
 
 # ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
@@ -9960,9 +10013,33 @@ def cmd_selftest() -> int:
     check("부고 요약 = ▲…☎ 블록",
           format_people_notice(_ob, "obituary"),
           "▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 = 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678")
-    check("인사 요약 = ◇…블록",
+    # 회귀 방지(2026-09-28): 한 기사에 여러 부고가 있으면 첫 번째 전화번호에서
+    # 끊기지 않고 전부 한 줄씩 나뉜다 — 예전엔 두 번째 이후가 통째로 사라졌다.
+    _ob2 = ("김 기자 구독 구독중 이전 다음 ▲ 김철수씨 별세 = 발인 10일 ☎ 02-1111-2222 "
+            "▲ 이영희씨 별세 = 발인 11일 ☎ 02-3333-4444 (서울=연합뉴스) 무단 전재 금지")
+    check("부고 2건 — 첫 번째에서 끊기지 않고 둘 다 남는다",
+          format_people_notice(_ob2, "obituary"),
+          "▲ 김철수씨 별세 = 발인 10일 ☎ 02-1111-2222\n▲ 이영희씨 별세 = 발인 11일 ☎ 02-3333-4444")
+    check("인사 요약 — 직책·이름을 갈라 'ㆍ직책 이름 (부서)' 로 정리",
           format_people_notice("기자 구독 구독중 이전 다음 ◇ 편집국 ▲ 산업본부장 류준형 (서울=연합뉴스)", "personnel"),
-          "◇ 편집국 ▲ 산업본부장 류준형")
+          "ㆍ산업본부장 류준형 (편집국)")
+    # 회귀 방지(2026-09-28, 사용자 지적): LLM 예산이 없어 이 규칙 기반으로 빠지면
+    # 원문을 그대로 노출해 '요약이 안 된다'는 지적이 있었다 — [인사] 프라임경제 실사례.
+    _personnel_dump = (
+        "◇ 부장 승진 ▲ 정치사회부/생활산업부장 김경태 ▲ 건설산업부장 전훈식 "
+        "▲ 미래산업부장 노병우 ◇ 차장 승진 ▲ 생활산업부 차장 이인영 "
+        "▲ 미래산업부 차장 박지혜 ▲ 자본시장부 차장 장민태")
+    check("인사 다건(실사례) — 사람마다 한 줄, 헤더는 괄호로",
+          format_people_notice(_personnel_dump, "personnel"),
+          "ㆍ정치사회부/생활산업부장 김경태 (부장 승진)\n"
+          "ㆍ건설산업부장 전훈식 (부장 승진)\n"
+          "ㆍ미래산업부장 노병우 (부장 승진)\n"
+          "ㆍ생활산업부 차장 이인영 (차장 승진)\n"
+          "ㆍ미래산업부 차장 박지혜 (차장 승진)\n"
+          "ㆍ자본시장부 차장 장민태 (차장 승진)")
+    check("직함만 있고 이름이 없으면(끝 토큰이 흔한 직함) 나누지 않는다",
+          format_people_notice("◇ 인사 ▲ 정치부 부장", "personnel"),
+          "ㆍ정치부 부장 (인사)")
     # LLM 구조화 결과 렌더 (format_people_llm)
     _pl = {"kind": "personnel", "people": [{
         "name": "이지원", "org": "기획예산처 재정관리국", "position": "부이사관", "change": "승진",
