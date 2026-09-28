@@ -3244,6 +3244,83 @@ def _split_people_sections(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _join_capped(blocks: list[str], sep: str, limit: int) -> str:
+    """블록 단위로 이어 붙이되, 한도를 넘기면 통째로 빼고 만다.
+
+    문자 수로 그냥 잘라 버리면 마지막 블록의 마지막 줄(대개 연락처)이 중간에서
+    잘려 나간다(사용자 지적 2026-09-28 — 부고 연락처가 잘려 보임). 블록 하나를
+    통째로 빼거나 통째로 넣거나만 하므로, 남는 블록은 완전한 채로 남는다.
+    """
+    out: list[str] = []
+    total = 0
+    for b in blocks:
+        add = (len(sep) if out else 0) + len(b)
+        if out and total + add > limit:
+            break
+        out.append(b)
+        total += add
+    if not out and blocks:
+        out = [blocks[0]]   # 첫 블록마저 넘으면 그거라도 안 잘리게 통째로 준다
+    return sep.join(out)
+
+
+# 부고 본문에서 이 단어가 그대로 나오면 그 뒤 텍스트를 해당 항목 값으로 본다.
+# 라벨이 없는 선두 텍스트(대개 장례식장 안내)는 '빈소'로 취급한다.
+_OBIT_FIELD_RE = re.compile(r"(상주|빈소|발인|장지)\s*[:：=]?\s*")
+
+
+def _parse_obituary_block(raw_block: str) -> str:
+    """'김철수(향년 80)씨 별세, 김영희씨 부친상 = 서울대병원, 발인 10일 ☎ 02-1234-5678'을
+
+    '대상명/관계 → 상주 → 빈소 → 발인 → 연락처' 순서로 정리한다(사용자 지정
+    2026-09-28). 라벨(상주·빈소·발인·장지)이 원문에 그대로 있으면 그 문장을
+    해당 항목에 담고, 없으면 빈 항목은 건너뛴다 — 지어내지 않는다.
+    연락처(☎ 뒤)는 끝까지 통째로 담아 절대 잘리지 않게 한다(전화번호가
+    두 개 이상 나열돼도 마찬가지).
+    """
+    block = raw_block.strip(" ▲")
+    contact = ""
+    m = re.search(r"☎\s*(.+)$", block)
+    if m:
+        contact = m.group(1).strip()
+        block = block[:m.start()].strip()
+
+    head, sep, rest = block.partition("=")
+    head = head.strip().rstrip(",")
+    rest = rest.strip()
+    # 흔한 패턴 "OOO씨 별세, XXX씨 YY상" — 마지막 쉼표로 대상명과 관계를 갈라
+    # LLM 구조화 결과와 같은 '대상 / 관계' 모양으로 맞춘다.
+    subj, csep, rel = head.rpartition(",")
+    head_line = f"{subj.strip()} / {rel.strip()}" if csep else head
+
+    fields = {"상주": "", "빈소": "", "발인": "", "장지": ""}
+    if rest:
+        markers = list(_OBIT_FIELD_RE.finditer(rest))
+        prefix = rest[:markers[0].start()].strip(" ,.、") if markers else rest.strip(" ,.、")
+        if prefix:
+            fields["빈소"] = prefix
+        for i, mk in enumerate(markers):
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(rest)
+            val = rest[mk.end():end].strip(" ,.、")
+            if val:
+                key = mk.group(1)
+                fields[key] = f"{fields[key]}, {val}" if fields[key] else val
+
+    lines = [f"ㆍ{head_line}" if head_line else "ㆍ부고"]
+    if fields["상주"]:
+        lines.append(f"   · 상주: {fields['상주']}")
+    if fields["빈소"]:
+        lines.append(f"   · 빈소: {fields['빈소']}")
+    fb = " / ".join(x for x in (
+        f"발인 {fields['발인']}" if fields["발인"] else "",
+        f"장지 {fields['장지']}" if fields["장지"] else "") if x)
+    if fb:
+        lines.append(f"   · {fb}")
+    if contact:
+        lines.append(f"   · ☎ {contact}")
+    return "\n".join(lines)
+
+
 def format_people_notice(body: str, kind: str) -> str:
     """인사·부고 공지에서 핵심 블록만 남긴다. LLM 을 쓰지 않는다.
 
@@ -3252,19 +3329,20 @@ def format_people_notice(body: str, kind: str) -> str:
     2026-09-28 — [인사] 프라임경제 기사가 원문 그대로 노출됨). 그래서 사람별로
     한 줄씩 나눠 LLM 구조화 결과(format_people_llm)와 비슷한 모양으로 만든다.
 
-    부고:  '▲ 별세·상주 … = 빈소, 발인, 장지 ☎ 전화' — 여러 명이면 ▲ 단위로 나눈다.
+    부고:  '▲ 별세·상주 … = 빈소, 발인, 장지 ☎ 전화' — 여러 명이면 ▲ 단위로 나눠
+           각각 '대상명/관계 → 상주 → 빈소 → 발인 → 연락처' 순서로 정리한다
+           (사용자 지정 2026-09-28). 연락처는 ▲ 단위로만 잘라 절대 안 잘린다.
     인사:  '◇ 부서 ▲ 직책 이름 …' — (직책, 이름)을 갈라 'ㆍ직책 이름 (헤더)' 로 만든다.
     """
     text = re.sub(r"\s+", " ", (body or "").strip())
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
     text = _NOTICE_TAIL_RE.sub("", text).strip()
     if kind == "obituary":
-        blocks = [b.strip() for b in
-                  re.findall(r"▲.*?(?:☎[\s\d\-()]+|(?=▲)|$)", text)]
-        blocks = [b for b in blocks if b]
-        if blocks:
-            return "\n".join(blocks)[:1600]
-        return text[:800]
+        raw_blocks = [b.strip() for b in text.split("▲") if b.strip()]
+        if not raw_blocks:
+            return text[:800]
+        blocks = [_parse_obituary_block(b) for b in raw_blocks]
+        return _join_capped(blocks, "\n\n", 1600)
     m = re.search(r"[◇▲■].*", text)
     if not m:
         return text[:800]
@@ -3278,7 +3356,7 @@ def format_people_notice(body: str, kind: str) -> str:
         if header:
             line += f" ({header})"
         lines.append(line)
-    return "\n".join(lines)[:1600]
+    return _join_capped(lines, "\n", 1600)
 
 
 # ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
@@ -3374,7 +3452,9 @@ def format_people_llm(parsed: dict, kind: str) -> str:
             if _pp(p.get("education")):
                 lines.append(f"   · 학력: {_pp(p.get('education'))}")
             blocks.append("\n".join(lines))
-    return "\n\n".join(blocks).strip()
+    # 문자 수로 그냥 자르면 마지막 사람의 마지막 줄(대개 연락처)이 중간에서
+    # 잘려 나간다(사용자 지적 2026-09-28). 사람 단위로만 자른다.
+    return _join_capped(blocks, "\n\n", 1600)
 
 
 def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
@@ -3389,7 +3469,9 @@ def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
         parsed, usage = ctx.llm.people_notice(kind, title, press, notice)
         text = format_people_llm(parsed, kind) if parsed else ""
         if text:
-            return text[:1600], ctx.llm.model, usage
+            # format_people_llm 이 사람 단위로 이미 1600자 안에 담아 왔다(_join_capped).
+            # 여기서 문자 수로 다시 자르면 마지막 사람의 연락처가 잘릴 수 있어 안 자른다.
+            return text, ctx.llm.model, usage
     return format_people_notice(notice, kind), "", {}
 
 
@@ -10008,18 +10090,44 @@ def cmd_selftest() -> int:
           people_news_kind("", "산업통상부 4월 정기 보직인사 단행"), "personnel")
     check("부처명만 있고 인사 표현 없으면 대상 아님",
           people_news_kind("", "산업통상부, 반도체 국장급 회의 소집"), "")
+    # 회귀 방지(2026-09-28, 사용자 지정): 부고는 항상
+    # '대상명/관계 → 상주 → 빈소 → 발인 → 연락처' 순서로 정리하고, 연락처는
+    # (전화번호가 두 개 이상이어도) 절대 잘리지 않는다.
     _ob = ("김 기자 구독 구독중 이전 다음 ▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 "
            "= 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678 (서울=연합뉴스) 무단 전재 금지")
-    check("부고 요약 = ▲…☎ 블록",
+    check("부고 요약 — 대상/관계 → 빈소 → 발인 → 연락처 순으로 정리",
           format_people_notice(_ob, "obituary"),
-          "▲ 김철수(향년 80세)씨 별세, 김영희씨 부친상 = 8일 오전, 서울대병원, 발인 10일. ☎ 02-1234-5678")
+          "ㆍ김철수(향년 80세)씨 별세 / 김영희씨 부친상\n"
+          "   · 빈소: 8일 오전, 서울대병원\n"
+          "   · 발인 10일\n"
+          "   · ☎ 02-1234-5678")
+    _ob_full = ("▲ 홍길동(향년 85세)씨 별세, 아들 홍민수씨 부친상 = 상주 홍민수, "
+                "빈소 서울성모병원 3호실, 발인 12일 오전 7시, 장지 하늘공원 "
+                "☎ 010-1234-5678, 010-8765-4321")
+    check("부고 요약 — 상주까지 있으면 5개 항목 전부, 연락처 2개 다 안 잘림",
+          format_people_notice(_ob_full, "obituary"),
+          "ㆍ홍길동(향년 85세)씨 별세 / 아들 홍민수씨 부친상\n"
+          "   · 상주: 홍민수\n"
+          "   · 빈소: 서울성모병원 3호실\n"
+          "   · 발인 12일 오전 7시 / 장지 하늘공원\n"
+          "   · ☎ 010-1234-5678, 010-8765-4321")
     # 회귀 방지(2026-09-28): 한 기사에 여러 부고가 있으면 첫 번째 전화번호에서
-    # 끊기지 않고 전부 한 줄씩 나뉜다 — 예전엔 두 번째 이후가 통째로 사라졌다.
+    # 끊기지 않고 전부 남는다 — 예전엔 두 번째 이후가 통째로 사라졌다.
     _ob2 = ("김 기자 구독 구독중 이전 다음 ▲ 김철수씨 별세 = 발인 10일 ☎ 02-1111-2222 "
             "▲ 이영희씨 별세 = 발인 11일 ☎ 02-3333-4444 (서울=연합뉴스) 무단 전재 금지")
     check("부고 2건 — 첫 번째에서 끊기지 않고 둘 다 남는다",
           format_people_notice(_ob2, "obituary"),
-          "▲ 김철수씨 별세 = 발인 10일 ☎ 02-1111-2222\n▲ 이영희씨 별세 = 발인 11일 ☎ 02-3333-4444")
+          "ㆍ김철수씨 별세\n   · 발인 10일\n   · ☎ 02-1111-2222\n\n"
+          "ㆍ이영희씨 별세\n   · 발인 11일\n   · ☎ 02-3333-4444")
+    # _join_capped — 한도를 넘으면 블록을 통째로 빼지, 블록 중간(=대개 연락처)에서
+    # 자르지 않는다. 블록 3개(각 624자)를 1600자 한도에 넣으면 2개만 들어간다.
+    _ob3 = ["대상" + c * 600 + f"\n   · ☎ 010-{n}-{n}"
+            for c, n in (("X", "1111"), ("Y", "2222"), ("Z", "3333"))]
+    _capped3 = _join_capped(_ob3, "\n\n", 1600)
+    check("_join_capped — 넘치기 직전까지만 통째로 담고 마지막 줄이 안 잘린다",
+          _capped3.endswith("☎ 010-2222-2222"), True)
+    check("_join_capped — 한도를 넘는 블록은 아예 통째로 뺀다(중간에서 안 자름)",
+          "3333" in _capped3, False)
     check("인사 요약 — 직책·이름을 갈라 'ㆍ직책 이름 (부서)' 로 정리",
           format_people_notice("기자 구독 구독중 이전 다음 ◇ 편집국 ▲ 산업본부장 류준형 (서울=연합뉴스)", "personnel"),
           "ㆍ산업본부장 류준형 (편집국)")
