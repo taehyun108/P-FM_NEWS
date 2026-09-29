@@ -1923,6 +1923,20 @@ function init() {
   setAdvOpen(advActive().length > 0);
   $('advToggle').addEventListener('click', () => setAdvOpen($('advSearch').hidden));
 
+  // 카드 사진 ON/OFF — 이 브라우저에 기억한다(기본 ON). 목록을 다시 그릴 필요 없이 CSS 클래스만 바꾼다.
+  const setThumbs = (on, save) => {
+    document.body.classList.toggle('hide-thumbs', !on);
+    $('thumbToggle').setAttribute('aria-pressed', String(on));
+    $('thumbToggle').textContent = on ? '사진 ON' : '사진 OFF';
+    if (save) { try { localStorage.setItem('pfm.thumbs', on ? '1' : '0'); } catch { /* noop */ } }
+  };
+  let thumbsOn = true;
+  try { thumbsOn = localStorage.getItem('pfm.thumbs') !== '0'; } catch { /* noop */ }
+  setThumbs(thumbsOn, false);
+  $('thumbToggle').addEventListener('click', () => {
+    setThumbs($('thumbToggle').getAttribute('aria-pressed') !== 'true', true);
+  });
+
   // 마지막으로 접었는지 기억한다. 활성 필터가 있으면 펼친 상태로 시작한다.
   let collapsed = false;
   try { collapsed = localStorage.getItem('pfm.filterCollapsed') === '1'; } catch { /* noop */ }

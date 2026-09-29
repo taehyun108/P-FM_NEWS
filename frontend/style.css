@@ -311,6 +311,9 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 .card-thumb > a { display: block; width: 100%; height: 100%; }
 .card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
+/* 필터의 '카드 사진' 을 OFF 로 하면 모든 카드의 사진·로고 배지를 숨긴다(lazy 이미지는 받지도 않는다) */
+body.hide-thumbs .card-thumb { display: none; }
+
 /* 사진이 없을 때 그룹사 로고 배지 */
 .card-thumb-logo { display: flex; align-items: center; justify-content: center; }
 .logo-badge {
