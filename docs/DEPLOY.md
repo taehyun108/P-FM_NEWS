@@ -15,6 +15,9 @@ DB는 이미 Supabase(외부 클라우드)를 쓰고 있으므로 **AWS에 DB를
 > 단일 인스턴스**(§11) 방식으로 운영 중이다 — 이미지는 로컬 Docker
 > 없이 **AWS CodeBuild**가 빌드해 ECR로 푸시하고, EC2(`i-0eb37f241ecbba234`,
 > `3.38.148.194`)에서 `serve`+`worker` 컨테이너 2개를 직접 띄운다.
+> 접속 주소는 `https://pfm-news.duckdns.org/` 이다 — 인스턴스의 **nginx**(Certbot 인증서)가
+> 80·443 을 받아 `127.0.0.1:8000` 의 `serve` 컨테이너로 전달하므로, `serve` 는
+> **`-p 127.0.0.1:8000:8000`** 으로 띄운다(`-p 80:8000` 은 nginx 와 80번이 겹쳐 시작에 실패한다).
 > 접속은 SSH 대신 **SSM(Session Manager)**을 쓴다(키 관리·포트 22
 > 노출이 없다). 코드를 고친 뒤 재배포는 `deploy/redeploy.sh` 한 번이면
 > 끝난다(CodeBuild 빌드 대기 → ECR 푸시 → EC2 pull·컨테이너 재시작까지

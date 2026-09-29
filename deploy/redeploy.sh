@@ -47,10 +47,12 @@ CMD_ID=$(aws ssm send-command \
     \"docker pull $ECR_URI:latest\",
     \"aws ssm get-parameter --name pfm-news-env --with-decryption --region $AWS_REGION --query Parameter.Value --output text > /opt/pfm-news/.env\",
     \"docker rm -f pfm-serve pfm-worker 2>/dev/null || true\",
-    \"docker run -d --name pfm-serve --restart unless-stopped -p 80:8000 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py serve\",
+    \"docker run -d --name pfm-serve --restart unless-stopped -p 127.0.0.1:8000:8000 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py serve\",
     \"docker run -d --name pfm-worker --restart unless-stopped --health-cmd='python backend/main.py healthcheck' --health-interval=60s --health-timeout=10s --health-start-period=40s --health-retries=3 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py worker\",
     \"sleep 5\",
-    \"docker ps\"
+    \"docker ps\",
+    \"for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do curl -fs http://127.0.0.1:8000/healthz >/dev/null && break; sleep 3; done\",
+    \"curl -fs http://127.0.0.1:8000/healthz >/dev/null && echo 웹사이트_정상 || { echo 웹사이트가_켜지지_않았습니다; docker ps -a --filter name=pfm-serve; docker logs --tail 30 pfm-serve; exit 1; }\"
   ]" \
   --region "$AWS_REGION" --query 'Command.CommandId' --output text)
 
@@ -70,4 +72,4 @@ if [ "$STATUS" != "Success" ]; then
   exit 1
 fi
 
-echo "배포 완료. http://3.38.148.194/ 에서 확인하세요."
+echo "배포 완료. https://pfm-news.duckdns.org/ 에서 확인하세요. (Ctrl+Shift+R 로 강력 새로고침)"
