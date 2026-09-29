@@ -9,6 +9,11 @@
 # 때마다 거기서 다시 받아 /opt/pfm-news/.env 를 덮어쓴다 — 예전엔 이 단계가
 # 없어서 파라미터를 고쳐도 인스턴스에는 조용히 반영이 안 됐다(2026-09-15).
 #
+# pfm-serve 는 127.0.0.1:8000 으로만 열어야 한다 — 포트 80/443은 EC2에 별도
+# 설치된 nginx(+ Certbot, /etc/nginx/sites-available/pfm-news)가 이미 물고
+# 있고, 그 설정이 127.0.0.1:8000 으로 프록시한다. 예전엔 여기가 -p 80:8000
+# 이라 nginx 와 포트가 충돌했다(2026-09-22 발견, 실행은 안 해봤어야 안전했음).
+#
 # 사전 조건: aws configure 로 자격증명이 연결돼 있어야 한다.
 set -euo pipefail
 
@@ -47,7 +52,7 @@ CMD_ID=$(aws ssm send-command \
     \"docker pull $ECR_URI:latest\",
     \"aws ssm get-parameter --name pfm-news-env --with-decryption --region $AWS_REGION --query Parameter.Value --output text > /opt/pfm-news/.env\",
     \"docker rm -f pfm-serve pfm-worker 2>/dev/null || true\",
-    \"docker run -d --name pfm-serve --restart unless-stopped -p 80:8000 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py serve\",
+    \"docker run -d --name pfm-serve --restart unless-stopped -p 127.0.0.1:8000:8000 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py serve\",
     \"docker run -d --name pfm-worker --restart unless-stopped --health-cmd='python backend/main.py healthcheck' --health-interval=60s --health-timeout=10s --health-start-period=40s --health-retries=3 --env-file /opt/pfm-news/.env $ECR_URI:latest python backend/main.py worker\",
     \"sleep 5\",
     \"docker ps\"
@@ -70,4 +75,4 @@ if [ "$STATUS" != "Success" ]; then
   exit 1
 fi
 
-echo "배포 완료. http://3.38.148.194/ 에서 확인하세요."
+echo "배포 완료. https://pfm-news.duckdns.org/ 에서 확인하세요."
