@@ -7477,28 +7477,47 @@ def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> 
         e = by.setdefault(press, {
             "press": press, "week": 0, "month": 0, "year": 0,
             "tone": {"긍정": 0, "중립": 0, "부정": 0, "미판정": 0},
-            "_rep": Counter(), "articles": [],
+            "_rep": Counter(), "_rep_tone": {}, "articles": [],
         })
         for key, _ in PRESS_STATS_WINDOWS:
             if pub >= cuts[key]:
                 e[key] += 1
         tone = r.get("pfm_tone") if r.get("pfm_tone") in PFM_TONES else "미판정"
         e["tone"][tone] += 1
-        for nm in split_authors(r.get("author") or ""):
+        authors = split_authors(r.get("author") or "")
+        for nm in authors:
             e["_rep"][nm] += 1
+            e["_rep_tone"].setdefault(nm, {"긍정": 0, "중립": 0, "부정": 0, "미판정": 0})[tone] += 1
         if len(e["articles"]) < PRESS_STATS_ARTICLES_MAX:
             e["articles"].append({
                 "id": r.get("id"), "title": r.get("title") or "", "url": url,
                 "published_at": r.get("published_at"), "author": r.get("author") or "",
+                "authors": authors,
                 "tone": r.get("pfm_tone") or "", "tone_reason": r.get("pfm_tone_reason") or "",
             })
     out = []
     for e in by.values():
-        e["reporters"] = [{"name": n, "count": c} for n, c in e.pop("_rep").most_common()]
+        tones = e.pop("_rep_tone")
+        e["reporters"] = [{"name": n, "count": c, "tone": tones[n], "color": reporter_tone(tones[n])}
+                          for n, c in e.pop("_rep").most_common()]
         e["articles"].sort(key=lambda a: a.get("published_at") or "", reverse=True)
         out.append(e)
     out.sort(key=lambda e: (-e["year"], -e["month"], -e["week"], e["press"]))
+    for i, e in enumerate(out, 1):
+        e["rank"] = i          # 언급 순위 — 연간 → 월간 → 주간 건수 순
     return out
+
+
+def reporter_tone(tone: dict[str, int]) -> str:
+    """기자의 대표 논조 — 긍정·중립·부정 중 가장 많은 쪽(동률이면 중립). 판정된 기사가 없으면 ''.
+
+    화면 색: 긍정=파랑, 중립=검정, 부정=빨강.
+    """
+    top = max(tone.get(k, 0) for k in PFM_TONES)
+    if top <= 0:
+        return ""
+    best = [k for k in PFM_TONES if tone.get(k, 0) == top]
+    return best[0] if len(best) == 1 else "중립"
 
 
 def weekly_window(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -9409,7 +9428,7 @@ def cmd_fixpress(ctx: Context, dry: bool = False) -> None:
     # 한 번 더 본다(_homepage_site_name). 그래도 실패하면 도메인 전체로 둔다.
     ogfix = 0
     tried: set[str] = set()
-    for r in ctx.storage.list_articles(5000, 0, None, ""):
+    for r in ctx.storage.article_press_rows():   # 최근 5000건이 아니라 전체 기사를 본다
         name = (r.get("press_name") or "").strip()
         if _has_hangul(name):
             continue
@@ -9632,6 +9651,8 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
     rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=days)))
     need_excerpt = [r for r in rows if r.get("pfm_excerpt") is None]
     need_tone = [r for r in rows if r.get("pfm_excerpt") and not r.get("pfm_tone")]
+    # 요약문으로 이미 논조를 판정한 기사(발췌는 NULL 인 채)는 다시 보지 않는다.
+    need_excerpt = [r for r in need_excerpt if not r.get("pfm_tone")]
     todo = need_tone + need_excerpt   # 발췌가 이미 있는 쪽이 싸다(원문 재수집 불필요) — 먼저
     log.info("논조 백필 대상 %d건 — 발췌부터 필요 %d · 논조만 필요 %d (최근 %d일 포스코퓨처엠 기사 %d건)",
              len(todo), len(need_excerpt), len(need_tone), days, len(rows))
@@ -9657,7 +9678,22 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
                 except Exception as exc:
                     log.debug("원문 재수집 실패 %s: %s", target, exc)
             if len(body) < 50:
-                failed += 1        # 원문을 못 받음 — NULL 로 두어 다음 실행에서 다시 시도
+                # 본문이 없다(30일 보관 이전 기사이거나 원문 접속 실패) — 저장된 요약문에서
+                # 포스코퓨처엠 언급 문장을 찾아 그것으로 논조만 판정한다. 발췌는 NULL 로 둔다
+                # (요약은 발췌가 아니므로 카드의 '포스코퓨처엠 언급' 칸에 넣지 않는다).
+                detail = ctx.storage.article_detail(r["id"]) or {}
+                from_summary = extract_pfm_excerpt(detail.get("summary_text") or "")
+                if not from_summary:
+                    failed += 1    # 요약에도 언급이 없다 — NULL 로 두어 다음 실행에서 다시 시도
+                    continue
+                tone, reason = ctx.llm.pfm_tone(from_summary)
+                llm_used += 1
+                if tone:
+                    ctx.storage.update_article(
+                        r["id"], {"pfm_tone": tone, "pfm_tone_reason": reason})
+                    toned += 1
+                else:
+                    failed += 1
                 continue
             excerpt = extract_pfm_excerpt(body)
             ctx.storage.update_article(r["id"], {"pfm_excerpt": excerpt})
@@ -11193,7 +11229,17 @@ def cmd_selftest() -> int:
           (_agg["MS투데이"]["tone"]["긍정"], _agg["MS투데이"]["tone"]["부정"],
            _agg["한국경제"]["tone"]["미판정"]), (1, 1, 1))
     check("집계 — 기자별 건수(많은 순)",
-          _agg["MS투데이"]["reporters"], [{"name": "김기자", "count": 2}, {"name": "박기자", "count": 1}])
+          [(x["name"], x["count"]) for x in _agg["MS투데이"]["reporters"]], [("김기자", 2), ("박기자", 1)])
+    check("집계 — 기자 대표 논조(긍1·부1 동률→중립, 부정 1건→부정, 미판정만→'')",
+          [x["color"] for x in _agg["MS투데이"]["reporters"]] + [x["color"] for x in _agg["한국경제"]["reporters"]],
+          ["중립", "부정", ""])
+    check("집계 — 기자 색 규칙(다수결·판정 없음)",
+          (reporter_tone({"긍정": 2, "부정": 1}), reporter_tone({"중립": 3, "부정": 1}),
+           reporter_tone({"미판정": 4})), ("긍정", "중립", ""))
+    check("집계 — 기사에 기자 목록이 실려 화면이 기자별로 거른다",
+          [a["authors"] for a in _agg["MS투데이"]["articles"]], [["김기자"], ["김기자", "박기자"]])
+    check("집계 — 언급 순위(1위부터)",
+          [(e["press"], e["rank"]) for e in aggregate_press_stats(_prows, _pnow)], [("MS투데이", 1), ("한국경제", 2)])
     check("집계 — 언론사 행 클릭 시 펼칠 기사 목록(최신순)",
           [a["id"] for a in _agg["MS투데이"]["articles"]], ["p1", "p2"])
     check("집계 — 연간 건수 많은 언론사가 위", aggregate_press_stats(_prows, _pnow)[0]["press"], "MS투데이")
@@ -11237,6 +11283,26 @@ def cmd_selftest() -> int:
           (_pt["pt-2"]["pfm_tone"], _pt["pt-2"]["pfm_tone_reason"]), ("중립", "사실 전달"))
     check("백필 — 언급 없음('')·이미 판정된 기사는 다시 안 부른다",
           (_pt["pt-3"]["pfm_tone"], _pt["pt-5"]["pfm_tone"], _ToneLLM.calls), (None, "긍정", 2))
+    # 본문이 없고 원문 재접속도 안 되는 기사 — 저장된 요약문의 언급 문장으로 논조만 판정한다
+    _tmp._exec(
+        "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+        " collected_at, source_type, group_companies, press_name, analyzed_at, status,"
+        " is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("pt-6", "u/pt-6", "u/pt-6", "u/pt-6", "t", iso(_pnow), iso(_pnow), "rss",
+         '["포스코퓨처엠"]', "한경", iso(_pnow), "active", 1))
+    _tmp.save_summary({"id": new_id(), "article_id": "pt-6",
+                       "summary_text": "포스코퓨처엠이 양극재 증설을 발표했다. 시장은 환영했다.",
+                       "perspective_text": "", "summary_source": "fulltext", "model": "m",
+                       "token_usage": None, "created_at": iso(_pnow)})
+    _before = _ToneLLM.calls
+    cmd_pfmtone(_tctx, limit=10)
+    _p6 = _tmp._one("select pfm_excerpt, pfm_tone from articles where id='pt-6'")
+    check("백필 — 본문이 없으면 요약문으로 논조만 판정(발췌는 NULL 유지)",
+          (_p6["pfm_tone"], _p6["pfm_excerpt"], _ToneLLM.calls - _before), ("중립", None, 1))
+    cmd_pfmtone(_tctx, limit=10)
+    check("백필 — 요약으로 판정된 기사는 다음 실행에서 다시 안 부른다",
+          _ToneLLM.calls - _before, 1)
+    _tmp._exec("delete from summaries where article_id='pt-6'")
     _tmp._exec("delete from articles where id like 'pt-%'")
     _tmp._exec("delete from article_bodies")
 

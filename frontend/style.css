@@ -656,9 +656,10 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .press-name { font-weight: 600; color: var(--navy); white-space: nowrap; }
 .press-caret { display: inline-block; width: 12px; color: var(--ink-soft); }
 .press-reporters { color: var(--ink-mid); font-size: 12.5px; min-width: 180px; }
-.press-table .tone-pos { color: var(--pos); font-weight: 600; }
+/* 언론사 탭 논조 색 — 긍정=파랑, 중립=검정, 부정=빨강 (기자 이름 색과 같은 규칙) */
+.press-table .tone-pos { color: #1a56db; font-weight: 600; }
 .press-table .tone-neg { color: var(--neg); font-weight: 600; }
-.press-table .tone-neu { color: var(--ink-mid); }
+.press-table .tone-neu { color: #111; }
 .press-table .zero { color: var(--ink-soft); font-weight: 400; }
 .press-detail[hidden] { display: none; }
 .press-detail > td { background: #fafbfe; padding: 6px 14px 12px; }
@@ -673,7 +674,27 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
   display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
   margin-right: 8px; background: #eef1f6; color: var(--ink-mid);
 }
-.press-tone.tone-pos { background: #e8f3ea; color: var(--pos); }
+.press-tone.tone-pos { background: #e6eeff; color: #1a56db; }
+.press-tone.tone-neu { background: #eee; color: #111; }
 .press-tone.tone-neg { background: #fde8e6; color: var(--neg); }
 .press-reason { margin: 2px 0 0; font-size: 12px; color: var(--ink-mid); }
 .press-more { color: var(--ink-soft); font-size: 12px; }
+.press-rank {
+  display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px;
+  background: var(--navy-soft); color: var(--navy); font-size: 11px; font-weight: 700;
+}
+/* 기자 이름 버튼 — 색이 논조: 긍정=파랑, 중립=검정, 부정=빨강, 미판정=회색 */
+.rep-chip {
+  border: 0; background: none; padding: 1px 3px; margin: 0; font: inherit; font-size: 12.5px;
+  cursor: pointer; border-radius: 4px; color: var(--ink-soft);
+}
+.rep-chip:hover, .rep-chip:focus { background: #eef1f6; outline: none; text-decoration: underline; }
+.rep-chip.rep-pos { color: #1a56db; font-weight: 600; }
+.rep-chip.rep-neu { color: #111; font-weight: 600; }
+.rep-chip.rep-neg { color: #d92d20; font-weight: 600; }
+.rep-view { padding-top: 4px; }
+.rep-back {
+  border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 3px 12px;
+  font-size: 12px; cursor: pointer; color: var(--navy);
+}
+.rep-title { margin: 12px 0 4px; font-size: 13px; color: var(--navy); }

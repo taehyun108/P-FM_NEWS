@@ -624,9 +624,14 @@ function openMaster() {
   $('masterModal').hidden = false;
   if (masterAuth()) showMasterPanel(); else showMasterLogin();
 }
-function closeMaster() { $('masterModal').hidden = true; }
+function closeMaster() { $('masterModal').hidden = true; afterMasterLogin = null; }
+
+// 로그인이 필요해 멈춘 동작(예: URL 등록). 로그인에 성공하면 이어서 실행한다.
+let afterMasterLogin = null;
 
 function showMasterLogin() {
+  // 예전엔 창을 열지 않고 내부 상태만 바꿔서, 로그인 전에 '등록'을 누르면 아무 반응이 없었다.
+  $('masterModal').hidden = false;
   $('masterLogin').hidden = false;
   $('masterPanel').hidden = true;
   $('masterPw').value = '';
@@ -1013,7 +1018,9 @@ function initMaster() {
       const d = await res.json();
       if (!d.ok) { $('masterLoginMsg').textContent = d.error || '로그인 실패'; $('masterLoginMsg').hidden = false; return; }
       saveMasterAuth(d.token, d.ttl_hours);
-      showMasterPanel();
+      const next = afterMasterLogin;
+      afterMasterLogin = null;
+      if (next) { closeMaster(); next(); } else showMasterPanel();
     } catch {
       $('masterLoginMsg').textContent = '서버에 연결하지 못했습니다.';
       $('masterLoginMsg').hidden = false;
@@ -1389,12 +1396,12 @@ function buildPressTable(items) {
   const table = el('table', 'press-table');
   const thead = el('thead');
   const h1 = el('tr');
-  [['언론사', { rowSpan: 2 }], ['언급 횟수', { colSpan: 3 }], ['논조', { colSpan: 3 }],
-    ['기자 (건수)', { rowSpan: 2 }]].forEach(([t, span]) => {
+  [['언론사 (언급 순위)', { rowSpan: 2 }], ['언급 횟수', { colSpan: 3 }], ['논조', { colSpan: 4 }],
+    ['기자 (건수) · 색=논조', { rowSpan: 2 }]].forEach(([t, span]) => {
     h1.append(Object.assign(el('th', null, t), span));
   });
   const h2 = el('tr');
-  ['주간', '월간', '연간', '긍정', '중립', '부정'].forEach((t) => h2.append(el('th', 'num', t)));
+  ['주간', '월간', '연간', '긍정', '중립', '부정', '미판정'].forEach((t) => h2.append(el('th', 'num', t)));
   thead.append(h1, h2);
   const tbody = el('tbody');
   items.forEach((it) => {
@@ -1403,27 +1410,50 @@ function buildPressTable(items) {
     tr.setAttribute('aria-expanded', 'false');
     const name = el('td', 'press-name');
     name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
+    if (it.rank) name.append(el('span', 'press-rank', `${it.rank}위`));
     tr.append(name);
     [it.week, it.month, it.year].forEach((n) => tr.append(el('td', 'num', String(n))));
     ['긍정', '중립', '부정'].forEach((k) => {
       const n = (it.tone || {})[k] || 0;
       tr.append(el('td', `num tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n)));
     });
-    const reps = (it.reporters || []).map((r) => `${r.name}(${r.count})`).join(', ');
-    tr.append(el('td', 'press-reporters', reps || '—'));
+    tr.append(el('td', `num${((it.tone || {})['미판정'] || 0) ? '' : ' zero'}`,
+      String((it.tone || {})['미판정'] || 0)));
 
     const detail = el('tr', 'press-detail');
     detail.hidden = true;
     const cell = el('td');
-    cell.colSpan = 9;
+    cell.colSpan = 10;
     detail.append(cell);
-    const toggle = () => {
-      const open = detail.hidden;
+    const showAll = () => cell.replaceChildren(buildPressArticles(it));   // 언론사 전체 기사
+    const setOpen = (open) => {
       detail.hidden = !open;
       tr.setAttribute('aria-expanded', String(open));
       name.firstChild.textContent = open ? '▾' : '▸';
-      if (open && !cell.childNodes.length) cell.append(buildPressArticles(it));
     };
+    const toggle = () => {
+      const open = detail.hidden;
+      setOpen(open);
+      if (open) showAll();     // 기자 화면에서 접었다 펼치면 전체 기사로 돌아온다
+    };
+    // 기자 이름 — 논조 색(긍정=파랑·중립=검정·부정=빨강). 누르면 그 기자의 기사만 보여준다.
+    const repCell = el('td', 'press-reporters');
+    (it.reporters || []).forEach((r) => {
+      const cls = TONE_CLASS[r.color] || 'none';
+      const chip = el('button', `rep-chip rep-${cls}`, `${r.name}(${r.count})`);
+      chip.type = 'button';
+      const t = r.tone || {};
+      chip.title = `긍정 ${t['긍정'] || 0} · 중립 ${t['중립'] || 0} · 부정 ${t['부정'] || 0}`
+        + ` · 미판정 ${t['미판정'] || 0} — 누르면 이 기자의 기사만 봅니다`;
+      chip.addEventListener('click', (ev) => {
+        ev.stopPropagation();   // 언론사 행 펼침 토글과 분리
+        setOpen(true);
+        cell.replaceChildren(buildReporterView(it, r, showAll));
+      });
+      repCell.append(chip, document.createTextNode(' '));
+    });
+    if (!(it.reporters || []).length) repCell.textContent = '—';
+    tr.append(repCell);
     tr.addEventListener('click', toggle);
     tr.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
@@ -1433,6 +1463,42 @@ function buildPressTable(items) {
   table.append(thead, tbody);
   wrap.append(table);
   return wrap;
+}
+
+/* 기자 1명의 기사 — 포스코퓨처엠 기사(집계 데이터) + 그 기자가 쓴 인사·부고(목록 API) */
+function buildReporterView(it, rep, onBack) {
+  const box = el('div', 'rep-view');
+  const back = el('button', 'rep-back', `← ${it.press} 전체 기사`);
+  back.type = 'button';
+  back.addEventListener('click', (ev) => { ev.stopPropagation(); onBack(); });
+  box.append(back, el('h4', 'rep-title', `${rep.name} 기자 · 포스코퓨처엠 기사 ${rep.count}건`));
+  const mine = (it.articles || []).filter((a) => (a.authors || []).includes(rep.name));
+  box.append(buildPressArticles({ articles: mine, year: mine.length }));
+
+  box.append(el('h4', 'rep-title', '인사·부고'));
+  const people = el('ul', 'press-articles');
+  people.append(el('li', 'press-more', '불러오는 중…'));
+  box.append(people);
+  const qs = new URLSearchParams({
+    cat: '인사·부고', s_author: rep.name, press: it.press, size: '50',
+  });
+  getJSON(`/api/articles?${qs}`).then((d) => {
+    people.replaceChildren();
+    (d.items || []).forEach((c) => {
+      const li = el('li');
+      li.append(el('span', 'press-date', (c.published_at || '').slice(0, 10)));
+      const link = el('a', null, c.title);
+      link.href = c.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      li.append(link);
+      people.append(li);
+    });
+    if (!(d.items || []).length) people.append(el('li', 'press-more', '이 기자의 인사·부고 기사가 없습니다.'));
+  }).catch(() => {
+    people.replaceChildren(el('li', 'press-more', '불러오지 못했습니다.'));
+  });
+  return box;
 }
 
 function buildPressArticles(it) {
@@ -1795,7 +1861,12 @@ async function submitUrl(e) {
 
 async function confirmDraft() {
   if (!pendingDraft) return;
-  if (!masterAuth()) { showMasterLogin(); return; }
+  if (!masterAuth()) {
+    urlMsg('info', '등록은 관리자 로그인이 필요합니다. 로그인하면 이어서 등록됩니다.');
+    afterMasterLogin = confirmDraft;
+    showMasterLogin();
+    return;
+  }
   try {
     const res = await masterFetch(`/api/articles/${pendingDraft.id}/confirm`, { method: 'POST' });
     if (!(await res.json()).ok) throw new Error();
@@ -1804,13 +1875,23 @@ async function confirmDraft() {
     urlMsg('ok', '목록에 등록했습니다.');
     clearUrlPreview();
   } catch (err) {
-    if (err.message !== 'unauthorized') urlMsg('err', '등록에 실패했습니다.');
+    if (err.message === 'unauthorized') {
+      afterMasterLogin = confirmDraft;   // 토큰 만료 — 다시 로그인하면 이어서 등록
+      urlMsg('info', '로그인이 만료되었습니다. 다시 로그인하면 이어서 등록됩니다.');
+    } else {
+      urlMsg('err', '등록에 실패했습니다.');
+    }
   }
 }
 
 async function discardDraft() {
   if (!pendingDraft) return;
-  if (!masterAuth()) { showMasterLogin(); return; }
+  if (!masterAuth()) {
+    // 로그인 없이는 서버 초안을 지울 수 없다(24시간 뒤 자동 정리) — 화면 미리보기만 닫는다.
+    urlMsg('info', '등록하지 않았습니다.');
+    clearUrlPreview();
+    return;
+  }
   try {
     await masterFetch(`/api/articles/${pendingDraft.id}/discard`, { method: 'POST' });
   } catch { /* 실패해도 24시간 뒤 자동 정리된다 */ }
