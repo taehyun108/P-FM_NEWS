@@ -331,6 +331,12 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 
 .card-summary { margin: 9px 14px 0; font-size: 13px; color: var(--ink-mid); }
 .card-summary--people { white-space: pre-wrap; line-height: 1.6; }
+/* 긴 인사 명단은 10줄 높이로 접는다(줄 높이 1.6 × 13px ≈ 20.8px) */
+.card-summary--people.is-folded { max-height: calc(20.8px * 10); overflow: hidden; }
+.people-more {
+  display: block; margin: 4px 14px 0; padding: 2px 10px; border: 1px solid var(--line);
+  background: #fff; color: var(--navy); border-radius: 999px; font-size: 12px; cursor: pointer;
+}
 .summary-head { color: var(--navy); font-weight: 700; }
 
 .card-excerpt {

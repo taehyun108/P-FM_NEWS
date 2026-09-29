@@ -2452,6 +2452,7 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "fnnews.com": ("파이낸셜뉴스", 2), "edaily.co.kr": ("이데일리", 2), "mt.co.kr": ("머니투데이", 2),
     "etnews.com": ("전자신문", 2), "thelec.kr": ("전자부품 전문 미디어", 2),
     "econovill.com": ("이코노믹리뷰", 2), "ebn.co.kr": ("EBN", 2), "fetv.co.kr": ("FETV", 2),
+    "busan.com": ("부산일보", 2), "tjb.co.kr": ("TJB 대전방송", 3), "vop.co.kr": ("민중의소리", 3),
     "kookje.co.kr": ("국제신문", 2), "asiae.co.kr": ("아시아경제", 2),
     "electimes.com": ("전기신문", 2), "theguru.co.kr": ("더구루", 3),
     "economist.co.kr": ("이코노미스트", 2), "biz.chosun.com": ("조선비즈", 2),
@@ -3338,14 +3339,22 @@ def _split_person_item(item: str) -> tuple[str, str]:
     return "", ""
 
 
+# 인사 기사 표기 — 헤더는 ◇◆□■, 항목은 ▲△▶▷ 로 시작한다. 연합뉴스 [인사] 법무부처럼
+# 기사마다 △ 를 쓰기도 해서(2026-09-29 사용자 지적: 검사 전보 내용 누락) ▲ 만 보면 항목이 통째로 사라진다.
+_PEOPLE_HEAD_RE = re.compile(r"[◇◆□■]\s*")
+_PEOPLE_ITEM_RE = re.compile(r"[▲△▶▷]")
+PEOPLE_RULE_MODEL = "rule"     # 규칙 기반으로 정리했다는 표시(LLM 을 쓰지 않았다)
+PEOPLE_BULK_ITEMS = 6          # 이 인원을 넘으면 LLM 을 건너뛰고 한 줄씩 규칙 정리한다
+
+
 def _split_people_sections(text: str) -> list[tuple[str, str]]:
-    """'◇ 헤더 ▲ 항목 ▲ 항목 ◇ 헤더2 ▲ 항목' → [(헤더, 항목), …]."""
+    """'◇ 헤더 ▲ 항목 △ 항목 ◇ 헤더2 ▲ 항목' → [(헤더, 항목), …]."""
     pairs: list[tuple[str, str]] = []
-    for section in re.split(r"◇\s*", text):
+    for section in _PEOPLE_HEAD_RE.split(text):
         section = section.strip()
         if not section:
             continue
-        parts = section.split("▲")
+        parts = _PEOPLE_ITEM_RE.split(section)
         header = parts[0].strip()
         for raw_item in parts[1:]:
             item = raw_item.strip(" ·,;")
@@ -3444,21 +3453,17 @@ def format_people_notice(body: str, kind: str) -> str:
            (사용자 지정 2026-09-28). 연락처는 ▲ 단위로만 잘라 절대 안 잘린다.
     인사:  '◇ 부서 ▲ 직책 이름 …' — (직책, 이름)을 갈라 'ㆍ직책 이름 (헤더)' 로 만든다.
     """
-    text = re.sub(r"\s+", " ", (body or "").strip())
-    text = _NOTICE_HEAD_RE.sub("", text, count=1)
-    text = _NOTICE_TAIL_RE.sub("", text).strip()
+    text = _clean_notice_text(body)
     if kind == "obituary":
         raw_blocks = [b.strip() for b in text.split("▲") if b.strip()]
         if not raw_blocks:
             return text[:800]
         blocks = [_parse_obituary_block(b) for b in raw_blocks]
         return _join_capped(blocks, "\n\n", 1600)
-    m = re.search(r"[◇▲■].*", text)
-    if not m:
-        return text[:800]
-    pairs = _split_people_sections(m.group(0))
+    pairs = _personnel_pairs(text)
     if not pairs:
-        return m.group(0).strip()[:800]
+        m = re.search(r"[◇◆□■▲△].*", text)
+        return m.group(0).strip()[:2000] if m else text[:800]
     lines = []
     for header, item in pairs:
         pos, name = _split_person_item(item)
@@ -3466,7 +3471,25 @@ def format_people_notice(body: str, kind: str) -> str:
         if header:
             line += f" ({header})"
         lines.append(line)
-    return _join_capped(lines, "\n", 1600)
+    # 인사는 사람 수가 수백 명일 수 있다(검사 인사 등). 뒤쪽(전보 등)이 잘려 나가면 안 되므로
+    # 사실상 상한 없이 전부 담는다 — 카드는 화면에서 접어 보여 준다.
+    return _join_capped(lines, "\n", PEOPLE_LINES_MAX_CHARS)
+
+
+PEOPLE_LINES_MAX_CHARS = 60000
+
+
+def _clean_notice_text(body: str) -> str:
+    """공백을 정리하고 머리(구독 안내)·꼬리(저작권 문구)를 떼어낸 인사·부고 공지 본문."""
+    text = re.sub(r"\s+", " ", (body or "").strip())
+    text = _NOTICE_HEAD_RE.sub("", text, count=1)
+    return _NOTICE_TAIL_RE.sub("", text).strip()
+
+
+def _personnel_pairs(text: str) -> list[tuple[str, str]]:
+    """정리된 공지 본문에서 (헤더, 항목) 목록을 뽑는다. 항목이 없으면 빈 목록."""
+    m = re.search(r"[◇◆□■▲△].*", text)
+    return _split_people_sections(m.group(0)) if m else []
 
 
 # ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
@@ -3575,6 +3598,11 @@ def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
     공지가 짧아 본문 추출이 푸터를 잡은 경우 og:description·<article> 텍스트로 보강한다.
     """
     notice = _notice_text(html, body)
+    # 인원이 많은 인사(검사 인사 수십~수백 명 등)는 LLM 이 20명에서 끊기고 뒤 섹션(전보)이
+    # 빠졌다. 이런 공지는 이름·직책 나열이라 LLM 이 더 보탤 것도 없으므로, 규칙으로 전원을
+    # 한 줄씩 정리한다(LLM 비용도 0).
+    if kind == "personnel" and len(_personnel_pairs(_clean_notice_text(notice))) > PEOPLE_BULK_ITEMS:
+        return format_people_notice(notice, kind), PEOPLE_RULE_MODEL, {}
     if use_llm:
         parsed, usage = ctx.llm.people_notice(kind, title, press, notice)
         text = format_people_llm(parsed, kind) if parsed else ""
@@ -3689,6 +3717,11 @@ def select_naver_keywords(keyword_rows: Sequence[dict], cycle: int) -> list[dict
     return always + [r for i, r in enumerate(rotating) if i % slots == slot]
 
 
+NAVER_FETCH_WORKERS = 4      # 네이버 API 전용 동시 요청 수 — 10개로 보내면 초당 한도(429)에 걸렸다
+NAVER_429_RETRIES = 2        # 429 를 받으면 쉬었다가 이만큼 다시 시도한 뒤에야 라운드를 중단한다
+NAVER_429_BACKOFF_SEC = 1.5  # 첫 대기(다음은 2배·3배)
+
+
 def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -> list[RawItem]:
     """NAVER API HUB 뉴스 검색. 직접 크롤링은 약관 위반이므로 하지 않는다. (PRD §7-4)
 
@@ -3710,7 +3743,8 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
         return []
     headers = {"X-NCP-APIGW-API-KEY-ID": cfg.naver_client_id,
                "X-NCP-APIGW-API-KEY": cfg.naver_client_secret}
-    stop_event = threading.Event()   # 429 한 번 보면 아직 안 나간 요청은 건너뛴다
+    stop_event = threading.Event()   # 재시도까지 해도 429 면 아직 안 나간 요청은 건너뛴다
+    pause_until = [0.0]              # 429 를 본 순간 모든 작업자가 이 시각까지 함께 쉰다(순간 폭주 완화)
 
     def _fetch_one(row: Any) -> tuple[list[RawItem], int, bool]:
         if stop_event.is_set():
@@ -3718,13 +3752,26 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
         keyword = row["keyword"] if isinstance(row, dict) else row
         category = row.get("category", "") if isinstance(row, dict) else ""
         try:
-            resp = http.get(
-                NAVER_NEWS_API,
-                # 5분 간격 폴링에는 최신 30건이면 충분하다. 100건을 받으면
-                # 대부분 backfill·중복이라 분석 백로그만 부풀린다.
-                params={"query": keyword, "display": 30, "sort": "date"},
-                headers=headers,
-            )
+            resp = None
+            for attempt in range(NAVER_429_RETRIES + 1):
+                wait = pause_until[0] - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                if stop_event.is_set():
+                    return [], 0, False
+                resp = http.get(
+                    NAVER_NEWS_API,
+                    # 5분 간격 폴링에는 최신 30건이면 충분하다. 100건을 받으면
+                    # 대부분 backfill·중복이라 분석 백로그만 부풀린다.
+                    params={"query": keyword, "display": 30, "sort": "date"},
+                    headers=headers,
+                )
+                if resp.status_code != 429:
+                    break
+                # 429 는 하루 한도 소진이 아니라 '1초에 너무 많이' 인 경우가 대부분이다
+                # (2026-09-30 로그: 라운드 시작 1초 뒤 동시 2~4건, 나머지 회차는 정상).
+                # 예전엔 즉시 라운드 전체를 중단해 그 회차 키워드 조회가 통째로 사라졌다.
+                pause_until[0] = max(pause_until[0], time.monotonic() + NAVER_429_BACKOFF_SEC * (attempt + 1))
             if resp.status_code in (401, 403):
                 raise RuntimeError(
                     f"{resp.status_code} 인증 실패 — .env 의 NAVER_CLIENT_ID/SECRET 이 "
@@ -3732,7 +3779,8 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
                 )
             if resp.status_code == 429:
                 stop_event.set()
-                log.warning("Naver API 호출 한도 초과(429). 이번 실행의 네이버 수집을 중단합니다.")
+                log.warning("Naver API 호출 한도 초과(429) — %d회 재시도 후에도 계속됩니다. "
+                            "이번 실행의 네이버 수집을 중단합니다.", NAVER_429_RETRIES)
                 return [], 0, True
             resp.raise_for_status()
             data = resp.json()
@@ -3762,7 +3810,7 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
     dropped = 0
     fail_count = 0
     if keyword_rows:
-        with ThreadPoolExecutor(max_workers=min(SOURCE_FETCH_WORKERS, len(keyword_rows))) as pool:
+        with ThreadPoolExecutor(max_workers=min(NAVER_FETCH_WORKERS, len(keyword_rows))) as pool:
             for its, drp, failed in pool.map(_fetch_one, keyword_rows):
                 items.extend(its)
                 dropped += drp
@@ -3898,6 +3946,24 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
     if not canonical:
         canonical = final_url if not _is_bare_root(final_url) else url
     return normalize_url(canonical), text
+
+
+FETCH_FAIL_LIMIT = 3   # 원문 접속에 연속 이만큼 실패해야 '접속 실패'로 영구 제외한다
+
+
+def fetch_fallback_url(item: Any) -> str:
+    """원문 접속에 실패했지만 제목·리드만으로 이어갈 수 있으면 그 기사 URL, 아니면 ''.
+
+    구글뉴스 중간 링크(news.google.com)는 실제 기사 주소가 아니라 카드 링크로 쓸 수 없으므로
+    제외한다. 제목이 없거나 http 주소가 아니어도 이어갈 수 없다.
+    """
+    url = (item.url_original or "").strip()
+    if not (item.title or "").strip() or not url.lower().startswith(("http://", "https://")):
+        return ""
+    host = (urlsplit(url).hostname or "").lower()
+    if host.endswith("news.google.com") or _is_bare_root(url):
+        return ""
+    return normalize_url(url)
 
 
 def prefetch_articles(http: HttpClient, urls: Sequence[str], workers: int = 6) -> dict[str, tuple[str, str]]:
@@ -5111,7 +5177,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             })
             summary, model, usage = people_summary(ctx, pk, art["title"], press_name, body,
                                                    use_llm=people_llm > 0, html=html)
-            if model:
+            if model and model != PEOPLE_RULE_MODEL:
                 people_llm -= 1
             storage.save_summary({
                 "id": new_id(), "article_id": aid,
@@ -5222,7 +5288,7 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "summary_source": "notice", "model": model, "token_usage": usage or None,
         "created_at": iso(now_utc()),
     })
-    return bool(model)
+    return bool(model) and model != PEOPLE_RULE_MODEL   # 규칙 정리는 LLM 예산을 쓰지 않는다
 
 
 @dataclass
@@ -5233,6 +5299,7 @@ class Context:
     seen_cache: set[str] = field(default_factory=set)
     last_naver_fetch: float = 0.0
     naver_cycle: int = 0        # 키워드 교대 조회 회차 (select_naver_keywords)
+    fetch_fail: dict[str, int] = field(default_factory=dict)   # 원문 접속 연속 실패 횟수(프로세스 메모리)
     _llm: LLMClient | None = None
 
     @property
@@ -5727,8 +5794,26 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     for item, is_backfill in fresh:
         canonical, html = prefetched.get(item.url_original, ("", ""))
         if not canonical:
-            storage.upsert_ledger(item.url_source, "extract_failed")
-            continue
+            # 원문 접속 실패. 예전엔 1회 실패로 180일 영구 제외해서, 일시 장애든 우리 서버 IP 를
+            # 막은 사이트든 관련 기사가 통째로 사라졌다(2026-09-30 진단: 3일간 143건).
+            # ① 제목·리드(스니펫)가 있으면 그것만으로 계속 진행한다 — 아래 G4 가 snippet 요약으로
+            #    처리하고 관련성 판정도 똑같이 적용한다.
+            # ② 그럴 수 없으면 연속 3회 실패해야 제외한다(그 전까지는 다음 회차에 다시 시도).
+            # 인사·부고는 본문 명단이 곧 내용이라 제목만으로는 의미가 없다 — 재시도 쪽으로 보낸다.
+            fallback = ("" if people_news_kind(item.url_original, item.title)
+                        else fetch_fallback_url(item))
+            if fallback:
+                canonical, html = fallback, ""
+                ctx.fetch_fail.pop(item.url_source, None)
+                log.info("원문 접속 실패 → 제목·요약만으로 진행: %s", item.title[:44])
+            else:
+                strikes = ctx.fetch_fail.get(item.url_source, 0) + 1
+                if strikes >= FETCH_FAIL_LIMIT:
+                    storage.upsert_ledger(item.url_source, "extract_failed")
+                    ctx.fetch_fail.pop(item.url_source, None)
+                else:
+                    ctx.fetch_fail[item.url_source] = strikes
+                continue
 
         # ── G4: 본문 추출 (G3 응답을 재사용하므로 추가 요청 없음) ────
         body = extract_body(html)
@@ -5738,7 +5823,10 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         if summary_source == "snippet":
             body = item.snippet or item.title
 
-        press_name, press_id, press_tier = resolve_press(storage, canonical, item.press_hint, html, http)
+        # 원문을 못 받은(html 없음) 기사는 언론사 홈페이지도 막혀 있을 가능성이 커서 조회하지 않는다
+        # (막힌 사이트마다 수십 초씩 회차가 늘어지는 것을 막는다).
+        press_name, press_id, press_tier = resolve_press(
+            storage, canonical, item.press_hint, html, http if html else None)
         is_policy = bool(KOREA_KR_NEWS_RE.search(canonical or ""))
         # 정책브리핑 기사는 기자명 대신 발표 부처명을 넣는다. (사용자 지정)
         author = extract_ministry(html, body) if is_policy else extract_author(html, body, press_name)
@@ -10664,6 +10752,41 @@ def cmd_selftest() -> int:
           "ㆍ생활산업부 차장 이인영 (차장 승진)\n"
           "ㆍ미래산업부 차장 박지혜 (차장 승진)\n"
           "ㆍ자본시장부 차장 장민태 (차장 승진)")
+    # 회귀 방지(2026-09-29, 사용자 지적): [인사] 법무부 — 신규 보임 뒤 '전보' 명단이 누락됐다.
+    # 원인: LLM 20명 상한 · △ 항목 표시 미인식 · 1600자 상한. 실제 연합뉴스 기사 형식.
+    _moj_new = ["법무연수원 기획부장 박진성", "대검찰청 마약·조직범죄부장 홍완희", "대검찰청 공판송무부장 안성희",
+                "대검찰청 과학수사부장 장혜영", "대전고검 차장검사 정광수", "대구고검 차장검사 조아라",
+                "전주지검 검사장 이정렬"]
+    _moj_move = [f"서울{i}지검 검사장 김철{'수영민준서진호'[i % 6]}" for i in range(25)]
+    _moj_text = ("◇ 대검검사급 신규 보임 " + " ".join("▲ " + x for x in _moj_new)
+                 + " ◇ 대검검사급 전보 " + " ".join("▲ " + x for x in _moj_move) + " (서울=연합뉴스)")
+    _moj_out = format_people_notice(_moj_text, "personnel").splitlines()
+    check("인사 대량(검사 인사) — 신규 보임 7 + 전보 25 = 32줄, 뒤 섹션까지 전부",
+          (len(_moj_out), _moj_out[0], _moj_out[-1].endswith("(대검검사급 전보)")),
+          (32, "ㆍ법무연수원 기획부장 박진성 (대검검사급 신규 보임)", True))
+    check("인사 대량 — 꼬리표 '(서울=연합뉴스)' 는 이름에 안 섞인다",
+          any("연합뉴스" in ln for ln in _moj_out), False)
+    _moj_tri = ("◇ 공소청 검사급 검사 신규 보임 △ 법무부 법무실장 김남훈 △ 법무연수원 기획부장 구태연 "
+                "◇ 공소청 검사급 검사 전보 △ 법무부 형사사법국장 박지호 △ 서울고검 차장검사 이도윤")
+    check("인사 — △ 표시 기사도 한 줄씩(전보 포함)",
+          format_people_notice(_moj_tri, "personnel").splitlines(),
+          ["ㆍ법무부 법무실장 김남훈 (공소청 검사급 검사 신규 보임)",
+           "ㆍ법무연수원 기획부장 구태연 (공소청 검사급 검사 신규 보임)",
+           "ㆍ법무부 형사사법국장 박지호 (공소청 검사급 검사 전보)",
+           "ㆍ서울고검 차장검사 이도윤 (공소청 검사급 검사 전보)"])
+    check("인사 — ◆ 헤더도 인식", format_people_notice("◆ 신규 ▲ 서울지검 검사장 김철수", "personnel"),
+          "ㆍ서울지검 검사장 김철수 (신규)")
+
+    class _NoLLM:
+        model = "x"
+
+        def people_notice(self, *a, **k):
+            raise AssertionError("대량 인사는 LLM 을 부르면 안 된다")
+
+    _bulk_ctx = type("C", (), {"llm": _NoLLM()})()
+    _bs, _bm, _bu = people_summary(_bulk_ctx, "personnel", "[인사] 법무부", "연합뉴스", _moj_text, True)
+    check("인사 대량 — LLM 없이 규칙 정리(모델 표시 rule), 32줄 전부",
+          (_bm, len(_bs.splitlines())), (PEOPLE_RULE_MODEL, 32))
     check("직함만 있고 이름이 없으면(끝 토큰이 흔한 직함) 나누지 않는다",
           format_people_notice("◇ 인사 ▲ 정치부 부장", "personnel"),
           "ㆍ정치부 부장 (인사)")
@@ -11592,7 +11715,36 @@ def cmd_selftest() -> int:
         def get(self, url: str, params: dict | None = None, headers: dict | None = None,
                **kw: Any) -> Any:
             return _FakeNaverResp(429, [])
-    check("429 응답이면 예외 없이 빈 결과", collect_naver(_FakeNaver429Http(), _ncfg2, _nkw_rows), [])
+    check("429 응답이 계속되면 예외 없이 빈 결과", collect_naver(_FakeNaver429Http(), _ncfg2, _nkw_rows), [])
+
+    # 순간 폭주로 처음 몇 건만 429 → 쉬었다 재시도해서 라운드 전체가 살아야 한다(2026-09-30).
+    class _FakeNaverBurstHttp(_FakeNaverHttp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = 3
+            self._lk = threading.Lock()
+        def get(self, url: str, params: dict | None = None, headers: dict | None = None,
+               **kw: Any) -> Any:
+            with self._lk:
+                if self.first > 0:
+                    self.first -= 1
+                    return _FakeNaverResp(429, [])
+            return super().get(url, params=params, headers=headers, **kw)
+    _burst = collect_naver(_FakeNaverBurstHttp(), _ncfg2, _nkw_rows)
+    check("일시적 429(초반 3건) — 재시도해서 12개 키워드 결과를 모두 받는다", len(_burst), 12)
+    check("네이버 조회 동시 작업 수는 10보다 낮다(순간 폭주 방지)", NAVER_FETCH_WORKERS < SOURCE_FETCH_WORKERS, True)
+
+    print("\n[7-3] 원문 접속 실패 처리 — 기사가 조용히 사라지지 않는다 (2026-09-30)")
+    _fb = RawItem(url_source="https://www.busan.com/a/1", url_original="https://www.busan.com/a/1?x=1",
+                  title="포스코퓨처엠, 증설", published_at=None, source_type="naver_api", snippet="증설한다")
+    check("접속 실패 시 제목·리드로 계속 — 기사 URL 을 그대로 쓴다",
+          fetch_fallback_url(_fb), normalize_url("https://www.busan.com/a/1?x=1"))
+    check("구글뉴스 중간 링크는 진행 불가(카드 링크로 못 씀)",
+          fetch_fallback_url(RawItem("u", "https://news.google.com/rss/articles/CBM", "제목", None, "google_rss")), "")
+    check("제목이 없거나 도메인 루트면 진행 불가",
+          (fetch_fallback_url(RawItem("u", "https://a.com/x", "  ", None, "rss")),
+           fetch_fallback_url(RawItem("u", "https://a.com/", "제목", None, "rss"))), ("", ""))
+    check("영구 제외는 연속 3회 실패부터", FETCH_FAIL_LIMIT, 3)
 
     def _rss_xml(title: str, link: str) -> str:
         return (

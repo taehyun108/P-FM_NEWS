@@ -42,6 +42,8 @@ const SORT_OPTIONS = [
 ];
 
 const $ = (id) => document.getElementById(id);
+const PEOPLE_FOLD_LINES = 10;   // 인사·부고 카드는 이 줄 수까지만 접힌 채로 보여 준다
+
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -497,6 +499,18 @@ function buildCard(item) {
     }
     p.append(document.createTextNode(item.summary_text));
     card.append(p);
+    /* 인사가 수십 명이면(검사 인사 등) 카드가 너무 길어지므로 처음 10줄만 보이고 펼친다. 내용은 전부 있다. */
+    const lineCount = item.summary_text.split('\n').filter((l) => l.trim()).length;
+    if (isPeople && lineCount > PEOPLE_FOLD_LINES) {
+      p.classList.add('is-folded');
+      const more = el('button', 'people-more', `전체 ${lineCount}줄 펼치기 ▾`);
+      more.type = 'button';
+      more.addEventListener('click', () => {
+        const folded = p.classList.toggle('is-folded');
+        more.textContent = folded ? `전체 ${lineCount}줄 펼치기 ▾` : '접기 ▴';
+      });
+      card.append(more);
+    }
   }
 
   /* 포스코퓨처엠 언급 발췌 — 본문 원문에서 언급 문장+앞뒤 문맥(약 4줄).
