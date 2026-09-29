@@ -3035,11 +3035,33 @@ class HttpClient:
         self.count = 0
         self._lock = threading.Lock()
 
+    def _is_dropped_connection(self, exc: Exception) -> bool:
+        """재사용하려던 연결이 이미 끊겨 있어서 난 실패인가.
+
+        'Connection aborted' / RemoteDisconnected / 'Connection reset' 이 해당한다.
+        SSL·프록시·연결 시간초과·읽기 시간초과는 재시도로 나아지지 않으니 제외한다.
+        """
+        exc_mod = self._requests.exceptions
+        if isinstance(exc, (exc_mod.SSLError, exc_mod.ProxyError, exc_mod.ConnectTimeout)):
+            return False
+        text = str(exc)
+        return ("Connection aborted" in text or "RemoteDisconnected" in text
+                or "Connection reset" in text)
+
     def get(self, url: str, **kwargs: Any):
         with self._lock:
             self.count += 1
         kwargs.setdefault("timeout", self.timeout)
-        return self.session.get(url, **kwargs)
+        try:
+            return self.session.get(url, **kwargs)
+        except self._requests.exceptions.ConnectionError as exc:
+            if not self._is_dropped_connection(exc):
+                raise
+            # 서버·중간 장비가 유휴 연결을 조용히 끊었는데 그 연결을 재사용하다 실패한 경우다.
+            # 실사례(2026-09-30): 연합뉴스 RSS 가 5분 수집 회차마다 번갈아 실패했다. 죽은 연결은
+            # 이미 풀에서 버려졌으니 새 연결로 딱 1회만 다시 시도한다. (GET 전용 — 멱등이라 안전.
+            # 기사 페이지 조회가 이렇게 한 번 실패하면 URL 원장에 영구 제외로 남았다.)
+            return self.session.get(url, **kwargs)
 
     def post(self, url: str, **kwargs: Any):
         with self._lock:
@@ -11044,6 +11066,105 @@ def cmd_selftest() -> int:
     check("분석 끝난 기사의 보관 본문은 분석 대기 큐에 안 들어간다",
           "st-b" in {r["id"] for r in _tmp.unanalyzed_with_body(50)}, False)
     _tmp._exec("delete from article_bodies")
+
+    print("\n[11-2e4] HTTP 끊어진 연결 재사용 실패 — 1회 재시도 (2026-09-30)")
+    # 실사례: 연합뉴스 RSS 가 5분 회차마다 번갈아 'Connection aborted / RemoteDisconnected' 로 실패했다.
+    # 로컬 서버가 같은 연결의 두 번째 요청에 응답 없이 연결을 끊는 상황을 재현한다.
+    import http.server as _hs
+    import socketserver as _ss
+
+    class _DropSecondHandler(_hs.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"   # keep-alive
+        _hits = 0
+
+        def do_GET(self):
+            self._hits += 1
+            if self._hits >= 2:         # 같은 연결의 2번째 요청 → 무응답 종료(유휴 연결이 죽은 상황)
+                self.close_connection = True
+                self.connection.close()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    class _DropServer(_ss.ThreadingMixIn, _hs.HTTPServer):
+        daemon_threads = True
+
+    _srv = _DropServer(("127.0.0.1", 0), _DropSecondHandler)
+    threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    _drop_url = f"http://127.0.0.1:{_srv.server_address[1]}/x"
+    _hc = HttpClient()
+    _hc.session.trust_env = False       # 환경 프록시가 로컬 주소를 가로채지 않게
+    _codes = []
+    for _ in range(4):                  # 요청마다 '죽은 연결 재사용' 이 번갈아 일어난다
+        _codes.append(_hc.get(_drop_url).status_code)
+    check("끊어진 연결을 재사용해 실패해도 새 연결로 재시도해 성공한다", _codes, [200, 200, 200, 200])
+    # 재시도 없는 세션 그대로면 실제로 실패한다 — 위 테스트가 의미 있는지 확인
+    _plain = HttpClient()
+    _plain.session.trust_env = False
+    _plain.session.get(_drop_url)
+    try:
+        _plain.session.get(_drop_url)
+        _plain_failed = False
+    except Exception:
+        _plain_failed = True
+    check("(대조) 재시도 없는 세션은 같은 상황에서 실제로 실패한다", _plain_failed, True)
+    _srv.shutdown()
+
+    _calls = {"n": 0}
+    _hc2 = HttpClient()
+    _ex = _hc2._requests.exceptions
+
+    def _raise_ssl(url, **kw):
+        _calls["n"] += 1
+        raise _ex.SSLError("certificate verify failed")
+
+    _hc2.session.get = _raise_ssl
+    try:
+        _hc2.get("http://x.test/")
+    except _ex.SSLError:
+        pass
+    check("SSL 오류는 재시도하지 않는다(1번만 시도)", _calls["n"], 1)
+
+    def _raise_connect_timeout(url, **kw):
+        _calls["n"] += 1
+        raise _ex.ConnectTimeout("Connection to x timed out")
+
+    _calls["n"] = 0
+    _hc2.session.get = _raise_connect_timeout
+    try:
+        _hc2.get("http://x.test/")
+    except _ex.ConnectTimeout:
+        pass
+    check("연결 시간초과는 재시도하지 않는다(응답 없는 서버를 두 배로 기다리지 않게)", _calls["n"], 1)
+
+    def _raise_read_timeout(url, **kw):
+        _calls["n"] += 1
+        raise _ex.ReadTimeout("Read timed out")
+
+    _calls["n"] = 0
+    _hc2.session.get = _raise_read_timeout
+    try:
+        _hc2.get("http://x.test/")
+    except _ex.ReadTimeout:
+        pass
+    check("읽기 시간초과도 재시도하지 않는다", _calls["n"], 1)
+
+    def _always_dropped(url, **kw):
+        _calls["n"] += 1
+        raise _ex.ConnectionError("('Connection aborted.', RemoteDisconnected('x'))")
+
+    _calls["n"] = 0
+    _hc2.session.get = _always_dropped
+    try:
+        _hc2.get("http://x.test/")
+    except _ex.ConnectionError:
+        pass
+    check("계속 끊기는 서버는 딱 2번(원래 1 + 재시도 1)만 시도하고 포기한다", _calls["n"], 2)
 
     print("\n[11-2e3] 언론사 탭 — 포스코퓨처엠 언론사별 집계 · 논조 백필 (2026-09-29)")
     check("기자 분리 — 공동 바이라인·'기자' 꼬리 제거",
