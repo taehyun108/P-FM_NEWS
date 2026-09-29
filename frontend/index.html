@@ -25,6 +25,7 @@
       <button type="button" class="fav-tab" id="favTab" aria-pressed="false">★ 즐겨찾기</button>
       <button type="button" class="fav-tab" id="eaTab" aria-pressed="false">🏛 대외협력</button>
       <button type="button" class="fav-tab" id="weeklyTab" aria-pressed="false">📈 주간동향</button>
+      <button type="button" class="fav-tab" id="pressTab" aria-pressed="false">📰 언론사</button>
       <a class="fav-tab" id="tgLink" href="#" target="_blank" rel="noopener noreferrer" hidden>✈ Telegram</a>
       <button type="button" class="fav-tab" id="masterBtn">🔒 마스터</button>
     </div>
@@ -358,6 +359,17 @@
     <div class="weekly-body" id="weeklyBody"></div>
   </section>
 
+  <!-- 언론사 탭 — 포스코퓨처엠 보도 언론사별 집계 (주간동향과 같은 패널 스타일) -->
+  <section class="weekly-panel" id="pressPanel" aria-label="언론사" hidden>
+    <div class="weekly-head">
+      <div>
+        <h2>📰 언론사별 포스코퓨처엠 보도</h2>
+        <p class="weekly-meta" id="pressMeta">불러오는 중…</p>
+      </div>
+    </div>
+    <div class="weekly-body press-body" id="pressBody"></div>
+  </section>
+
   <!-- 필터 (PRD F6.1-4, F6.1a) -->
   <section class="filters" id="mainFilters" aria-label="기사 필터">
     <div class="filter-head">
@@ -377,6 +389,18 @@
       <div class="filter-row">
         <label class="filter-label" for="searchInput">검색</label>
         <input type="search" id="searchInput" class="search" placeholder="제목·요약·기자·언론사 검색" autocomplete="off">
+        <button type="button" class="adv-toggle" id="advToggle" aria-expanded="false" aria-controls="advSearch">상세 검색 ▾</button>
+      </div>
+
+      <!-- 상세 검색 — 입력한 칸끼리 AND 조건 -->
+      <div class="filter-row adv-search" id="advSearch" hidden>
+        <span class="filter-label">상세 검색 <em>입력칸 모두 만족</em></span>
+        <div class="adv-fields">
+          <input type="search" id="advTitle" class="search adv-input" placeholder="제목" aria-label="제목 검색" autocomplete="off">
+          <input type="search" id="advBody" class="search adv-input" placeholder="본문 (최근 30일 원문 + 요약)" aria-label="본문 검색" autocomplete="off">
+          <input type="search" id="advPress" class="search adv-input" placeholder="언론사" aria-label="언론사 검색" autocomplete="off">
+          <input type="search" id="advAuthor" class="search adv-input" placeholder="기자" aria-label="기자 검색" autocomplete="off">
+        </div>
       </div>
 
       <div class="filter-row">

@@ -49,7 +49,10 @@ create table if not exists articles (
   categories         TEXT default '[]',
   title_embedding    TEXT,
   analyzed_at        TEXT,
-  status             TEXT default 'active'   -- active | draft | archived | error
+  status             TEXT default 'active',  -- active | draft | archived | error
+  pfm_excerpt        TEXT,                   -- 본문 속 포스코퓨처엠 언급 문장+앞뒤 문맥(약 4줄)
+  pfm_tone           TEXT,                   -- 포스코퓨처엠 논조 '긍정'|'중립'|'부정' (발췌문 LLM 판정)
+  pfm_tone_reason    TEXT                    -- 논조 근거 한 줄
 );
 
 create table if not exists url_ledger (

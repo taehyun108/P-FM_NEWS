@@ -247,6 +247,17 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 }
 .search:focus { outline: none; border-color: var(--navy); box-shadow: 0 0 0 3px var(--navy-soft); }
 
+/* 상세 검색 (제목·본문·언론사·기자, AND) */
+.adv-toggle {
+  flex: none; border: 1px solid var(--line); background: #fff; color: var(--ink-mid);
+  border-radius: 9px; padding: 7px 12px; font-size: 12.5px; cursor: pointer; font-family: inherit;
+}
+.adv-toggle:hover, .adv-toggle[aria-expanded="true"] { border-color: var(--navy); color: var(--navy); }
+.adv-search[hidden] { display: none; }
+.adv-fields { flex: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.adv-input { min-width: 0; }
+@media (max-width: 760px) { .adv-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
 /* ── 카드 그리드 (F6.2) ───────────────────────────────────────────── */
 .grid {
   display: grid; gap: 16px;
@@ -322,12 +333,13 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 .card-summary--people { white-space: pre-wrap; line-height: 1.6; }
 .summary-head { color: var(--navy); font-weight: 700; }
 
-.card-perspective {
+.card-excerpt {
+  line-height: 1.55;
   margin: 10px 14px 0; padding: 9px 11px;
   background: var(--navy-soft); border-radius: 9px;
   font-size: 12.5px; color: var(--navy-dark);
 }
-.card-perspective strong { font-weight: 700; }
+.card-excerpt strong { font-weight: 700; }
 
 .card-meta {
   display: flex; align-items: center; gap: 8px;
@@ -625,3 +637,43 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .weekly-body h2 { font-size: 15px; }
 .weekly-body ol { line-height: 1.6; }
 .weekly-body .empty { color: var(--ink-soft); padding: 24px 0; text-align: center; }
+
+/* ── 언론사 탭 (포스코퓨처엠 보도 언론사별 집계) ─────────────────────── */
+.press-table-wrap { overflow-x: auto; }
+.press-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.press-table th, .press-table td {
+  border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top;
+}
+.press-table thead th {
+  background: var(--navy-soft); color: var(--navy-dark); font-weight: 700; font-size: 12.5px;
+  text-align: center; white-space: nowrap;
+}
+.press-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.press-table thead .num { text-align: center; }
+.press-row { cursor: pointer; }
+.press-row:hover, .press-row:focus { background: #f5f7fc; outline: none; }
+.press-row[aria-expanded="true"] { background: var(--navy-soft); }
+.press-name { font-weight: 600; color: var(--navy); white-space: nowrap; }
+.press-caret { display: inline-block; width: 12px; color: var(--ink-soft); }
+.press-reporters { color: var(--ink-mid); font-size: 12.5px; min-width: 180px; }
+.press-table .tone-pos { color: var(--pos); font-weight: 600; }
+.press-table .tone-neg { color: var(--neg); font-weight: 600; }
+.press-table .tone-neu { color: var(--ink-mid); }
+.press-table .zero { color: var(--ink-soft); font-weight: 400; }
+.press-detail[hidden] { display: none; }
+.press-detail > td { background: #fafbfe; padding: 6px 14px 12px; }
+.press-articles { list-style: none; margin: 0; padding: 0; }
+.press-articles li { padding: 7px 0; border-bottom: 1px dashed var(--line); line-height: 1.5; }
+.press-articles li:last-child { border-bottom: 0; }
+.press-articles a { color: var(--ink); text-decoration: none; }
+.press-articles a:hover { color: var(--navy); text-decoration: underline; }
+.press-date { color: var(--ink-soft); font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+.press-author { color: var(--ink-soft); font-size: 12px; margin-left: 8px; }
+.press-tone {
+  display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  margin-right: 8px; background: #eef1f6; color: var(--ink-mid);
+}
+.press-tone.tone-pos { background: #e8f3ea; color: var(--pos); }
+.press-tone.tone-neg { background: #fde8e6; color: var(--neg); }
+.press-reason { margin: 2px 0 0; font-size: 12px; color: var(--ink-mid); }
+.press-more { color: var(--ink-soft); font-size: 12px; }

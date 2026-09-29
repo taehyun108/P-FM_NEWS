@@ -19,10 +19,21 @@ const state = {
   period: 'all',
   sort: 'recent',   // 'recent'(발행일 최신순, 기본) | 'score'(직접 등록·중요도순)
   q: '',
+  // 상세 검색 — 입력된 칸끼리 AND. 키는 API 파라미터(s_title 등)와 같다.
+  adv: { s_title: '', s_body: '', s_press: '', s_author: '' },
   page: 1,
   total: 0,
   loading: false,
 };
+
+/* 상세 검색 칸 — [상태 키, 입력칸 id, 요약 라벨] */
+const ADV_FIELDS = [
+  ['s_title', 'advTitle', '제목'],
+  ['s_body', 'advBody', '본문'],
+  ['s_press', 'advPress', '언론사'],
+  ['s_author', 'advAuthor', '기자'],
+];
+const advActive = () => ADV_FIELDS.filter(([k]) => state.adv[k]);
 
 /* 정렬 옵션 — 백엔드 /api/articles?sort= 값과 라벨. */
 const SORT_OPTIONS = [
@@ -102,6 +113,7 @@ function readStateFromURL() {
   state.period = p.get('period') || 'all';
   state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
   state.q = p.get('q') || '';
+  ADV_FIELDS.forEach(([k]) => { state.adv[k] = p.get(k) || ''; });
   state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
 }
 
@@ -113,6 +125,7 @@ function writeStateToURL() {
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
+  advActive().forEach(([k]) => p.set(k, state.adv[k]));
   if (state.page > 1) p.set('page', String(state.page));
   const qs = p.toString();
   history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
@@ -486,11 +499,12 @@ function buildCard(item) {
     card.append(p);
   }
 
-  /* 포스코 관점 — 요약과 분리해 표시한다 (F4.1) */
-  if (item.perspective_text) {
-    const box = el('div', 'card-perspective');
-    box.append(el('strong', null, '포스코 관점: '));
-    box.append(document.createTextNode(item.perspective_text));
+  /* 포스코퓨처엠 언급 발췌 — 본문 원문에서 언급 문장+앞뒤 문맥(약 4줄).
+     언급이 없는 기사는 이 영역을 아예 그리지 않는다(대체 문구 없음). */
+  if (item.pfm_excerpt) {
+    const box = el('div', 'card-excerpt');
+    box.append(el('strong', null, '포스코퓨처엠 언급: '));
+    box.append(document.createTextNode(item.pfm_excerpt));
     card.append(box);
   }
 
@@ -1292,6 +1306,7 @@ let favView = false;
 
 function toggleFavView() {
   if (weeklyView && !favView) toggleWeeklyView();   // 주간동향 화면이면 먼저 닫는다
+  if (pressView && !favView) togglePressView();     // 언론사 화면이면 먼저 닫는다
   if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 먼저 닫는다
   favView = !favView;
   $('favTab').setAttribute('aria-pressed', String(favView));
@@ -1318,6 +1333,136 @@ async function renderFavorites() {
     ? nodes : [el('p', 'empty', '즐겨찾기 기사를 불러오지 못했습니다.')]));
 }
 
+/* ── 언론사 보기 — 포스코퓨처엠 보도 언론사별 집계 ─────────────────── */
+
+let pressView = false;
+let pressLoaded = false;
+const TONE_CLASS = { 긍정: 'pos', 중립: 'neu', 부정: 'neg' };
+
+function togglePressView() {
+  if (favView) toggleFavView();
+  if (weeklyView && !pressView) toggleWeeklyView();
+  if (window.pfmCloseEaView) window.pfmCloseEaView();
+  pressView = !pressView;
+  $('pressTab').setAttribute('aria-pressed', String(pressView));
+  $('pressTab').textContent = pressView ? '← 전체 기사' : '📰 언론사';
+  $('pressPanel').hidden = !pressView;
+  $('mainFilters').hidden = pressView;
+  $('grid').hidden = pressView;
+  document.querySelector('.more-wrap').hidden = pressView;
+  document.querySelector('.url-add').hidden = pressView;
+  $('stats').hidden = pressView;
+  if (pressView) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (!pressLoaded) { pressLoaded = true; loadPressStats(); }
+  } else {
+    refresh(true);
+  }
+}
+
+async function loadPressStats() {
+  const body = $('pressBody');
+  body.replaceChildren(el('p', 'empty', '불러오는 중…'));
+  let d;
+  try {
+    d = await getJSON('/api/press-stats');
+  } catch {
+    pressLoaded = false;   // 다음에 탭을 열면 다시 시도
+    $('pressMeta').textContent = '집계를 불러오지 못했습니다.';
+    body.replaceChildren();
+    return;
+  }
+  const gen = d.generated_at ? new Date(d.generated_at).toLocaleString('ko-KR') : '';
+  const w = d.windows || { week: 7, month: 30, year: 365 };
+  $('pressMeta').textContent =
+    `최근 ${w.year}일 포스코퓨처엠 기사 ${d.article_count || 0}건 · 언론사 ${(d.items || []).length}곳 · `
+    + `주간=${w.week}일 · 월간=${w.month}일 · 연간=${w.year}일 · 집계 ${gen}`;
+  if (!(d.items || []).length) {
+    body.replaceChildren(el('p', 'empty', '최근 1년간 포스코퓨처엠 기사가 없습니다.'));
+    return;
+  }
+  body.replaceChildren(buildPressTable(d.items));
+}
+
+function buildPressTable(items) {
+  const wrap = el('div', 'press-table-wrap');
+  const table = el('table', 'press-table');
+  const thead = el('thead');
+  const h1 = el('tr');
+  [['언론사', { rowSpan: 2 }], ['언급 횟수', { colSpan: 3 }], ['논조', { colSpan: 3 }],
+    ['기자 (건수)', { rowSpan: 2 }]].forEach(([t, span]) => {
+    h1.append(Object.assign(el('th', null, t), span));
+  });
+  const h2 = el('tr');
+  ['주간', '월간', '연간', '긍정', '중립', '부정'].forEach((t) => h2.append(el('th', 'num', t)));
+  thead.append(h1, h2);
+  const tbody = el('tbody');
+  items.forEach((it) => {
+    const tr = el('tr', 'press-row');
+    tr.tabIndex = 0;
+    tr.setAttribute('aria-expanded', 'false');
+    const name = el('td', 'press-name');
+    name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
+    tr.append(name);
+    [it.week, it.month, it.year].forEach((n) => tr.append(el('td', 'num', String(n))));
+    ['긍정', '중립', '부정'].forEach((k) => {
+      const n = (it.tone || {})[k] || 0;
+      tr.append(el('td', `num tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n)));
+    });
+    const reps = (it.reporters || []).map((r) => `${r.name}(${r.count})`).join(', ');
+    tr.append(el('td', 'press-reporters', reps || '—'));
+
+    const detail = el('tr', 'press-detail');
+    detail.hidden = true;
+    const cell = el('td');
+    cell.colSpan = 9;
+    detail.append(cell);
+    const toggle = () => {
+      const open = detail.hidden;
+      detail.hidden = !open;
+      tr.setAttribute('aria-expanded', String(open));
+      name.firstChild.textContent = open ? '▾' : '▸';
+      if (open && !cell.childNodes.length) cell.append(buildPressArticles(it));
+    };
+    tr.addEventListener('click', toggle);
+    tr.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+    tbody.append(tr, detail);
+  });
+  table.append(thead, tbody);
+  wrap.append(table);
+  return wrap;
+}
+
+function buildPressArticles(it) {
+  const list = el('ul', 'press-articles');
+  (it.articles || []).forEach((a) => {
+    const li = el('li');
+    li.append(el('span', 'press-date', (a.published_at || '').slice(0, 10)));
+    const tone = a.tone || '미판정';
+    const badge = el('span', `press-tone tone-${TONE_CLASS[tone] || 'none'}`, tone);
+    if (a.tone_reason) badge.title = a.tone_reason;
+    li.append(badge);
+    if (a.url) {
+      const link = el('a', null, a.title);
+      link.href = a.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      li.append(link);
+    } else {
+      li.append(el('span', null, a.title));
+    }
+    if (a.author) li.append(el('span', 'press-author', a.author));
+    if (a.tone_reason) li.append(el('p', 'press-reason', `근거: ${a.tone_reason}`));
+    list.append(li);
+  });
+  if (it.articles && it.year > it.articles.length) {
+    list.append(el('li', 'press-more', `최근 ${it.articles.length}건만 표시합니다.`));
+  }
+  return list;
+}
+
 /* ── 주간동향 보기 ────────────────────────────────────────────── */
 
 let weeklyView = false;
@@ -1327,6 +1472,7 @@ let weeklyRecipients = [];  // 마스터 패널 수신자 목록 (참고 표시�
 
 function toggleWeeklyView() {
   if (favView) toggleFavView();            // 즐겨찾기 화면이면 먼저 닫는다
+  if (pressView && !weeklyView) togglePressView();   // 언론사 화면이면 먼저 닫는다
   if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 먼저 닫는다
   weeklyView = !weeklyView;
   $('weeklyTab').setAttribute('aria-pressed', String(weeklyView));
@@ -1451,6 +1597,7 @@ function buildQuery() {
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
+  advActive().forEach(([k]) => p.set(k, state.adv[k]));
   p.set('page', String(state.page));
   p.set('size', String(PAGE_SIZE));
   return p.toString();
@@ -1459,7 +1606,7 @@ function buildQuery() {
 async function refresh(reset) {
   // 즐겨찾기 화면일 때는 일반 목록이 덮어쓰지 않게 막는다.
   // (필터를 숨기는 것만으로는 방어가 약하다 — 단축키·코드 변경에 취약)
-  if (favView || weeklyView || state.loading) return;
+  if (favView || weeklyView || pressView || state.loading) return;
   state.loading = true;
   if (reset) state.page = 1;
   $('grid').replaceChildren(...Array.from({ length: 6 }, () => el('div', 'skeleton')));
@@ -1533,7 +1680,7 @@ function renderPagination(page, total) {
 
 function activeFilterCount() {
   return state.group.size + state.cat.size + state.press.size
-    + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0);
+    + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0) + advActive().length;
 }
 
 const PERIOD_LABEL = { today: '오늘', '7d': '7일', '30d': '30일', all: '전체' };
@@ -1558,7 +1705,14 @@ function updateActiveFilterCount() {
   seg('카테고리', state.cat.size ? [...state.cat].join(', ') : '전체');
   seg('언론사', state.press.size ? [...state.press].join(', ') : '전체');
   if (state.q) seg('검색', state.q);
+  advActive().forEach(([k, , label]) => seg(`${label} 검색`, state.adv[k]));
   box.hidden = false;
+}
+
+function setAdvOpen(open) {
+  $('advSearch').hidden = !open;
+  $('advToggle').setAttribute('aria-expanded', String(open));
+  $('advToggle').textContent = open ? '상세 검색 ▴' : '상세 검색 ▾';
 }
 
 function setFilterCollapsed(collapsed) {
@@ -1656,6 +1810,10 @@ async function discardDraft() {
 function init() {
   readStateFromURL();
   $('searchInput').value = state.q;
+  ADV_FIELDS.forEach(([k, id]) => { $(id).value = state.adv[k]; });
+  // 상세 검색 칸에 값이 있으면(공유 링크 등) 펼친 채로 시작한다.
+  setAdvOpen(advActive().length > 0);
+  $('advToggle').addEventListener('click', () => setAdvOpen($('advSearch').hidden));
 
   // 마지막으로 접었는지 기억한다. 활성 필터가 있으면 펼친 상태로 시작한다.
   let collapsed = false;
@@ -1668,19 +1826,31 @@ function init() {
     setFilterCollapsed(!$('filterBody').hidden);   // 보이는 중이면 접고, 접혀 있으면 편다
   });
 
+  // 검색칸들은 디바운스 타이머 하나를 같이 쓰므로, 타이머가 터질 때 '바뀐 칸'만이 아니라
+  // 모든 칸을 다시 읽는다 — 안 그러면 빠르게 두 칸을 입력할 때 앞 칸 조건이 사라진다.
   let timer;
-  $('searchInput').addEventListener('input', (e) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => { state.q = e.target.value.trim(); refresh(true); }, 300);
+  const applySearch = () => {
+    state.q = $('searchInput').value.trim();
+    ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = $(id).value.trim(); });
+    updateActiveFilterCount();
+    refresh(true);
+  };
+  ['searchInput', ...ADV_FIELDS.map(([, id]) => id)].forEach((id) => {
+    $(id).addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(applySearch, 300);
+    });
   });
 
   const goHome = () => {
     if (weeklyView) toggleWeeklyView();     // 주간동향 화면이면 전체 목록으로
+    if (pressView) togglePressView();       // 언론사 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 전체 목록으로
     state.group.clear(); state.cat.clear(); state.press.clear();
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
+    ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = ''; $(id).value = ''; });
     window.scrollTo({ top: 0, behavior: 'smooth' });
     refresh(true);
   };
@@ -1690,7 +1860,12 @@ function init() {
 
   $('favTab').addEventListener('click', toggleFavView);
   $('weeklyTab').addEventListener('click', toggleWeeklyView);
-  window.pfmCloseOtherViews = () => { if (favView) toggleFavView(); if (weeklyView) toggleWeeklyView(); };
+  $('pressTab').addEventListener('click', togglePressView);
+  window.pfmCloseOtherViews = () => {
+    if (favView) toggleFavView();
+    if (weeklyView) toggleWeeklyView();
+    if (pressView) togglePressView();
+  };
   window.pfmRefreshList = () => refresh(true);
   $('weeklyGenBtn').addEventListener('click', generateWeekly);
   $('weeklyMailBtn').addEventListener('click', sendWeeklyMail);

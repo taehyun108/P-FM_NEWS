@@ -552,7 +552,8 @@ class Storage(ABC):
 
     @abstractmethod
     def save_body(self, article_id: str, body: str, summary_source: str) -> None:
-        """분석 대기용 본문 임시 저장 (§7-3). 분석 완료 시 delete_body 로 지운다."""
+        """본문 저장 (§7-3). 분석 후에도 '본문' 검색용으로 30일 보관하고 cleanup_bodies 가 지운다.
+        분석 실패 시에만 delete_body 로 즉시 지워 백로그 큐에서 뺀다."""
 
     @abstractmethod
     def unanalyzed_with_body(self, limit: int) -> list[dict]:
@@ -732,6 +733,23 @@ class Storage(ABC):
         """articles.press_name 을 press_outlets 의 현재 이름으로 다시 맞춘다. 갱신 건수 반환."""
 
     @abstractmethod
+    def pfm_articles(self, since: str) -> list[dict]:
+        """since 이후 발행된 활성·대표·분석완료 기사 중 그룹사 태그에 포스코퓨처엠이 있는 것.
+        언론사 탭 집계·논조 백필용 경량 컬럼만."""
+
+    @abstractmethod
+    def body_of(self, article_id: str) -> str | None:
+        """보관 중인 본문(최근 30일). 없으면 None."""
+
+    @abstractmethod
+    def body_match_ids(self, term: str, limit: int = 5000) -> set[str]:
+        """보관 중인 본문(최근 30일)에 term 이 들어 있는 기사 id. 대소문자 무시."""
+
+    @abstractmethod
+    def article_press_rows(self) -> list[dict]:
+        """모든 기사의 id·press_id·press_name·URL 만 가볍게 읽는다 (언론사명 정비용)."""
+
+    @abstractmethod
     def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool: ...
 
     @abstractmethod
@@ -767,6 +785,7 @@ ARTICLE_CARD_COLS = ", ".join(f"a.{c}" for c in (
     "source_type", "thumbnail_url", "content_hash", "dedup_group_id",
     "is_representative", "is_backfill", "importance_score", "sentiment",
     "keywords", "group_companies", "categories", "analyzed_at", "status",
+    "pfm_excerpt", "pfm_tone", "pfm_tone_reason",
 ))
 
 # 목록 스캔(필터·집계)에만 필요한 컬럼. 카드 렌더 전용 컬럼(SWOT 근거문 4개·포스코 관점·
@@ -777,7 +796,14 @@ ARTICLE_SCAN_COLS = ", ".join(f"a.{c}" for c in (
     "published_at", "source_type", "thumbnail_url", "is_backfill",
     "importance_score", "sentiment", "keywords", "group_companies", "categories",
     "analyzed_at",
+    # 포스코퓨처엠 발췌(상세 검색 '본문' 대체 대상) + 논조(언론사 탭 집계) — 해당 기사만 값이 있다
+    "pfm_excerpt", "pfm_tone",
 ))
+
+
+# 언론사 탭 집계·논조 백필 전용 컬럼 (포스코퓨처엠 태그 기사만 읽는다).
+PFM_ARTICLE_COLS = ("id, title, url_canonical, url_original, press_name, author, published_at,"
+                    " pfm_excerpt, pfm_tone, pfm_tone_reason")
 
 
 class SqliteStorage(Storage):
@@ -901,6 +927,10 @@ class SqliteStorage(Storage):
             # 잠금, 없으면 해제)을 그대로 따름. 0/1 이면 그 값을 명시적으로 따름.
             "alter table run_state add column web_lock_enabled INTEGER",
             "alter table run_state add column master_lock_enabled INTEGER",
+            # 포스코퓨처엠 발췌·논조 (2026-09-29) — 카드 발췌 표시 + 언론사 탭 집계
+            "alter table articles add column pfm_excerpt TEXT",
+            "alter table articles add column pfm_tone TEXT",
+            "alter table articles add column pfm_tone_reason TEXT",
         ]
         for sql in migrations:
             try:
@@ -1449,6 +1479,29 @@ class SqliteStorage(Storage):
             (name, tier, domain),
         )
 
+    def pfm_articles(self, since: str) -> list[dict]:
+        return self._rows(
+            f"select {PFM_ARTICLE_COLS} from articles"
+            " where status='active' and is_representative=1 and analyzed_at is not null"
+            " and published_at >= ? and group_companies like ?"
+            " order by published_at desc",
+            (since, '%"포스코퓨처엠"%'))
+
+    def body_of(self, article_id: str) -> str | None:
+        row = self._one("select body from article_bodies where article_id=?", (article_id,))
+        return row["body"] if row else None
+
+    def body_match_ids(self, term: str, limit: int = 5000) -> set[str]:
+        if not term:
+            return set()
+        rows = self._rows("select article_id from article_bodies where body like ? limit ?",
+                          (f"%{term}%", limit))
+        return {r["article_id"] for r in rows}
+
+    def article_press_rows(self) -> list[dict]:
+        return self._rows("select id, press_id, press_name, url_canonical, url_original,"
+                          " url_source from articles")
+
     def sync_article_press_names(self) -> int:
         cur = self._exec(
             "update articles set press_name = (select name from press_outlets where id = articles.press_id)"
@@ -1472,8 +1525,8 @@ class SqliteStorage(Storage):
     def pending_notifications(self, limit: int) -> list[dict]:
         return self._rows(
             "select n.*, a.title, a.url_canonical, a.url_original, a.press_name, a.author,"
-            " a.importance_score, a.published_at, a.group_companies, a.source_type,"
-            " s.summary_text, s.perspective_text"
+            " a.importance_score, a.published_at, a.group_companies, a.source_type, a.pfm_excerpt,"
+            " s.summary_text"
             " from notifications n"
             " join articles a on a.id = n.article_id"
             " left join summaries s on s.article_id = a.id"
@@ -1750,8 +1803,11 @@ class SupabaseStorage(Storage):
         }, on_conflict="article_id").execute()
 
     def unanalyzed_with_body(self, limit: int) -> list[dict]:
+        # 본문을 30일 보관하므로(분석 끝난 것 포함) 서버에서 미분석·활성만 거른다 —
+        # 안 거르면 매 사이클 보관 중인 본문 수천 건을 통째로 내려받는다.
         rows = (self._t("article_bodies")
                 .select("body,summary_source,articles!inner(id,title,press_id,press_name,importance_score,group_companies,analyzed_at,status)")
+                .is_("articles.analyzed_at", "null").eq("articles.status", "active")
                 .execute().data)
         out = []
         for row in rows:
@@ -1779,8 +1835,9 @@ class SupabaseStorage(Storage):
         # 1,000건 넘게 쌓이면(디퍼드 백로그가 불어날 때) 페이지네이션 없이는
         # 일부만 '본문 있음'으로 잡혀, 실제로는 본문이 있는 기사가 여기 잘못
         # 섞여 들어간다. _page 로 전부 본다.
-        bodies = {r["article_id"] for r in
-                  self._page(lambda: self._t("article_bodies").select("article_id"), cap=20000)}
+        bodies = {r["article_id"] for r in self._page(lambda: (
+            self._t("article_bodies").select("article_id,articles!inner(analyzed_at,status)")
+            .is_("articles.analyzed_at", "null").eq("articles.status", "active")), cap=20000)}
         rows = (self._t("articles")
                 .select("id,title,url_source,url_canonical,url_original,press_name,"
                         "published_at,collected_at,group_companies")
@@ -2157,6 +2214,30 @@ class SupabaseStorage(Storage):
             {"name": name, "tier": tier, "status": "approved"}
         ).eq("domain", domain).execute()
 
+    def pfm_articles(self, since: str) -> list[dict]:
+        # group_companies 는 jsonb 배열 — cs(포함) 연산자에 JSON 배열 문자열을 넘긴다.
+        return self._page(lambda: (
+            self._t("articles").select(PFM_ARTICLE_COLS.replace(" ", ""))
+            .eq("status", "active").eq("is_representative", True)
+            .not_.is_("analyzed_at", "null").gte("published_at", since)
+            .filter("group_companies", "cs", jdump(["포스코퓨처엠"]))
+            .order("published_at", desc=True)), cap=50000)
+
+    def body_of(self, article_id: str) -> str | None:
+        rows = (self._t("article_bodies").select("body")
+                .eq("article_id", article_id).execute().data) or []
+        return rows[0]["body"] if rows else None
+
+    def body_match_ids(self, term: str, limit: int = 5000) -> set[str]:
+        if not term:
+            return set()
+        return {r["article_id"] for r in self._page(lambda: (
+            self._t("article_bodies").select("article_id").ilike("body", f"%{term}%")), cap=limit)}
+
+    def article_press_rows(self) -> list[dict]:
+        return self._page(lambda: self._t("articles").select(
+            "id,press_id,press_name,url_canonical,url_original,url_source"), cap=200000)
+
     def sync_article_press_names(self) -> int:
         # PostgREST 는 응답을 1000행으로 자른다. .execute() 를 그냥 쓰면 기사가 1000건
         # 넘을 때 나머지는 검사조차 안 돼 언론사명 정정이 조용히 반쪽만 반영된다
@@ -2199,8 +2280,8 @@ class SupabaseStorage(Storage):
         rows = self._page(lambda: (
             self._t("notifications")
             .select("*, articles(title,url_canonical,url_original,press_name,author,"
-                    "importance_score,published_at,group_companies,source_type,"
-                    "summaries(summary_text,perspective_text))")
+                    "importance_score,published_at,group_companies,source_type,pfm_excerpt,"
+                    "summaries(summary_text))")
             .eq("status", "queued").lt("retry_count", 3)
             .order("created_at")
         ), cap=2000)
@@ -2258,7 +2339,9 @@ class SupabaseStorage(Storage):
         return out
 
     def unanalyzed_articles(self, limit: int) -> list[dict]:
-        bodies = (self._t("article_bodies").select("article_id,fetched_at,summary_source")
+        bodies = (self._t("article_bodies")
+                  .select("article_id,fetched_at,summary_source,articles!inner(analyzed_at,status)")
+                  .is_("articles.analyzed_at", "null").eq("articles.status", "active")
                   .order("fetched_at", desc=True).limit(1000).execute().data) or []
         by_id = {b["article_id"]: b for b in bodies}
         if not by_id:
@@ -4134,6 +4217,49 @@ def detect_group_companies(text: str) -> list[str]:
     return found
 
 
+# ── 포스코퓨처엠 언급 발췌 (사용자 지정 2026-09-29) ─────────────────────
+# 카드의 '포스코 관점'(LLM 생성문)을 대신해, 본문에서 포스코퓨처엠이 실제로 나온
+# 문장을 앞뒤 문맥과 함께 약 4줄(카드 한 줄 ≈ 45~50자) 분량으로 그대로 발췌한다.
+# 이 발췌문은 언론사 탭의 논조 판정(LLM) 입력으로도 재사용하므로 DB 에 저장한다.
+PFM_EXCERPT_TARGET = 190   # 이 길이에 닿을 때까지 앞뒤 문장을 덧붙인다(≈4줄)
+PFM_EXCERPT_MAX = 280      # 문장 하나가 너무 길면 여기서 자른다
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。…])\s+|(?<=다\.)(?=\S)|\n+")
+
+
+def extract_pfm_excerpt(body: str) -> str:
+    """본문에서 포스코퓨처엠(옛 사명·영문 포함) 언급 문장 + 앞뒤 문맥을 발췌한다.
+
+    언급이 없으면 빈 문자열 — 카드는 이 영역을 아예 그리지 않는다(대체 문구 없음).
+    기사 문장을 그대로 옮길 뿐 요약·재서술하지 않는다(지어낸 문장 방지).
+    """
+    text = re.sub(r"[ \t\r\f\v]+", " ", (body or "")).strip()
+    if not text:
+        return ""
+    sents = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s and s.strip()]
+    aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
+    hit = next((i for i, s in enumerate(sents) if any(a in s.lower() for a in aliases)), None)
+    if hit is None:
+        return ""
+    lo = hi = hit
+    total = len(sents[hit])
+    # 뒤 문장을 먼저(맥락이 이어지는 쪽), 그다음 앞 문장을 번갈아 붙인다.
+    while total < PFM_EXCERPT_TARGET and (lo > 0 or hi < len(sents) - 1):
+        if hi < len(sents) - 1:
+            hi += 1
+            total += len(sents[hi]) + 1
+        if total < PFM_EXCERPT_TARGET and lo > 0:
+            lo -= 1
+            total += len(sents[lo]) + 1
+    out = " ".join(sents[lo:hi + 1])
+    if len(out) > PFM_EXCERPT_MAX:
+        # 언급 문장이 잘려 나가지 않도록, 넘치면 언급 문장부터 다시 잰다.
+        out = " ".join(sents[hit:hi + 1])
+        if len(out) > PFM_EXCERPT_MAX:
+            cut = out[:PFM_EXCERPT_MAX]
+            out = (cut[:cut.rfind(" ")] if " " in cut else cut).rstrip() + "…"
+    return out
+
+
 def normalize_group_list(groups: Iterable[str]) -> list[str]:
     """그룹사 목록 정리. 구체 계열사가 있으면 상위 개념 '포스코'는 뺀다.
 
@@ -4234,7 +4360,8 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
 
 # =====================================================================
 # 10. LLM 분석 (PRD F4)
-#     요약 · 포스코 관점 · 키워드 · 그룹사 · 감성 · SWOT 을 호출 1회로 받는다.
+#     요약 · 키워드 · 그룹사 · 감성 · SWOT 을 호출 1회로 받는다.
+#     '포스코 관점'은 2026-09-29 생성 중단 — 본문 발췌(extract_pfm_excerpt)로 대체했다.
 #     항목별로 나눠 호출하면 과금이 4배가 된다.
 # =====================================================================
 
@@ -4250,21 +4377,6 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 원문 문장을 그대로 복사하지 않고 재서술한다
 - 언론사명과 기자명은 summary 에 넣지 않는다 (표시할 때 따로 붙인다)
 - 기사가 요약하기에 불충분하면 summary 를 ["요약불가"] 로만 채운다
-
-[포스코 관점]
-- perspective: 이 기사에 등장하는 포스코 그룹 계열사(포스코홀딩스·포스코·포스코퓨처엠·
-  포스코이앤씨·포스코DX·포스코인터내셔널 등) 입장에서의 시사점 1~2문장
-- 포스코퓨처엠이 아닌 다른 계열사 기사여도(예: 포스코이앤씨 수주, 포스코 노사 이슈)
-  그 계열사 관점에서 반드시 작성한다 — 포스코퓨처엠 사업으로 좁혀서 판단하지 않는다
-- 배터리·이차전지·양극재·음극재·전기차·ESS 등 이차전지 산업 기사는(포스코퓨처엠·
-  포스코 그룹사 이름이 본문에 없어도) 포스코퓨처엠 관점(소재·공급망·경쟁 동향)의
-  시사점을 반드시 작성한다 — 포스코퓨처엠이 이 그룹의 이차전지 소재 사업체다
-- 계열사 이름이 등장해도 사업적 영향으로 볼 내용이 없는 단순 언급(임직원의
-  소속 표기, 행사·포럼·대담 참석, 수상 등)이면 시사점 대신 그 사실 자체를
-  적는다 — 절대 빈 문자열로 두지 않는다.
-  예: "포스코퓨처엠 소속 홍길동 OO실장이 OO행사에 참석했다는 언급입니다."
-- "검토할 필요가 있습니다" 수준의 확인 요청 톤으로 쓰고 단정하지 않는다
-- 어느 계열사와도, 이차전지 산업과도 관련이 없으면 빈 문자열
 
 [키워드]
 - keywords: 기사 핵심 키워드 최대 6개, 한국어 명사구
@@ -4294,7 +4406,7 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 정말로 근거를 찾을 수 없는 항목만 score 0, text "해당 없음"
 
 [출력 형식 — 이 구조를 정확히 지킨다]
-{{"summary":["문장1","문장2","문장3"],"perspective":"...","keywords":["..."],
+{{"summary":["문장1","문장2","문장3"],"keywords":["..."],
 "group_companies":["..."],"sentiment":"중립",
 "swot":{{"s":{{"score":0,"text":"..."}},"w":{{"score":0,"text":"..."}},
 "o":{{"score":0,"text":"..."}},"t":{{"score":0,"text":"..."}}}}}}
@@ -4306,6 +4418,25 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 """
 
 MAX_BODY_CHARS = 6000  # 토큰 비용 상한. 기사 본문 대부분은 이 안에 들어간다.
+
+# ── 포스코퓨처엠 논조 판정 (사용자 지정 2026-09-29) ─────────────────────
+# 입력은 본문 전체가 아니라 extract_pfm_excerpt 발췌문뿐이다. 다른 회사 평가는 반영하지 않는다.
+PFM_TONES = ("긍정", "중립", "부정")
+PFM_TONE_SYSTEM = ("당신은 기업 홍보팀의 언론 모니터링 담당자다. 주어진 발췌문만 근거로 "
+                   "판정하고 JSON 으로만 답한다.")
+PFM_TONE_PROMPT = """[판정 대상] 포스코퓨처엠
+[기사 본문 발췌 — 포스코퓨처엠 언급 부분]
+{excerpt}
+
+이 기사가 '포스코퓨처엠'에 대해 어떤 논조인지 판정하라.
+- 긍정: 포스코퓨처엠의 실적·수주·기술·투자·평판 등을 호의적으로 다룸
+- 부정: 포스코퓨처엠의 손실·사고·리스크·비판·실적 악화 등을 다룸
+- 중립: 단순 사실 전달, 여러 회사 나열 속 언급, 평가가 드러나지 않음
+- 다른 회사(경쟁사·고객사·모회사 등)에 대한 평가는 판정에 반영하지 않는다
+- 발췌문에 없는 내용을 추측하지 않는다
+- reason: 판정 근거가 된 발췌문 속 표현을 한 줄(60자 이내)로
+
+형식: {{"tone":"긍정|중립|부정","reason":"..."}}"""
 
 
 @dataclass
@@ -4499,6 +4630,30 @@ class LLMClient:
                     time.sleep(2 ** attempt)
         log.warning("인사·부고 구조화 실패(규칙 기반으로 대체): %s", last_error)
         return None, {}
+
+    def pfm_tone(self, excerpt: str) -> tuple[str, str]:
+        """포스코퓨처엠 언급 발췌문만 보고 이 기사의 포스코퓨처엠 논조를 판정한다.
+
+        반환: (긍정|중립|부정, 근거 한 줄). 실패하면 ("", "") — 호출부는 미판정으로 둔다.
+        수집 때 1회만 부르고 결과를 DB 에 저장한다(언론사 탭은 저장값만 집계).
+        """
+        if not (excerpt or "").strip():
+            return "", ""
+        prompt = PFM_TONE_PROMPT.format(excerpt=excerpt.strip()[:1200])
+        for attempt in range(2):
+            try:
+                content, _ = self._chat(PFM_TONE_SYSTEM, prompt)
+                data = _parse_json_object(content) or {}
+                tone = str(data.get("tone") or "").strip()
+                if tone in PFM_TONES:
+                    return tone, _pp(data.get("reason"))[:120]
+                raise ValueError(f"알 수 없는 논조 값: {tone!r}")
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                else:
+                    log.warning("포스코퓨처엠 논조 판정 실패(미판정으로 둠): %s", exc)
+        return "", ""
 
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
@@ -4977,6 +5132,8 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
         # 두 기사가 서로 중복이면, 먼저 처리된 쪽이 저장한 content_hash·canonical URL을
         # DB에서 바로 조회해 뒤 항목이 중복으로 잡아낸다. 이 시점부터는 서로 독립적인
         # LLM 호출만 남으므로(2026-09-14) 병렬로 보낸다.
+        # 신규 수집 경로처럼 본문을 저장해 둔다 — '본문' 상세 검색(30일 보관) 대상.
+        storage.save_body(aid, body, "fulltext")
         to_analyze.append((aid, row, body))
 
     if to_analyze:
@@ -5290,7 +5447,34 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     name = row.get("name") or ""
     if _looks_like_domain(name):
         name = seed[0] if seed else (og_name or prettify_domain(domain))
+    if _looks_like_domain(name):
+        _log_unmapped_press(domain)
     return name, row.get("id"), int(row.get("tier") or 3)
+
+
+# 매핑표(SEED_PRESS)에 없어 도메인 그대로 저장되는 매체 — 같은 도메인은 프로세스당 한 번만 경고한다.
+_UNMAPPED_PRESS_LOGGED: set[str] = set()
+
+
+def _log_unmapped_press(domain: str) -> None:
+    if domain and domain not in _UNMAPPED_PRESS_LOGGED:
+        _UNMAPPED_PRESS_LOGGED.add(domain)
+        log.warning("언론사 매핑 없음 — 도메인 그대로 표시됨: %s (SEED_PRESS 에 추가 필요)", domain)
+
+
+def press_display_name(name: str, url: str = "") -> str:
+    """언론사명이 도메인 모양('mstoday.co.kr')이면 매핑표(SEED_PRESS)의 정식 이름으로 바꾼다.
+
+    articles.press_name 은 복사본이라, 매핑을 추가해도 과거 기사는 `fixpress` 전까지
+    도메인 그대로 남는다(2026-09-29 사용자 지적). 화면·집계는 이 함수를 거쳐 즉시 바로잡는다.
+    """
+    nm = (name or "").strip()
+    if nm and not _looks_like_domain(nm):
+        return nm
+    for cand in (domain_of(url) if url else "", domain_of(f"http://{nm}") if nm else ""):
+        if cand and cand in SEED_PRESS:
+            return SEED_PRESS[cand][0]
+    return nm
 
 
 def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False) -> dict:
@@ -5892,14 +6076,22 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         categories = ["정부/정책"] + categories
     # 통상환경은 detect_categories 가 '제목에 조치명' 조건으로 이미 판정한다 — 강제 추가 안 함.
 
-    ctx.storage.update_article(article_id, {
+    # 포스코퓨처엠 언급 발췌 — 카드 표시 + 논조 판정 입력. 언급이 없으면 빈 값(영역 미표시).
+    excerpt = extract_pfm_excerpt(body)
+    patch = {
         "sentiment": analysis.sentiment,
         "keywords": keywords,
         "group_companies": groups,
         "categories": categories,
         "importance_score": score,
         "analyzed_at": iso(now_utc()),
-    })
+        "pfm_excerpt": excerpt,
+    }
+    if excerpt:
+        tone, reason = ctx.llm.pfm_tone(excerpt)
+        if tone:
+            patch.update(pfm_tone=tone, pfm_tone_reason=reason)
+    ctx.storage.update_article(article_id, patch)
     ctx.storage.save_summary({
         "id": new_id(),
         "article_id": article_id,
@@ -5922,7 +6114,8 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
             "model": ctx.cfg.llm_model,
             "created_at": iso(now_utc()),
         })
-    ctx.storage.delete_body(article_id)  # 분석 끝 — 임시 본문 삭제
+    # 본문은 지우지 않고 30일 보관한다 — '본문' 상세 검색용(사용자 지정 2026-09-29).
+    # 30일이 지나면 run_once 의 cleanup_bodies(30) 가 지운다(PRD §7 보존 기간 제안값).
     return score
 
 
@@ -6344,15 +6537,17 @@ def format_message(row: dict) -> str:
         probe = f"{row.get('title') or ''}\n{row.get('summary_text') or ''}"
         groups = normalize_group_list(detect_group_companies(probe))
     tag = groups[0] if groups else "포스코"
-    header = format_summary_header(row.get("press_name") or "", row.get("author") or "")
+    press = press_display_name(row.get("press_name") or "",
+                               row.get("url_canonical") or row.get("url_original") or "")
+    header = format_summary_header(press, row.get("author") or "")
 
     lines = [f"{emoji} [{esc(tag)}] {esc(row.get('title') or '')}", ""]
     summary = (row.get("summary_text") or "").strip()
     if summary:
         lines.append(f"{esc(header)} {esc(summary)}".strip())
-    perspective = (row.get("perspective_text") or "").strip()
-    if perspective:
-        lines += ["", f"포스코 관점: {esc(perspective)}"]
+    excerpt = (row.get("pfm_excerpt") or "").strip()
+    if excerpt:
+        lines += ["", f"포스코퓨처엠 언급: {esc(excerpt)}"]
     link = row.get("url_canonical") or row.get("url_original") or ""
     if link:
         lines += ["", f'🔗 <a href="{esc_attr(link)}">원문 보기</a>']
@@ -6831,15 +7026,17 @@ def _kakao_text_from_row(row: dict, link: str) -> dict:
     tag = groups[0] if groups else "포스코"
 
     body = f"{emoji} [{tag}] {(row.get('title') or '').strip()}"
-    hdr = format_summary_header(row.get("press_name") or "", row.get("author") or "")
+    hdr = format_summary_header(press_display_name(row.get("press_name") or "",
+                                                   row.get("url_canonical") or row.get("url_original") or ""),
+                                row.get("author") or "")
     summary = (row.get("summary_text") or "").strip()
-    perspective = (row.get("perspective_text") or "").strip()
+    excerpt = (row.get("pfm_excerpt") or "").strip()
 
     seg = f"{hdr} {summary}".strip() if (hdr and summary) else summary
     if seg and KAKAO_TEXT_MAX - len(body) > 14:
         body += "\n\n" + _clip(seg, KAKAO_TEXT_MAX - len(body) - 2)
-    if perspective and KAKAO_TEXT_MAX - len(body) > 20:
-        body += "\n\n포스코 관점: " + _clip(perspective, KAKAO_TEXT_MAX - len(body) - 10)
+    if excerpt and KAKAO_TEXT_MAX - len(body) > 20:
+        body += "\n\n포스코퓨처엠 언급: " + _clip(excerpt, KAKAO_TEXT_MAX - len(body) - 13)
 
     return {
         "object_type": "text",
@@ -6992,8 +7189,8 @@ def _card_full_text(card: dict, already: bool = False) -> str:
     lines = [f"{head}{emoji} [{esc(tag)}] {esc(card.get('title') or '')}", ""]
     if card.get("summary_header") or card.get("summary_text"):
         lines.append(f"{esc(card.get('summary_header') or '')} {esc(card.get('summary_text') or '')}".strip())
-    if card.get("perspective_text"):
-        lines += ["", f"포스코 관점: {esc(card['perspective_text'])}"]
+    if card.get("pfm_excerpt"):
+        lines += ["", f"포스코퓨처엠 언급: {esc(card['pfm_excerpt'])}"]
     sw = card.get("swot")
     if sw:
         lines += ["", f"SWOT 종합 {sw['total']} · 감성 {esc(card.get('sentiment') or '-')} · 중요도 {score}"]
@@ -7183,6 +7380,69 @@ WEEKLY_SECTIONS: list[tuple[str, str, str]] = [
     ("정부/정책", "topic", "정부/정책"),
     ("글로벌 통상환경", "topic", "글로벌 통상환경"),
 ]
+
+
+# ── 언론사 탭 — 포스코퓨처엠 보도 언론사별 집계 (사용자 지정 2026-09-29) ─────
+# 주간동향과 같은 '발송(조회) 시점 기준 최근 N일' 롤링 구간을 쓴다.
+PRESS_STATS_WINDOWS = (("week", 7), ("month", 30), ("year", 365))
+PRESS_STATS_ARTICLES_MAX = 200   # 언론사 1곳당 펼쳐 보여줄 기사 수 상한
+PRESS_STATS_TTL_SEC = 300        # 탭을 열 때마다 DB 를 치지 않게 5분 캐시
+_AUTHOR_SPLIT_RE = re.compile(r"\s*[,·/]\s*|\s{2,}")
+
+
+def split_authors(author: str) -> list[str]:
+    """'김철수 기자, 이영희 기자' → ['김철수', '이영희'] (공동 바이라인을 기자별로 센다)."""
+    names: list[str] = []
+    for part in _AUTHOR_SPLIT_RE.split(author or ""):
+        part = part.strip()
+        nm = re.sub(r"\s*기자$", "", part)
+        if len(nm) < 2:      # '김기자'처럼 떼고 나면 이름이 안 남으면 원문 그대로 둔다
+            nm = part
+        if nm and nm not in names:
+            names.append(nm)
+    return names
+
+
+def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> list[dict]:
+    """포스코퓨처엠 태그 기사를 언론사별로 묶어 주간·월간·연간 건수, 논조, 기자별 건수를 센다.
+
+    언론사명은 press_display_name 을 거친다 — 도메인으로 저장된 이름('mstoday.co.kr')도
+    매핑표 이름('MS투데이')으로 합쳐 집계한다. 논조는 수집 때 저장한 값만 센다(재판정 없음).
+    """
+    now = now or now_utc()
+    cuts = {k: now - timedelta(days=d) for k, d in PRESS_STATS_WINDOWS}
+    by: dict[str, dict] = {}
+    for r in rows:
+        pub = parse_dt(r.get("published_at"))
+        if pub is None or pub < cuts["year"]:
+            continue
+        url = r.get("url_canonical") or r.get("url_original") or ""
+        press = press_display_name(r.get("press_name") or "", url) or "(언론사 미상)"
+        e = by.setdefault(press, {
+            "press": press, "week": 0, "month": 0, "year": 0,
+            "tone": {"긍정": 0, "중립": 0, "부정": 0, "미판정": 0},
+            "_rep": Counter(), "articles": [],
+        })
+        for key, _ in PRESS_STATS_WINDOWS:
+            if pub >= cuts[key]:
+                e[key] += 1
+        tone = r.get("pfm_tone") if r.get("pfm_tone") in PFM_TONES else "미판정"
+        e["tone"][tone] += 1
+        for nm in split_authors(r.get("author") or ""):
+            e["_rep"][nm] += 1
+        if len(e["articles"]) < PRESS_STATS_ARTICLES_MAX:
+            e["articles"].append({
+                "id": r.get("id"), "title": r.get("title") or "", "url": url,
+                "published_at": r.get("published_at"), "author": r.get("author") or "",
+                "tone": r.get("pfm_tone") or "", "tone_reason": r.get("pfm_tone_reason") or "",
+            })
+    out = []
+    for e in by.values():
+        e["reporters"] = [{"name": n, "count": c} for n, c in e.pop("_rep").most_common()]
+        e["articles"].sort(key=lambda a: a.get("published_at") or "", reverse=True)
+        out.append(e)
+    out.sort(key=lambda e: (-e["year"], -e["month"], -e["week"], e["press"]))
+    return out
 
 
 def weekly_window(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -7659,12 +7919,14 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
         ])
         groups = normalize_group_list(detect_group_companies(probe))
     categories = dedupe_chips(cats, exclude=groups)
-    return groups, categories, row.get("press_name") or ""
+    press = press_display_name(row.get("press_name") or "",
+                               row.get("url_canonical") or row.get("url_original") or "")
+    return groups, categories, press
 
 
 def build_card(row: dict) -> dict:
     """카드 1건의 표시용 형태를 만든다. 칩 중복 제거를 여기서 한 번 더 한다. (PRD F6.2b)"""
-    groups, categories, _ = card_tags(row)
+    groups, categories, press = card_tags(row)
     keywords = dedupe_chips(jload(row.get("keywords"), []), exclude=groups + categories)
 
     swot = None
@@ -7689,11 +7951,12 @@ def build_card(row: dict) -> dict:
         "id": row.get("id"),
         "title": row.get("title") or "",
         "url": row.get("url_canonical") or row.get("url_original") or "",
-        "press_name": row.get("press_name") or "",
+        "press_name": press,
         "author": row.get("author") or "",
-        "summary_header": format_summary_header(row.get("press_name") or "", row.get("author") or ""),
+        "summary_header": format_summary_header(press, row.get("author") or ""),
         "summary_text": row.get("summary_text") or "",
-        "perspective_text": row.get("perspective_text") or "",
+        "pfm_excerpt": row.get("pfm_excerpt") or "",
+        "pfm_tone": row.get("pfm_tone") or "",
         "summary_source": row.get("summary_source") or "",
         "published_at": row.get("published_at"),
         "thumbnail_url": row.get("thumbnail_url") or "",
@@ -7706,6 +7969,38 @@ def build_card(row: dict) -> dict:
         "manual": (row.get("source_type") == "manual"),   # 사용자가 URL 로 직접 등록한 기사
         "swot": swot,
     }
+
+
+def field_search(tagged: list[dict], fields: dict[str, str],
+                 body_ids: set[str] | None = None) -> list[dict]:
+    """상세 검색 — 제목·본문·언론사·기자 칸 중 입력된 칸끼리 AND, 각 칸은 부분 일치.
+
+    fields 키: title / body / press / author (빈 값은 조건 없음).
+    '본문'은 30일 보관 본문(body_ids = 저장소에서 찾은 기사 id)에 더해, 본문이 이미
+    지워진 오래된 기사도 찾을 수 있도록 요약문과 포스코퓨처엠 발췌문까지 본다.
+    언론사는 화면에 보이는 이름(도메인 → 매핑 반영된 t["p"])으로 비교한다.
+    """
+    want = {k: (v or "").strip().lower() for k, v in fields.items() if (v or "").strip()}
+    if not want:
+        return tagged
+    out = []
+    for t in tagged:
+        r = t["row"]
+        if "title" in want and want["title"] not in (r.get("title") or "").lower():
+            continue
+        if "press" in want and want["press"] not in (t.get("p") or "").lower():
+            continue
+        if "author" in want and want["author"] not in (r.get("author") or "").lower():
+            continue
+        if "body" in want:
+            term = want["body"]
+            hit = (r.get("id") in (body_ids or set())
+                   or term in (r.get("summary_text") or "").lower()
+                   or term in (r.get("pfm_excerpt") or "").lower())
+            if not hit:
+                continue
+        out.append(t)
+    return out
 
 
 def _split_multi(value: str) -> list[str]:
@@ -8091,13 +8386,34 @@ def create_app(ctx: Context):
         else:
             _SCAN_STORE["full_at"] = 0.0
 
+    # '본문' 상세 검색 결과(기사 id 집합)를 잠깐 캐시한다 — 입력 중 매 타자마다 DB 를 치지 않게.
+    _body_cache: dict[str, dict] = {}
+
+    def _body_ids(term: str) -> set[str]:
+        now = time.monotonic()
+        ent = _body_cache.get(term)
+        if ent and now - ent["at"] < SCAN_TTL_SEC:
+            return ent["ids"]
+        ids = ctx.storage.body_match_ids(term)
+        _body_cache[term] = {"at": now, "ids": ids}
+        if len(_body_cache) > 24:
+            for k in sorted(_body_cache, key=lambda k: _body_cache[k]["at"])[:12]:
+                _body_cache.pop(k, None)
+        return ids
+
     @app.get("/api/articles")
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20,
-                     sort: str = "recent"):
+                     sort: str = "recent", s_title: str = "", s_body: str = "",
+                     s_press: str = "", s_author: str = ""):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
+        # 상세 검색(제목·본문·언론사·기자) — 통합 검색 q 와도 AND 로 겹쳐진다.
+        fields = {"title": s_title, "body": s_body, "press": s_press, "author": s_author}
+        if any((v or "").strip() for v in fields.values()):
+            body_term = (s_body or "").strip()
+            tagged = field_search(tagged, fields, _body_ids(body_term) if body_term else None)
         # 같은 그룹 안 OR, 다른 그룹 사이 AND. (PRD F6.1a — filter_tagged 가 유일한 구현)
         matched = filter_tagged(tagged,
                                 {normalize_chip(x) for x in _split_multi(group)},
@@ -8815,6 +9131,26 @@ def create_app(ctx: Context):
             ctx.storage.update_article(article_id, {"status": "archived"})
         return JSONResponse({"ok": True})
 
+    _press_stats_cache: dict[str, Any] = {"at": 0.0, "data": None}
+
+    @app.get("/api/press-stats")
+    def api_press_stats():
+        """언론사 탭 — 포스코퓨처엠 기사 언론사별 집계(최근 1년). 5분 캐시."""
+        mono = time.monotonic()
+        if _press_stats_cache["data"] and mono - _press_stats_cache["at"] < PRESS_STATS_TTL_SEC:
+            return JSONResponse(_press_stats_cache["data"])
+        now = now_utc()
+        rows = ctx.storage.pfm_articles(iso(now - timedelta(days=365)))
+        items = aggregate_press_stats(rows, now)
+        data = {
+            "generated_at": iso(now),
+            "windows": {k: d for k, d in PRESS_STATS_WINDOWS},
+            "article_count": sum(e["year"] for e in items),
+            "items": items,
+        }
+        _press_stats_cache.update(at=mono, data=data)
+        return JSONResponse(data)
+
     @app.get("/api/weekly")
     def api_weekly(id: str = ""):
         """주간 레포트 1건 (기본: 최신). payload + html 포함."""
@@ -8941,11 +9277,57 @@ def create_app(ctx: Context):
 # 16. CLI
 # =====================================================================
 
-def cmd_fixpress(ctx: Context) -> None:
+def fix_domain_press_names(ctx: Context, dry: bool) -> tuple[int, dict[str, int]]:
+    """기사 테이블에서 언론사명이 도메인 모양이거나 비어 있는 행을 매핑표로 바로잡는다.
+
+    sync_article_press_names 는 press_id 로 조인하므로, press_id 가 비어 있는 기사
+    (메타만 먼저 저장된 기사 등)는 영영 고쳐지지 않았다. 여기서는 기사 URL 의 도메인으로
+    직접 찾는다. 반환: (고친 건수, 매핑이 없어 못 고친 도메인별 기사 수).
+    """
+    press_by_domain = {r["domain"]: r for r in ctx.storage.all_press() if r.get("domain")}
+    fixed = 0
+    unmapped: dict[str, int] = {}
+    for r in ctx.storage.article_press_rows():
+        cur = (r.get("press_name") or "").strip()
+        if cur and not _looks_like_domain(cur):
+            continue
+        url = r.get("url_canonical") or r.get("url_original") or r.get("url_source") or ""
+        domain = domain_of(url) or (domain_of(f"http://{cur}") if cur else "")
+        want = press_display_name(cur, url)
+        prow = press_by_domain.get(domain)
+        if (not want or _looks_like_domain(want)) and prow and not _looks_like_domain(prow.get("name") or ""):
+            want = prow["name"]
+        if not want or _looks_like_domain(want):
+            if domain:
+                unmapped[domain] = unmapped.get(domain, 0) + 1
+            continue
+        if want == cur:
+            continue
+        fixed += 1
+        if not dry:
+            patch: dict[str, Any] = {"press_name": want}
+            if not r.get("press_id") and prow:
+                patch["press_id"] = prow["id"]
+            ctx.storage.update_article(r["id"], patch)
+    return fixed, unmapped
+
+
+def cmd_fixpress(ctx: Context, dry: bool = False) -> None:
     """SEED_PRESS 의 최신 이름을 press_outlets 에 반영하고, 기사에도 다시 맞춘다.
 
     도메인 그대로(예: 'ajunews.com') 저장돼 있던 언론사명을 정식 이름으로 교체한다.
+    dry=True(`fixpress --dry`) 이면 아무것도 쓰지 않고 고칠 대상만 보고한다.
     """
+    if dry:
+        seed_todo = [d for d, (name, _) in SEED_PRESS.items()
+                     if (ctx.storage.press_by_domain(d) or {}).get("name") != name]
+        fixed, unmapped = fix_domain_press_names(ctx, dry=True)
+        log.info("[미리보기] 매핑표 반영 대상 언론사 %d곳 · 도메인 이름 기사 %d건 교정 예정",
+                 len(seed_todo), fixed)
+        for d, n in sorted(unmapped.items(), key=lambda x: -x[1]):
+            log.warning("[미리보기] 매핑 없음 — %s (기사 %d건). SEED_PRESS 에 추가 필요", d, n)
+        log.info("[미리보기] 실제로 고치려면 --dry 없이 다시 실행하세요.")
+        return
     renamed = 0
     for domain, (name, tier) in SEED_PRESS.items():
         row = ctx.storage.press_by_domain(domain)
@@ -8993,8 +9375,12 @@ def cmd_fixpress(ctx: Context) -> None:
             ogfix += 1
 
     synced = ctx.storage.sync_article_press_names()
-    log.info("언론사명 정리: %d개 SEED 교체 · %d개 부제 제거 · %d개 og:site_name 복원 · 기사 %d건 반영",
-             renamed, cleaned, ogfix, synced)
+    fixed, unmapped = fix_domain_press_names(ctx, dry=False)
+    log.info("언론사명 정리: %d개 SEED 교체 · %d개 부제 제거 · %d개 og:site_name 복원 · "
+             "기사 %d건 반영 · 도메인 이름 기사 %d건 교정",
+             renamed, cleaned, ogfix, synced, fixed)
+    for d, n in sorted(unmapped.items(), key=lambda x: -x[1]):
+        log.warning("매핑 없음 — %s (기사 %d건). SEED_PRESS 에 추가 필요", d, n)
 
 
 def cmd_fixauthors(ctx: Context) -> None:
@@ -9178,6 +9564,63 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
 
 
+def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 365) -> None:
+    """기존 포스코퓨처엠 기사에 발췌문·논조를 채운다(백필, 사용자 지정 2026-09-29).
+
+    대상: 최근 days 일 포스코퓨처엠 태그 기사 중 발췌문이 아직 없거나(NULL),
+    발췌는 있는데 논조가 비어 있는 것. 이미 판정된 기사는 건너뛴다(재판정 없음).
+    본문은 30일 보관분을 먼저 쓰고, 없으면 원문 페이지를 다시 받는다.
+    limit = 이번 실행의 LLM 호출 상한(비용 관리). dry=True 면 대상 수만 보고하고 아무것도
+    쓰지 않으며 네트워크·LLM 도 쓰지 않는다.
+    """
+    rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=days)))
+    need_excerpt = [r for r in rows if r.get("pfm_excerpt") is None]
+    need_tone = [r for r in rows if r.get("pfm_excerpt") and not r.get("pfm_tone")]
+    todo = need_tone + need_excerpt   # 발췌가 이미 있는 쪽이 싸다(원문 재수집 불필요) — 먼저
+    log.info("논조 백필 대상 %d건 — 발췌부터 필요 %d · 논조만 필요 %d (최근 %d일 포스코퓨처엠 기사 %d건)",
+             len(todo), len(need_excerpt), len(need_tone), days, len(rows))
+    if dry:
+        log.info("[미리보기] 이번 실행 LLM 호출은 최대 %d건입니다(limit=%d). "
+                 "발췌가 필요한 기사는 원문을 다시 받아 언급이 없으면 호출하지 않습니다.",
+                 min(len(todo), limit), limit)
+        log.info("[미리보기] 실제로 채우려면 --dry 없이 다시 실행하세요.")
+        return
+    excerpted = no_mention = toned = failed = llm_used = visited = 0
+    for r in todo:
+        if llm_used >= limit:
+            break
+        visited += 1
+        excerpt = r.get("pfm_excerpt")
+        if excerpt is None:
+            body = ctx.storage.body_of(r["id"]) or ""
+            if not body:
+                target = r.get("url_canonical") or r.get("url_original") or ""
+                try:
+                    _, html = resolve_canonical(ctx.http, target)
+                    body = extract_body(html) if html else ""
+                except Exception as exc:
+                    log.debug("원문 재수집 실패 %s: %s", target, exc)
+            if len(body) < 50:
+                failed += 1        # 원문을 못 받음 — NULL 로 두어 다음 실행에서 다시 시도
+                continue
+            excerpt = extract_pfm_excerpt(body)
+            ctx.storage.update_article(r["id"], {"pfm_excerpt": excerpt})
+            excerpted += 1
+            if not excerpt:
+                no_mention += 1    # 태그는 있지만 본문에 언급 없음 — '' 로 저장돼 다시 안 본다
+                continue
+        tone, reason = ctx.llm.pfm_tone(excerpt)
+        llm_used += 1
+        if tone:
+            ctx.storage.update_article(r["id"], {"pfm_tone": tone, "pfm_tone_reason": reason})
+            toned += 1
+        else:
+            failed += 1
+    log.info("논조 백필 완료: 발췌 %d건(언급 없음 %d) · 논조 판정 %d건 · 실패 %d건 · LLM %d회 · "
+             "이번에 못 본 대상 %d건(실패분과 함께 다음 실행에서 계속)",
+             excerpted, no_mention, toned, failed, llm_used, len(todo) - visited)
+
+
 def cmd_fixlinks(ctx: Context) -> None:
     """홈페이지 루트로 잘못 저장된 url_canonical 을 바로잡는다 (일회성).
 
@@ -9331,52 +9774,6 @@ def cmd_reswot(ctx: Context) -> None:
             log.debug("SWOT 재분석 실패 %s: %s", target, exc)
             failed += 1
     log.info("SWOT 재분석: 성공 %d건 · 실패 %d건", done, failed)
-
-
-def cmd_reperspective(ctx: Context, limit: int = 500) -> None:
-    """계열사 태그·배터리 카테고리는 있는데 '포스코 관점'이 빈 기사를 재분석한다
-    (일회성).
-
-    2026-09-10 이전 프롬프트는 perspective 를 '포스코퓨처엠 사업 관점'으로만
-    좁혀 물어봤다. 그래서 포스코·포스코이앤씨·홀딩스 등 다른 계열사만 다루고
-    이차전지와 무관한 기사(노사 이슈·아파트 분양 등)는 관점이 통째로 비었다.
-    프롬프트를 '포스코 그룹 전체 관점'으로 넓힌 뒤, 이어서 '계열사명이 없어도
-    배터리·이차전지 기사는 포스코퓨처엠 관점을 쓴다'로 다시 넓혔다(실사례:
-    현대차·LG엔솔 UBESS 실증 기사 — 포스코 계열사 미언급이라 관점이 비었었다).
-    이미 group_companies 가 붙어 있거나 배터리 계열 카테고리인데 관점이 빈
-    기존 카드를 다시 돌려 채운다.
-    """
-    _battery_cats = {"배터리·이차전지", "양극재", "음극재"}
-    rows = ctx.storage.list_articles(8000, 0, None, "")
-    targets = [r for r in rows
-               if r.get("analyzed_at") and r.get("summary_source") == "fulltext"
-               and (jload(r.get("group_companies"), []) or _battery_cats & set(jload(r.get("categories"), [])))
-               and not (r.get("perspective_text") or "").strip()][:limit]
-    log.info("포스코 관점 재분석 대상 %d건", len(targets))
-    done = failed = 0
-    for r in targets:
-        target = r.get("url_canonical") or r.get("url_original") or ""
-        try:
-            _, html = resolve_canonical(ctx.http, target)
-            body = extract_body(html)
-            if len(body) < 300:
-                failed += 1
-                continue
-            ctx.storage.save_body(r["id"], body, "fulltext")
-            row = {
-                "id": r["id"], "title": r.get("title") or "",
-                "press_id": r.get("press_id"), "press_name": r.get("press_name") or "",
-                "importance_score": r.get("importance_score") or 0,
-                "group_companies": jload(r.get("group_companies"), []),
-            }
-            if analyze_and_save(ctx, r["id"], row, body, "fulltext") is not None:
-                done += 1
-            else:
-                failed += 1
-        except Exception as exc:
-            log.debug("포스코 관점 재분석 실패 %s: %s", target, exc)
-            failed += 1
-    log.info("포스코 관점 재분석: 성공 %d건 · 실패 %d건", done, failed)
 
 
 def cmd_fixdates(ctx: Context) -> None:
@@ -10002,6 +10399,36 @@ def cmd_selftest() -> int:
           (press_tier_cached(_pstore, None), _tier_hits["n"]), (3, 1))
     _pstore.press_tier_by_id = _real_tier
 
+    # ── 도메인 모양 언론사명 교정 (2026-09-29 사용자 지적: 'mstoday.co.kr') ──
+    check("표시 단계 매핑 — 도메인 이름이면 매핑표 이름으로",
+          press_display_name("mstoday.co.kr"), "MS투데이")
+    check("표시 단계 매핑 — www·서브도메인도 접어서 찾는다",
+          press_display_name("", "https://www.mstoday.co.kr/news/1"), "MS투데이")
+    check("표시 단계 매핑 — 이미 한글 이름이면 그대로",
+          press_display_name("한국경제", "https://www.mstoday.co.kr/x"), "한국경제")
+    check("표시 단계 매핑 — 매핑 없는 도메인은 그대로(지어내지 않음)",
+          press_display_name("unknown-press.kr"), "unknown-press.kr")
+    for _aid, _pn, _url in (("fp-1", "mstoday.co.kr", "https://www.mstoday.co.kr/a"),
+                            ("fp-2", "", "https://mstoday.co.kr/b"),
+                            ("fp-3", "unknown-press.kr", "https://unknown-press.kr/c"),
+                            ("fp-4", "한국경제", "https://hankyung.com/d")):
+        _pstore._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, press_name, status, is_representative)"
+            " values (?,?,?,?,?,?,?,?,?,?,?)",
+            (_aid, _url, _url, _url, "t", iso(now_utc()), iso(now_utc()), "rss", _pn, "active", 1))
+    _fpctx = type("C", (), {"storage": _pstore})()
+    _fx, _um = fix_domain_press_names(_fpctx, dry=True)
+    check("fixpress --dry — 고칠 대상만 세고(2건) 매핑 없는 도메인을 보고한다",
+          (_fx, _um), (2, {"unknown-press.kr": 1}))
+    check("fixpress --dry — 실제로는 아무것도 안 바뀐다",
+          _pstore._one("select press_name from articles where id='fp-1'")["press_name"], "mstoday.co.kr")
+    fix_domain_press_names(_fpctx, dry=False)
+    check("fixpress — press_id 없는 기사도 도메인으로 찾아 고친다",
+          [_pstore._one("select press_name from articles where id=?", (i,))["press_name"]
+           for i in ("fp-1", "fp-2", "fp-3", "fp-4")],
+          ["MS투데이", "MS투데이", "unknown-press.kr", "한국경제"])
+
     class _FakeHttpComma:
         """홈페이지 title 이 '매체명 - 슬로건' 도 아니고 og:site_name 도 없어서
         _homepage_site_name 의 쉼표 최후 수단까지 가는 실사례(weeklytrade.co.kr)."""
@@ -10514,6 +10941,134 @@ def cmd_selftest() -> int:
           [t["row"]["id"] for t in refresh_scan_store(_tmp)][0], "st-c")
     _reset_store()
 
+    print("\n[11-2e1] 포스코퓨처엠 언급 발췌 (2026-09-29)")
+    _pb = ("정부가 이차전지 지원책을 발표했다. 업계는 대체로 환영했다. "
+           "포스코퓨처엠은 광양 양극재 공장 증설을 서두르기로 했다. "
+           "회사 관계자는 내년 가동을 목표로 한다고 밝혔다. 증권가는 실적 개선을 전망했다. "
+           "한편 삼성SDI는 미국 공장을 늘린다.")
+    _ex = extract_pfm_excerpt(_pb)
+    check("발췌 — 언급 문장이 들어 있다", "포스코퓨처엠은 광양 양극재" in _ex, True)
+    check("발췌 — 뒤 문맥(다음 문장)도 붙는다", "내년 가동" in _ex, True)
+    check("발췌 — 약 4줄(목표 길이 근처, 상한 이하)",
+          PFM_EXCERPT_TARGET * 0.5 <= len(_ex) <= PFM_EXCERPT_MAX, True)
+    check("발췌 — 언급 없으면 빈 문자열(영역 미표시)",
+          extract_pfm_excerpt("삼성SDI가 공장을 늘린다. 업계가 주목한다."), "")
+    check("발췌 — 옛 사명(포스코케미칼)도 언급으로 본다",
+          "포스코케미칼" in extract_pfm_excerpt("과거 포스코케미칼 시절 투자다."), True)
+    check("발췌 — 빈 본문", extract_pfm_excerpt(""), "")
+    _long = "포스코퓨처엠이 " + "아주 긴 문장을 " * 80 + "끝낸다."
+    check("발췌 — 너무 긴 문장은 상한에서 자르고 … 표시",
+          (len(extract_pfm_excerpt(_long)) <= PFM_EXCERPT_MAX + 1,
+           extract_pfm_excerpt(_long).endswith("…")), (True, True))
+
+    print("\n[11-2e2] 상세 검색 — 제목·본문·언론사·기자 AND (2026-09-29)")
+    _fs_rows = [tag_row(r) for r in (
+        {"id": "fs-1", "title": "포스코퓨처엠 양극재 증설", "author": "김기자",
+         "press_name": "mstoday.co.kr", "url_canonical": "https://www.mstoday.co.kr/1",
+         "summary_text": "광양 공장", "pfm_excerpt": ""},
+        {"id": "fs-2", "title": "포스코퓨처엠 음극재 수주", "author": "이기자",
+         "press_name": "한국경제", "url_canonical": "https://hankyung.com/2",
+         "summary_text": "요약", "pfm_excerpt": "리튬 가격 하락"},
+        {"id": "fs-3", "title": "삼성SDI 실적", "author": "김기자",
+         "press_name": "한국경제", "url_canonical": "https://hankyung.com/3",
+         "summary_text": "요약", "pfm_excerpt": ""},
+    )]
+    _ids = lambda ts: [t["row"]["id"] for t in ts]
+    check("빈 칸만 있으면 조건 없음", _ids(field_search(_fs_rows, {"title": "", "body": " "})),
+          ["fs-1", "fs-2", "fs-3"])
+    check("제목 칸", _ids(field_search(_fs_rows, {"title": "포스코퓨처엠"})), ["fs-1", "fs-2"])
+    check("여러 칸은 AND (제목 + 기자)",
+          _ids(field_search(_fs_rows, {"title": "포스코퓨처엠", "author": "김기자"})), ["fs-1"])
+    check("언론사 칸은 화면 이름(도메인 → 매핑)으로 비교",
+          _ids(field_search(_fs_rows, {"press": "MS투데이"})), ["fs-1"])
+    check("본문 칸 — 보관 본문 id 로 찾음",
+          _ids(field_search(_fs_rows, {"body": "배터리"}, {"fs-3"})), ["fs-3"])
+    check("본문 칸 — 본문이 지워진 기사도 요약·발췌문으로 찾음",
+          _ids(field_search(_fs_rows, {"body": "리튬"}, set())), ["fs-2"])
+    _tmp._exec("delete from article_bodies")
+    _tmp.save_body("st-b", "원문에만 있는 전고체 이야기", "fulltext")
+    check("body_match_ids — 보관 본문에서 찾는다", _tmp.body_match_ids("전고체"), {"st-b"})
+    check("body_match_ids — 빈 검색어는 빈 집합", _tmp.body_match_ids(""), set())
+    # 본문 30일 보관: 분석 끝난 기사의 본문이 남아 있어도 '분석 대기'로 잡히면 안 된다.
+    _tmp._exec("update articles set analyzed_at=? where id='st-b'", (iso(now_utc()),))
+    check("분석 끝난 기사의 보관 본문은 분석 대기 큐에 안 들어간다",
+          "st-b" in {r["id"] for r in _tmp.unanalyzed_with_body(50)}, False)
+    _tmp._exec("delete from article_bodies")
+
+    print("\n[11-2e3] 언론사 탭 — 포스코퓨처엠 언론사별 집계 · 논조 백필 (2026-09-29)")
+    check("기자 분리 — 공동 바이라인·'기자' 꼬리 제거",
+          split_authors("김철수 기자, 이영희 기자"), ["김철수", "이영희"])
+    check("기자 분리 — 빈 값", split_authors(""), [])
+    check("기자 분리 — 붙여 쓴 '기자'도 떼되 이름이 안 남으면 그대로",
+          (split_authors("김철수기자"), split_authors("김기자")), (["김철수"], ["김기자"]))
+    _pnow = now_utc()
+    _prows = [
+        {"id": "p1", "title": "A", "press_name": "mstoday.co.kr", "url_canonical": "https://mstoday.co.kr/1",
+         "author": "김기자", "published_at": iso(_pnow - timedelta(days=1)), "pfm_tone": "긍정"},
+        {"id": "p2", "title": "B", "press_name": "MS투데이", "url_canonical": "https://mstoday.co.kr/2",
+         "author": "김기자, 박기자", "published_at": iso(_pnow - timedelta(days=20)), "pfm_tone": "부정"},
+        {"id": "p3", "title": "C", "press_name": "한국경제", "url_canonical": "https://hankyung.com/3",
+         "author": "이기자", "published_at": iso(_pnow - timedelta(days=200)), "pfm_tone": None},
+        {"id": "p4", "title": "D", "press_name": "한국경제", "url_canonical": "https://hankyung.com/4",
+         "author": "", "published_at": iso(_pnow - timedelta(days=400)), "pfm_tone": "중립"},
+    ]
+    _agg = {e["press"]: e for e in aggregate_press_stats(_prows, _pnow)}
+    check("집계 — 도메인 이름과 정식 이름이 한 언론사로 합쳐진다",
+          sorted(_agg), ["MS투데이", "한국경제"])
+    check("집계 — 주간·월간·연간 롤링 건수",
+          (_agg["MS투데이"]["week"], _agg["MS투데이"]["month"], _agg["MS투데이"]["year"]), (1, 2, 2))
+    check("집계 — 1년 넘은 기사는 제외", _agg["한국경제"]["year"], 1)
+    check("집계 — 논조 건수(저장값만, 미판정 따로)",
+          (_agg["MS투데이"]["tone"]["긍정"], _agg["MS투데이"]["tone"]["부정"],
+           _agg["한국경제"]["tone"]["미판정"]), (1, 1, 1))
+    check("집계 — 기자별 건수(많은 순)",
+          _agg["MS투데이"]["reporters"], [{"name": "김기자", "count": 2}, {"name": "박기자", "count": 1}])
+    check("집계 — 언론사 행 클릭 시 펼칠 기사 목록(최신순)",
+          [a["id"] for a in _agg["MS투데이"]["articles"]], ["p1", "p2"])
+    check("집계 — 연간 건수 많은 언론사가 위", aggregate_press_stats(_prows, _pnow)[0]["press"], "MS투데이")
+
+    _tmp._exec("delete from articles where id like 'pt-%'")
+    for _aid, _grp, _ex, _tone in (("pt-1", '["포스코퓨처엠"]', None, None),
+                                   ("pt-2", '["포스코퓨처엠"]', "포스코퓨처엠이 증설한다.", None),
+                                   ("pt-3", '["포스코퓨처엠"]', "", None),
+                                   ("pt-4", '["포스코이앤씨"]', None, None),
+                                   ("pt-5", '["포스코퓨처엠"]', "포스코퓨처엠 호조.", "긍정")):
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, group_companies, press_name, analyzed_at, status,"
+            " is_representative, pfm_excerpt, pfm_tone) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_aid, f"u/{_aid}", f"u/{_aid}", f"u/{_aid}", "t", iso(_pnow), iso(_pnow), "rss",
+             _grp, "한경", iso(_pnow), "active", 1, _ex, _tone))
+    check("pfm_articles — 포스코퓨처엠 태그 기사만",
+          sorted(r["id"] for r in _tmp.pfm_articles(iso(_pnow - timedelta(days=1)))
+                 if r["id"].startswith("pt-")), ["pt-1", "pt-2", "pt-3", "pt-5"])
+    _tmp.save_body("pt-1", "업계 소식이다. 포스코퓨처엠이 광양 공장의 양극재 생산능력을 늘린다. "
+                           "시장은 대체로 이 결정을 반긴다는 분위기다.", "fulltext")
+
+    class _ToneLLM:
+        calls = 0
+
+        def pfm_tone(self, excerpt: str) -> tuple[str, str]:
+            _ToneLLM.calls += 1
+            return "중립", "사실 전달"
+
+    _tctx = type("C", (), {"storage": _tmp, "llm": _ToneLLM(), "http": None})()
+    cmd_pfmtone(_tctx, limit=10, dry=True)
+    check("백필 --dry — LLM 도 안 부르고 아무것도 안 쓴다",
+          (_ToneLLM.calls, _tmp._one("select pfm_excerpt from articles where id='pt-1'")["pfm_excerpt"]),
+          (0, None))
+    cmd_pfmtone(_tctx, limit=10)
+    _pt = {r["id"]: r for r in _tmp._rows(
+        "select id, pfm_excerpt, pfm_tone, pfm_tone_reason from articles where id like 'pt-%'")}
+    check("백필 — 보관 본문으로 발췌 후 논조 판정", (bool(_pt["pt-1"]["pfm_excerpt"]), _pt["pt-1"]["pfm_tone"]),
+          (True, "중립"))
+    check("백필 — 발췌만 있고 논조 없던 기사는 논조만 채운다",
+          (_pt["pt-2"]["pfm_tone"], _pt["pt-2"]["pfm_tone_reason"]), ("중립", "사실 전달"))
+    check("백필 — 언급 없음('')·이미 판정된 기사는 다시 안 부른다",
+          (_pt["pt-3"]["pfm_tone"], _pt["pt-5"]["pfm_tone"], _ToneLLM.calls), (None, "긍정", 2))
+    _tmp._exec("delete from articles where id like 'pt-%'")
+    _tmp._exec("delete from article_bodies")
+
     print("\n[11-2f] 대체 공급자(Gemini·Grok·NVIDIA) — OpenAI 실패시 전환 (배포 전 점검, 2026-09-11/15)")
     _llm_blank = {f: "" for f in Config.__dataclass_fields__}
     _lcfg_with_fallback = Config(**{**_llm_blank, "openai_api_key": "sk-test",
@@ -10622,6 +11177,9 @@ def cmd_selftest() -> int:
             return Analysis(summary_sentences=[f"요약:{title}"], perspective="", keywords=[],
                             group_companies=[], sentiment="중립", ok=True)
 
+        def pfm_tone(self, excerpt: str) -> tuple[str, str]:
+            return "긍정", "테스트 근거"
+
     _pcfg = Config(**{**_llm_blank, "openai_api_key": "x", "llm_model": "m", "embedding_model": "e",
                       "nvidia_embed_api_key": "", "nvidia_embed_model": "n",
                       "nvidia_llm_api_key": "", "nvidia_llm_model": "nvm"})
@@ -10695,6 +11253,12 @@ def cmd_selftest() -> int:
     _dctx._llm = _StubAnalyzeLLM()
     _drained = _drain_deferred(_dctx, 10, [])
     check("드레인 처리 건수 — 중복 1건은 걸러지고 2건만 분석", _drained, 2)
+    _dc = _tmp._one("select pfm_excerpt, pfm_tone, pfm_tone_reason from articles where id='dd-c'")
+    check("분석 시 포스코퓨처엠 발췌·논조·근거가 함께 저장된다",
+          (bool(_dc["pfm_excerpt"]), _dc["pfm_tone"], _dc["pfm_tone_reason"]),
+          (True, "긍정", "테스트 근거"))
+    check("분석 후에도 본문은 30일 보관된다(본문 검색용)",
+          _tmp._one("select count(*) as n from article_bodies where article_id='dd-c'")["n"], 1)
     _final_status = {r["id"]: r["status"] for r in
                      _tmp._rows("select id, status from articles where id like 'dd-%'")}
     check("중복 쌍 중 하나는 archived, 나머지는 active 그대로",
@@ -11236,19 +11800,20 @@ def cmd_selftest() -> int:
     check("_clip — 넘치면 … 부착", _clip("가나다라마바", 4), "가나다…")
     _fr = {"title": "포스코퓨처엠 양극재 증설", "importance_score": 85,
            "group_companies": '["포스코퓨처엠"]', "press_name": "뉴스1", "author": "김기자",
-           "summary_text": "짧은 요약 문장.", "perspective_text": "관점 문장",
+           "summary_text": "짧은 요약 문장.", "pfm_excerpt": "포스코퓨처엠이 증설한다.",
            "url_canonical": "https://x.test/a"}
     _ft = _kakao_text_from_row(_fr, "https://x.test/a")
     check("row text — object_type=text", _ft["object_type"], "text")
     check("row text — 점수 85 는 🔴", _ft["text"].startswith("🔴"), True)
     check("row text — 태그가 머리줄에", "[포스코퓨처엠]" in _ft["text"], True)
     check("row text — 언론사·기자 머리표", "[뉴스1, 김기자]" in _ft["text"], True)
-    check("row text — 포스코 관점 포함", "포스코 관점:" in _ft["text"], True)
+    check("row text — 포스코 관점은 더 이상 안 나간다", "포스코 관점" in _ft["text"], False)
+    check("row text — 포스코퓨처엠 언급 발췌 포함", "포스코퓨처엠 언급:" in _ft["text"], True)
     check("row text — 링크는 본문 아닌 link 필드", "http" not in _ft["text"], True)
     check("row text — 원문 버튼", _ft["button_title"], "원문 보기")
     check("row text — 긴 요약도 200자 이하",
           len(_kakao_text_from_row({**_fr, "summary_text": "요" * 500,
-                                    "perspective_text": "관" * 500},
+                                    "pfm_excerpt": "관" * 500},
                                    "https://x.test/a")["text"]) <= 200, True)
 
     print("\n[13-2d] 배포 안전장치 — 시간대 · 세션 · SSRF · 호출 상한")
@@ -11509,7 +12074,10 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
-  fixpress   언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체)
+  pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
+                      --dry 는 대상 수만 보여주고 쓰지 않음)
+  fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
+                    --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
@@ -11517,7 +12085,6 @@ USAGE = """사용법: python backend/main.py <명령>
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
-  reperspective [N]  계열사 태그는 있는데 포스코 관점이 빈 기사를 재분석 (일회성, 기본 500건)
   repeople [N|all]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (구조화 안 된 것만, all 이면 전부)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
@@ -11564,7 +12131,7 @@ def main(argv: Sequence[str]) -> int:
     if command == "initdb":
         cmd_initdb(ctx)
     elif command == "fixpress":
-        cmd_fixpress(ctx)
+        cmd_fixpress(ctx, dry="--dry" in argv[2:])
     elif command == "fixauthors":
         cmd_fixauthors(ctx)
     elif command == "fixgroups":
@@ -11579,14 +12146,15 @@ def main(argv: Sequence[str]) -> int:
         cmd_reanalyze(ctx)
     elif command == "reswot":
         cmd_reswot(ctx)
-    elif command == "reperspective":
-        _lim = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 500
-        cmd_reperspective(ctx, _lim)
     elif command == "repeople":
         rest = argv[2:]
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+    elif command == "pfmtone":
+        rest = argv[2:]
+        nums = [int(a) for a in rest if a.isdigit()]
+        cmd_pfmtone(ctx, nums[0] if nums else 200, dry="--dry" in rest)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":

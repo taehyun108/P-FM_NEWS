@@ -44,7 +44,10 @@ create table if not exists articles (
   categories         jsonb default '[]',     -- 카테고리 태그 (F3.1)
   title_embedding    jsonb,                  -- 중복 판정 4단계용 캐시 (F2.2)
   analyzed_at        timestamptz,            -- LLM 분석 완료 시각. null 이면 재처리 큐 대상
-  status             text default 'active'   -- 'active' | 'draft' | 'archived' | 'error'
+  status             text default 'active',  -- 'active' | 'draft' | 'archived' | 'error'
+  pfm_excerpt        text,                   -- 본문 속 포스코퓨처엠 언급 문장+앞뒤 문맥(약 4줄)
+  pfm_tone           text,                   -- 포스코퓨처엠 논조 '긍정'|'중립'|'부정' (발췌문 LLM 판정)
+  pfm_tone_reason    text                    -- 논조 근거 한 줄
 );
 
 -- ── 영구 제외 원장 (저장하지 않기로 확정된 URL — 재조회 방지) ──────
@@ -337,3 +340,10 @@ alter table ea_agencies     enable row level security;
 alter table ea_url_ledger   enable row level security;
 alter table ea_run_state    enable row level security;
 -- 대외협력 데이터는 사내 대관 업무용이라 공개 정책을 두지 않는다 (service role 로만 접근).
+
+-- ── 2026-09-29 마이그레이션: 포스코퓨처엠 발췌·논조 ────────────────────
+-- 이미 운영 중인 DB 는 위 create table 이 건너뛰어지므로 아래를 SQL Editor 에서 1회 실행한다.
+alter table articles add column if not exists pfm_excerpt     text;
+alter table articles add column if not exists pfm_tone        text;
+alter table articles add column if not exists pfm_tone_reason text;
+create index if not exists idx_articles_pfm_tone on articles (pfm_tone) where pfm_tone is not null;
