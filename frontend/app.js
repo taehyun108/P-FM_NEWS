@@ -1231,6 +1231,7 @@ const GROUP_BRAND = {
   '포스코인터내셔널': '#0e2a5e',
   '포스코이앤씨':     '#0f7b52',
   '포스코':           '#0b3a86',
+  '배터리협회':       '#1f7a8c',
 };
 
 function buildLogoThumb(item) {

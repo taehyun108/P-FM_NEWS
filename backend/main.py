@@ -2379,7 +2379,8 @@ def make_storage(cfg: Config) -> Storage:
 
 SEED_KEYWORDS: list[tuple[str, str]] = (
     [("그룹사", k) for k in
-     ["포스코", "포스코홀딩스", "포스코퓨처엠", "포스코DX", "포스코인터내셔널", "포스코이앤씨", "POSCO"]]
+     ["포스코", "포스코홀딩스", "포스코퓨처엠", "포스코DX", "포스코인터내셔널", "포스코이앤씨", "POSCO",
+      "배터리협회", "한국배터리산업협회", "KBIA"]]
     + [("산업", k) for k in
        ["이차전지", "배터리 소재", "양극재", "음극재", "전구체", "리튬", "니켈", "흑연",
         "전고체 배터리", "나트륨 배터리", "LFP",
@@ -2652,9 +2653,15 @@ GROUP_COMPANIES: dict[str, list[str]] = {
     "절강화포": ["절강화포", "저장화포", "浙江华浦", "zhejiang huapu"],
     "씨앤피신소재테크놀로지": ["씨앤피신소재테크놀로지", "c&p신소재테크놀로지",
                               "씨앤피신소재", "cnp신소재"],
+    # 포스코 계열사는 아니지만 함께 추적하는 기관 (사용자 지정 2026-09-30) — 필터 '그룹사' 칩에 같이 나온다.
+    "배터리협회": ["한국배터리산업협회", "배터리산업협회", "한국전지산업협회", "배터리협회", "KBIA"],
     # 상위 개념 — 계열사가 특정되면 제거됨
     "포스코": ["포스코", "POSCO"],
 }
+
+# '그룹사' 칩에는 나오지만 포스코 계열이 아닌 항목 — 이것만 잡혔다고 해서 상위 개념 '포스코'
+# 태그를 빼거나(normalize_group_list) 붙이지 않는(detect_group_companies) 일이 없어야 한다.
+NON_POSCO_GROUPS = frozenset({"배터리협회"})
 
 # 별칭 소문자 사전계산 — detect_group_companies·score_article 이 호출마다
 # `[a.lower() for a in aliases]` 를 다시 만들던 것을 제거한다(파이프라인·API 공통 경로).
@@ -4305,7 +4312,8 @@ def detect_group_companies(text: str) -> list[str]:
             continue  # 마지막에 따로 판단
         if any(alias in lowered for alias in aliases):
             found.append(canonical)
-    if not found and any(alias in lowered for alias in _GROUP_ALIASES_LOWER["포스코"]):
+    if (not [g for g in found if g not in NON_POSCO_GROUPS]
+            and any(alias in lowered for alias in _GROUP_ALIASES_LOWER["포스코"])):
         found.append("포스코")
     return found
 
@@ -4360,7 +4368,7 @@ def normalize_group_list(groups: Iterable[str]) -> list[str]:
     상위·하위가 같이 붙는다. 칩이 늘어나기만 하고 정보량은 늘지 않는다.
     """
     cleaned = dedupe_chips(g for g in groups if g in GROUP_COMPANIES)
-    if len(cleaned) > 1 and "포스코" in cleaned:
+    if "포스코" in cleaned and any(g not in NON_POSCO_GROUPS and g != "포스코" for g in cleaned):
         cleaned = [g for g in cleaned if g != "포스코"]
     return cleaned
 
@@ -4478,7 +4486,8 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 
 [관련 그룹사]
 - group_companies: 기사 본문에 그 회사 이름이 실제로 등장하는 경우에만 넣는다
-  포스코홀딩스, 포스코퓨처엠, 포스코DX, 포스코인터내셔널, 포스코이앤씨, 포스코
+  포스코홀딩스, 포스코퓨처엠, 포스코DX, 포스코인터내셔널, 포스코이앤씨, 포스코,
+  배터리협회(한국배터리산업협회·KBIA — 포스코 계열은 아니지만 함께 추적한다)
 - 여러 소식을 묶은 브리핑·모음 기사는 본문 전체(주요 항목이 아닌 다른 항목
   포함)를 끝까지 확인한다 — 요약 문장에 담기지 않은 항목이라도 본문에 회사
   이름이 있으면 반드시 group_companies 에 넣는다
@@ -9727,6 +9736,26 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
 
 
+def cmd_addkw(ctx: Context, category: str, words: Sequence[str]) -> None:
+    """수집 키워드를 서버에서 바로 추가한다(마스터 패널 화면 없이). 이미 있으면 건너뛴다."""
+    if category not in KEYWORD_CATEGORIES:
+        log.error("분류는 %s 중 하나여야 합니다. 예: addkw 그룹사 배터리협회 KBIA",
+                  " · ".join(KEYWORD_CATEGORIES))
+        return
+    added = skipped = 0
+    for w in words:
+        kw = (w or "").strip()
+        if not kw:
+            continue
+        if ctx.storage.add_keyword(category, kw):
+            added += 1
+            log.info("  + 추가: [%s] %s", category, kw)
+        else:
+            skipped += 1
+            log.info("  = 이미 있음: [%s] %s", category, kw)
+    log.info("수집 키워드 추가 완료: 새로 %d개 · 이미 있음 %d개 (다음 수집 회차부터 조회됩니다)", added, skipped)
+
+
 def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 365) -> None:
     """기존 포스코퓨처엠 기사에 발췌문·논조를 채운다(백필, 사용자 지정 2026-09-29).
 
@@ -10787,6 +10816,18 @@ def cmd_selftest() -> int:
     _bs, _bm, _bu = people_summary(_bulk_ctx, "personnel", "[인사] 법무부", "연합뉴스", _moj_text, True)
     check("인사 대량 — LLM 없이 규칙 정리(모델 표시 rule), 32줄 전부",
           (_bm, len(_bs.splitlines())), (PEOPLE_RULE_MODEL, 32))
+    # 배터리협회 — 계열사는 아니지만 그룹사 칩·수집 대상 (2026-09-30)
+    check("배터리협회 — 정식 명칭·약칭·옛 명칭 모두 잡는다",
+          [detect_group_companies(t) for t in ("한국배터리산업협회가 발표했다", "KBIA 총회", "배터리협회 세미나",
+                                                "한국전지산업협회 시절")],
+          [["배터리협회"]] * 4)
+    check("배터리협회 + 포스코 — 포스코 태그가 사라지지 않는다",
+          (detect_group_companies("포스코와 배터리협회가 협약"), normalize_group_list(["배터리협회", "포스코"])),
+          (["배터리협회", "포스코"], ["배터리협회", "포스코"]))
+    check("배터리협회 + 포스코퓨처엠 — 상위 '포스코' 는 여전히 빠진다",
+          normalize_group_list(["배터리협회", "포스코퓨처엠", "포스코"]), ["배터리협회", "포스코퓨처엠"])
+    check("네이버 그룹사 키워드 — 협회 기사는 포스코 언급이 없어도 통과",
+          _naver_item_relevant("배터리협회, 배터리 안전 세미나 개최", "그룹사", "배터리협회", ""), True)
     check("직함만 있고 이름이 없으면(끝 토큰이 흔한 직함) 나누지 않는다",
           format_people_notice("◇ 인사 ▲ 정치부 부장", "personnel"),
           "ㆍ정치부 부장 (인사)")
@@ -12463,6 +12504,8 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
+  addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
+                    분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
                       --dry 는 대상 수만 보여주고 쓰지 않음)
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
@@ -12540,6 +12583,8 @@ def main(argv: Sequence[str]) -> int:
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+    elif command == "addkw":
+        cmd_addkw(ctx, argv[2] if len(argv) > 2 else "", argv[3:])
     elif command == "pfmtone":
         rest = argv[2:]
         nums = [int(a) for a in rest if a.isdigit()]
