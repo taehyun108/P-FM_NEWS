@@ -733,9 +733,9 @@ class Storage(ABC):
         """articles.press_name 을 press_outlets 의 현재 이름으로 다시 맞춘다. 갱신 건수 반환."""
 
     @abstractmethod
-    def pfm_articles(self, since: str) -> list[dict]:
+    def pfm_articles(self, since: str, with_excerpt: bool = True) -> list[dict]:
         """since 이후 발행된 활성·대표·분석완료 기사 중 그룹사 태그에 포스코퓨처엠이 있는 것.
-        언론사 탭 집계·논조 백필용 경량 컬럼만."""
+        언론사 탭 집계·논조 백필용 경량 컬럼만. 집계는 발췌 본문이 필요 없어 with_excerpt=False."""
 
     @abstractmethod
     def body_of(self, article_id: str) -> str | None:
@@ -803,7 +803,11 @@ ARTICLE_SCAN_COLS = ", ".join(f"a.{c}" for c in (
 
 # 언론사 탭 집계·논조 백필 전용 컬럼 (포스코퓨처엠 태그 기사만 읽는다).
 PFM_ARTICLE_COLS = ("id, title, url_canonical, url_original, press_name, author, published_at,"
-                    " pfm_excerpt, pfm_tone, pfm_tone_reason")
+                    " pfm_tone, pfm_tone_reason")
+
+
+def _pfm_cols(with_excerpt: bool) -> str:
+    return PFM_ARTICLE_COLS + (", pfm_excerpt" if with_excerpt else "")
 
 
 class SqliteStorage(Storage):
@@ -1479,9 +1483,9 @@ class SqliteStorage(Storage):
             (name, tier, domain),
         )
 
-    def pfm_articles(self, since: str) -> list[dict]:
+    def pfm_articles(self, since: str, with_excerpt: bool = True) -> list[dict]:
         return self._rows(
-            f"select {PFM_ARTICLE_COLS} from articles"
+            f"select {_pfm_cols(with_excerpt)} from articles"
             " where status='active' and is_representative=1 and analyzed_at is not null"
             " and published_at >= ? and group_companies like ?"
             " order by published_at desc",
@@ -2214,10 +2218,11 @@ class SupabaseStorage(Storage):
             {"name": name, "tier": tier, "status": "approved"}
         ).eq("domain", domain).execute()
 
-    def pfm_articles(self, since: str) -> list[dict]:
+    def pfm_articles(self, since: str, with_excerpt: bool = True) -> list[dict]:
         # group_companies 는 jsonb 배열 — cs(포함) 연산자에 JSON 배열 문자열을 넘긴다.
+        cols = _pfm_cols(with_excerpt).replace(" ", "")
         return self._page(lambda: (
-            self._t("articles").select(PFM_ARTICLE_COLS.replace(" ", ""))
+            self._t("articles").select(cols)
             .eq("status", "active").eq("is_representative", True)
             .not_.is_("analyzed_at", "null").gte("published_at", since)
             .filter("group_companies", "cs", jdump(["포스코퓨처엠"]))
@@ -7387,20 +7392,49 @@ WEEKLY_SECTIONS: list[tuple[str, str, str]] = [
 PRESS_STATS_WINDOWS = (("week", 7), ("month", 30), ("year", 365))
 PRESS_STATS_ARTICLES_MAX = 200   # 언론사 1곳당 펼쳐 보여줄 기사 수 상한
 PRESS_STATS_TTL_SEC = 300        # 탭을 열 때마다 DB 를 치지 않게 5분 캐시
-_AUTHOR_SPLIT_RE = re.compile(r"\s*[,·/]\s*|\s{2,}")
+_AUTHOR_SPLIT_RE = re.compile(r"\s*(?:[,·/、&]|\s및\s)\s*|\s{2,}")
+_AUTHOR_NOISE_RE = re.compile(r"\S+@\S+|\([^)]*\)|\[[^\]]*\]|^[가-힣A-Za-z]{2,10}\s*[=:]\s*")
+_AUTHOR_TITLE_RE = re.compile(
+    r"\s*(?:선임기자|수석기자|전문기자|인턴기자|수습기자|객원기자|기자|특파원|논설위원|편집위원"
+    r"|인턴|수습|객원|선임|에디터|PD|앵커)$", re.I)
 
 
 def split_authors(author: str) -> list[str]:
-    """'김철수 기자, 이영희 기자' → ['김철수', '이영희'] (공동 바이라인을 기자별로 센다)."""
+    """기자명 필드를 사람 이름 목록으로 정규화한다.
+
+    '김철수 기자, 이영희 인턴기자' → ['김철수', '이영희'], '김철수 (kcs@x.com)' → ['김철수'].
+    상세 검색 '기자' 칸과 언론사 탭 기자별 건수가 **같은 규칙**으로 이름을 비교·집계한다.
+    """
     names: list[str] = []
     for part in _AUTHOR_SPLIT_RE.split(author or ""):
-        part = part.strip()
-        nm = re.sub(r"\s*기자$", "", part)
+        part = _AUTHOR_NOISE_RE.sub("", part).strip()
+        nm = _AUTHOR_TITLE_RE.sub("", part).strip()
         if len(nm) < 2:      # '김기자'처럼 떼고 나면 이름이 안 남으면 원문 그대로 둔다
             nm = part
-        if nm and nm not in names:
-            names.append(nm)
+        # '김철수 이영희' 처럼 한글 이름만 공백으로 나열된 공동 바이라인은 사람별로 나눈다.
+        pieces = nm.split()
+        if len(pieces) > 1 and all(re.fullmatch(r"[가-힣]{2,4}", x) for x in pieces):
+            cands = pieces
+        else:
+            cands = [nm]
+        for c in cands:
+            if c and c not in names:
+                names.append(c)
     return names
+
+
+def author_matches(author: str, query: str) -> bool:
+    """상세 검색 '기자' 칸 — 이름이 **정확히** 같은 기자만 찾는다.
+
+    예전엔 부분 일치라 '김민'을 치면 김민수·김민지가, 입력 도중 '김철'이 먼저 검색되면
+    김철민이 섞여 나왔다(2026-09-29 사용자 지적). '기자'·직함·이메일은 떼고 비교한다.
+    정규화하면 아무것도 안 남는 검색어(예: 이메일만 입력)일 때만 부분 일치로 찾는다.
+    """
+    want = [q.lower() for q in split_authors(query)]
+    if not want:
+        return (query or "").strip().lower() in (author or "").lower()
+    have = {n.lower() for n in split_authors(author)}
+    return all(w in have for w in want)
 
 
 def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> list[dict]:
@@ -7990,7 +8024,7 @@ def field_search(tagged: list[dict], fields: dict[str, str],
             continue
         if "press" in want and want["press"] not in (t.get("p") or "").lower():
             continue
-        if "author" in want and want["author"] not in (r.get("author") or "").lower():
+        if "author" in want and not author_matches(r.get("author") or "", want["author"]):
             continue
         if "body" in want:
             term = want["body"]
@@ -9140,7 +9174,7 @@ def create_app(ctx: Context):
         if _press_stats_cache["data"] and mono - _press_stats_cache["at"] < PRESS_STATS_TTL_SEC:
             return JSONResponse(_press_stats_cache["data"])
         now = now_utc()
-        rows = ctx.storage.pfm_articles(iso(now - timedelta(days=365)))
+        rows = ctx.storage.pfm_articles(iso(now - timedelta(days=365)), with_excerpt=False)
         items = aggregate_press_stats(rows, now)
         data = {
             "generated_at": iso(now),
@@ -10977,6 +11011,22 @@ def cmd_selftest() -> int:
     check("빈 칸만 있으면 조건 없음", _ids(field_search(_fs_rows, {"title": "", "body": " "})),
           ["fs-1", "fs-2", "fs-3"])
     check("제목 칸", _ids(field_search(_fs_rows, {"title": "포스코퓨처엠"})), ["fs-1", "fs-2"])
+    # 회귀 방지(2026-09-29 사용자 지적: 기자명을 검색했는데 다른 기자가 나옴)
+    check("기자 칸 — 정확히 같은 이름만 (김철 ≠ 김철수·김철민)",
+          [author_matches(a, "김철") for a in ("김철수", "김철민", "김철")], [False, False, True])
+    check("기자 칸 — '기자'·직함·이메일 떼고 비교",
+          [author_matches(a, "김철수") for a in ("김철수 기자", "김철수 인턴기자", "김철수 (kcs@x.com)",
+                                                 "영남본부=김철수", "김철수민")],
+          [True, True, True, True, False])
+    check("기자 칸 — 공동 바이라인 속 한 명도 찾는다",
+          [author_matches(a, "이영희") for a in ("김철수·이영희", "김철수, 이영희 기자", "김철수 이영희")],
+          [True, True, True])
+    check("기자 칸 — 검색어에 '기자'를 붙여도 같다", author_matches("김철수", "김철수 기자"), True)
+    check("기자 칸 — 팀 바이라인도 이름 전체가 같으면 찾는다",
+          (author_matches("온라인뉴스팀", "온라인뉴스팀"), author_matches("온라인뉴스팀", "뉴스팀")),
+          (True, False))
+    check("기자 분리 — 직함·이메일 정리 후 중복 제거",
+          split_authors("김철수 선임기자, 김철수 (kcs@x.com) / 이영희 특파원"), ["김철수", "이영희"])
     check("여러 칸은 AND (제목 + 기자)",
           _ids(field_search(_fs_rows, {"title": "포스코퓨처엠", "author": "김기자"})), ["fs-1"])
     check("언론사 칸은 화면 이름(도메인 → 매핑)으로 비교",

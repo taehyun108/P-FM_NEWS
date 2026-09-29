@@ -93,8 +93,8 @@ function formatPrice(value, kind) {
   });
 }
 
-async function getJSON(path) {
-  const res = await fetch(API + path, { headers: { Accept: 'application/json' } });
+async function getJSON(path, signal) {
+  const res = await fetch(API + path, { headers: { Accept: 'application/json' }, signal });
   if (!res.ok) throw new Error(`${res.status} ${path}`);
   return res.json();
 }
@@ -1603,10 +1603,21 @@ function buildQuery() {
   return p.toString();
 }
 
+// 목록 요청은 '마지막 요청이 이긴다'. 예전엔 요청 중에 들어온 새 요청을 버려서,
+// 한글 입력 도중('김철') 먼저 나간 검색 결과가 최종 검색어('김철수') 대신 화면에 남았다
+// (2026-09-29 사용자 지적: 기자명을 검색했는데 다른 기자가 나옴). 이제 새 요청이 오면
+// 이전 요청을 취소하고, 늦게 도착한 옛 응답은 번호(seq)로 걸러 버린다.
+let refreshSeq = 0;
+let refreshAbort = null;
+
 async function refresh(reset) {
   // 즐겨찾기 화면일 때는 일반 목록이 덮어쓰지 않게 막는다.
   // (필터를 숨기는 것만으로는 방어가 약하다 — 단축키·코드 변경에 취약)
-  if (favView || weeklyView || pressView || state.loading) return;
+  if (favView || weeklyView || pressView) return;
+  const seq = ++refreshSeq;
+  if (refreshAbort) refreshAbort.abort();
+  refreshAbort = new AbortController();
+  const signal = refreshAbort.signal;
   state.loading = true;
   if (reset) state.page = 1;
   $('grid').replaceChildren(...Array.from({ length: 6 }, () => el('div', 'skeleton')));
@@ -1614,7 +1625,8 @@ async function refresh(reset) {
   syncChipStates();
 
   try {
-    const data = await getJSON('/api/articles?' + buildQuery());
+    const data = await getJSON('/api/articles?' + buildQuery(), signal);
+    if (seq !== refreshSeq) return;   // 더 새 요청이 나갔다 — 이 응답은 버린다
     state.total = data.total;
     // 필터가 좁아져 현재 페이지가 범위를 벗어나면 마지막 페이지로 되돌린다.
     const pages = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
@@ -1629,18 +1641,19 @@ async function refresh(reset) {
     renderPagination(state.page, data.total);
     updateActiveFilterCount();
   } catch (err) {
+    if (seq !== refreshSeq || err.name === 'AbortError') return;   // 취소된 옛 요청
     console.error('기사 조회 실패', err);
     $('grid').replaceChildren(el('p', 'empty', '기사를 불러오지 못했습니다.'));
     renderPagination(1, 0);
   } finally {
-    state.loading = false;
+    if (seq === refreshSeq) state.loading = false;
   }
 }
 
 /* ── 페이지네이션 ──────────────────────────────────────────────── */
 
 function gotoPage(n) {
-  if (n === state.page || state.loading) return;
+  if (n === state.page) return;
   state.page = n;
   refresh(false);
   const grid = document.querySelector('.grid');
