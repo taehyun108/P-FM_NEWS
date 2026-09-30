@@ -1411,7 +1411,7 @@ function buildPressTable(items) {
   const table = el('table', 'press-table');
   const thead = el('thead');
   const h1 = el('tr');
-  [['언론사 (언급 순위)', { rowSpan: 2 }], ['언급 횟수', { colSpan: 3 }], ['논조', { colSpan: 4 }],
+  [['순위', { rowSpan: 2 }], ['언론사', { rowSpan: 2 }], ['언급 횟수', { colSpan: 3 }], ['논조', { colSpan: 4 }],
     ['기자 (건수) · 색=논조', { rowSpan: 2 }]].forEach(([t, span]) => {
     h1.append(Object.assign(el('th', null, t), span));
   });
@@ -1423,9 +1423,10 @@ function buildPressTable(items) {
     const tr = el('tr', 'press-row');
     tr.tabIndex = 0;
     tr.setAttribute('aria-expanded', 'false');
+    // 순위는 별도 칸으로 맨 왼쪽에 둔다(언급 건수 많은 순 — 연간 → 월간 → 주간).
+    tr.append(el('td', 'press-rank-cell', it.rank ? String(it.rank) : '—'));
     const name = el('td', 'press-name');
     name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
-    if (it.rank) name.append(el('span', 'press-rank', `${it.rank}위`));
     tr.append(name);
     [it.week, it.month, it.year].forEach((n) => tr.append(el('td', 'num', String(n))));
     ['긍정', '중립', '부정'].forEach((k) => {
@@ -1438,7 +1439,7 @@ function buildPressTable(items) {
     const detail = el('tr', 'press-detail');
     detail.hidden = true;
     const cell = el('td');
-    cell.colSpan = 10;
+    cell.colSpan = 11;
     detail.append(cell);
     const showAll = () => cell.replaceChildren(buildPressArticles(it));   // 언론사 전체 기사
     const setOpen = (open) => {
