@@ -8097,6 +8097,13 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
             " ".join(jload(row.get("keywords"), [])),
         ])
         groups = normalize_group_list(detect_group_companies(probe))
+    else:
+        # 저장된 그룹사가 있어도, 제목·요약에 협회 이름이 나오면 '배터리협회' 칩을 덧붙인다 —
+        # 이 칩은 나중에 추가돼 과거 기사에는 저장값이 없다(2026-09-30).
+        probe = f"{row.get('title') or ''} {row.get('summary_text') or ''}".lower()
+        for extra in NON_POSCO_GROUPS:
+            if extra not in groups and any(a in probe for a in _GROUP_ALIASES_LOWER[extra]):
+                groups = groups + [extra]
     categories = dedupe_chips(cats, exclude=groups)
     press = press_display_name(row.get("press_name") or "",
                                row.get("url_canonical") or row.get("url_original") or "")
@@ -8644,7 +8651,9 @@ def create_app(ctx: Context):
             if t["p"]:
                 presses.append(t["p"])
         data = {
-            "groups": _ordered(groups, GROUP_ORDER),
+            # 포스코 계열이 아닌 '배터리협회'는 기사가 아직 없어도 칩이 사라지지 않게 항상 맨 끝에 둔다.
+            "groups": [g for g in _ordered(groups, GROUP_ORDER) if g not in NON_POSCO_GROUPS]
+                      + sorted(NON_POSCO_GROUPS),
             "categories": _ordered(cats, CATEGORY_ORDER),
             "presses": [p for p, _ in Counter(presses).most_common()],  # 기사 많은 순
             "periods": [{"key": "today", "label": "오늘"}, {"key": "7d", "label": "7일"},
@@ -10828,6 +10837,10 @@ def cmd_selftest() -> int:
           [detect_group_companies(t) for t in ("한국배터리산업협회가 발표했다", "KBIA 총회", "배터리협회 세미나",
                                                 "한국전지산업협회 시절")],
           [["배터리협회"]] * 4)
+    check("과거 기사(저장된 그룹사 있음)도 제목·요약에 협회가 나오면 배터리협회 칩이 붙는다",
+          card_tags({"title": "포스코퓨처엠 양극재 증설", "summary_text": "한국배터리산업협회는 환영했다",
+                     "group_companies": '["포스코퓨처엠"]', "categories": "[]", "keywords": "[]"})[0],
+          ["포스코퓨처엠", "배터리협회"])
     check("배터리협회 + 포스코 — 포스코 태그가 사라지지 않는다",
           (detect_group_companies("포스코와 배터리협회가 협약"), normalize_group_list(["배터리협회", "포스코"])),
           (["배터리협회", "포스코"], ["배터리협회", "포스코"]))
