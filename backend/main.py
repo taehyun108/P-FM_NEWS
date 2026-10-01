@@ -614,6 +614,10 @@ class Storage(ABC):
     def save_summary(self, row: dict) -> None: ...
 
     @abstractmethod
+    def set_perspective(self, article_id: str, text: str) -> None:
+        """summaries.perspective_text 만 바꾼다(요약·생성시각은 그대로 — 일일 LLM 호출 집계가 늘지 않는다)."""
+
+    @abstractmethod
     def save_swot(self, row: dict) -> None: ...
 
     @abstractmethod
@@ -1194,6 +1198,9 @@ class SqliteStorage(Storage):
             f" on conflict(article_id) do update set {updates}",
             list(data.values()),
         )
+
+    def set_perspective(self, article_id: str, text: str) -> None:
+        self._exec("update summaries set perspective_text=? where article_id=?", (text, article_id))
 
     def save_swot(self, row: dict) -> None:
         data = self._encode(row)
@@ -1973,6 +1980,9 @@ class SupabaseStorage(Storage):
 
     def save_summary(self, row: dict) -> None:
         self._t("summaries").upsert(row, on_conflict="article_id").execute()
+
+    def set_perspective(self, article_id: str, text: str) -> None:
+        self._t("summaries").update({"perspective_text": text}).eq("article_id", article_id).execute()
 
     def save_swot(self, row: dict) -> None:
         self._t("swot_analyses").upsert(row, on_conflict="article_id").execute()
@@ -4427,47 +4437,131 @@ def detect_group_companies(text: str) -> list[str]:
     return found
 
 
-# ── 포스코퓨처엠 언급 발췌 (사용자 지정 2026-09-29) ─────────────────────
-# 카드의 '포스코 관점'(LLM 생성문)을 대신해, 본문에서 포스코퓨처엠이 실제로 나온
-# 문장을 앞뒤 문맥과 함께 약 4줄(카드 한 줄 ≈ 45~50자) 분량으로 그대로 발췌한다.
-# 이 발췌문은 언론사 탭의 논조 판정(LLM) 입력으로도 재사용하므로 DB 에 저장한다.
-PFM_EXCERPT_TARGET = 190   # 이 길이에 닿을 때까지 앞뒤 문장을 덧붙인다(≈4줄)
-PFM_EXCERPT_MAX = 280      # 문장 하나가 너무 길면 여기서 자른다
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。…])\s+|(?<=다\.)(?=\S)|\n+")
+# ── 포스코퓨처엠 언급 발췌 (사용자 지정 2026-09-29, 흐름 개선 2026-10-01) ─────────
+# 카드의 '포스코 관점'(LLM 생성문)을 대신해, 본문에서 포스코퓨처엠이 실제로 나온 대목을 기사 주제(도입부)와
+# 함께 문단 단위로 그대로 발췌한다. 이 발췌문은 언론사 탭의 논조 판정(LLM) 입력으로도 재사용하므로
+# DB 에 저장한다. 영어 기사는 한글로 번역해 저장한다(translate_to_korean).
+PFM_EXCERPT_MAX = 700      # 발췌 전체 상한(글자)
+PFM_PARA_MAX = 380         # 언급 문단 하나에서 가져오는 상한 — 넘으면 언급 문장 앞뒤를 문장 단위로만 자른다
+PFM_LEAD_MAX = 160         # 기사 주제(첫 문단) 도입부 상한
+PFM_MENTION_PARAS = 3      # 언급 문단을 최대 몇 개까지 담을지
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。…])\s+|(?<=다\.)(?=\S)")
+
+
+def _sentences(text: str) -> list[str]:
+    return [x.strip() for x in _SENT_SPLIT_RE.split(text or "") if x and x.strip()]
+
+
+def _cut_at_word(text: str, limit: int) -> str:
+    """limit 를 넘으면 단어 경계에서 잘라 … 를 붙인다(문장이 한 개뿐인 극단적인 경우에만 쓴다)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    return (cut[:cut.rfind(" ")] if " " in cut else cut).rstrip() + "…"
+
+
+def _paragraph_window(par: str, aliases: Sequence[str], limit: int) -> str:
+    """문단이 limit 이하면 통째로, 길면 첫 언급 문장 앞뒤를 **문장 단위로** 붙여 limit 안에서 자른다."""
+    if len(par) <= limit:
+        return par
+    sents = _sentences(par)
+    hit = next((i for i, x in enumerate(sents) if any(a in x.lower() for a in aliases)), 0)
+    lo = hi = hit
+    total = len(sents[hit])
+    while True:   # 뒤(이어지는 내용) → 앞(배경) 순으로 번갈아, 문장이 통째로 들어갈 때만 붙인다
+        grew = False
+        if hi + 1 < len(sents) and total + len(sents[hi + 1]) + 1 <= limit:
+            hi += 1
+            total += len(sents[hi]) + 1
+            grew = True
+        if lo - 1 >= 0 and total + len(sents[lo - 1]) + 1 <= limit:
+            lo -= 1
+            total += len(sents[lo]) + 1
+            grew = True
+        if not grew:
+            break
+    return _cut_at_word(" ".join(sents[lo:hi + 1]), limit)
 
 
 def extract_pfm_excerpt(body: str) -> str:
-    """본문에서 포스코퓨처엠(옛 사명·영문 포함) 언급 문장 + 앞뒤 문맥을 발췌한다.
+    """본문에서 포스코퓨처엠(옛 사명·영문 포함) 언급을 **흐름이 이어지게** 발췌한다.
 
-    언급이 없으면 빈 문자열 — 카드는 이 영역을 아예 그리지 않는다(대체 문구 없음).
-    기사 문장을 그대로 옮길 뿐 요약·재서술하지 않는다(지어낸 문장 방지).
+    예전엔 첫 언급 문장 앞뒤를 190자쯤 이어 붙여 '맥락 없이 한 토막'만 보였다(2026-10-01 지적).
+    이제는 ① 기사 주제를 알 수 있게 첫 문단 도입부, ② 언급이 나온 문단(최대 3개)을 문단째로,
+    ③ 언급 문단이 짧은 인용·단문이면 바로 앞 문장까지 문서 순서대로 담는다. 문장은 중간에서 자르지
+    않고(극단적으로 긴 문장만 예외), 기사에 있는 문장을 그대로 옮길 뿐 재서술하지 않는다.
+    언급이 없으면 빈 문자열 — 카드는 이 영역을 아예 그리지 않는다.
     """
     text = re.sub(r"[ \t\r\f\v]+", " ", (body or "")).strip()
     if not text:
         return ""
-    sents = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s and s.strip()]
+    paras = [p.strip() for p in text.split("\n") if len(p.strip()) >= 15] or [text]
     aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
-    hit = next((i for i, s in enumerate(sents) if any(a in s.lower() for a in aliases)), None)
-    if hit is None:
+    hits = [i for i, p in enumerate(paras) if any(a in p.lower() for a in aliases)]
+    if not hits:
         return ""
-    lo = hi = hit
-    total = len(sents[hit])
-    # 뒤 문장을 먼저(맥락이 이어지는 쪽), 그다음 앞 문장을 번갈아 붙인다.
-    while total < PFM_EXCERPT_TARGET and (lo > 0 or hi < len(sents) - 1):
-        if hi < len(sents) - 1:
-            hi += 1
-            total += len(sents[hi]) + 1
-        if total < PFM_EXCERPT_TARGET and lo > 0:
-            lo -= 1
-            total += len(sents[lo]) + 1
-    out = " ".join(sents[lo:hi + 1])
-    if len(out) > PFM_EXCERPT_MAX:
-        # 언급 문장이 잘려 나가지 않도록, 넘치면 언급 문장부터 다시 잰다.
-        out = " ".join(sents[hit:hi + 1])
-        if len(out) > PFM_EXCERPT_MAX:
-            cut = out[:PFM_EXCERPT_MAX]
-            out = (cut[:cut.rfind(" ")] if " " in cut else cut).rstrip() + "…"
-    return out
+
+    segs: list[tuple[int, str]] = []
+    used = 0
+
+    def add(idx: int, t: str) -> bool:
+        nonlocal used
+        t = t.strip()
+        if not t or used + len(t) + 1 > PFM_EXCERPT_MAX:
+            return False
+        segs.append((idx, t))
+        used += len(t) + 1
+        return True
+
+    # ① 기사 주제 — 언급이 첫 문단 밖에 있거나, 첫 문단이 길어 언급 부분만 잘리는 경우의 도입부
+    first = _sentences(paras[0])
+    if first and not any(a in first[0].lower() for a in aliases) \
+            and (hits[0] > 0 or len(paras[0]) > PFM_PARA_MAX):
+        lead = " ".join(first[:2])
+        lead = lead if len(lead) <= PFM_LEAD_MAX else first[0]
+        add(0, _cut_at_word(lead, PFM_LEAD_MAX))
+
+    # ② 언급 문단 (+ ③ 짧은 문단이면 바로 앞 문장)
+    for idx in hits[:PFM_MENTION_PARAS]:
+        chunk = _paragraph_window(paras[idx], aliases, PFM_PARA_MAX)
+        if len(paras[idx]) < 70 and idx - 1 >= 0 and all(i != idx - 1 for i, _ in segs) \
+                and not any(a in paras[idx - 1].lower() for a in aliases):
+            prev = _sentences(paras[idx - 1])
+            if prev and len(prev[-1]) <= PFM_PARA_MAX:
+                add(idx - 1, prev[-1])
+        if not add(idx, chunk):
+            break
+
+    # 첫 문단 도입부가 언급 구간과 같은 문장이면 중복을 뺀다
+    segs.sort(key=lambda x: x[0])
+    out: list[str] = []
+    for _, t in segs:
+        if not any(t in o or o in t for o in out):
+            out.append(t)
+    return "\n".join(out)
+
+
+def excerpt_for_message(text: str, limit: int = 450) -> str:
+    """텔레그램 등 메시지용 발췌 — 줄바꿈을 공백으로 잇고, 길면 문장 단위로만 자른다(문장 중간에서 안 끊는다)."""
+    one = re.sub(r"\s*\n\s*", " ", (text or "").strip())
+    if len(one) <= limit:
+        return one
+    out = ""
+    for sent in _sentences(one):
+        if len(out) + len(sent) + 1 > limit:
+            break
+        out = f"{out} {sent}".strip()
+    return out or _cut_at_word(one, limit)
+
+
+def looks_english(text: str) -> bool:
+    """글자의 대부분이 영문인가(한글이 거의 없다) — 영어 기사 판별용. 너무 짧으면 판단하지 않는다."""
+    letters = [c for c in (text or "") if c.isalpha()]
+    if len(letters) < 12:
+        return False
+    hangul = sum(1 for c in letters if "가" <= c <= "힣")
+    latin = sum(1 for c in letters if c.isascii())
+    return hangul / len(letters) < 0.1 and latin / len(letters) > 0.8
 
 
 def normalize_group_list(groups: Iterable[str]) -> list[str]:
@@ -4675,6 +4769,25 @@ PFM_TONE_PROMPT = """[판정 대상] 포스코퓨처엠
 형식: {{"tone":"긍정|중립|부정","reason":"..."}}"""
 
 
+TRANSLATE_SYSTEM = ("당신은 영한 뉴스 번역가다. 원문의 뜻을 바꾸거나 덧붙이지 않고 자연스러운 한국어 "
+                    "뉴스 문체로 옮기며, JSON 으로만 답한다.")
+TRANSLATE_PROMPT = """아래 영어 기사의 제목과 발췌를 한국어로 번역하라.
+- 원문에 없는 내용을 추가하거나 빼지 않는다. 숫자·단위·날짜·인용은 그대로 옮긴다.
+- 회사명은 한국에서 쓰는 표기를 쓴다: POSCO Future M → 포스코퓨처엠, POSCO Holdings → 포스코홀딩스,
+  POSCO → 포스코, LG Energy Solution → LG에너지솔루션, Samsung SDI → 삼성SDI, SK On → SK온.
+  그 밖의 고유명사는 통용 표기가 있으면 그것을, 없으면 원어를 그대로 둔다.
+- 문장은 "~했다"체 뉴스 문장으로. 발췌에 줄바꿈이 있으면 같은 줄바꿈을 유지한다.
+- 비어 있는 항목은 빈 문자열로 둔다.
+
+[제목]
+{title}
+
+[발췌]
+{excerpt}
+
+형식: {{"title":"한국어 제목","excerpt":"한국어 발췌"}}"""
+
+
 @dataclass
 class Analysis:
     summary_sentences: list[str] = field(default_factory=list)
@@ -4868,6 +4981,34 @@ class LLMClient:
         log.warning("인사·부고 구조화 실패(규칙 기반으로 대체): %s", last_error)
         return None, {}
 
+    def translate_to_korean(self, title: str, excerpt: str) -> tuple[str, str]:
+        """영어 기사의 제목·포스코퓨처엠 언급 발췌를 한국어로 번역한다(AI 1회 호출).
+
+        반환: (한국어 제목, 한국어 발췌). 번역에 실패하면(또는 결과에 한글이 없으면) 해당 항목은 ''
+        — 호출부는 원문을 그대로 둔다. 번역할 내용이 없으면 호출하지 않는다.
+        """
+        if not (title or "").strip() and not (excerpt or "").strip():
+            return "", ""
+        prompt = TRANSLATE_PROMPT.format(title=(title or "").strip()[:300], excerpt=(excerpt or "").strip()[:1500])
+        for attempt in range(2):
+            try:
+                content, _ = self._chat(TRANSLATE_SYSTEM, prompt)
+                data = _parse_json_object(content) or {}
+                t_ko = _pp(data.get("title"))
+                e_ko = re.sub(r"[ \t]+", " ", str(data.get("excerpt") or "")).strip()
+                # 번역 결과에 한글이 있어야 한다(영어를 그대로 돌려주면 번역 실패로 본다)
+                t_ko = t_ko if _has_hangul(t_ko) else ""
+                e_ko = e_ko if _has_hangul(e_ko) else ""
+                if t_ko or e_ko:
+                    return t_ko, e_ko
+                raise ValueError("한글 번역 결과 없음")
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                else:
+                    log.warning("영어 기사 번역 실패(원문 그대로 둠): %s", exc)
+        return "", ""
+
     def pfm_tone(self, excerpt: str) -> tuple[str, str]:
         """포스코퓨처엠 언급 발췌문만 보고 이 기사의 포스코퓨처엠 논조를 판정한다.
 
@@ -5021,12 +5162,37 @@ def _build_analysis(data: dict, usage: dict) -> Analysis:
 
 
 SENTIMENT_REASON_TAG = "[감성근거] "
+TITLE_ORIGINAL_TAG = "[원제] "
+
+
+def _perspective_field(row: dict, tag: str) -> str:
+    """summaries.perspective_text 는 줄마다 '[머리말] 값' 으로 여러 값을 담는다. tag 줄의 값, 없으면 ''."""
+    for line in (row.get("perspective_text") or "").splitlines():
+        line = line.strip()
+        if line.startswith(tag):
+            return line[len(tag):].strip()
+    return ""
 
 
 def sentiment_reason_of(row: dict) -> str:
     """summaries.perspective_text 에 머리말과 함께 저장된 감성 판단 근거. 없으면 ''."""
-    text = (row.get("perspective_text") or "").strip()
-    return text[len(SENTIMENT_REASON_TAG):].strip() if text.startswith(SENTIMENT_REASON_TAG) else ""
+    return _perspective_field(row, SENTIMENT_REASON_TAG)
+
+
+def title_original_of(row: dict) -> str:
+    """영어 기사를 한글로 번역해 저장했을 때의 영어 원제. 번역하지 않았으면 ''."""
+    return _perspective_field(row, TITLE_ORIGINAL_TAG)
+
+
+def pack_perspective(reason: str = "", original_title: str = "", fallback: str = "") -> str:
+    """감성 근거·원제를 perspective_text 한 칸에 줄 단위로 담는다(컬럼 추가 없이)."""
+    lines = []
+    if reason:
+        lines.append(f"{SENTIMENT_REASON_TAG}{reason}")
+    if original_title:
+        one_line = re.sub(r"\s+", " ", original_title).strip()   # 줄바꿈이 있으면 머리말 구조가 깨진다
+        lines.append(TITLE_ORIGINAL_TAG + one_line)
+    return "\n".join(lines) if lines else fallback
 
 
 def swot_total(swot: dict[str, dict[str, Any]]) -> int:
@@ -6373,6 +6539,17 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
 
     # 포스코퓨처엠 언급 발췌 — 카드 표시 + 논조 판정 입력. 언급이 없으면 빈 값(영역 미표시).
     excerpt = extract_pfm_excerpt(body)
+    # 영어 기사는 제목과 발췌를 한글로 번역해 저장한다(요약·키워드·SWOT 근거는 이미 한국어로 만든다).
+    # 번역이 실패하면 원문을 그대로 둔다. 영어 원제는 카드에 작게 보이도록 따로 남긴다.
+    orig_title = ""
+    en_title, en_excerpt = looks_english(row["title"]), looks_english(excerpt)
+    translated_title = ""
+    if en_title or en_excerpt:
+        t_ko, e_ko = ctx.llm.translate_to_korean(row["title"] if en_title else "", excerpt if en_excerpt else "")
+        if t_ko:
+            translated_title, orig_title = t_ko, row["title"]
+        if e_ko:
+            excerpt = e_ko
     patch = {
         "sentiment": analysis.sentiment,
         "keywords": keywords,
@@ -6382,6 +6559,8 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         "analyzed_at": iso(now_utc()),
         "pfm_excerpt": excerpt,
     }
+    if translated_title:
+        patch["title"] = translated_title
     if excerpt:
         tone, reason = ctx.llm.pfm_tone(excerpt)
         if tone:
@@ -6393,8 +6572,7 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         "summary_text": analysis.summary_text,
         # '포스코 관점'은 생성을 중단해 이 칸이 비어 있다 — 감성 판단 근거를 표시 머리말과 함께 담는다
         # (컬럼 추가 없이 쓰려는 것. 읽을 때는 sentiment_reason_of 가 머리말로 구분한다).
-        "perspective_text": (f"{SENTIMENT_REASON_TAG}{analysis.sentiment_reason}"
-                             if analysis.sentiment_reason else analysis.perspective),
+        "perspective_text": pack_perspective(analysis.sentiment_reason, orig_title, analysis.perspective),
         "summary_source": summary_source,
         "model": ctx.cfg.llm_model,
         "token_usage": analysis.token_usage,
@@ -6843,7 +7021,7 @@ def format_message(row: dict) -> str:
     summary = (row.get("summary_text") or "").strip()
     if summary:
         lines.append(f"{esc(header)} {esc(summary)}".strip())
-    excerpt = (row.get("pfm_excerpt") or "").strip()
+    excerpt = excerpt_for_message(row.get("pfm_excerpt") or "")
     if excerpt:
         lines += ["", f"포스코퓨처엠 언급: {esc(excerpt)}"]
     link = row.get("url_canonical") or row.get("url_original") or ""
@@ -7328,7 +7506,7 @@ def _kakao_text_from_row(row: dict, link: str) -> dict:
                                                    row.get("url_canonical") or row.get("url_original") or ""),
                                 row.get("author") or "")
     summary = (row.get("summary_text") or "").strip()
-    excerpt = (row.get("pfm_excerpt") or "").strip()
+    excerpt = excerpt_for_message(row.get("pfm_excerpt") or "")
 
     seg = f"{hdr} {summary}".strip() if (hdr and summary) else summary
     if seg and KAKAO_TEXT_MAX - len(body) > 14:
@@ -7488,7 +7666,7 @@ def _card_full_text(card: dict, already: bool = False) -> str:
     if card.get("summary_header") or card.get("summary_text"):
         lines.append(f"{esc(card.get('summary_header') or '')} {esc(card.get('summary_text') or '')}".strip())
     if card.get("pfm_excerpt"):
-        lines += ["", f"포스코퓨처엠 언급: {esc(card['pfm_excerpt'])}"]
+        lines += ["", f"포스코퓨처엠 언급: {esc(excerpt_for_message(card['pfm_excerpt']))}"]
     sw = card.get("swot")
     if sw:
         lines += ["", f"SWOT 종합 {sw['total']} · 감성 {esc(card.get('sentiment') or '-')} · 중요도 {score}"]
@@ -8349,6 +8527,7 @@ def build_card(row: dict) -> dict:
         "importance_score": int(row.get("importance_score") or 0),
         "sentiment": row.get("sentiment") or "",
         "sentiment_reason": sentiment_reason_of(row),
+        "title_original": title_original_of(row),
         "keywords": keywords,
         "group_companies": groups,
         "categories": categories,
@@ -9991,6 +10170,69 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
 
 
+def cmd_reexcerpt(ctx: Context, dry: bool = False) -> None:
+    """보관 중인 본문(30일)으로 포스코퓨처엠 언급 발췌를 새 방식(문단 단위·기사 주제 포함)으로 다시 만든다.
+
+    LLM 을 쓰지 않는다(논조는 그대로 둔다). 영어 본문은 건너뛴다 — 새로 뽑으면 영어 원문으로 되돌아가므로
+    `retranslate` 로 번역한다. 본문이 30일 보관 기간을 지난 기사는 원문이 없어 옛 발췌를 그대로 둔다.
+    """
+    rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=30)), with_excerpt=True)
+    changed = skipped = nobody = 0
+    for r in rows:
+        body = ctx.storage.body_of(r["id"]) or ""
+        if not body:
+            nobody += 1
+            continue
+        if looks_english(body[:600]):
+            skipped += 1
+            continue
+        new = extract_pfm_excerpt(body)
+        if new and new != (r.get("pfm_excerpt") or ""):
+            changed += 1
+            if not dry:
+                ctx.storage.update_article(r["id"], {"pfm_excerpt": new})
+    log.info("발췌 재생성%s: %d건 새 방식으로 교체 · 영어 본문 %d건 건너뜀 · 보관 본문 없음 %d건 (대상 %d건)",
+             " [미리보기, 쓰지 않음]" if dry else "", changed, skipped, nobody, len(rows))
+
+
+def cmd_retranslate(ctx: Context, limit: int = 50, dry: bool = False) -> None:
+    """이미 저장된 영어 기사(제목·포스코퓨처엠 발췌)를 한국어로 번역한다(AI 호출 최대 limit 회).
+
+    영어 원제는 카드에 작게 남기도록 summaries.perspective_text 에 함께 저장한다. 이미 번역된 기사는 건너뛴다.
+    """
+    rows = ctx.storage.list_articles(5000, 0, None, "")
+    todo = []
+    for r in rows:
+        en_title = looks_english(r.get("title") or "") and not title_original_of(r)
+        en_excerpt = looks_english(r.get("pfm_excerpt") or "")
+        if en_title or en_excerpt:
+            todo.append((r, en_title, en_excerpt))
+    log.info("영어 기사 번역 대상 %d건 (최대 %d건 처리)%s", len(todo), limit, " [미리보기, 쓰지 않음]" if dry else "")
+    if dry:
+        for r, _, _ in todo[:10]:
+            log.info("  - %s | %s", (r.get("press_name") or "")[:10], (r.get("title") or "")[:60])
+        return
+    done = failed = 0
+    for r, en_title, en_excerpt in todo[:limit]:
+        t_ko, e_ko = ctx.llm.translate_to_korean(r.get("title") if en_title else "",
+                                                 r.get("pfm_excerpt") if en_excerpt else "")
+        patch: dict[str, Any] = {}
+        if t_ko:
+            patch["title"] = t_ko
+        if e_ko:
+            patch["pfm_excerpt"] = e_ko
+        if not patch:
+            failed += 1
+            continue
+        ctx.storage.update_article(r["id"], patch)
+        if t_ko:
+            ctx.storage.set_perspective(r["id"], pack_perspective(
+                sentiment_reason_of(r), r.get("title") or "", r.get("perspective_text") or ""))
+        done += 1
+        log.info("  ✓ %s", (t_ko or r.get("title") or "")[:50])
+    log.info("영어 기사 번역 완료: 성공 %d · 실패 %d · 남은 대상 %d건", done, failed, max(0, len(todo) - limit))
+
+
 def cmd_fixpfm(ctx: Context, dry: bool = False) -> None:
     """'포스코퓨처엠' 태그가 붙었지만 제목·본문 어디에도 언급이 없는 기사에서 그 태그를 뗀다(일회성).
 
@@ -10142,6 +10384,9 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
                     failed += 1
                 continue
             excerpt = extract_pfm_excerpt(body)
+            if looks_english(excerpt):        # 영어 기사는 한글로 번역해 저장한다(실패하면 원문 그대로)
+                _, e_ko = ctx.llm.translate_to_korean("", excerpt)
+                excerpt = e_ko or excerpt
             ctx.storage.update_article(r["id"], {"pfm_excerpt": excerpt})
             excerpted += 1
             if not excerpt:
@@ -11439,6 +11684,112 @@ def cmd_selftest() -> int:
     check("원문에 실제로 있으면 정상적으로 붙는다",
           jload(_gt._one("select group_companies from articles where id='g1'")["group_companies"], []), ["포스코퓨처엠"])
 
+    # 2026-10-01: 포스코퓨처엠 언급 발췌가 맥락 없이 끊겨 읽힌다는 지적, 영어 기사 한글 번역
+    print("\n[8-2c5] 포스코퓨처엠 언급 발췌 — 맥락 · 영어 기사 번역")
+    _mp = ("정부가 이차전지 지원책을 발표했다. 업계는 대체로 환영했다.\n"
+           "시장은 전반적으로 긍정적인 반응을 보였다.\n"
+           "포스코퓨처엠은 광양 양극재 공장 증설을 서두르기로 했다. 회사 관계자는 내년 가동을 목표로 한다고 밝혔다.\n"
+           "증권가는 실적 개선을 전망했다.\n"
+           "한편 삼성SDI는 미국 공장을 늘린다.")
+    _mx = extract_pfm_excerpt(_mp)
+    check("발췌 맥락 — 기사 주제(첫 문단 도입부)가 앞에 붙는다", _mx.splitlines()[0].startswith("정부가 이차전지 지원책을 발표했다"), True)
+    check("발췌 맥락 — 언급 문단이 문단째(두 문장 모두) 들어간다",
+          "광양 양극재 공장 증설을 서두르기로 했다. 회사 관계자는 내년 가동을 목표로 한다고 밝혔다." in _mx, True)
+    check("발췌 맥락 — 관련 없는 뒷 문단은 안 붙는다", "삼성SDI" in _mx or "증권가" in _mx, False)
+    _mq = ("국내 배터리 업계가 증설 경쟁을 벌이고 있다.\n원료 수급이 가장 큰 변수로 꼽힌다. 가격 변동성도 크다.\n"
+           "\"포스코퓨처엠은 계획대로 간다\"고 말했다.")
+    check("발췌 맥락 — 언급 문단이 짧은 인용이면 바로 앞 문장까지 붙는다", "가격 변동성도 크다." in extract_pfm_excerpt(_mq), True)
+    _many = "\n".join(f"포스코퓨처엠 관련 {i}번째 소식이다. " + ("배경 설명이 이어진다. " * 8) for i in range(6))
+    _me = extract_pfm_excerpt(_many)
+    check("발췌 맥락 — 언급 문단은 최대 3개, 전체는 상한 이하",
+          (_me.count("번째 소식") <= PFM_MENTION_PARAS, len(_me) <= PFM_EXCERPT_MAX), (True, True))
+    _bigpar = "도입 문장이다. " + "".join(f"{i}번째 배경 문장이 이어진다. " for i in range(40)) \
+        + "포스코퓨처엠은 증설을 발표했다. " + "".join(f"{i}번째 후속 문장이다. " for i in range(40))
+    _mb = extract_pfm_excerpt(_bigpar)
+    check("발췌 맥락 — 긴 문단도 문장 중간에서 자르지 않는다(모든 줄이 문장 끝으로 끝남)",
+          all(ln.rstrip().endswith((".", "다.")) for ln in _mb.splitlines()), True)
+    check("발췌 맥락 — 긴 문단에서도 언급 문장이 들어 있다", "포스코퓨처엠은 증설을 발표했다." in _mb, True)
+
+    check("영어 판별 — 영문 기사/한글 기사/짧은 글",
+          (looks_english("POSCO Future M to expand cathode plant in Gwangyang"),
+           looks_english("포스코퓨처엠이 광양 공장을 증설한다"), looks_english("EV"),
+           looks_english("POSCO퓨처엠 Q3 실적 발표")), (True, False, False, False))
+    check("원제 머리말 — 감성 근거와 함께 한 칸에 담고 각각 꺼낸다",
+          (sentiment_reason_of({"perspective_text": pack_perspective("수주 호재", "POSCO Future M expands")}),
+           title_original_of({"perspective_text": pack_perspective("수주 호재", "POSCO Future M expands")}),
+           title_original_of({"perspective_text": "옛 포스코 관점 문장"})),
+          ("수주 호재", "POSCO Future M expands", ""))
+
+    class _EnLLM:
+        """영어 기사: 요약은 한국어, 번역은 제목·발췌. fail=True 면 번역 실패."""
+        fail = False
+
+        def analyze(self, title: str, press: str, body: str) -> Analysis:
+            return Analysis(summary_sentences=["포스코퓨처엠이 양극재 공장을 증설한다."], perspective="",
+                            keywords=["양극재"], group_companies=["포스코퓨처엠"], sentiment="긍정",
+                            sentiment_reason="증설 보도", ok=True)
+
+        def translate_to_korean(self, title: str, excerpt: str) -> tuple[str, str]:
+            if _EnLLM.fail:
+                return "", ""
+            return ("포스코퓨처엠, 광양 양극재 공장 증설" if title else "",
+                    "포스코퓨처엠은 광양 양극재 공장을 증설한다." if excerpt else "")
+
+        def pfm_tone(self, excerpt: str) -> tuple[str, str]:
+            return ("긍정", "x") if excerpt else ("", "")
+
+    _en_body = ("POSCO Future M will expand its cathode plant in Gwangyang, the company said on Tuesday. "
+                "The expansion is expected to be completed next year. ") * 4
+    _et = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "en.db"))
+    _et.init_schema()
+    _ectx = Context(cfg=Config(**{**{f: "" for f in Config.__dataclass_fields__}, "openai_api_key": "x",
+                                  "llm_model": "m", "embedding_model": "e", "nvidia_embed_model": "n",
+                                  "nvidia_llm_model": "nvm"}), storage=_et, http=HttpClient())
+    _ectx._llm = _EnLLM()
+    for _eid, _etitle in (("e1", "POSCO Future M to expand cathode plant"), ("e2", "POSCO Future M to expand plant too")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_eid, "u/" + _eid, "u/" + _eid, "u/" + _eid, _etitle, iso(_pn), iso(_pn), "rss", 10, "[]", "[]",
+                   "Yonhap", None, "active", 1))
+    analyze_and_save(_ectx, "e1", {"id": "e1", "title": "POSCO Future M to expand cathode plant", "press_id": None,
+                                   "press_name": "Yonhap", "importance_score": 10, "group_companies": []},
+                     _en_body, "fulltext")
+    _e1 = _et.article_detail("e1")
+    _c1 = build_card(_e1)
+    check("영어 기사 — 제목·발췌가 한글로 저장된다", (_e1["title"], _e1["pfm_excerpt"]),
+          ("포스코퓨처엠, 광양 양극재 공장 증설", "포스코퓨처엠은 광양 양극재 공장을 증설한다."))
+    check("영어 기사 — 영어 원제는 카드에 따로 실린다(감성 근거도 유지)",
+          (_c1["title_original"], _c1["sentiment_reason"]), ("POSCO Future M to expand cathode plant", "증설 보도"))
+    check("영어 기사 — 논조는 번역된 발췌로 판정", _e1["pfm_tone"], "긍정")
+    _EnLLM.fail = True
+    analyze_and_save(_ectx, "e2", {"id": "e2", "title": "POSCO Future M to expand plant too", "press_id": None,
+                                   "press_name": "Yonhap", "importance_score": 10, "group_companies": []},
+                     _en_body, "fulltext")
+    _e2 = _et.article_detail("e2")
+    check("번역 실패 — 원문 제목을 그대로 두고 원제 칸은 비운다",
+          (_e2["title"], build_card(_e2)["title_original"]), ("POSCO Future M to expand plant too", ""))
+    _EnLLM.fail = False
+    cmd_retranslate(_ectx, 10, dry=True)
+    check("retranslate --dry — 아무것도 쓰지 않는다", _et.article_detail("e2")["title"], "POSCO Future M to expand plant too")
+    cmd_retranslate(_ectx, 10)
+    _e2b = _et.article_detail("e2")
+    check("retranslate — 영어로 남은 기사를 번역하고 원제를 남긴다",
+          (_e2b["title"], title_original_of(_e2b)), ("포스코퓨처엠, 광양 양극재 공장 증설", "POSCO Future M to expand plant too"))
+    check("retranslate — 번역한 기사의 감성 근거는 지워지지 않는다(e1 재실행 대상 아님)",
+          sentiment_reason_of(_et.article_detail("e1")), "증설 보도")
+    cmd_retranslate(_ectx, 10)
+    check("retranslate — 이미 번역된 기사는 다시 하지 않는다", _et.article_detail("e1")["title"], "포스코퓨처엠, 광양 양극재 공장 증설")
+
+    # reexcerpt — 보관 본문으로 새 방식 발췌 재생성(LLM 0)
+    _et._exec("update articles set pfm_excerpt='옛 토막', group_companies='[\"포스코퓨처엠\"]' where id='e1'")
+    _et.save_body("e1", _mp, "fulltext")
+    cmd_reexcerpt(_ectx, dry=True)
+    check("reexcerpt --dry — 쓰지 않는다", _et.article_detail("e1")["pfm_excerpt"], "옛 토막")
+    cmd_reexcerpt(_ectx)
+    check("reexcerpt — 보관 본문으로 문단 단위 발췌를 다시 만든다",
+          _et.article_detail("e1")["pfm_excerpt"].startswith("정부가 이차전지 지원책을 발표했다"), True)
+
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
     _lt.init_schema()
@@ -11705,8 +12056,7 @@ def cmd_selftest() -> int:
     _ex = extract_pfm_excerpt(_pb)
     check("발췌 — 언급 문장이 들어 있다", "포스코퓨처엠은 광양 양극재" in _ex, True)
     check("발췌 — 뒤 문맥(다음 문장)도 붙는다", "내년 가동" in _ex, True)
-    check("발췌 — 약 4줄(목표 길이 근처, 상한 이하)",
-          PFM_EXCERPT_TARGET * 0.5 <= len(_ex) <= PFM_EXCERPT_MAX, True)
+    check("발췌 — 상한 이하", 0 < len(_ex) <= PFM_EXCERPT_MAX, True)
     check("발췌 — 언급 없으면 빈 문자열(영역 미표시)",
           extract_pfm_excerpt("삼성SDI가 공장을 늘린다. 업계가 주목한다."), "")
     check("발췌 — 옛 사명(포스코케미칼)도 언급으로 본다",
@@ -13004,6 +13354,8 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
+  reexcerpt [--dry]  보관 본문(30일)으로 포스코퓨처엠 언급 발췌를 새 방식(문단 단위·맥락 포함)으로 다시 만들기 (LLM 0)
+  retranslate [N] [--dry]  저장된 영어 기사(제목·발췌)를 한국어로 번역 (AI 호출 최대 N회, 기본 50)
   fixpfm [--dry]  포스코퓨처엠 태그가 붙었지만 제목·본문에 언급이 없는 기사에서 태그 제거 (먼저 pfmtone 으로 발췌 채우기)
   reopen [일수] [--dry]  규칙을 넓힌 뒤 최근 며칠(기본 3일)의 '무관'·'접속 실패' 제외 기록을 지워 다시 판정(실행 후 worker 재시작)
   tagassoc [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
@@ -13086,6 +13438,11 @@ def main(argv: Sequence[str]) -> int:
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+    elif command == "reexcerpt":
+        cmd_reexcerpt(ctx, dry="--dry" in argv[2:])
+    elif command == "retranslate":
+        nums = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_retranslate(ctx, nums[0] if nums else 50, dry="--dry" in argv[2:])
     elif command == "fixpfm":
         cmd_fixpfm(ctx, dry="--dry" in argv[2:])
     elif command == "reopen":

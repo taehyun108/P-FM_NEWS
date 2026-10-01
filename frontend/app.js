@@ -42,6 +42,7 @@ const SORT_OPTIONS = [
 ];
 
 const $ = (id) => document.getElementById(id);
+const EXCERPT_FOLD_CHARS = 200;  // 포스코퓨처엠 언급 발췌가 이보다 길면 접어서 보여 준다
 const PEOPLE_FOLD_LINES = 10;   // 인사·부고 카드는 이 줄 수까지만 접힌 채로 보여 준다
 
 const el = (tag, cls, text) => {
@@ -488,6 +489,8 @@ function buildCard(item) {
     h3.textContent = item.title;
   }
   card.append(h3);
+  /* 영어 기사는 제목을 한글로 번역해 저장하므로, 영어 원제는 작게 덧붙인다 */
+  if (item.title_original) card.append(el('p', 'card-orig', `원제: ${item.title_original}`));
 
   /* 요약 — '[언론사, 기자]' 머리표 + 본문 (F4.1) */
   if (item.summary_text) {
@@ -517,8 +520,19 @@ function buildCard(item) {
      언급이 없는 기사는 이 영역을 아예 그리지 않는다(대체 문구 없음). */
   if (item.pfm_excerpt) {
     const box = el('div', 'card-excerpt');
-    box.append(el('strong', null, '포스코퓨처엠 언급: '));
-    box.append(document.createTextNode(item.pfm_excerpt));
+    box.append(el('strong', null, '포스코퓨처엠 언급'));
+    box.append(el('div', 'card-excerpt-text', item.pfm_excerpt));   // 문단 사이 줄바꿈을 살린다(pre-line)
+    /* 맥락을 위해 길게 가져오므로 6줄까지만 보이고 펼친다 */
+    if (item.pfm_excerpt.length > EXCERPT_FOLD_CHARS) {
+      box.classList.add('is-folded');
+      const more = el('button', 'excerpt-more', '더보기 ▾');
+      more.type = 'button';
+      more.addEventListener('click', () => {
+        const folded = box.classList.toggle('is-folded');
+        more.textContent = folded ? '더보기 ▾' : '접기 ▴';
+      });
+      box.append(more);
+    }
     card.append(box);
   }
 
