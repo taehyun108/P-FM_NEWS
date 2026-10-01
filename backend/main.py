@@ -4148,20 +4148,51 @@ _NON_PERSON_BYLINE_RE = re.compile(
 
 def is_non_person_byline(name: str) -> bool:
     """기자 이름이 아니라 부서·데스크·통신사명인가."""
-    return bool(_NON_PERSON_BYLINE_RE.search((name or "").strip()))
+    nm = (name or "").strip()
+    return bool(_NON_PERSON_BYLINE_RE.search(nm)) or normalize_chip(nm) in _WIRE_AND_LABEL_WORDS
+
+
+# 통신사·바이라인 라벨 — 사람이 아니다. ('Reuters', 'AFP', '사진', '영상' …)
+_WIRE_AND_LABEL_WORDS = frozenset({
+    "reuters", "afp", "ap", "epa", "bloomberg", "xinhua", "kyodo", "tass", "cnn", "bbc",
+    "사진", "영상", "그래픽", "촬영", "취재", "글", "정리", "제공", "자료", "편집", "기획",
+})
+
+
+@lru_cache(maxsize=1)
+def _press_name_keys() -> frozenset:
+    """매핑표의 언론사명(정규화) — 바이라인 앞에 붙는 소속 매체('이데일리 김철수')를 떼는 데 쓴다."""
+    return frozenset(normalize_chip(n) for n, _ in SEED_PRESS.values())
+
+
+def _is_affiliation_token(tok: str) -> bool:
+    """바이라인의 한 토큰이 사람이 아니라 소속(매체명·부서·통신사·라벨)인가."""
+    key = normalize_chip(tok)
+    return (not key or key in _press_name_keys() or key in NON_AUTHOR_WORDS
+            or is_non_person_byline(tok) or tok.endswith(MEDIA_NAME_SUFFIX))
 
 
 def author_display(author: str) -> str:
-    """카드 머리표에 쓸 기자명. 전부 사람 이름이 아닌 바이라인이면 빈 문자열(→ '[언론사]' 만 표기)."""
-    parts = [p.strip() for p in re.split(r"\s*[,·/、&]\s*", author or "") if p.strip()]
-    if parts and all(is_non_person_byline(p) for p in parts):
+    """카드 머리표에 쓸 기자명 — 소속·직함·이메일을 뗀 사람 이름만 '·' 로 잇는다.
+    사람 이름이 하나도 안 남으면(부서·데스크·통신사뿐) 빈 문자열 → '[언론사]' 만 표기."""
+    raw = (author or "").strip()
+    if not raw:
         return ""
-    return (author or "").strip()
+    names = split_authors(raw)
+    return "·".join(names) if names else ""
 
 
 def _valid_author(raw: str, press_key: str) -> str:
     """기자명 후보를 정제·검증한다. 부적합하면 빈 문자열."""
-    name = clean_author(fix_mojibake(decode_unicode_escapes((raw or "").strip())))
+    raw_text = fix_mojibake(decode_unicode_escapes((raw or "").strip()))
+    if is_non_person_byline(raw_text):   # clean_author 가 '취재팀'의 '팀'을 떼기 전에 먼저 거른다
+        return ""
+    name = clean_author(raw_text)
+    # '김철수 선임기자'·'산업부 김철수'·'이데일리 김철수' 처럼 직함·소속·이메일이 붙은 값은 이름만 남긴다.
+    names = split_authors(name)
+    if not names:
+        return ""
+    name = "·".join(names)
     if not (2 <= len(name) <= 20):
         return ""
     if is_non_person_byline(name):
@@ -5622,7 +5653,7 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
 
     우선순위: SEED_PRESS > 본문 og:site_name/<title> > 홈페이지 재조회 > 피드 힌트 > 도메인 표기.
     """
-    domain = domain_of(url)
+    domain = press_domain_of(url)
     if not domain:
         return (hint if hint and not _looks_like_domain(hint) else ""), None, 3
 
@@ -5673,6 +5704,24 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
 _UNMAPPED_PRESS_LOGGED: set[str] = set()
 
 
+def press_domain_of(url: str) -> str:
+    """언론사 식별용 도메인. domain_of 는 서브도메인을 등록 도메인으로 접는데, SEED_PRESS 에는
+    'biz.chosun.com'(조선비즈)·'biz.sbs.co.kr'(SBS Biz) 처럼 서브도메인이 **다른 매체**인 항목이 있다.
+    접어 버리면 그 항목은 영영 안 맞아 조선비즈 기사가 '조선일보'로 표시되던 문제(2026-10-01 점검)를 막으려고,
+    서브도메인 키가 SEED_PRESS 에 있으면 그 호스트부터 먼저 맞춰 본다."""
+    host = (urlsplit(url).hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    for key in _SUBDOMAIN_PRESS_KEYS:
+        if host == key or host.endswith("." + key):
+            return key
+    return domain_of(url)
+
+
+# SEED_PRESS 중 서브도메인이 별개 매체인 키 — 긴 것(더 구체적인 것)부터 맞춘다.
+_SUBDOMAIN_PRESS_KEYS = tuple(sorted(
+    (d for d in SEED_PRESS if domain_of(f"http://{d}") != d), key=len, reverse=True))
+
+
 def _log_unmapped_press(domain: str) -> None:
     if domain and domain not in _UNMAPPED_PRESS_LOGGED:
         _UNMAPPED_PRESS_LOGGED.add(domain)
@@ -5686,9 +5735,13 @@ def press_display_name(name: str, url: str = "") -> str:
     도메인 그대로 남는다(2026-09-29 사용자 지적). 화면·집계는 이 함수를 거쳐 즉시 바로잡는다.
     """
     nm = (name or "").strip()
+    # 서브도메인이 별개 매체인 경우(biz.chosun.com)는 저장된 이름이 모회사('조선일보')여도 바로잡는다.
+    sub = press_domain_of(url) if url else ""
+    if sub in _SUBDOMAIN_PRESS_KEYS and sub in SEED_PRESS:
+        return SEED_PRESS[sub][0]
     if nm and not _looks_like_domain(nm):
         return nm
-    for cand in (domain_of(url) if url else "", domain_of(f"http://{nm}") if nm else ""):
+    for cand in (press_domain_of(url) if url else "", domain_of(f"http://{nm}") if nm else ""):
         if cand and cand in SEED_PRESS:
             return SEED_PRESS[cand][0]
     return nm
@@ -7640,6 +7693,11 @@ _AUTHOR_TITLE_RE = re.compile(
 
 
 def split_authors(author: str) -> list[str]:
+    return list(_split_authors_cached(author or ""))
+
+
+@lru_cache(maxsize=30000)
+def _split_authors_cached(author: str) -> tuple[str, ...]:
     """기자명 필드를 사람 이름 목록으로 정규화한다.
 
     '김철수 기자, 이영희 인턴기자' → ['김철수', '이영희'], '김철수 (kcs@x.com)' → ['김철수'].
@@ -7653,16 +7711,21 @@ def split_authors(author: str) -> list[str]:
         nm = _AUTHOR_TITLE_RE.sub("", part).strip()
         if len(nm) < 2:      # '김기자'처럼 떼고 나면 이름이 안 남으면 원문 그대로 둔다
             nm = part
+        # 소속이 앞에 붙은 바이라인('이데일리 김철수', '산업부 김철수', '뉴스1 김철수')은 소속을 떼고
+        # 사람 이름만 남긴다. 직함('기자')은 위에서 이미 뗐으므로 중간 토큰도 직함·라벨이면 버린다.
+        pieces = [t for t in nm.split() if not _is_affiliation_token(t)
+                  and not _AUTHOR_TITLE_RE.fullmatch(t)]
+        if not pieces:
+            continue
         # '김철수 이영희' 처럼 한글 이름만 공백으로 나열된 공동 바이라인은 사람별로 나눈다.
-        pieces = nm.split()
         if len(pieces) > 1 and all(re.fullmatch(r"[가-힣]{2,4}", x) for x in pieces):
             cands = pieces
         else:
-            cands = [nm]
+            cands = [" ".join(pieces)]
         for c in cands:
             if c and c not in names:
                 names.append(c)
-    return names
+    return tuple(names)
 
 
 def author_matches(author: str, query: str) -> bool:
@@ -9652,7 +9715,7 @@ def fix_domain_press_names(ctx: Context, dry: bool) -> tuple[int, dict[str, int]
         if cur and not _looks_like_domain(cur):
             continue
         url = r.get("url_canonical") or r.get("url_original") or r.get("url_source") or ""
-        domain = domain_of(url) or (domain_of(f"http://{cur}") if cur else "")
+        domain = press_domain_of(url) or (domain_of(f"http://{cur}") if cur else "")
         want = press_display_name(cur, url)
         prow = press_by_domain.get(domain)
         if (not want or _looks_like_domain(want)) and prow and not _looks_like_domain(prow.get("name") or ""):
@@ -9718,7 +9781,7 @@ def cmd_fixpress(ctx: Context, dry: bool = False) -> None:
         if _has_hangul(name):
             continue
         target = r.get("url_original") or r.get("url_canonical") or ""
-        domain = domain_of(target)
+        domain = press_domain_of(target)
         if not domain or domain in SEED_PRESS or domain in tried:
             continue
         tried.add(domain)
@@ -9764,7 +9827,7 @@ def cmd_fixauthors(ctx: Context) -> None:
                or not (2 <= len(restored) <= 20)
                or restored.endswith(MEDIA_NAME_SUFFIX)
                or normalize_chip(restored) in NON_AUTHOR_WORDS
-               or is_non_person_byline(restored)
+               or is_non_person_byline(restored) or not split_authors(restored)
                or (press and normalize_chip(restored) == normalize_chip(press)))
         if bad:
             new_author = ""
@@ -9782,9 +9845,12 @@ def cmd_fixauthors(ctx: Context) -> None:
                 recovered += 1
             else:
                 cleared += 1
-        elif restored != author:
-            ctx.storage.update_article(r["id"], {"author": restored})
-            fixed += 1
+        else:
+            # 소속·직함·이메일이 붙은 값('연합뉴스 김철수 기자')은 사람 이름만 남긴다.
+            norm = "·".join(split_authors(restored)) or restored
+            if norm != author:
+                ctx.storage.update_article(r["id"], {"author": norm})
+                fixed += 1
     log.info("기자명 복구: %d건 정리 · %d건 재추출 · %d건 제거", fixed, recovered, cleared)
 
 
@@ -11294,9 +11360,30 @@ def cmd_selftest() -> int:
     check("기자 집계 — English News Desk 는 기자에서 빠진다",
           (split_authors("English News Desk"), split_authors("김철수 기자, English News Desk"),
            split_authors("John Smith")), ([], ["김철수"], ["John Smith"]))
-    check("카드 머리표 — 부서·데스크뿐이면 비운다, 사람이 있으면 그대로",
+    check("카드 머리표 — 부서·데스크뿐이면 비우고, 사람이 있으면 이름만 남긴다",
           (author_display("English News Desk"), author_display("김철수 기자"),
-           author_display("김철수, 편집국")), ("", "김철수 기자", "김철수, 편집국"))
+           author_display("김철수, 편집국")), ("", "김철수", "김철수"))
+    # 2026-10-01 점검 — 소속·직함·이메일·라벨이 붙은 바이라인, 서브도메인 매체
+    check("기자 정규화 — 소속(매체·부서)이 앞에 붙어도 사람 이름만",
+          [split_authors(x) for x in ("연합뉴스 김철수 기자", "서울=연합뉴스 김철수 기자", "이데일리 김철수",
+                                      "뉴스1 김철수 기자", "산업부 김철수 기자", "김철수 (서울=연합뉴스)")],
+          [["김철수"]] * 6)
+    check("기자 정규화 — 통신사·라벨·괄호 매체명은 기자가 아니다",
+          [split_authors(x) for x in ("Reuters", "AFP=연합뉴스", "(주)한국경제", "취재팀", "특별취재팀")], [[]] * 5)
+    check("기자 정규화 — 공동 바이라인의 '사진' 라벨은 사람이 아니다",
+          split_authors("김철수 기자·사진 이영희"), ["김철수", "이영희"])
+    check("기자 정규화 — 직함 붙은 값·이메일도 이름만(추출 단계)",
+          [_valid_author(x, normalize_chip("연합뉴스")) for x in ("김철수 선임기자", "산업부 김철수", "취재팀",
+                                                              "김철수 기자 chulsoo@x.com")],
+          ["김철수", "김철수", "", "김철수"])
+    check("서브도메인 매체 — biz.chosun.com 은 조선비즈, www.chosun.com 은 조선일보",
+          (press_domain_of("https://biz.chosun.com/a"), press_domain_of("https://news.chosun.com/a"),
+           press_display_name("조선일보", "https://biz.chosun.com/a"),
+           press_display_name("조선일보", "https://www.chosun.com/a")),
+          ("biz.chosun.com", "chosun.com", "조선비즈", "조선일보"))
+    check("서브도메인 매체 — SBS Biz·뉴데일리경제도 모회사와 구분",
+          (press_display_name("SBS", "https://biz.sbs.co.kr/x"), press_display_name("SBS", "https://news.sbs.co.kr/x"),
+           press_display_name("", "https://biz.newdaily.co.kr/x")), ("SBS Biz", "SBS", "뉴데일리경제"))
     check("기자 추출 — JSON-LD author 가 데스크명이면 채택하지 않는다",
           extract_author('<script type="application/ld+json">{"author":{"@type":"Person","name":"English News Desk"}}</script>',
                          "", "연합뉴스"), "")
