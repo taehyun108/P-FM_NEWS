@@ -1249,6 +1249,44 @@ function buildLogoThumb(item) {
   return wrap;
 }
 
+/* ── 말풍선 공통 동작 (SWOT 배지 · 감성/점수 칩) ─────────────────────────
+   마우스: 올리면 열고 벗어나면 닫는다.
+   터치(스마트폰): 탭하면 열고, 같은 곳을 다시 탭하거나 바깥을 탭하면 닫는다.
+   예전엔 터치도 mouseenter 로 한 번 열리고 곧바로 이어지는 click 이 '열려 있으면 닫기'라
+   열렸다가 즉시 닫혀 모바일에서는 말풍선이 보이지 않았다(2026-10-01 제보). */
+let openTipAnchor = null;     // 지금 말풍선을 연 요소
+
+function closeTip() {
+  openTipAnchor = null;
+  hideSwotTip();
+}
+
+function bindTip(anchor, show) {
+  const open = () => { openTipAnchor = anchor; show(); };
+  // 마우스 포인터일 때만 호버로 연다. 터치가 만드는 호환용 mouseenter 는 pointerType 이 'touch' 다.
+  anchor.addEventListener('pointerenter', (e) => { if (e.pointerType === 'mouse') open(); });
+  anchor.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse' && openTipAnchor !== anchor) open(); });
+  anchor.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && openTipAnchor === anchor) closeTip(); });
+  // 키보드로 포커스가 왔을 때만(탭으로 생긴 포커스는 제외) 연다.
+  anchor.addEventListener('focus', () => { if (anchor.matches(':focus-visible')) open(); });
+  anchor.addEventListener('blur', () => { if (openTipAnchor === anchor) closeTip(); });
+  anchor.addEventListener('click', (e) => {
+    e.preventDefault();
+    const isOpen = openTipAnchor === anchor && !$('swotTip').hidden;
+    if (!isOpen) { open(); return; }
+    // 이미 열려 있는데 눌렀다: 마우스는 호버로 열린 상태라 그대로 두고, 터치(두 번째 탭)만 닫는다.
+    if (lastPointerType === 'touch') closeTip();
+  });
+}
+
+let lastPointerType = 'mouse';
+document.addEventListener('pointerdown', (e) => {
+  lastPointerType = e.pointerType || 'mouse';
+  // 말풍선 밖을 누르면 닫는다(스마트폰에서 닫는 유일한 방법이므로 꼭 필요하다).
+  const tip = $('swotTip');
+  if (!tip.hidden && !tip.contains(e.target) && !(openTipAnchor && openTipAnchor.contains(e.target))) closeTip();
+}, true);
+
 /* ── SWOT 배지 및 툴팁 (F6.2a) ──────────────────────────────────── */
 
 const SWOT_LABELS = { s: '강점 S', w: '약점 W', o: '기회 O', t: '위협 T' };
@@ -1260,17 +1298,8 @@ function buildSwotBadge(swot) {
   badge.append(el('span', null, 'SWOT'));
   badge.append(el('b', null, String(swot.total)));
 
-  // 호버 · 드래그 · 키보드 포커스 · 모바일 탭 모두에서 열린다.
-  const show = () => showSwotTip(badge, swot);
-  badge.addEventListener('mouseenter', show);
-  badge.addEventListener('mousemove', show);
-  badge.addEventListener('focus', show);
-  badge.addEventListener('mouseleave', hideSwotTip);
-  badge.addEventListener('blur', hideSwotTip);
-  badge.addEventListener('click', (e) => {
-    e.preventDefault();
-    if ($('swotTip').hidden) show(); else hideSwotTip();
-  });
+  // 마우스 호버 · 키보드 포커스 · 모바일 탭 모두에서 열린다.
+  bindTip(badge, () => showSwotTip(badge, swot));
   return badge;
 }
 
@@ -1319,15 +1348,7 @@ function attachSentiTip(chip, item) {
   chip.setAttribute('role', 'button');
   chip.setAttribute('aria-label', `${item.sentiment || '중립'} ${item.importance_score}점. 이유 보기`);
   chip.classList.add('has-tip');
-  const show = () => showSentiTip(chip, item);
-  chip.addEventListener('mouseenter', show);
-  chip.addEventListener('focus', show);
-  chip.addEventListener('mouseleave', hideSwotTip);
-  chip.addEventListener('blur', hideSwotTip);
-  chip.addEventListener('click', (e) => {     // 모바일 탭
-    e.preventDefault();
-    if ($('swotTip').hidden) show(); else hideSwotTip();
-  });
+  bindTip(chip, () => showSentiTip(chip, item));
 }
 
 function placeTip(anchor, tip) {
@@ -1398,7 +1419,7 @@ async function showSentiTip(chip, item) {
   placeTip(chip, tip);
 }
 
-document.addEventListener('scroll', hideSwotTip, { passive: true });
+document.addEventListener('scroll', closeTip, { passive: true });
 
 /* ── 즐겨찾기 (브라우저별 로컬 저장) ────────────────────────────── */
 
