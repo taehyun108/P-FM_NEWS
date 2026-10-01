@@ -2487,6 +2487,7 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "fnnews.com": ("파이낸셜뉴스", 2), "edaily.co.kr": ("이데일리", 2), "mt.co.kr": ("머니투데이", 2),
     "etnews.com": ("전자신문", 2), "thelec.kr": ("전자부품 전문 미디어", 2),
     "econovill.com": ("이코노믹리뷰", 2), "ebn.co.kr": ("EBN", 2), "fetv.co.kr": ("FETV", 2),
+    "andongmbc.co.kr": ("안동MBC", 3), "itworld.co.kr": ("ITWorld Korea", 3), "msn.com": ("MSN", 3),
     "busan.com": ("부산일보", 2), "tjb.co.kr": ("TJB 대전방송", 3), "vop.co.kr": ("민중의소리", 3),
     "kookje.co.kr": ("국제신문", 2), "asiae.co.kr": ("아시아경제", 2),
     "electimes.com": ("전기신문", 2), "theguru.co.kr": ("더구루", 3),
@@ -2699,8 +2700,24 @@ NON_POSCO_GROUPS = frozenset({"배터리협회"})
 
 # 별칭 소문자 사전계산 — detect_group_companies·score_article 이 호출마다
 # `[a.lower() for a in aliases]` 를 다시 만들던 것을 제거한다(파이프라인·API 공통 경로).
+def alias_variants(alias: str) -> list[str]:
+    """별칭의 띄어쓰기 변형 — '포스코퓨처엠' → ['포스코퓨처엠', '포스코 퓨처엠'].
+
+    기사에는 '포스코 퓨처엠'·'POSCO 퓨처엠'처럼 띄어 쓴 표기가 흔한데 예전엔 인식하지 못해, 제목에 이름이 있는
+    기사도 '언급 없음'으로 판정됐다(2026-10-01 fixpfm 이 포항남부서-포스코 퓨처엠 기사 태그를 잘못 뗌).
+    상위 개념 '포스코'(3글자) 자체는 변형을 만들지 않는다.
+    """
+    a = alias.lower()
+    out = [a]
+    for prefix in ("포스코", "posco"):
+        if a.startswith(prefix) and len(a) > len(prefix) and a[len(prefix)] != " ":
+            out.append(f"{prefix} {a[len(prefix):]}")
+    return out
+
+
 _GROUP_ALIASES_LOWER: dict[str, list[str]] = {
-    canonical: [a.lower() for a in aliases] for canonical, aliases in GROUP_COMPANIES.items()
+    canonical: list(dict.fromkeys(v for a in aliases for v in alias_variants(a)))
+    for canonical, aliases in GROUP_COMPANIES.items()
 }
 
 # 그룹사 판정에 쓰는 본문 길이. 기사의 '주체'는 제목과 리드 문단에 드러난다.
@@ -3258,6 +3275,15 @@ def is_trade_topic(title: str, extra: str = "") -> bool:
     if _kw_hit_any(title, TRADE_MACRO_KW):
         return True
     return _kw_hit_any(title, TRADE_MEASURE_KW) and _kw_hit_any(f"{title}\n{extra}", TRADE_INDUSTRY_KW)
+
+
+_MARKET_LIST_TITLE_RE = re.compile(
+    r"(?i)closing\s+price\s+list|opening\s+price\s+list|코스피\s*200\s*(?:종가|시가)\s*목록|종가\s*목록")
+
+
+def is_market_list_title(title: str) -> bool:
+    """종가표·시세 목록 형태의 제목인가(기사가 아니라 데이터 나열)."""
+    return bool(_MARKET_LIST_TITLE_RE.search(title or ""))
 
 
 def is_policy_brief(row: dict) -> bool:
@@ -6032,6 +6058,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     fresh: list[tuple[RawItem, bool]] = []   # (항목, is_backfill)
     now = now_utc()
     for item in after_g2:
+        if is_market_list_title(item.title):
+            # 종가표·시세 목록('KOSPI 200 Closing Price List')은 구성 종목에 포스코퓨처엠이 끼어 있을 뿐
+            # 기사가 아니다 — 언론사 탭에 잡히던 잡음(2026-10-01). 원문도 받지 않고 제외한다.
+            storage.upsert_ledger(item.url_source, "off_topic")
+            ctx.seen_cache.add(item.url_source)
+            continue
         if item.published_at is None:
             storage.upsert_ledger(item.url_source, "no_pubdate")
             continue
@@ -8016,7 +8048,7 @@ def _weekly_pick(rows: list[dict], kind: str, key: str,
     시황·기관수급 기사(제목은 다른 종목)가 상위를 차지하는 것을 막는다.
     tags = 기사별 card_tags 결과(섹션 7개가 공유한다. 없으면 그때그때 계산).
     """
-    aliases = [a.lower() for a in GROUP_COMPANIES.get(key, [key])] if kind == "group" else []
+    aliases = _GROUP_ALIASES_LOWER.get(key, [key.lower()]) if kind == "group" else []
     hits = []
     for r in rows:
         cached = tags.get(r.get("id")) if tags else None
@@ -10276,35 +10308,42 @@ def cmd_reopen(ctx: Context, days: int = 3, dry: bool = False) -> None:
 
 
 def cmd_tagassoc(ctx: Context, dry: bool = False) -> None:
-    """이미 저장된 기사에 '배터리협회' 그룹사 태그를 뒤늦게 붙인다(일회성).
+    """이미 저장된 기사에 빠진 그룹사 태그를 뒤늦게 붙인다(일회성) — '배터리협회'와 '포스코퓨처엠'.
 
+    제목·보관 본문(30일)에 별칭(띄어쓴 표기 포함)이 있으면 태그를 더한다. 협회는 요약까지 보지만,
+    포스코퓨처엠은 AI 가 쓴 요약을 근거로 인정하지 않으므로 제목·본문만 본다.
+    포스코퓨처엠 태그를 새로 붙이는 기사는 발췌를 비워 두어(NULL) `pfmtone` 이 발췌·논조를 다시 채운다.
     (이름 주의: `regroup` 은 원문 리드 기준 그룹사 재판정이라는 별개의 기존 명령이다.)
-
-    제목·요약, 그리고 30일 보관 본문에 협회 이름(별칭)이 있으면 태그를 더한다.
     dry=True 면 대상 건수만 보여 주고 쓰지 않는다.
     """
-    targets: dict[str, dict] = {}
-    for group in NON_POSCO_GROUPS:
-        aliases = GROUP_COMPANIES[group]
+    targets: dict[tuple[str, str], dict] = {}
+    rows = ctx.storage.list_articles(20000, 0, None, "")
+    for group in ("포스코퓨처엠", *sorted(NON_POSCO_GROUPS)):
+        aliases = _GROUP_ALIASES_LOWER[group]
         ids: set[str] = set()
         for alias in aliases:
             ids |= ctx.storage.body_match_ids(alias)
-        for r in ctx.storage.list_articles(20000, 0, None, ""):
-            probe = f"{r.get('title') or ''} {r.get('summary_text') or ''}".lower()
-            has_tag = group in jload(r.get("group_companies"), [])
-            if has_tag:
+        for r in rows:
+            if group in jload(r.get("group_companies"), []):
                 continue
-            if r.get("id") in ids or any(a.lower() in probe for a in aliases):
-                targets[r["id"]] = {"row": r, "group": group}
+            probe = (r.get("title") or "").lower()
+            if group in NON_POSCO_GROUPS:
+                probe += " " + (r.get("summary_text") or "").lower()
+            if r.get("id") in ids or any(a in probe for a in aliases):
+                targets[(r["id"], group)] = {"row": r, "group": group}
     log.info("그룹사 태그 보충 대상 %d건%s", len(targets), " (미리보기 — 쓰지 않음)" if dry else "")
     if dry:
         return
-    for aid, t in targets.items():
+    for (aid, group), t in targets.items():
         r = t["row"]
-        groups = normalize_group_list(jload(r.get("group_companies"), []) + [t["group"]])
-        ctx.storage.update_article(aid, {"group_companies": groups})
-        log.info("  + %s → %s", (r.get("title") or "")[:40], t["group"])
-    log.info("그룹사 태그 보충 완료: %d건 (화면 필터는 최대 몇 분 뒤 반영)", len(targets))
+        groups = normalize_group_list(jload(r.get("group_companies"), []) + [group])
+        patch: dict[str, Any] = {"group_companies": groups}
+        if group == "포스코퓨처엠" and (r.get("pfm_excerpt") or "") == "":
+            patch["pfm_excerpt"] = None   # pfmtone 이 다시 채운다
+        ctx.storage.update_article(aid, patch)
+        log.info("  + %s → %s", (r.get("title") or "")[:40], group)
+    log.info("그룹사 태그 보충 완료: %d건 (화면 필터는 최대 몇 분 뒤 반영 — 포스코퓨처엠은 이어서 pfmtone 실행)",
+             len(targets))
 
 
 def cmd_addkw(ctx: Context, category: str, words: Sequence[str]) -> None:
@@ -11789,6 +11828,45 @@ def cmd_selftest() -> int:
     cmd_reexcerpt(_ectx)
     check("reexcerpt — 보관 본문으로 문단 단위 발췌를 다시 만든다",
           _et.article_detail("e1")["pfm_excerpt"].startswith("정부가 이차전지 지원책을 발표했다"), True)
+
+    print("\n[8-2c6] 띄어쓴 회사명 인식 · 태그 복구 (2026-10-01)")
+    check("띄어쓴 표기도 그룹사로 인식 — 포스코 퓨처엠·POSCO 퓨처엠·포스코 홀딩스·포스코 인터내셔널",
+          [detect_group_companies(t) for t in ("포스코 퓨처엠, 태양열 지원", "POSCO 퓨처엠 신공장",
+                                              "포스코 홀딩스 회장", "포스코 인터내셔널 수주")],
+          [["포스코퓨처엠"], ["포스코퓨처엠"], ["포스코홀딩스"], ["포스코인터내셔널"]])
+    check("띄어쓴 표기는 언급 근거·발췌에서도 인정",
+          (pfm_mention_supported({"pfm_excerpt": "", "title": "포항남부서-포스코 퓨처엠, 1인 소상공인 지원"}),
+           "포스코 퓨처엠" in extract_pfm_excerpt("지역 소식이다.\n포스코 퓨처엠은 태양열 설비를 지원했다.")),
+          (True, True))
+    check("상위 개념 '포스코' 는 변형을 만들지 않고, 띄어쓴 일반 문구는 오탐하지 않는다",
+          (alias_variants("포스코"), detect_group_companies("포스코 협력사 대금 조기 지급")), (["포스코"], ["포스코"]))
+    _tg = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "tg.db"))
+    _tg.init_schema()
+    for _gid, _gt2, _gg, _gx in (("x1", "포항남부서-포스코 퓨처엠, 소상공인 지원", "[]", ""),
+                                 ("x2", "무관한 기사", "[]", ""),
+                                 ("x3", "포스코퓨처엠 증설", '["포스코퓨처엠"]', "있는 발췌")):
+        _tg._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative,pfm_excerpt) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_gid, "u/" + _gid, "u/" + _gid, "u/" + _gid, _gt2, iso(_pn), iso(_pn), "rss", 10, _gg, "[]",
+                   "서울신문", iso(_pn), "active", 1, _gx))
+        _tg.save_summary({"id": new_id(), "article_id": _gid, "summary_text": "요약", "perspective_text": "",
+                          "summary_source": "fulltext", "model": "m", "token_usage": None, "created_at": iso(_pn)})
+    _tgctx = type("C", (), {"storage": _tg})()
+    cmd_tagassoc(_tgctx, dry=True)
+    check("tagassoc --dry — 쓰지 않는다", jload(_tg._one("select group_companies from articles where id='x1'")["group_companies"], []), [])
+    cmd_tagassoc(_tgctx)
+    _x1 = _tg._one("select group_companies, pfm_excerpt from articles where id='x1'")
+    check("tagassoc — 제목에 띄어쓴 이름이 있는 기사에 포스코퓨처엠 태그를 되돌리고 발췌는 비워 pfmtone 이 채우게 한다",
+          (jload(_x1["group_companies"], []), _x1["pfm_excerpt"]), (["포스코퓨처엠"], None))
+    check("tagassoc — 무관한 기사·이미 태그된 기사는 그대로",
+          (jload(_tg._one("select group_companies from articles where id='x2'")["group_companies"], []),
+           _tg._one("select pfm_excerpt from articles where id='x3'")["pfm_excerpt"]), ([], "있는 발췌"))
+
+    check("종가표 목록 제목은 수집 제외 대상, 일반 기사는 아니다",
+          ([is_market_list_title(t) for t in ("KOSPI 200 Closing Price List-2", "코스피 200 종가 목록-3",
+                                              "포스코퓨처엠 양극재 증설", "[Closing Market] Micron Sparks KOSPI Reversal")]),
+          [True, True, False, False])
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
@@ -13358,7 +13436,7 @@ USAGE = """사용법: python backend/main.py <명령>
   retranslate [N] [--dry]  저장된 영어 기사(제목·발췌)를 한국어로 번역 (AI 호출 최대 N회, 기본 50)
   fixpfm [--dry]  포스코퓨처엠 태그가 붙었지만 제목·본문에 언급이 없는 기사에서 태그 제거 (먼저 pfmtone 으로 발췌 채우기)
   reopen [일수] [--dry]  규칙을 넓힌 뒤 최근 며칠(기본 3일)의 '무관'·'접속 실패' 제외 기록을 지워 다시 판정(실행 후 worker 재시작)
-  tagassoc [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
+  tagassoc [--dry]  이미 저장된 기사에 빠진 그룹사 태그 보충('배터리협회'·'포스코퓨처엠', 띄어쓴 표기 포함, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
                     분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
