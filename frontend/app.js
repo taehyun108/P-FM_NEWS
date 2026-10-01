@@ -1521,13 +1521,22 @@ function buildPressTable(items) {
     const name = el('td', 'press-name');
     name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
     tr.append(name);
-    [it.week, it.month, it.year].forEach((n) => tr.append(el('td', 'num', String(n))));
+    // data-label — 모바일에서 표를 카드로 쌓을 때 각 숫자 위에 '주간·월간…' 라벨로 쓴다
+    [['주간', it.week], ['월간', it.month], ['연간', it.year]].forEach(([lb, n]) => {
+      const td = el('td', 'num', String(n));
+      td.dataset.label = lb;
+      tr.append(td);
+    });
     ['긍정', '중립', '부정'].forEach((k) => {
       const n = (it.tone || {})[k] || 0;
-      tr.append(el('td', `num tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n)));
+      const td = el('td', `num tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n));
+      td.dataset.label = k;
+      tr.append(td);
     });
-    tr.append(el('td', `num${((it.tone || {})['미판정'] || 0) ? '' : ' zero'}`,
-      String((it.tone || {})['미판정'] || 0)));
+    const unrated = el('td', `num${((it.tone || {})['미판정'] || 0) ? '' : ' zero'}`,
+      String((it.tone || {})['미판정'] || 0));
+    unrated.dataset.label = '미판정';
+    tr.append(unrated);
 
     const detail = el('tr', 'press-detail');
     detail.hidden = true;

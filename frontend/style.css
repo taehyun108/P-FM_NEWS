@@ -740,3 +740,124 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .swot-tip .tip-sub { color: #fff; opacity: .6; font-size: 11.5px; margin: 4px 0 0; }
 .swot-tip .tip-row { font-variant-numeric: tabular-nums; margin: 2px 0 0; white-space: pre-wrap; }
 .swot-tip .tip-sum { font-weight: 700; border-top: 1px solid rgba(255,255,255,.25); margin-top: 4px; padding-top: 4px; }
+
+
+/* =====================================================================
+   모바일 최적화 (2026-10-01) — 스마트폰(≈360~430px)에서 가로로 벗어나지 않고 읽기 쉽게
+   · 필터 행: 라벨을 윗줄로 올리고 내용을 전체 폭으로 (96px 라벨 + 내용 가로 배치가 폭을 밀어냈다)
+   · 입력칸은 flex 자식의 기본 최소폭(min-width:auto) 때문에 넘치므로 min-width:0
+   · 언론사 표는 가로 스크롤 대신 행마다 카드로 쌓는다
+   ===================================================================== */
+html { -webkit-text-size-adjust: 100%; }
+img, video { max-width: 100%; }
+.search, .adv-input, .url-add-input { min-width: 0; }
+
+@media (max-width: 640px) {
+  .wrap { padding: 0 14px; }
+
+  /* 헤더 — 로고 줄 아래에 탭 버튼을 한 줄씩 감싸 보여준다 */
+  .header-inner { padding-top: 12px; padding-bottom: 12px; gap: 10px; }
+  .brand { gap: 10px; min-width: 0; }
+  .brand-mark { width: 36px; height: 36px; font-size: 17px; border-radius: 10px; }
+  .header h1 { font-size: 16px; }
+  .brand-sub { font-size: 11px; }
+  .header-right { width: 100%; gap: 6px; }
+  .fav-tab { padding: 7px 12px; font-size: 12.5px; flex: 1 1 auto; text-align: center; }
+
+  /* 시세 티커 — 시각 표시는 숨기고 목록만 옆으로 밀어 본다 */
+  .ticker-inner { gap: 8px; }
+  .ticker-time { display: none; }
+
+  /* 통계 바 — 두 칸씩 */
+  .stats { gap: 8px; margin-bottom: 16px; }
+  .stat { flex: 1 1 calc(50% - 8px); padding: 10px 12px; }
+
+  /* 필터 — 라벨은 윗줄, 내용은 아랫줄 전체 폭 */
+  .filters { padding: 12px 12px; margin-bottom: 14px; }
+  .filter-head { flex-wrap: wrap; }
+  .filter-row { flex-wrap: wrap; gap: 6px 8px; padding: 10px 0; }
+  .filter-label { flex: 1 0 100%; padding-top: 0; }
+  .filter-label em { display: inline; margin-left: 6px; }
+  .chips { flex: 1 0 100%; gap: 7px; }
+  .chip { padding: 8px 14px; font-size: 13px; min-height: 36px; }   /* 손가락으로 누르기 쉽게 */
+  .search { flex: 1 1 0; font-size: 16px; padding: 10px 12px; }     /* 16px 미만이면 iOS 가 확대한다 */
+  .adv-toggle { padding: 10px 12px; }
+  .adv-fields { flex: 1 0 100%; grid-template-columns: 1fr; }
+  .adv-input { font-size: 16px; }
+  .btn-clear { padding: 7px 12px; }
+
+  /* URL 등록 */
+  .url-add { padding: 14px 12px; }
+  .url-add-input { flex: 1 1 100%; font-size: 16px; padding: 10px 12px; }
+  .url-add-btn { flex: 1 1 100%; padding: 11px 16px; }
+  .url-add-confirm { flex-wrap: wrap; }
+
+  /* 카드 */
+  .grid { gap: 12px; }
+  .card h3 { font-size: 15.5px; line-height: 1.45; }
+  .card-summary { font-size: 13.5px; line-height: 1.65; }
+  .icon-btn { min-width: 36px; min-height: 36px; display: inline-flex; align-items: center; justify-content: center; }
+  .tag { padding: 4px 11px; font-size: 12px; }
+  .pagination, .more-wrap { flex-wrap: wrap; justify-content: center; }
+
+  /* 패널(주간동향·언론사) */
+  .weekly-panel { padding: 14px 12px; }
+  .weekly-head { gap: 10px; }
+  .weekly-actions { width: 100%; }
+
+  /* 언론사 표 → 행마다 카드. 머리글은 숨기고 각 칸이 라벨(data-label)을 달고 나온다 */
+  .press-table-wrap { overflow: visible; }
+  .press-table, .press-table tbody, .press-table tr, .press-table td { display: block; width: 100%; }
+  .press-table thead { display: none; }
+  .press-table tr.press-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 0;
+    border: 1px solid var(--line); border-radius: 12px; background: #fff;
+    padding: 10px 10px 8px; margin-bottom: 10px;
+  }
+  .press-table tr.press-row[aria-expanded="true"] { background: var(--navy-soft); }
+  .press-table td { border: 0; padding: 2px 4px; }
+  .press-table td.press-rank-cell {
+    flex: 0 0 40px; width: 40px; text-align: center; border-radius: 8px; padding: 4px 0; font-size: 15px;
+  }
+  .press-table td.press-name {
+    flex: 1 1 calc(100% - 52px); width: auto; font-size: 16px; white-space: normal; padding-left: 8px;
+    display: flex; align-items: center; gap: 4px; word-break: keep-all;
+  }
+  /* 숫자 칸: 첫 줄 주간·월간·연간(3칸), 둘째 줄 긍정·중립·부정·미판정(4칸) */
+  .press-table td.num {
+    flex: 1 1 25%; width: auto; text-align: center; font-size: 15px; white-space: normal;
+  }
+  .press-table td.num:nth-child(-n+5) { flex-basis: 33%; }
+  .press-table td.num::before {
+    content: attr(data-label); display: block; font-size: 10.5px; font-weight: 400; color: var(--ink-soft);
+  }
+  .press-table td.num.zero::before { color: var(--ink-soft); }
+  .press-table td.press-reporters {
+    flex: 1 0 100%; width: 100%; min-width: 0; margin-top: 4px; padding-top: 6px;
+    border-top: 1px dashed var(--line); line-height: 2;
+  }
+  .rep-chip { padding: 4px 8px; font-size: 13px; min-height: 30px; }
+  .press-table tr.press-detail { margin: -4px 0 12px; }
+  .press-table tr.press-detail[hidden] { display: none; }
+  .press-table tr.press-detail > td { padding: 6px 10px 10px; border-radius: 0 0 12px 12px; }
+  .press-articles li { font-size: 13.5px; }
+
+  /* 푸터 — 작은 글씨지만 줄 간격을 넉넉히 */
+  .footer { padding: 18px 0 28px; }
+  .footer .swot-guide, .footer p { line-height: 1.7; }
+  .footer code { word-break: break-all; }
+
+  /* 팝업(SWOT·감성 툴팁) */
+  .swot-tip { max-width: calc(100vw - 24px); }
+}
+
+@media (max-width: 380px) {
+  .fav-tab { padding: 7px 8px; font-size: 12px; }
+}
+
+/* 태블릿 이하 — 평가 기준 안내를 떠 있는 창이 아니라 제목 아래로 펼친다(좁은 화면에서 왼쪽으로 삐져나갔다) */
+@media (max-width: 900px) {
+  .press-criteria { width: 100%; }
+  .press-criteria > summary { text-align: left; }
+  .press-criteria-body { position: static; width: auto; box-shadow: none; }
+}
