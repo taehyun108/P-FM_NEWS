@@ -4391,18 +4391,20 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     return dedupe_chips(found)
 
 
-def score_article(title: str, body: str, group_companies: Sequence[str], press_tier: int,
-                  overrides: dict[str, dict] | None = None,
-                  custom_rules: Sequence[dict] | None = None) -> int:
-    """중요도 0~100. (PRD F3.2)
+def score_breakdown(title: str, body: str, group_companies: Sequence[str], press_tier: int,
+                    overrides: dict[str, dict] | None = None,
+                    custom_rules: Sequence[dict] | None = None) -> list[tuple[str, int]]:
+    """중요도 점수를 이루는 항목 내역 [(항목 설명, 가감 점수)]. 0점 항목은 뺀다.
 
     overrides: 마스터 패널에서 고친 기본 항목 {키: {"points": int, "enabled": bool}}.
     custom_rules: 마스터 패널에서 추가한 키워드 기반 항목
                   [{"keywords": [...], "scope": "title"|"title_or_body", "points": int}, ...].
-    둘 다 없으면(선택 인자) 기존 하드코딩 상수 그대로 동작한다."""
+    둘 다 없으면(선택 인자) 기존 하드코딩 상수 그대로 동작한다.
+    카드의 '긍정 · 22' 툴팁이 이 내역을 그대로 보여 준다 — 점수 계산과 설명이 갈라지지 않도록
+    score_article 도 이 함수의 합계를 쓴다."""
     title_l = (title or "").lower()
     full_l = f"{title} {body}".lower()
-    score = 0
+    items: list[tuple[str, int]] = []
 
     def pts(key: str) -> int:
         default, _label = SCORE_RULE_DEFS[key]
@@ -4416,35 +4418,40 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
         except (TypeError, ValueError):
             return default
 
+    def add(key: str) -> None:
+        p = pts(key)
+        if p:
+            items.append((SCORE_RULE_DEFS[key][1], p))
+
     futurem = _GROUP_ALIASES_LOWER["포스코퓨처엠"]
     if any(a in title_l for a in futurem):
-        score += pts("futurem_title")
+        add("futurem_title")
     elif any(a in full_l for a in futurem):
-        score += pts("futurem_body")
+        add("futurem_body")
 
     if any(g != "포스코퓨처엠" for g in group_companies):
-        score += pts("group")
+        add("group")
 
     # 배터리 생태계 기사(포스코 미언급 허용 대상)는 그룹사 언급이 없어도
     # 전방 수요·경쟁 동향이라 최소 중요도를 준다. 예전엔 0점이라 큐에서 굶었다.
     if is_battery_scope(title_l, ""):
-        score += pts("battery_title")
+        add("battery_title")
     elif is_battery_scope("", body[:1500]):
-        score += pts("battery_body")
+        add("battery_body")
     if is_trade_topic(title):
-        score += pts("trade")
+        add("trade")
 
     if any(w in full_l for w in _POLICY_KEYWORDS_LOWER):
-        score += pts("policy")
+        add("policy")
     if press_tier <= 1:
-        score += pts("major_press")
+        add("major_press")
 
     # 단순 시황·주가 기사는 알림 피로를 유발하므로 감점한다.
     if any(w in title_l for w in _MARKET_ONLY_KEYWORDS_LOWER):
-        score += pts("market_penalty")
+        add("market_penalty")
 
-    # 사용자가 마스터 패널에서 추가한 키워드 항목 — 제목(또는 제목+본문)에
-    # 키워드 중 하나라도 있으면 점수를 더하거나(양수) 뺀다(음수).
+    # 사용자가 마스터 패널에서 추가한 키워드 항목 — 제목(또는 제목+본문)에 키워드 중
+    # 하나라도 있으면 점수를 더하거나(양수) 뺀다(음수).
     for rule in (custom_rules or []):
         kws = [str(k).lower() for k in (rule.get("keywords") or []) if str(k).strip()]
         if not kws:
@@ -4452,10 +4459,20 @@ def score_article(title: str, body: str, group_companies: Sequence[str], press_t
         hay = title_l if rule.get("scope") == "title" else full_l
         if any(k in hay for k in kws):
             try:
-                score += int(rule.get("points") or 0)
+                p = int(rule.get("points") or 0)
             except (TypeError, ValueError):
-                pass
+                p = 0
+            if p:
+                items.append((f"직접 추가한 항목({', '.join(str(k) for k in (rule.get('keywords') or [])[:3])})", p))
+    return items
 
+
+def score_article(title: str, body: str, group_companies: Sequence[str], press_tier: int,
+                  overrides: dict[str, dict] | None = None,
+                  custom_rules: Sequence[dict] | None = None) -> int:
+    """중요도 0~100. (PRD F3.2) 항목 내역은 score_breakdown 참고."""
+    score = sum(p for _, p in score_breakdown(title, body, group_companies, press_tier,
+                                              overrides, custom_rules))
     return int(clamp(score, 0, 100))
 
 
@@ -4498,6 +4515,7 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 [감성]
 - sentiment: "긍정" | "중립" | "부정" 중 하나
 - 주가 호재/악재가 아니라 포스코 그룹의 대외협력 대응 필요성 기준으로 판단한다
+- sentiment_reason: 그렇게 판단한 근거를 본문 속 표현 기준으로 한 줄(60자 이내)
 
 [SWOT]
 - swot: 이 기사의 사안이 포스코 그룹(철강·이차전지소재·인프라 전반)에 주는
@@ -4516,7 +4534,7 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 
 [출력 형식 — 이 구조를 정확히 지킨다]
 {{"summary":["문장1","문장2","문장3"],"keywords":["..."],
-"group_companies":["..."],"sentiment":"중립",
+"group_companies":["..."],"sentiment":"중립","sentiment_reason":"...",
 "swot":{{"s":{{"score":0,"text":"..."}},"w":{{"score":0,"text":"..."}},
 "o":{{"score":0,"text":"..."}},"t":{{"score":0,"text":"..."}}}}}}
 
@@ -4555,6 +4573,7 @@ class Analysis:
     keywords: list[str] = field(default_factory=list)
     group_companies: list[str] = field(default_factory=list)
     sentiment: str = "중립"
+    sentiment_reason: str = ""
     swot: dict[str, dict[str, Any]] = field(default_factory=dict)
     token_usage: dict[str, Any] = field(default_factory=dict)
     ok: bool = False
@@ -4885,10 +4904,20 @@ def _build_analysis(data: dict, usage: dict) -> Analysis:
         keywords=[str(k).strip() for k in (data.get("keywords") or []) if str(k).strip()],
         group_companies=groups,
         sentiment=sentiment,
+        sentiment_reason=re.sub(r"\s+", " ", str(data.get("sentiment_reason") or "")).strip()[:120],
         swot=swot,
         token_usage=usage,
         ok=True,
     )
+
+
+SENTIMENT_REASON_TAG = "[감성근거] "
+
+
+def sentiment_reason_of(row: dict) -> str:
+    """summaries.perspective_text 에 머리말과 함께 저장된 감성 판단 근거. 없으면 ''."""
+    text = (row.get("perspective_text") or "").strip()
+    return text[len(SENTIMENT_REASON_TAG):].strip() if text.startswith(SENTIMENT_REASON_TAG) else ""
 
 
 def swot_total(swot: dict[str, dict[str, Any]]) -> int:
@@ -6227,7 +6256,10 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         "id": new_id(),
         "article_id": article_id,
         "summary_text": analysis.summary_text,
-        "perspective_text": analysis.perspective,
+        # '포스코 관점'은 생성을 중단해 이 칸이 비어 있다 — 감성 판단 근거를 표시 머리말과 함께 담는다
+        # (컬럼 추가 없이 쓰려는 것. 읽을 때는 sentiment_reason_of 가 머리말로 구분한다).
+        "perspective_text": (f"{SENTIMENT_REASON_TAG}{analysis.sentiment_reason}"
+                             if analysis.sentiment_reason else analysis.perspective),
         "summary_source": summary_source,
         "model": ctx.cfg.llm_model,
         "token_usage": analysis.token_usage,
@@ -8148,6 +8180,7 @@ def build_card(row: dict) -> dict:
         "thumbnail_url": row.get("thumbnail_url") or "",
         "importance_score": int(row.get("importance_score") or 0),
         "sentiment": row.get("sentiment") or "",
+        "sentiment_reason": sentiment_reason_of(row),
         "keywords": keywords,
         "group_companies": groups,
         "categories": categories,
@@ -9319,6 +9352,40 @@ def create_app(ctx: Context):
             ctx.storage.update_article(article_id, {"status": "archived"})
         return JSONResponse({"ok": True})
 
+    @app.get("/api/articles/{article_id}/score-detail")
+    def api_score_detail(article_id: str):
+        """카드의 '긍정 · 22' 툴팁 — 감성 판단 근거와 중요도 점수 내역을 돌려준다.
+
+        점수 내역은 지금의 규칙·본문으로 다시 계산한 값이다. 저장된 점수는 수집 때와 분석 때
+        두 번 계산한 값 중 큰 쪽이라 다를 수 있어, 다르면 그 사실을 note 로 알려 준다.
+        """
+        row = ctx.storage.article_detail(article_id)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
+        body = ctx.storage.body_of(article_id) or ""
+        basis = body or (row.get("summary_text") or "")
+        groups = normalize_group_list(jload(row.get("group_companies"), []))
+        overrides, customs = get_score_rules(ctx.storage)
+        # analyze_and_save 와 같은 조건(언론사가 식별돼 있으면 주요 언론사 기준 1)으로 계산한다.
+        items = score_breakdown(row.get("title") or "", basis, groups,
+                                1 if row.get("press_id") else 3, overrides, customs)
+        computed = int(clamp(sum(p for _, p in items), 0, 100))
+        stored = int(row.get("importance_score") or 0)
+        notes = []
+        if not body:
+            notes.append("원문 본문(30일 보관)이 없어 요약문으로 계산했습니다.")
+        if computed != stored:
+            notes.append(f"저장된 점수 {stored}점은 수집·분석 두 시점의 계산 중 높은 값이라 위 합계와 다를 수 있습니다.")
+        return JSONResponse({
+            "ok": True,
+            "sentiment": row.get("sentiment") or "중립",
+            "sentiment_reason": sentiment_reason_of(row),
+            "score": stored,
+            "computed": computed,
+            "items": [{"label": label, "points": p} for label, p in items],
+            "notes": notes,
+        })
+
     _press_stats_cache: dict[str, Any] = {"at": 0.0, "data": None}
 
     @app.get("/api/press-stats")
@@ -9750,6 +9817,36 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
             failed += 1
             log.warning("  ✗ %s — %s", (r.get("title") or "")[:44], exc)
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
+
+
+def cmd_regroup(ctx: Context, dry: bool = False) -> None:
+    """이미 저장된 기사에 '배터리협회' 그룹사 태그를 뒤늦게 붙인다(일회성).
+
+    제목·요약, 그리고 30일 보관 본문에 협회 이름(별칭)이 있으면 태그를 더한다.
+    dry=True 면 대상 건수만 보여 주고 쓰지 않는다.
+    """
+    targets: dict[str, dict] = {}
+    for group in NON_POSCO_GROUPS:
+        aliases = GROUP_COMPANIES[group]
+        ids: set[str] = set()
+        for alias in aliases:
+            ids |= ctx.storage.body_match_ids(alias)
+        for r in ctx.storage.list_articles(20000, 0, None, ""):
+            probe = f"{r.get('title') or ''} {r.get('summary_text') or ''}".lower()
+            has_tag = group in jload(r.get("group_companies"), [])
+            if has_tag:
+                continue
+            if r.get("id") in ids or any(a.lower() in probe for a in aliases):
+                targets[r["id"]] = {"row": r, "group": group}
+    log.info("그룹사 태그 보충 대상 %d건%s", len(targets), " (미리보기 — 쓰지 않음)" if dry else "")
+    if dry:
+        return
+    for aid, t in targets.items():
+        r = t["row"]
+        groups = normalize_group_list(jload(r.get("group_companies"), []) + [t["group"]])
+        ctx.storage.update_article(aid, {"group_companies": groups})
+        log.info("  + %s → %s", (r.get("title") or "")[:40], t["group"])
+    log.info("그룹사 태그 보충 완료: %d건 (화면 필터는 최대 몇 분 뒤 반영)", len(targets))
 
 
 def cmd_addkw(ctx: Context, category: str, words: Sequence[str]) -> None:
@@ -10837,6 +10934,24 @@ def cmd_selftest() -> int:
           [detect_group_companies(t) for t in ("한국배터리산업협회가 발표했다", "KBIA 총회", "배터리협회 세미나",
                                                 "한국전지산업협회 시절")],
           [["배터리협회"]] * 4)
+    # 카드 '긍정 · 22' 툴팁 — 점수 내역과 감성 근거 (2026-09-30)
+    _bd = score_breakdown("포스코퓨처엠 양극재 증설", "포스코퓨처엠이 광양에 공장을 짓는다.", ["포스코퓨처엠"], 1)
+    check("점수 내역 — 합계가 score_article 과 같다(설명과 계산이 갈라지지 않는다)",
+          (sum(p for _, p in _bd),
+           score_article("포스코퓨처엠 양극재 증설", "포스코퓨처엠이 광양에 공장을 짓는다.", ["포스코퓨처엠"], 1)),
+          (sum(p for _, p in _bd), int(clamp(sum(p for _, p in _bd), 0, 100))))
+    check("점수 내역 — 항목 설명과 가산점이 함께 나온다",
+          any("포스코퓨처엠이 제목에" in label and p > 0 for label, p in _bd), True)
+    check("점수 내역 — 꺼진 항목(0점)은 내역에서 빠진다",
+          any("제목에" in label for label, _ in score_breakdown(
+              "포스코퓨처엠 소식", "", [], 3, {"futurem_title": {"enabled": False}})), False)
+    check("감성 근거 — 머리말로 저장하고 읽을 때 꺼낸다",
+          (sentiment_reason_of({"perspective_text": SENTIMENT_REASON_TAG + "증설 수주를 호의적으로 보도"}),
+           sentiment_reason_of({"perspective_text": "옛 포스코 관점 문장"}), sentiment_reason_of({})),
+          ("증설 수주를 호의적으로 보도", "", ""))
+    check("감성 근거 — 분석 JSON 의 sentiment_reason 을 읽는다",
+          _build_analysis({"summary": ["a"], "sentiment": "긍정", "sentiment_reason": "  수주  확대 ",
+                           "swot": {}}, {}).sentiment_reason, "수주 확대")
     check("과거 기사(저장된 그룹사 있음)도 제목·요약에 협회가 나오면 배터리협회 칩이 붙는다",
           card_tags({"title": "포스코퓨처엠 양극재 증설", "summary_text": "한국배터리산업협회는 환영했다",
                      "group_companies": '["포스코퓨처엠"]', "categories": "[]", "keywords": "[]"})[0],
@@ -12524,6 +12639,7 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
+  regroup [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
                     분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
@@ -12603,6 +12719,8 @@ def main(argv: Sequence[str]) -> int:
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+    elif command == "regroup":
+        cmd_regroup(ctx, dry="--dry" in argv[2:])
     elif command == "addkw":
         cmd_addkw(ctx, argv[2] if len(argv) > 2 else "", argv[3:])
     elif command == "pfmtone":

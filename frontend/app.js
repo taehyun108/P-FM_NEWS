@@ -546,7 +546,9 @@ function buildCard(item) {
   // ② 감성 · 중요도 — 회사명 없이 독립.
   const cls = item.sentiment === '긍정' ? 'pos' : item.sentiment === '부정' ? 'neg' : 'neu';
   const senti = item.sentiment || '중립';
-  chips.append(el('span', `tag tag-senti ${cls}`, `${senti} · ${item.importance_score}`));
+  const sentiChip = el('span', `tag tag-senti ${cls}`, `${senti} · ${item.importance_score}`);
+  attachSentiTip(sentiChip, item);   // 마우스를 올리면 '왜 긍정인지 · 왜 N점인지' 설명
+  chips.append(sentiChip);
 
   if (item.is_backfill) chips.append(el('span', 'tag tag-backfill', '지연 수집'));
   // 아직 LLM 분석 전이면 요약·키워드가 없다. 빈 카드처럼 보이지 않게 상태를 알린다.
@@ -1304,6 +1306,97 @@ function showSwotTip(anchor, swot) {
 }
 
 function hideSwotTip() { $('swotTip').hidden = true; }
+
+/* ── 감성·중요도 칩 툴팁 ('긍정 · 22' — 왜 긍정인지, 왜 22점인지) ─────── */
+
+const scoreDetailCache = new Map();   // 기사 id → 서버 응답. 같은 카드를 다시 올려도 재요청하지 않는다.
+let sentiTipToken = 0;                // 마우스를 빨리 옮길 때 늦게 온 옛 응답이 덮어쓰지 않게 한다.
+
+const SENTI_CRITERIA = '감성은 주가 호재·악재가 아니라 포스코 그룹의 대외협력 대응 필요성 기준으로 AI가 판단합니다.';
+
+function attachSentiTip(chip, item) {
+  chip.tabIndex = 0;
+  chip.setAttribute('role', 'button');
+  chip.setAttribute('aria-label', `${item.sentiment || '중립'} ${item.importance_score}점. 이유 보기`);
+  chip.classList.add('has-tip');
+  const show = () => showSentiTip(chip, item);
+  chip.addEventListener('mouseenter', show);
+  chip.addEventListener('focus', show);
+  chip.addEventListener('mouseleave', hideSwotTip);
+  chip.addEventListener('blur', hideSwotTip);
+  chip.addEventListener('click', (e) => {     // 모바일 탭
+    e.preventDefault();
+    if ($('swotTip').hidden) show(); else hideSwotTip();
+  });
+}
+
+function placeTip(anchor, tip) {
+  const rect = anchor.getBoundingClientRect();
+  const tipRect = tip.getBoundingClientRect();
+  let left = rect.left + window.scrollX;
+  let top = rect.bottom + window.scrollY + 8;
+  if (left + tipRect.width > window.innerWidth - 12) {
+    left = Math.max(12, window.innerWidth - tipRect.width - 12);
+  }
+  if (rect.bottom + tipRect.height + 20 > window.innerHeight) {
+    top = rect.top + window.scrollY - tipRect.height - 8;
+  }
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+
+function fillSentiTip(tip, item, d) {
+  tip.replaceChildren();
+  const senti = d.sentiment || item.sentiment || '중립';
+  tip.append(el('h4', null, `${senti} · ${d.score}점`));
+
+  const dl = el('dl', 'senti-dl');
+  dl.append(el('dt', null, `왜 ${senti}인가요?`));
+  dl.append(el('dd', null, d.sentiment_reason
+    ? `AI 판단 근거: ${d.sentiment_reason}`
+    : '이 기사는 개별 근거가 저장되기 전에 분석되어 기준만 표시합니다.'));
+  dl.append(el('dd', 'tip-sub', SENTI_CRITERIA));
+
+  dl.append(el('dt', null, `왜 ${d.score}점인가요? (중요도 0~100)`));
+  if (!d.items.length) {
+    dl.append(el('dd', null, '해당되는 가산 항목이 없어 0점입니다.'));
+  } else {
+    d.items.forEach((it) => {
+      dl.append(el('dd', 'tip-row', `${it.points > 0 ? '+' : ''}${it.points}  ${it.label}`));
+    });
+    dl.append(el('dd', 'tip-sum', `합계 ${d.computed}점 (0~100으로 제한)`));
+  }
+  (d.notes || []).forEach((n) => dl.append(el('dd', 'tip-sub', n)));
+  dl.append(el('dd', 'tip-sub', '점수 기준 항목과 점수는 마스터 패널 ‘중요도 점수’ 설정을 따릅니다.'));
+  tip.append(dl);
+}
+
+async function showSentiTip(chip, item) {
+  const tip = $('swotTip');
+  const token = ++sentiTipToken;
+  tip.replaceChildren(el('h4', null, `${item.sentiment || '중립'} · ${item.importance_score}점`),
+    el('p', 'tip-sub', '이유를 불러오는 중…'));
+  tip.hidden = false;
+  placeTip(chip, tip);
+  let d = scoreDetailCache.get(item.id);
+  if (!d) {
+    try {
+      const res = await fetch(`${API}/api/articles/${encodeURIComponent(item.id)}/score-detail`);
+      d = await res.json();
+      if (!d.ok) throw new Error(d.error || 'fail');
+      scoreDetailCache.set(item.id, d);
+    } catch {
+      if (token === sentiTipToken) {
+        tip.replaceChildren(el('h4', null, `${item.sentiment || '중립'} · ${item.importance_score}점`),
+          el('p', 'tip-sub', '설명을 불러오지 못했습니다.'));
+      }
+      return;
+    }
+  }
+  if (token !== sentiTipToken || tip.hidden) return;   // 그 사이 다른 칩으로 옮겼거나 닫았다
+  fillSentiTip(tip, item, d);
+  placeTip(chip, tip);
+}
 
 document.addEventListener('scroll', hideSwotTip, { passive: true });
 
