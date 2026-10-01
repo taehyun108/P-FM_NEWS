@@ -4138,10 +4138,33 @@ def fix_mojibake(text: str) -> str:
     return restored if _has_hangul(restored) else text
 
 
+# 사람 이름이 아닌 바이라인 — 부서·데스크·통신사명 ('English News Desk', '편집국', '뉴스룸').
+# 영문은 낱말 단위로, 한글은 끝말(부서 접미)로 본다. 사람 이름에는 거의 안 나오는 표현만 넣는다.
+_NON_PERSON_BYLINE_RE = re.compile(
+    r"(?i)\b(?:desk|newsroom|news|staff|team|editorial|editors?|bureau|agency|wire|online|digital|admin|yonhap|newsis)\b"
+    r"|(?:데스크|뉴스룸|편집부|편집국|편집팀|취재팀|뉴스팀|기획팀|제작팀|사진부|영상팀|콘텐츠팀|산업부|경제부|사회부"
+    r"|정치부|국제부|증권부|온라인팀|특파원단|속보팀|디지털팀|관리자)$")
+
+
+def is_non_person_byline(name: str) -> bool:
+    """기자 이름이 아니라 부서·데스크·통신사명인가."""
+    return bool(_NON_PERSON_BYLINE_RE.search((name or "").strip()))
+
+
+def author_display(author: str) -> str:
+    """카드 머리표에 쓸 기자명. 전부 사람 이름이 아닌 바이라인이면 빈 문자열(→ '[언론사]' 만 표기)."""
+    parts = [p.strip() for p in re.split(r"\s*[,·/、&]\s*", author or "") if p.strip()]
+    if parts and all(is_non_person_byline(p) for p in parts):
+        return ""
+    return (author or "").strip()
+
+
 def _valid_author(raw: str, press_key: str) -> str:
     """기자명 후보를 정제·검증한다. 부적합하면 빈 문자열."""
     name = clean_author(fix_mojibake(decode_unicode_escapes((raw or "").strip())))
     if not (2 <= len(name) <= 20):
+        return ""
+    if is_non_person_byline(name):
         return ""
     if re.match(r"(https?:|www\.)", name, re.I) or _looks_like_domain(name):
         return ""
@@ -6272,9 +6295,13 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     kw_text = " ".join(analysis.keywords)
     mentioned = set(detect_group_companies(
         f"{row['title']}\n{group_lead_text(body)}\n{analysis.summary_text}\n{kw_text}"))
-    llm_verified = [g for g in analysis.group_companies if g in mentioned]
-    # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다.
-    kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코"]
+    # 요약·키워드는 LLM 이 쓴 글이라 거기 나온 회사명만으로는 근거가 못 된다(스스로 만든 말로 스스로를
+    # 검증하는 셈 — 언론사 탭에서 '포스코퓨처엠 언급이 전혀 없는 기사'가 잡힌 원인 후보, 2026-09-30).
+    # LLM 이 더한 계열사는 제목·원문 어딘가에 실제 이름(별칭)이 있어야 인정한다.
+    in_source = set(detect_group_companies(f"{row['title']}\n{body}"))
+    llm_verified = [g for g in analysis.group_companies if g in mentioned and g in in_source]
+    # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다(원문에도 있어야 한다).
+    kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코" and g in in_source]
     groups = normalize_group_list(rule_groups + llm_verified + kw_groups)
     # 그룹사로 표기된 값은 키워드에서 제외한다 — 칩 중복의 근본 원인이다.
     keywords = dedupe_chips(analysis.keywords, exclude=groups)[:6]
@@ -7621,6 +7648,8 @@ def split_authors(author: str) -> list[str]:
     names: list[str] = []
     for part in _AUTHOR_SPLIT_RE.split(author or ""):
         part = _AUTHOR_NOISE_RE.sub("", part).strip()
+        if is_non_person_byline(part):   # 'English News Desk' 같은 부서·데스크는 기자가 아니다
+            continue
         nm = _AUTHOR_TITLE_RE.sub("", part).strip()
         if len(nm) < 2:      # '김기자'처럼 떼고 나면 이름이 안 남으면 원문 그대로 둔다
             nm = part
@@ -7645,9 +7674,28 @@ def author_matches(author: str, query: str) -> bool:
     """
     want = [q.lower() for q in split_authors(query)]
     if not want:
-        return (query or "").strip().lower() in (author or "").lower()
+        q = (query or "").strip().lower()
+        if is_non_person_byline(q):
+            # 부서·데스크 바이라인('온라인뉴스팀')은 기자 집계에서는 빠지지만, 검색은 이름 전체가
+            # 같을 때만 찾는다('뉴스팀' 으로 '온라인뉴스팀' 이 걸리면 안 된다).
+            return q in {p.strip().lower() for p in re.split(r"\s*[,·/、&]\s*", author or "")}
+        return q in (author or "").lower()
     have = {n.lower() for n in split_authors(author)}
     return all(w in have for w in want)
+
+
+def pfm_mention_supported(row: dict) -> bool:
+    """'포스코퓨처엠' 태그 기사에 실제 언급 근거가 있는가.
+
+    · 제목에 이름(별칭)이 있거나 · 본문 발췌문(pfm_excerpt)이 있으면 True
+    · 발췌가 빈 값('')이면 분석 때 본문에서 언급을 못 찾았다는 뜻 → 근거 없음
+    · 발췌가 NULL(아직 백필 전)이면 모른다 → 일단 True
+    """
+    excerpt = row.get("pfm_excerpt")
+    if excerpt is None or str(excerpt).strip():
+        return True
+    title = (row.get("title") or "").lower()
+    return any(a in title for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
 
 
 def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> list[dict]:
@@ -7663,6 +7711,8 @@ def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> 
         pub = parse_dt(r.get("published_at"))
         if pub is None or pub < cuts["year"]:
             continue
+        if not pfm_mention_supported(r):
+            continue   # 태그는 있는데 제목·본문 어디에도 포스코퓨처엠 언급이 없는 기사
         url = r.get("url_canonical") or r.get("url_original") or ""
         press = press_display_name(r.get("press_name") or "", url) or "(언론사 미상)"
         e = by.setdefault(press, {
@@ -8225,8 +8275,8 @@ def build_card(row: dict) -> dict:
         "title": row.get("title") or "",
         "url": row.get("url_canonical") or row.get("url_original") or "",
         "press_name": press,
-        "author": row.get("author") or "",
-        "summary_header": format_summary_header(press, row.get("author") or ""),
+        "author": author_display(row.get("author") or ""),
+        "summary_header": format_summary_header(press, author_display(row.get("author") or "")),
         "summary_text": row.get("summary_text") or "",
         "pfm_excerpt": row.get("pfm_excerpt") or "",
         "pfm_tone": row.get("pfm_tone") or "",
@@ -9450,7 +9500,7 @@ def create_app(ctx: Context):
         if _press_stats_cache["data"] and mono - _press_stats_cache["at"] < PRESS_STATS_TTL_SEC:
             return JSONResponse(_press_stats_cache["data"])
         now = now_utc()
-        rows = ctx.storage.pfm_articles(iso(now - timedelta(days=365)), with_excerpt=False)
+        rows = ctx.storage.pfm_articles(iso(now - timedelta(days=365)), with_excerpt=True)
         items = aggregate_press_stats(rows, now)
         data = {
             "generated_at": iso(now),
@@ -9714,6 +9764,7 @@ def cmd_fixauthors(ctx: Context) -> None:
                or not (2 <= len(restored) <= 20)
                or restored.endswith(MEDIA_NAME_SUFFIX)
                or normalize_chip(restored) in NON_AUTHOR_WORDS
+               or is_non_person_byline(restored)
                or (press and normalize_chip(restored) == normalize_chip(press)))
         if bad:
             new_author = ""
@@ -9872,6 +9923,29 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
             failed += 1
             log.warning("  ✗ %s — %s", (r.get("title") or "")[:44], exc)
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
+
+
+def cmd_fixpfm(ctx: Context, dry: bool = False) -> None:
+    """'포스코퓨처엠' 태그가 붙었지만 제목·본문 어디에도 언급이 없는 기사에서 그 태그를 뗀다(일회성).
+
+    발췌문(pfm_excerpt)이 빈 값('')인 기사 = 분석 때 본문에서 언급을 못 찾은 기사다.
+    (발췌가 NULL 인 기사는 아직 확인 전이라 건드리지 않는다 — 먼저 `pfmtone` 으로 채운다.)
+    dry=True 면 대상만 보여 주고 쓰지 않는다.
+    """
+    rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=365)), with_excerpt=True)
+    bad = [r for r in rows if not pfm_mention_supported(r)]
+    log.info("포스코퓨처엠 언급 근거 없는 태그 기사 %d건 (전체 %d건)%s", len(bad), len(rows),
+             " — 미리보기, 쓰지 않음" if dry else "")
+    if dry:
+        for r in bad[:15]:
+            log.info("  - %s | %s", (r.get("press_name") or "")[:10], (r.get("title") or "")[:50])
+        return
+    for r in bad:
+        detail = ctx.storage.article_detail(r["id"]) or {}
+        groups = [g for g in jload(detail.get("group_companies"), []) if g != "포스코퓨처엠"]
+        ctx.storage.update_article(r["id"], {"group_companies": groups})
+        log.info("  - 태그 제거: %s", (r.get("title") or "")[:50])
+    log.info("포스코퓨처엠 태그 정리 완료: %d건 (언론사 탭·필터는 최대 몇 분 뒤 반영)", len(bad))
 
 
 def cmd_reopen(ctx: Context, days: int = 3, dry: bool = False) -> None:
@@ -11209,6 +11283,74 @@ def cmd_selftest() -> int:
     check("무관 기사(코스피)는 여전히 제외", is_trade_topic("코스피 7100선 돌파"), False)
     check("통상 키워드 시드에 한미 관세협상 계열이 있다",
           {"대미투자", "트럼프 관세", "한미 관세협상"} <= {k for c, k in SEED_KEYWORDS if c == "통상"}, True)
+
+    # 2026-09-30: 연합뉴스 'English News Desk' 가 기자로 집계되고, 언급 없는 기사가 포스코퓨처엠으로 잡혔다
+    print("\n[8-2c4] 기자 아닌 바이라인 · 포스코퓨처엠 태그 근거 확인")
+    check("바이라인 — 데스크·부서·통신사명은 사람이 아니다",
+          [is_non_person_byline(x) for x in ("English News Desk", "편집국", "뉴스룸", "취재팀", "Yonhap News Agency")],
+          [True] * 5)
+    check("바이라인 — 사람 이름은 그대로(영문 이름 포함)",
+          [is_non_person_byline(x) for x in ("김철수", "김철수 기자", "John Smith", "Kim Min-su")], [False] * 4)
+    check("기자 집계 — English News Desk 는 기자에서 빠진다",
+          (split_authors("English News Desk"), split_authors("김철수 기자, English News Desk"),
+           split_authors("John Smith")), ([], ["김철수"], ["John Smith"]))
+    check("카드 머리표 — 부서·데스크뿐이면 비운다, 사람이 있으면 그대로",
+          (author_display("English News Desk"), author_display("김철수 기자"),
+           author_display("김철수, 편집국")), ("", "김철수 기자", "김철수, 편집국"))
+    check("기자 추출 — JSON-LD author 가 데스크명이면 채택하지 않는다",
+          extract_author('<script type="application/ld+json">{"author":{"@type":"Person","name":"English News Desk"}}</script>',
+                         "", "연합뉴스"), "")
+    check("언급 근거 — 발췌 있음/제목에 이름/발췌 NULL 은 인정",
+          [pfm_mention_supported(r) for r in (
+              {"pfm_excerpt": "포스코퓨처엠이 증설한다.", "title": "배터리"},
+              {"pfm_excerpt": "", "title": "포스코퓨처엠 신공장"},
+              {"pfm_excerpt": None, "title": "배터리"})], [True, True, True])
+    check("언급 근거 — 발췌가 빈 값이고 제목에도 없으면 근거 없음",
+          pfm_mention_supported({"pfm_excerpt": "", "title": "코스피 상승 마감"}), False)
+    _pn = now_utc()
+    _sup = aggregate_press_stats([
+        {"id": "s1", "title": "코스피 상승 마감", "press_name": "연합뉴스", "pfm_excerpt": "",
+         "url_canonical": "https://yna.co.kr/1", "author": "English News Desk",
+         "published_at": iso(_pn - timedelta(days=1))},
+        {"id": "s2", "title": "포스코퓨처엠 증설", "press_name": "연합뉴스", "pfm_excerpt": "포스코퓨처엠이 증설한다.",
+         "url_canonical": "https://yna.co.kr/2", "author": "English News Desk, 김철수 기자",
+         "published_at": iso(_pn - timedelta(days=2))}], _pn)
+    check("언론사 탭 — 언급 근거 없는 기사는 집계에서 빠지고, 데스크는 기자가 아니다",
+          (_sup[0]["year"], [x["name"] for x in _sup[0]["reporters"]]), (1, ["김철수"]))
+
+    class _GroupStubLLM:
+        """LLM 이 본문에 없는 '포스코퓨처엠'을 요약·키워드·그룹사에 지어낸 상황."""
+        def analyze(self, title: str, press: str, body: str) -> Analysis:
+            return Analysis(summary_sentences=["포스코퓨처엠이 양극재를 늘린다."], perspective="",
+                            keywords=["포스코퓨처엠", "양극재"], group_companies=["포스코퓨처엠"],
+                            sentiment="중립", ok=True)
+
+        def pfm_tone(self, excerpt: str) -> tuple[str, str]:
+            return "중립", "x"
+
+    _gt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "g.db"))
+    _gt.init_schema()
+    _gt._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("g1", "u/g1", "u/g1", "u/g1", "배터리 업계 동향", iso(_pn), iso(_pn), "rss", 10, "[]", "[]",
+               "연합뉴스", None, "active", 1))
+    _gctx = Context(cfg=Config(**{**{f: "" for f in Config.__dataclass_fields__}, "openai_api_key": "x",
+                                  "llm_model": "m", "embedding_model": "e", "nvidia_embed_model": "n",
+                                  "nvidia_llm_model": "nvm"}), storage=_gt, http=HttpClient())
+    _gctx._llm = _GroupStubLLM()
+    analyze_and_save(_gctx, "g1", {"id": "g1", "title": "배터리 업계 동향", "press_id": None, "press_name": "연합뉴스",
+                                   "importance_score": 10, "group_companies": []},
+                     "국내 배터리 업계가 전기차 수요 둔화에 대응하고 있다. " * 10, "fulltext")
+    _g1 = _gt._one("select group_companies, pfm_excerpt from articles where id='g1'")
+    check("LLM 이 지어낸 포스코퓨처엠 — 원문에 없으면 태그가 붙지 않는다",
+          (jload(_g1["group_companies"], []), _g1["pfm_excerpt"]), ([], ""))
+    _gt._exec("update articles set group_companies='[]', analyzed_at=null where id='g1'")
+    analyze_and_save(_gctx, "g1", {"id": "g1", "title": "배터리 업계 동향", "press_id": None, "press_name": "연합뉴스",
+                                   "importance_score": 10, "group_companies": []},
+                     "포스코퓨처엠은 양극재 증설을 발표했다. 국내 배터리 업계가 주목한다. " * 10, "fulltext")
+    check("원문에 실제로 있으면 정상적으로 붙는다",
+          jload(_gt._one("select group_companies from articles where id='g1'")["group_companies"], []), ["포스코퓨처엠"])
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
@@ -12775,6 +12917,7 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
+  fixpfm [--dry]  포스코퓨처엠 태그가 붙었지만 제목·본문에 언급이 없는 기사에서 태그 제거 (먼저 pfmtone 으로 발췌 채우기)
   reopen [일수] [--dry]  규칙을 넓힌 뒤 최근 며칠(기본 3일)의 '무관'·'접속 실패' 제외 기록을 지워 다시 판정(실행 후 worker 재시작)
   tagassoc [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
@@ -12856,6 +12999,8 @@ def main(argv: Sequence[str]) -> int:
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+    elif command == "fixpfm":
+        cmd_fixpfm(ctx, dry="--dry" in argv[2:])
     elif command == "reopen":
         nums = [int(a) for a in argv[2:] if a.isdigit()]
         cmd_reopen(ctx, nums[0] if nums else 3, dry="--dry" in argv[2:])
