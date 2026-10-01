@@ -43,6 +43,7 @@ const SORT_OPTIONS = [
 
 const $ = (id) => document.getElementById(id);
 const EXCERPT_FOLD_CHARS = 200;  // 포스코퓨처엠 언급 발췌가 이보다 길면 접어서 보여 준다
+const PFM_MENTION_RE = /(포스코\s*퓨처엠|POSCO\s*(?:FUTURE\s*M|퓨처엠)|퓨처엠)/i;  // 발췌에서 강조할 언급
 const PEOPLE_FOLD_LINES = 10;   // 인사·부고 카드는 이 줄 수까지만 접힌 채로 보여 준다
 
 const el = (tag, cls, text) => {
@@ -498,7 +499,7 @@ function buildCard(item) {
     const isPeople = (item.categories || []).includes('인사·부고');
     const p = el('p', isPeople ? 'card-summary card-summary--people' : 'card-summary');
     if (item.summary_header) {
-      p.append(el('span', 'summary-head', item.summary_header + ' '));
+      p.append(el('span', 'summary-head', item.summary_header + (isPeople ? '\n' : ' ')));
     }
     p.append(document.createTextNode(item.summary_text));
     card.append(p);
@@ -521,15 +522,42 @@ function buildCard(item) {
   if (item.pfm_excerpt) {
     const box = el('div', 'card-excerpt');
     box.append(el('strong', null, '포스코퓨처엠 언급'));
-    box.append(el('div', 'card-excerpt-text', item.pfm_excerpt));   // 문단 사이 줄바꿈을 살린다(pre-line)
-    /* 맥락을 위해 길게 가져오므로 6줄까지만 보이고 펼친다 */
-    if (item.pfm_excerpt.length > EXCERPT_FOLD_CHARS) {
-      box.classList.add('is-folded');
-      const more = el('button', 'excerpt-more', '더보기 ▾');
+    const body = el('div', 'card-excerpt-text');
+    const paras = item.pfm_excerpt.split('\n').filter((t) => t.trim());
+    const hit = paras.map((t) => PFM_MENTION_RE.test(t));
+    const first = Math.max(0, hit.indexOf(true));
+    /* 문단 하나를 그리되 포스코퓨처엠 언급은 <mark>로 강조한다 */
+    const paint = (t, idx) => {
+      const d = el('div', 'excerpt-para');
+      d.dataset.idx = idx;
+      let last = 0; let m;
+      const re = new RegExp(PFM_MENTION_RE.source, 'gi');
+      while ((m = re.exec(t))) {
+        if (m.index > last) d.append(document.createTextNode(t.slice(last, m.index)));
+        d.append(el('mark', 'pfm-mark', m[0]));
+        last = m.index + m[0].length;
+      }
+      if (last < t.length) d.append(document.createTextNode(t.slice(last)));
+      return d;
+    };
+    paras.forEach((t, i) => body.append(paint(t, i)));
+    box.append(body);
+    /* 길면 '언급이 든 문단'만 남기고 접는다 — 언급이 가려지는 일이 없도록 앞뒤 문단만 숨긴다 */
+    if (paras.length > 1 && item.pfm_excerpt.length > EXCERPT_FOLD_CHARS) {
+      const apply = (folded) => {
+        body.querySelectorAll('.excerpt-para').forEach((d) => {
+          d.hidden = folded && Number(d.dataset.idx) !== first;
+        });
+        body.classList.toggle('is-folded', folded);
+      };
+      apply(true);
+      const more = el('button', 'excerpt-more', '앞뒤 맥락 더보기 ▾');
       more.type = 'button';
+      let folded = true;
       more.addEventListener('click', () => {
-        const folded = box.classList.toggle('is-folded');
-        more.textContent = folded ? '더보기 ▾' : '접기 ▴';
+        folded = !folded;
+        apply(folded);
+        more.textContent = folded ? '앞뒤 맥락 더보기 ▾' : '접기 ▴';
       });
       box.append(more);
     }
@@ -1531,10 +1559,10 @@ async function loadPressStats() {
     body.replaceChildren(el('p', 'empty', '최근 1년간 포스코퓨처엠 기사가 없습니다.'));
     return;
   }
-  body.replaceChildren(buildPressTable(d.items));
+  body.replaceChildren(buildPressTable(d.items, w));
 }
 
-function buildPressTable(items) {
+function buildPressTable(items, windows) {
   const wrap = el('div', 'press-table-wrap');
   const table = el('table', 'press-table');
   const thead = el('thead');
@@ -1557,20 +1585,28 @@ function buildPressTable(items) {
     name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
     tr.append(name);
     // data-label — 모바일에서 표를 카드로 쌓을 때 각 숫자 위에 '주간·월간…' 라벨로 쓴다
-    [['주간', it.week], ['월간', it.month], ['연간', it.year]].forEach(([lb, n]) => {
-      const td = el('td', 'num', String(n));
+    // 숫자 칸은 누르면 그 조건(기간·논조)에 맞는 기사만 아래에 펼친다 — data-win / data-tone
+    const countCells = [];
+    [['주간', it.week, 'week'], ['월간', it.month, 'month'], ['연간', it.year, 'year']].forEach(([lb, n, win]) => {
+      const td = el('td', 'num clickable', String(n));
       td.dataset.label = lb;
+      td.title = `${lb} 기사만 보기`;
+      countCells.push([td, { win }]);
       tr.append(td);
     });
     ['긍정', '중립', '부정'].forEach((k) => {
       const n = (it.tone || {})[k] || 0;
-      const td = el('td', `num tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n));
+      const td = el('td', `num clickable tone-${TONE_CLASS[k]}${n ? '' : ' zero'}`, String(n));
       td.dataset.label = k;
+      td.title = `논조 ${k} 기사만 보기`;
+      countCells.push([td, { tone: k }]);
       tr.append(td);
     });
-    const unrated = el('td', `num${((it.tone || {})['미판정'] || 0) ? '' : ' zero'}`,
+    const unrated = el('td', `num clickable${((it.tone || {})['미판정'] || 0) ? '' : ' zero'}`,
       String((it.tone || {})['미판정'] || 0));
     unrated.dataset.label = '미판정';
+    unrated.title = '미판정 기사만 보기';
+    countCells.push([unrated, { tone: '미판정' }]);
     tr.append(unrated);
 
     const detail = el('tr', 'press-detail');
@@ -1578,7 +1614,10 @@ function buildPressTable(items) {
     const cell = el('td');
     cell.colSpan = 11;
     detail.append(cell);
-    const showAll = () => cell.replaceChildren(buildPressArticles(it));   // 언론사 전체 기사
+    // 언론사 기사 목록 — 필터(기간·논조)를 바꿀 때마다 같은 칸에서 다시 그린다
+    const render = (filter) => cell.replaceChildren(
+      buildPressArticles(it, { filter: filter || {}, windows, onFilter: render }));
+    const showAll = () => render({});   // 언론사 전체 기사
     const setOpen = (open) => {
       detail.hidden = !open;
       tr.setAttribute('aria-expanded', String(open));
@@ -1607,6 +1646,11 @@ function buildPressTable(items) {
     });
     if (!(it.reporters || []).length) repCell.textContent = '—';
     tr.append(repCell);
+    countCells.forEach(([td, filter]) => td.addEventListener('click', (ev) => {
+      ev.stopPropagation();        // 행 전체 펼침 토글과 분리
+      setOpen(true);
+      render(filter);
+    }));
     tr.addEventListener('click', toggle);
     tr.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
@@ -1654,9 +1698,42 @@ function buildReporterView(it, rep, onBack) {
   return box;
 }
 
-function buildPressArticles(it) {
+const PRESS_WIN_LABEL = { week: '주간', month: '월간', year: '연간' };
+const PRESS_TONES = ['긍정', '중립', '부정', '미판정'];
+
+/* opts 가 있으면 위쪽에 필터 칩(기간·논조)을 달고 조건에 맞는 기사만 보여 준다. opts 없으면 전체(기자 보기용). */
+function buildPressArticles(it, opts) {
+  const all = it.articles || [];
+  const f = (opts && opts.filter) || {};
+  let rows = all;
+  if (opts) {
+    const days = f.win && opts.windows ? opts.windows[f.win] : 0;
+    const cutoff = days ? Date.now() - days * 86400000 : 0;
+    rows = all.filter((a) => (!cutoff || (a.published_at && new Date(a.published_at).getTime() >= cutoff))
+      && (!f.tone || (f.tone === '미판정' ? !a.tone : a.tone === f.tone)));
+  }
+  const wrap = el('div', 'press-list');
+  if (opts) {
+    const bar = el('div', 'press-filterbar');
+    const mk = (label, active, apply) => {
+      const b = el('button', `press-fchip${active ? ' on' : ''}`, label);
+      b.type = 'button';
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); opts.onFilter(apply()); });
+      return b;
+    };
+    bar.append(el('span', 'press-flabel', '기간'));
+    bar.append(mk('전체', !f.win, () => ({ ...f, win: undefined })));
+    Object.entries(PRESS_WIN_LABEL).forEach(([k, lb]) => bar.append(mk(lb, f.win === k, () => ({ ...f, win: k }))));
+    bar.append(el('span', 'press-flabel', '논조'));
+    bar.append(mk('전체', !f.tone, () => ({ ...f, tone: undefined })));
+    PRESS_TONES.forEach((t) => bar.append(mk(t, f.tone === t, () => ({ ...f, tone: t }))));
+    wrap.append(bar);
+    const cond = [f.win ? PRESS_WIN_LABEL[f.win] : '', f.tone || ''].filter(Boolean).join(' · ') || '전체';
+    wrap.append(el('p', 'press-fcount', `${it.press} · ${cond} — ${rows.length}건`));
+  }
   const list = el('ul', 'press-articles');
-  (it.articles || []).forEach((a) => {
+  if (opts && !rows.length) list.append(el('li', 'press-more', '조건에 맞는 기사가 없습니다.'));
+  rows.forEach((a) => {
     const li = el('li');
     li.append(el('span', 'press-date', (a.published_at || '').slice(0, 10)));
     const tone = a.tone || '미판정';
@@ -1679,7 +1756,8 @@ function buildPressArticles(it) {
   if (it.articles && it.year > it.articles.length) {
     list.append(el('li', 'press-more', `최근 ${it.articles.length}건만 표시합니다.`));
   }
-  return list;
+  wrap.append(list);
+  return wrap;
 }
 
 /* ── 주간동향 보기 ────────────────────────────────────────────── */

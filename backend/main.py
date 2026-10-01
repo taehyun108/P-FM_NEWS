@@ -3438,25 +3438,41 @@ def _split_person_item(item: str) -> tuple[str, str]:
 
 # 인사 기사 표기 — 헤더는 ◇◆□■, 항목은 ▲△▶▷ 로 시작한다. 연합뉴스 [인사] 법무부처럼
 # 기사마다 △ 를 쓰기도 해서(2026-09-29 사용자 지적: 검사 전보 내용 누락) ▲ 만 보면 항목이 통째로 사라진다.
-_PEOPLE_HEAD_RE = re.compile(r"[◇◆□■]\s*")
-_PEOPLE_ITEM_RE = re.compile(r"[▲△▶▷]")
 PEOPLE_RULE_MODEL = "rule"     # 규칙 기반으로 정리했다는 표시(LLM 을 쓰지 않았다)
 PEOPLE_BULK_ITEMS = 6          # 이 인원을 넘으면 LLM 을 건너뛰고 한 줄씩 규칙 정리한다
 
 
+_PEOPLE_TOKEN_RE = re.compile(r"([◇◈◆◎□■])|([▲△▶▷])")
+_PEOPLE_HEAD_LEVEL = {"◇": 1, "◈": 1, "◆": 2, "◎": 2, "□": 2, "■": 2}
+
+
+def _clean_people_header(text: str) -> str:
+    """'승진<신규 임원>' → '승진 · 신규 임원'. 머리말 끝의 구분 기호를 정리한다."""
+    t = re.sub(r"\s*<([^<>]*)>\s*", r" · \1 ", text or "")
+    return re.sub(r"\s+", " ", t).strip(" ·,;:")
+
+
 def _split_people_sections(text: str) -> list[tuple[str, str]]:
-    """'◇ 헤더 ▲ 항목 △ 항목 ◇ 헤더2 ▲ 항목' → [(헤더, 항목), …]."""
+    """'◇ 기관 ◆ 구분 ▲ 항목 △ 항목 …' → [(머리말, 항목), …].
+
+    머리말은 위계를 잇는다 — 상위(◇·◈ 기관)와 하위(◆·◎·■·□ 구분)를 ' · ' 로 이어 항목마다 붙인다.
+    예) '◈한화M&S ◎승진<신규 임원> ▷박대주 ▷배상현' → ('한화M&S · 승진 · 신규 임원', '박대주'), …
+    연합뉴스처럼 ◇ 하나뿐이면 그 머리말이 곧 구분이다. 새 상위 머리말이 나오면 하위는 비운다.
+    """
     pairs: list[tuple[str, str]] = []
-    for section in _PEOPLE_HEAD_RE.split(text):
-        section = section.strip()
-        if not section:
-            continue
-        parts = _PEOPLE_ITEM_RE.split(section)
-        header = parts[0].strip()
-        for raw_item in parts[1:]:
-            item = raw_item.strip(" ·,;")
+    parts = _PEOPLE_TOKEN_RE.split(text)       # [앞글, 머리표, 항목표, 글, 머리표, 항목표, 글, …]
+    l1 = l2 = ""
+    for k in range(1, len(parts) - 2, 3):
+        head_mark, item_mark, seg = parts[k], parts[k + 1], parts[k + 2]
+        if head_mark:
+            if _PEOPLE_HEAD_LEVEL[head_mark] == 1:
+                l1, l2 = _clean_people_header(seg), ""
+            else:
+                l2 = _clean_people_header(seg)
+        elif item_mark:
+            item = (seg or "").strip(" ·,;")
             if item:
-                pairs.append((header, item))
+                pairs.append((" · ".join(x for x in (l1, l2) if x), item))
     return pairs
 
 
@@ -3537,7 +3553,7 @@ def _parse_obituary_block(raw_block: str) -> str:
     return "\n".join(lines)
 
 
-def format_people_notice(body: str, kind: str) -> str:
+def format_people_notice(body: str, kind: str, title: str = "") -> str:
     """인사·부고 공지에서 핵심 블록만 남긴다. LLM 을 쓰지 않는다.
 
     LLM 예산이 바닥나면(PEOPLE_LLM_PER_RUN) 이 함수가 그대로 카드 요약이 되므로,
@@ -3549,6 +3565,9 @@ def format_people_notice(body: str, kind: str) -> str:
            각각 '대상명/관계 → 상주 → 빈소 → 발인 → 연락처' 순서로 정리한다
            (사용자 지정 2026-09-28). 연락처는 ▲ 단위로만 잘라 절대 안 잘린다.
     인사:  '◇ 부서 ▲ 직책 이름 …' — (직책, 이름)을 갈라 'ㆍ직책 이름 (헤더)' 로 만든다.
+           원문에 적힌 대로만 옮긴다(해석·보강 없음, 사용자 지적 2026-10-01 — AI 가 업무·이력을 지어냈다).
+           명단 표시가 없는 줄글 기사는 원문 문장을 한 줄씩 그대로 옮기되, 제목과 관련 없는 본문
+           (추출이 엉뚱한 칼럼을 잡은 경우)이면 빈 문자열을 돌려준다 — 호출부가 안내 문구를 쓴다.
     """
     text = _clean_notice_text(body)
     if kind == "obituary":
@@ -3559,8 +3578,7 @@ def format_people_notice(body: str, kind: str) -> str:
         return _join_capped(blocks, "\n\n", 1600)
     pairs = _personnel_pairs(text)
     if not pairs:
-        m = re.search(r"[◇◆□■▲△].*", text)
-        return m.group(0).strip()[:2000] if m else text[:800]
+        return _personnel_prose_lines(text, title)
     lines = []
     for header, item in pairs:
         pos, name = _split_person_item(item)
@@ -3580,13 +3598,46 @@ def _clean_notice_text(body: str) -> str:
     """공백을 정리하고 머리(구독 안내)·꼬리(저작권 문구)를 떼어낸 인사·부고 공지 본문."""
     text = re.sub(r"\s+", " ", (body or "").strip())
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
+    # 줄글 기사는 맨 앞에 '(서울=연합뉴스) 홍길동 기자 =' 가 붙는다 — 꼬리표 규칙이 이걸 보고 본문 전체를
+    # 지우지 않도록 머리의 것은 먼저 떼어 낸다.
+    text = re.sub(r"^\s*\(\S+=\s*연합뉴스\)\s*(?:[가-힣]{2,4}\s*기자\s*=)?\s*", "", text)
     return _NOTICE_TAIL_RE.sub("", text).strip()
 
 
 def _personnel_pairs(text: str) -> list[tuple[str, str]]:
     """정리된 공지 본문에서 (헤더, 항목) 목록을 뽑는다. 항목이 없으면 빈 목록."""
-    m = re.search(r"[◇◆□■▲△].*", text)
+    m = re.search(r"[◇◈◆◎□■▲△▶▷].*", text)
     return _split_people_sections(m.group(0)) if m else []
+
+
+# 제목에서 '이 기사가 무엇에 관한 것인지' 알려 주는 낱말을 고를 때 뺄 일반어
+_PEOPLE_GENERIC_WORDS = frozenset({
+    "인사", "승진", "보직", "임원", "사장단", "발령", "신임", "신규", "임용", "정기", "단행", "동정",
+    "부고", "별세", "프로필", "취임", "선임", "발탁", "전보", "이동", "대표이사", "사장", "부사장",
+})
+PEOPLE_NO_LIST_MSG = "원문에서 인사 명단을 확인하지 못했습니다. 원문 링크에서 확인해 주세요."
+PEOPLE_PROSE_LINES = 8     # 명단 표시가 없는 줄글 기사에서 옮기는 문장 수 상한
+
+
+def _title_keywords(title: str) -> list[str]:
+    """제목에서 기사 주제를 가리키는 낱말(회사·기관명 등)을 뽑는다. 말머리([인사])·일반어는 뺀다."""
+    t = re.sub(r"\[[^\]]*\]|【[^】]*】", " ", title or "")
+    words = [w.replace("㈜", "").lower() for w in re.findall(r"[가-힣A-Za-z0-9&㈜]{2,}", t)]
+    return [w for w in words if len(w) >= 2 and w not in _PEOPLE_GENERIC_WORDS]
+
+
+def _personnel_prose_lines(text: str, title: str) -> str:
+    """명단 표시(◇▲)가 없는 줄글 인사 기사 — 원문 문장을 한 줄씩 그대로 옮긴다(해석 없음).
+
+    제목의 주제어가 본문에 하나도 없으면(본문 추출이 사이드바의 엉뚱한 칼럼을 잡은 경우) 빈 문자열.
+    """
+    if not text:
+        return ""
+    kws = _title_keywords(title)
+    if kws and not any(k in text.lower() for k in kws):
+        return ""
+    sents = [x for x in _sentences(text) if len(x) >= 8][:PEOPLE_PROSE_LINES]
+    return "\n".join("ㆍ" + _cut_at_word(x, 220) for x in sents)
 
 
 # ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
@@ -3694,12 +3745,12 @@ def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
     use_llm 이면 구조화를 시도하고, 실패하거나 use_llm 이 아니면 규칙 기반으로 대체한다.
     공지가 짧아 본문 추출이 푸터를 잡은 경우 og:description·<article> 텍스트로 보강한다.
     """
-    notice = _notice_text(html, body)
-    # 인원이 많은 인사(검사 인사 수십~수백 명 등)는 LLM 이 20명에서 끊기고 뒤 섹션(전보)이
-    # 빠졌다. 이런 공지는 이름·직책 나열이라 LLM 이 더 보탤 것도 없으므로, 규칙으로 전원을
-    # 한 줄씩 정리한다(LLM 비용도 0).
-    if kind == "personnel" and len(_personnel_pairs(_clean_notice_text(notice))) > PEOPLE_BULK_ITEMS:
-        return format_people_notice(notice, kind), PEOPLE_RULE_MODEL, {}
+    notice = _notice_text(html, body, title)
+    # 인사는 AI 를 쓰지 않고 원문에 적힌 대로 한 줄씩 옮긴다. 예전엔 AI 가 '업무·이력·학력'을 보태거나
+    # 20명에서 끊어 뒤 섹션(전보)이 빠졌고, 사이드바의 엉뚱한 글을 요약하기도 했다(2026-10-01).
+    # 명단을 못 찾으면 지어내지 않고 그 사실을 알린다. LLM 비용도 0이다.
+    if kind == "personnel":
+        return (format_people_notice(notice, kind, title) or PEOPLE_NO_LIST_MSG), PEOPLE_RULE_MODEL, {}
     if use_llm:
         parsed, usage = ctx.llm.people_notice(kind, title, press, notice)
         text = format_people_llm(parsed, kind) if parsed else ""
@@ -4289,6 +4340,9 @@ def extract_author(html: str, body: str, press_name: str = "") -> str:
 
 # 기자명 자리에 자주 잘못 들어오는 값들 (직함·부서·라벨)
 NON_AUTHOR_WORDS = {
+    # 화면 요소·기사 구분 낱말이 기자명으로 잡힌 사례('날씨'·'보도' 등, 2026-10-01)
+    "날씨", "보도", "제보", "속보", "단독", "종합", "인사", "부고", "동정", "포토", "기획", "연재",
+    "오피니언", "알림", "공지", "광고", "홍보", "보도자료", "기사", "출처", "관리자", "운영자", "admin",
     "뉴시스", "연합뉴스", "뉴스1", "편집국", "온라인뉴스팀", "산업부", "경제부",
     "취재팀", "디지털뉴스팀", "특별취재팀", "무단전재", "재배포금지",
     "칼럼", "시민", "객원", "명예", "인턴", "수습", "선임", "본지", "특약",
@@ -4415,12 +4469,21 @@ def extract_body(html: str) -> str:
 _NOTICE_FOOTER_HINT = ("무단 전재", "사업자등록번호", "Copyright", "저작권자", "All rights reserved")
 
 
-def _notice_text(html: str, body: str) -> str:
+_PEOPLE_MARK_RE = re.compile(r"[◇◈◆◎□■▲△▶▷]")
+_NOTICE_STRONG_FOOTER = ("사업자등록번호", "Copyright", "All rights reserved")
+
+
+def _notice_text(html: str, body: str, title: str = "") -> str:
     """인사·부고 공지 텍스트를 최대한 알차게 뽑는다.
 
     이런 공지는 몇 줄로 짧아서 Readability 가 본문 대신 <푸터(회사 정보)>를 잡는 일이 잦다.
-    body · og:description · meta description · <article> 컨테이너 텍스트 중
-    푸터가 아닌 가장 긴 것을 고른다.
+    body · og:description · meta description · <article> 컨테이너 텍스트를 후보로 모은다.
+    · 저작권·무단전재 같은 꼬리 문구는 **후보를 버리지 않고 그 앞까지만 쓴다** — 연합뉴스는 명단 바로 뒤에
+      '<저작권자(c) 연합뉴스, 무단 전재…>' 가 붙어 있어, 예전엔 그 때문에 통째로 버려지고 og:description
+      (머리말 한 줄 '◇ 신규 임원 승진')만 남아 명단이 사라졌다(2026-10-01 한화저축은행 사례).
+    · 회사정보 푸터(사업자등록번호 등)가 남은 후보는 버린다.
+    · 고르는 기준: 명단 표시(◇▲)가 있고 → 제목 주제어가 들어 있고 → 더 긴 것.
+      (예전엔 가장 긴 것을 골라, 사이드바의 긴 칼럼이 진짜 공지보다 먼저 뽑혔다.)
     """
     cands = [body or ""]
     for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
@@ -4428,17 +4491,23 @@ def _notice_text(html: str, body: str) -> str:
         m = re.search(pat, html or "", re.I)
         if m:
             cands.append(html_mod.unescape(m.group(1)))
-    m = re.search(r"<article[^>]*>(.*?)</article>", html or "", re.S | re.I)
-    if m:
+    for m in list(re.finditer(r"<article[^>]*>(.*?)</article>", html or "", re.S | re.I))[:5]:
         seg = re.sub(r"<script.*?</script>", " ", m.group(1), flags=re.S | re.I)
         seg = re.sub(r"<br\s*/?>", "\n", seg, flags=re.I)
         seg = html_mod.unescape(re.sub(r"<[^>]+>", " ", seg))
         seg = re.sub(r"[ \t]+", " ", seg).strip()
         if seg:
             cands.append(seg)
-    good = [c.strip() for c in cands
-            if c.strip() and not any(h in c for h in _NOTICE_FOOTER_HINT)]
-    return max(good, key=len) if good else (body or "")
+    good = []
+    for c in cands:
+        c = _NOTICE_TAIL_RE.sub("", c.strip()).strip() if _PEOPLE_MARK_RE.search(c) else c.strip()
+        if c and not any(h in c for h in _NOTICE_STRONG_FOOTER + _NOTICE_FOOTER_HINT):
+            good.append(c)
+    if not good:
+        return body or ""
+    kws = _title_keywords(title)
+    return max(good, key=lambda c: (bool(_PEOPLE_MARK_RE.search(c)),
+                                    bool(kws) and any(k in c.lower() for k in kws), len(c)))
 
 
 # =====================================================================
@@ -4469,7 +4538,6 @@ def detect_group_companies(text: str) -> list[str]:
 # DB 에 저장한다. 영어 기사는 한글로 번역해 저장한다(translate_to_korean).
 PFM_EXCERPT_MAX = 700      # 발췌 전체 상한(글자)
 PFM_PARA_MAX = 380         # 언급 문단 하나에서 가져오는 상한 — 넘으면 언급 문장 앞뒤를 문장 단위로만 자른다
-PFM_LEAD_MAX = 160         # 기사 주제(첫 문단) 도입부 상한
 PFM_MENTION_PARAS = 3      # 언급 문단을 최대 몇 개까지 담을지
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。…])\s+|(?<=다\.)(?=\S)")
 
@@ -4509,62 +4577,107 @@ def _paragraph_window(par: str, aliases: Sequence[str], limit: int) -> str:
     return _cut_at_word(" ".join(sents[lo:hi + 1]), limit)
 
 
-def extract_pfm_excerpt(body: str) -> str:
-    """본문에서 포스코퓨처엠(옛 사명·영문 포함) 언급을 **흐름이 이어지게** 발췌한다.
+# 문단 맨 앞에 붙는 작성 표기 — '(서울=연합뉴스) 홍길동 기자 =', '(뉴스메이커=이영수 기자)', '[잡포스트] 전진홍 기자', '홍길동 기자 ='
+_BYLINE_PREFIX_RES = (
+    re.compile(r"^\s*[\(\[（【][^\)\]）】]{0,24}[=＝][^\)\]）】]{0,24}[\)\]）】]\s*"
+               r"(?:[가-힣]{2,4}\s*(?:선임|수석|전문|인턴|수습)?\s*기자\s*(?:[=＝·:\-]\s*)?)?"),
+    re.compile(r"^\s*[\[【][^\]】]{1,14}[\]】]\s*(?:[가-힣]{2,4}\s*(?:선임|수석|전문|인턴|수습)?\s*기자\s*)?(?:[·=＝:\-]\s*)?"),
+    re.compile(r"^\s*[가-힣]{2,4}\s*(?:선임|수석|전문|인턴|수습)?\s*기자\s*[=＝·:]\s*"),
+)
 
-    예전엔 첫 언급 문장 앞뒤를 190자쯤 이어 붙여 '맥락 없이 한 토막'만 보였다(2026-10-01 지적).
-    이제는 ① 기사 주제를 알 수 있게 첫 문단 도입부, ② 언급이 나온 문단(최대 3개)을 문단째로,
-    ③ 언급 문단이 짧은 인용·단문이면 바로 앞 문장까지 문서 순서대로 담는다. 문장은 중간에서 자르지
-    않고(극단적으로 긴 문장만 예외), 기사에 있는 문장을 그대로 옮길 뿐 재서술하지 않는다.
-    언급이 없으면 빈 문자열 — 카드는 이 영역을 아예 그리지 않는다.
+
+def _strip_byline_prefix(par: str, aliases: Sequence[str]) -> str:
+    """문단 앞의 작성 표기(기자명·매체 말머리)를 뗀다. 회사명이 들어 있는 괄호이거나 뗀 뒤 글이 너무 짧으면 그대로 둔다."""
+    for rx in _BYLINE_PREFIX_RES:
+        m = rx.match(par)
+        if m and len(par) - m.end() >= 10 and not any(a in m.group(0).lower() for a in aliases):
+            par = par[m.end():]
+    return par.strip()
+
+
+def _headline_like(par: str) -> bool:
+    """소제목·헤드라인 같은 줄인가 — 짧고 문장 끝 부호가 없다. 맥락 문장으로는 쓰지 않는다."""
+    p = par.strip()
+    return len(p) <= 70 and not p.endswith((".", "!", "?", "。", "…", "”", "\"", "’", "'", "다", "요"))
+
+
+def _tail_sentences(par: str, limit: int = 170) -> str:
+    """문단의 마지막 문장들을 limit 안에서 — 언급 문단 바로 앞의 맥락."""
+    out: list[str] = []
+    total = 0
+    for sent in reversed(_sentences(par)[-3:]):
+        if out and total + len(sent) + 1 > limit:
+            break
+        if not out and len(sent) > limit:
+            return _cut_at_word(sent, limit)
+        out.insert(0, sent)
+        total += len(sent) + 1
+    return " ".join(out)
+
+
+def _head_sentences(par: str, limit: int = 170) -> str:
+    """문단의 첫 문장들을 limit 안에서 — 언급 문단 바로 뒤에 이어지는 내용."""
+    out: list[str] = []
+    total = 0
+    for sent in _sentences(par)[:3]:
+        if out and total + len(sent) + 1 > limit:
+            break
+        if not out and len(sent) > limit:
+            return _cut_at_word(sent, limit)
+        out.append(sent)
+        total += len(sent) + 1
+    return " ".join(out)
+
+
+def extract_pfm_excerpt(body: str) -> str:
+    """본문에서 포스코퓨처엠(옛 사명·영문·띄어쓴 표기 포함) 언급을 **원문 순서 그대로 이어지게** 발췌한다.
+
+    ① 언급이 나온 문단 — 문단째(길면 언급 문장 앞뒤를 문장 단위로)
+    ② 그 문단 바로 앞 문장(맥락)과 바로 뒤 문장(이어지는 내용) — 원문에서 붙어 있던 글만 가져온다
+    언급 문단은 최대 3개, 전체는 700자 이내. 문장은 중간에서 자르지 않고, 기사의 문장을 그대로 옮길 뿐
+    재서술하지 않는다.
+
+    예전엔 '기사 주제(첫 문단)'를 따로 앞에 붙여 서로 안 이어지는 두 토막이 됐고, 카드의 접힌 줄 아래로 정작
+    언급 부분이 밀려났다(2026-10-01 지적). 이제는 한 덩어리의 이어진 글이고, 앞의 '(서울=연합뉴스) 홍길동 기자 ='
+    같은 작성 표기와 헤드라인성 줄은 걷어 낸다. 언급이 없으면 빈 문자열(카드는 이 영역을 그리지 않는다).
     """
     text = re.sub(r"[ \t\r\f\v]+", " ", (body or "")).strip()
     if not text:
         return ""
-    paras = [p.strip() for p in text.split("\n") if len(p.strip()) >= 15] or [text]
     aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
+    paras = [_strip_byline_prefix(p.strip(), aliases) for p in text.split("\n") if len(p.strip()) >= 15] or [text]
     hits = [i for i, p in enumerate(paras) if any(a in p.lower() for a in aliases)]
     if not hits:
         return ""
+    hit_set = set(hits)
 
     segs: list[tuple[int, str]] = []
+    used_idx: set[int] = set()
     used = 0
-
-    def add(idx: int, t: str) -> bool:
-        nonlocal used
-        t = t.strip()
-        if not t or used + len(t) + 1 > PFM_EXCERPT_MAX:
-            return False
-        segs.append((idx, t))
-        used += len(t) + 1
-        return True
-
-    # ① 기사 주제 — 언급이 첫 문단 밖에 있거나, 첫 문단이 길어 언급 부분만 잘리는 경우의 도입부
-    first = _sentences(paras[0])
-    if first and not any(a in first[0].lower() for a in aliases) \
-            and (hits[0] > 0 or len(paras[0]) > PFM_PARA_MAX):
-        lead = " ".join(first[:2])
-        lead = lead if len(lead) <= PFM_LEAD_MAX else first[0]
-        add(0, _cut_at_word(lead, PFM_LEAD_MAX))
-
-    # ② 언급 문단 (+ ③ 짧은 문단이면 바로 앞 문장)
     for idx in hits[:PFM_MENTION_PARAS]:
-        chunk = _paragraph_window(paras[idx], aliases, PFM_PARA_MAX)
-        if len(paras[idx]) < 70 and idx - 1 >= 0 and all(i != idx - 1 for i, _ in segs) \
-                and not any(a in paras[idx - 1].lower() for a in aliases):
-            prev = _sentences(paras[idx - 1])
-            if prev and len(prev[-1]) <= PFM_PARA_MAX:
-                add(idx - 1, prev[-1])
-        if not add(idx, chunk):
-            break
-
-    # 첫 문단 도입부가 언급 구간과 같은 문장이면 중복을 뺀다
+        if idx in used_idx:
+            continue
+        window: list[tuple[int, str]] = []
+        prev_i, next_i = idx - 1, idx + 1
+        if prev_i >= 0 and prev_i not in hit_set and prev_i not in used_idx and not _headline_like(paras[prev_i]):
+            ctx_before = _tail_sentences(paras[prev_i])
+            if ctx_before:
+                window.append((prev_i, ctx_before))
+        window.append((idx, _paragraph_window(paras[idx], aliases, PFM_PARA_MAX)))
+        if next_i < len(paras) and next_i not in hit_set and next_i not in used_idx and not _headline_like(paras[next_i]):
+            ctx_after = _head_sentences(paras[next_i])
+            if ctx_after:
+                window.append((next_i, ctx_after))
+        if used + sum(len(t) + 1 for _, t in window) > PFM_EXCERPT_MAX:
+            window = [w for w in window if w[0] == idx]      # 넘치면 앞뒤 맥락부터 뺀다
+            if used + len(window[0][1]) + 1 > PFM_EXCERPT_MAX:
+                break
+        for i, t in window:
+            segs.append((i, t))
+            used_idx.add(i)
+            used += len(t) + 1
     segs.sort(key=lambda x: x[0])
-    out: list[str] = []
-    for _, t in segs:
-        if not any(t in o or o in t for o in out):
-            out.append(t)
-    return "\n".join(out)
+    return "\n".join(t for _, t in segs)
 
 
 def excerpt_for_message(text: str, limit: int = 450) -> str:
@@ -10179,7 +10292,7 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
         try:
             _, html = resolve_canonical(ctx.http, target)
             body = extract_body(html)
-            if len(_notice_text(html, body)) < 20:
+            if len(_notice_text(html, body, r.get("title") or "")) < 20:
                 skipped += 1
                 continue
             summary, model, usage = people_summary(
@@ -10366,6 +10479,34 @@ def cmd_addkw(ctx: Context, category: str, words: Sequence[str]) -> None:
     log.info("수집 키워드 추가 완료: 새로 %d개 · 이미 있음 %d개 (다음 수집 회차부터 조회됩니다)", added, skipped)
 
 
+def _title_tone_basis(ctx: Context, r: dict) -> str:
+    """본문에서 언급을 못 찾은 기사의 논조 판정 근거 — 제목에 포스코퓨처엠이 있을 때만 '제목 + 요약의 언급 문장'.
+    제목에도 없으면 ''(근거 없음)."""
+    title = (r.get("title") or "").strip()
+    if not any(a in title.lower() for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"]):
+        return ""
+    detail = ctx.storage.article_detail(r["id"]) or {}
+    from_summary = extract_pfm_excerpt(detail.get("summary_text") or "")
+    return f"{title}\n{from_summary}".strip()
+
+
+def cmd_unrated(ctx: Context, limit: int = 40) -> None:
+    """언론사 탭에서 '미판정'으로 남은 포스코퓨처엠 기사를 원인별로 나눠 보여 준다(점검용, 쓰지 않음)."""
+    rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=365)), with_excerpt=True)
+    unrated = [r for r in rows if pfm_mention_supported(r) and not r.get("pfm_tone")]
+    kinds = {"발췌 미생성(본문 확보 못함)": [], "본문엔 언급 없고 제목에만 있음": [], "발췌는 있는데 AI 판정 실패": []}
+    for r in unrated:
+        ex = r.get("pfm_excerpt")
+        kinds["발췌 미생성(본문 확보 못함)" if ex is None else
+              "본문엔 언급 없고 제목에만 있음" if ex == "" else "발췌는 있는데 AI 판정 실패"].append(r)
+    log.info("미판정 %d건 (집계 대상 %d건 중)", len(unrated), len([r for r in rows if pfm_mention_supported(r)]))
+    for name, lst in kinds.items():
+        log.info("  · %s: %d건", name, len(lst))
+        for r in lst[:limit]:
+            log.info("      - %s | %s | %s", (r.get("press_name") or "")[:10], (r.get("title") or "")[:46],
+                     (r.get("url_canonical") or r.get("url_original") or "")[:70])
+
+
 def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 365) -> None:
     """기존 포스코퓨처엠 기사에 발췌문·논조를 채운다(백필, 사용자 지정 2026-09-29).
 
@@ -10380,9 +10521,13 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
     need_tone = [r for r in rows if r.get("pfm_excerpt") and not r.get("pfm_tone")]
     # 요약문으로 이미 논조를 판정한 기사(발췌는 NULL 인 채)는 다시 보지 않는다.
     need_excerpt = [r for r in need_excerpt if not r.get("pfm_tone")]
-    todo = need_tone + need_excerpt   # 발췌가 이미 있는 쪽이 싸다(원문 재수집 불필요) — 먼저
-    log.info("논조 백필 대상 %d건 — 발췌부터 필요 %d · 논조만 필요 %d (최근 %d일 포스코퓨처엠 기사 %d건)",
-             len(todo), len(need_excerpt), len(need_tone), days, len(rows))
+    # 발췌가 빈 값('')인 기사 중 제목에 이름이 있는 것 — 본문에선 언급을 못 찾았어도 제목(+요약의 언급 문장)으로
+    # 논조를 판정한다. 안 그러면 언론사 탭에 계속 '미판정'으로 남는다(2026-10-01).
+    need_title = [r for r in rows if r.get("pfm_excerpt") == "" and not r.get("pfm_tone")
+                  and pfm_mention_supported(r)]
+    todo = need_tone + need_excerpt + need_title   # 발췌가 이미 있는 쪽이 싸다(원문 재수집 불필요) — 먼저
+    log.info("논조 백필 대상 %d건 — 발췌부터 필요 %d · 논조만 필요 %d · 제목 기준 %d (최근 %d일 포스코퓨처엠 기사 %d건)",
+             len(todo), len(need_excerpt), len(need_tone), len(need_title), days, len(rows))
     if dry:
         log.info("[미리보기] 이번 실행 LLM 호출은 최대 %d건입니다(limit=%d). "
                  "발췌가 필요한 기사는 원문을 다시 받아 언급이 없으면 호출하지 않습니다.",
@@ -10395,6 +10540,19 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
             break
         visited += 1
         excerpt = r.get("pfm_excerpt")
+        if excerpt == "":
+            basis = _title_tone_basis(ctx, r)
+            if not basis:
+                failed += 1
+                continue
+            tone, reason = ctx.llm.pfm_tone(basis)
+            llm_used += 1
+            if tone:
+                ctx.storage.update_article(r["id"], {"pfm_tone": tone, "pfm_tone_reason": reason})
+                toned += 1
+            else:
+                failed += 1
+            continue
         if excerpt is None:
             body = ctx.storage.body_of(r["id"]) or ""
             if not body:
@@ -10409,9 +10567,10 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
                 # 포스코퓨처엠 언급 문장을 찾아 그것으로 논조만 판정한다. 발췌는 NULL 로 둔다
                 # (요약은 발췌가 아니므로 카드의 '포스코퓨처엠 언급' 칸에 넣지 않는다).
                 detail = ctx.storage.article_detail(r["id"]) or {}
-                from_summary = extract_pfm_excerpt(detail.get("summary_text") or "")
+                from_summary = extract_pfm_excerpt(detail.get("summary_text") or "") \
+                    or _title_tone_basis(ctx, r)      # 요약에도 없으면 제목에 이름이 있을 때 제목으로
                 if not from_summary:
-                    failed += 1    # 요약에도 언급이 없다 — NULL 로 두어 다음 실행에서 다시 시도
+                    failed += 1    # 제목·요약 어디에도 언급이 없다 — NULL 로 두어 다음 실행에서 다시 시도
                     continue
                 tone, reason = ctx.llm.pfm_tone(from_summary)
                 llm_used += 1
@@ -11731,10 +11890,17 @@ def cmd_selftest() -> int:
            "증권가는 실적 개선을 전망했다.\n"
            "한편 삼성SDI는 미국 공장을 늘린다.")
     _mx = extract_pfm_excerpt(_mp)
-    check("발췌 맥락 — 기사 주제(첫 문단 도입부)가 앞에 붙는다", _mx.splitlines()[0].startswith("정부가 이차전지 지원책을 발표했다"), True)
+    check("발췌 맥락 — 언급 문단 바로 앞 문장이 맥락으로 앞에 붙고, 멀리 있는 첫 문단은 안 붙는다(흐름이 한 덩어리)",
+          (_mx.splitlines()[0], "정부가 이차전지" in _mx), ("시장은 전반적으로 긍정적인 반응을 보였다.", False))
+    check("발췌 맥락 — 언급 문단 바로 뒤에 이어지는 문장도 원문 순서대로 붙는다",
+          _mx.splitlines()[-1], "증권가는 실적 개선을 전망했다.")
     check("발췌 맥락 — 언급 문단이 문단째(두 문장 모두) 들어간다",
           "광양 양극재 공장 증설을 서두르기로 했다. 회사 관계자는 내년 가동을 목표로 한다고 밝혔다." in _mx, True)
-    check("발췌 맥락 — 관련 없는 뒷 문단은 안 붙는다", "삼성SDI" in _mx or "증권가" in _mx, False)
+    check("발췌 맥락 — 그 뒤 문단(삼성SDI)까지는 안 붙는다", "삼성SDI" in _mx, False)
+    _mh = ("광양만권, 국가첨단전략산업 특화단지로 최종 지정\n포스코퓨처엠 등 관련 선도기업을 중심으로 기업 간 연계를 강화한다.\n"
+           "(뉴스메이커=이영수 기자) 다음 문단이 이어진다. 후속 내용이다.")
+    check("발췌 — 헤드라인성 줄과 작성 표기((매체=기자))는 걷어 낸다",
+          ("특화단지로 최종 지정" in extract_pfm_excerpt(_mh), "이영수" in extract_pfm_excerpt(_mh)), (False, False))
     _mq = ("국내 배터리 업계가 증설 경쟁을 벌이고 있다.\n원료 수급이 가장 큰 변수로 꼽힌다. 가격 변동성도 크다.\n"
            "\"포스코퓨처엠은 계획대로 간다\"고 말했다.")
     check("발췌 맥락 — 언급 문단이 짧은 인용이면 바로 앞 문장까지 붙는다", "가격 변동성도 크다." in extract_pfm_excerpt(_mq), True)
@@ -11827,7 +11993,8 @@ def cmd_selftest() -> int:
     check("reexcerpt --dry — 쓰지 않는다", _et.article_detail("e1")["pfm_excerpt"], "옛 토막")
     cmd_reexcerpt(_ectx)
     check("reexcerpt — 보관 본문으로 문단 단위 발췌를 다시 만든다",
-          _et.article_detail("e1")["pfm_excerpt"].startswith("정부가 이차전지 지원책을 발표했다"), True)
+          ("포스코퓨처엠은 광양 양극재 공장 증설을" in _et.article_detail("e1")["pfm_excerpt"],
+           "정부가 이차전지" in _et.article_detail("e1")["pfm_excerpt"]), (True, False))
 
     print("\n[8-2c6] 띄어쓴 회사명 인식 · 태그 복구 (2026-10-01)")
     check("띄어쓴 표기도 그룹사로 인식 — 포스코 퓨처엠·POSCO 퓨처엠·포스코 홀딩스·포스코 인터내셔널",
@@ -11867,6 +12034,45 @@ def cmd_selftest() -> int:
           ([is_market_list_title(t) for t in ("KOSPI 200 Closing Price List-2", "코스피 200 종가 목록-3",
                                               "포스코퓨처엠 양극재 증설", "[Closing Market] Micron Sparks KOSPI Reversal")]),
           [True, True, False, False])
+
+    print("\n[8-2c7] 인사 — 원문 그대로 한 줄씩 (2026-10-01 실제 기사 형식)")
+    _hw = "◇ 신규 임원 승진 ▲ 강건희 (서울=연합뉴스) 신규 임원 과반이 1980년대생 (서울=연합뉴스) 인사를 단행했다."
+    check("연합 한화저축은행 — 이름만 있는 항목도 한 줄, 뒤의 기사 문장은 안 섞인다",
+          format_people_notice(_hw, "personnel"), "ㆍ강건희 (신규 임원 승진)")
+    _hw_html = ('<meta property="og:description" content="◇ 신규 임원 승진"/><article><p>◇ 신규 임원 승진</p>'
+                '<p>▲ 강건희 (서울=연합뉴스)</p><p>&lt;저작권자(c) 연합뉴스, 무단 전재-재배포, AI 학습 및 활용 금지&gt;</p></article>')
+    _hw_body = "◇ 신규 임원 승진 ▲ 강건희 <저작권자(c) 연합뉴스, 무단 전재-재배포, AI 학습 및 활용 금지>"
+    check("꼬리 문구(저작권·무단전재)가 붙어도 명단을 버리지 않는다(예전엔 머리말 한 줄만 남았다)",
+          "강건희" in _notice_text(_hw_html, _hw_body, "[인사] 한화저축은행"), True)
+    _hk = ("◈한화그룹 M&S부문◎승진<신규 임원>▷한화M&S 박대주 배상현 유상현 "
+           "◈한화자산운용◎승진<임원>▷김동영▷신정호")
+    check("한국경제식 표기(◈ 기관 ◎ 구분 <유형> ▷ 항목) — 위계 머리말을 이어 붙여 한 줄씩",
+          format_people_notice(_hk, "personnel").splitlines(),
+          ["ㆍ한화M&S 박대주 배상현 유상현 (한화그룹 M&S부문 · 승진 · 신규 임원)",
+           "ㆍ김동영 (한화자산운용 · 승진 · 임원)", "ㆍ신정호 (한화자산운용 · 승진 · 임원)"])
+    check("연합식(◇ 하나) 머리말은 그대로 — 위계 변경이 기존 형식을 바꾸지 않는다",
+          format_people_notice("◇ 대검검사급 전보 ▲ 법무부 기획조정실장 차범준", "personnel"),
+          "ㆍ법무부 기획조정실장 차범준 (대검검사급 전보)")
+    check("◇ 아래 ◆ 하위 구분도 이어 붙인다",
+          format_people_notice("◇ ㈜한화 ◆ 신규 임원 승진 ▲ 강창수 ▲ 곽원석", "personnel").splitlines(),
+          ["ㆍ강창수 (㈜한화 · 신규 임원 승진)", "ㆍ곽원석 (㈜한화 · 신규 임원 승진)"])
+    _col = "칼럼 윤문원의 쪽팔리게 살지마 마음의 시력을 가져야 쪽팔리지 않는다. 눈으로만 세상을 보면 사실만 보이지만, 마음의 시력으로 바라보면 감정과 사정까지 보이게 된다."
+    check("엉뚱한 본문(제목과 무관한 칼럼)은 옮기지 않는다 — 안내 문구로 대체",
+          (format_people_notice(_col, "personnel", "에코프로, 사장단 승진·보직 인사"),
+           people_summary(type("C", (), {})(), "personnel", "에코프로, 사장단 승진·보직 인사", "충청매일", _col, False)[0]),
+          ("", PEOPLE_NO_LIST_MSG))
+    _prose = "에코프로는 1일 사장단 승진·보직 인사를 단행했다. 이재영 부사장이 사장으로 승진했다. 김철수 상무는 전무로 승진했다."
+    check("줄글 인사 기사는 제목과 관련 있을 때 원문 문장을 한 줄씩 그대로(재서술 없음)",
+          format_people_notice(_prose, "personnel", "에코프로, 사장단 승진·보직 인사").splitlines(),
+          ["ㆍ에코프로는 1일 사장단 승진·보직 인사를 단행했다.", "ㆍ이재영 부사장이 사장으로 승진했다.",
+           "ㆍ김철수 상무는 전무로 승진했다."])
+    check("줄글 맨 앞의 연합 dateline 이 본문을 통째로 지우지 않는다",
+          "이재영" in format_people_notice("(서울=연합뉴스) 홍길동 기자 = " + _prose, "personnel", "에코프로 인사"), True)
+    check("인사는 AI 를 부르지 않고 규칙(rule)으로 처리한다",
+          people_summary(type("C", (), {})(), "personnel", "[인사] 법무부", "연합", _hw, True)[1], PEOPLE_RULE_MODEL)
+    check("기자명 — '날씨'·'보도' 같은 화면 낱말은 기자가 아니다",
+          ([_valid_author(x, "연합뉴스") for x in ("날씨", "보도", "제보", "속보")],
+           [split_authors(x) for x in ("날씨", "보도")]), (["", "", "", ""], [[], []]))
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
@@ -12374,7 +12580,19 @@ def cmd_selftest() -> int:
     check("백필 — 발췌만 있고 논조 없던 기사는 논조만 채운다",
           (_pt["pt-2"]["pfm_tone"], _pt["pt-2"]["pfm_tone_reason"]), ("중립", "사실 전달"))
     check("백필 — 언급 없음('')·이미 판정된 기사는 다시 안 부른다",
-          (_pt["pt-3"]["pfm_tone"], _pt["pt-5"]["pfm_tone"], _ToneLLM.calls), (None, "긍정", 2))
+          (_pt["pt-3"]["pfm_tone"], _pt["pt-5"]["pfm_tone"]), (None, "긍정"))
+    # 제목에 이름이 있고 발췌가 ''(본문엔 없음)인 기사는 제목+요약 언급 문장으로 논조를 판정한다(미판정 방지)
+    _tmp._exec("insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+               " collected_at, source_type, group_companies, press_name, analyzed_at, status,"
+               " is_representative, pfm_excerpt) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               ("pt-7", "u/pt-7", "u/pt-7", "u/pt-7", "포스코퓨처엠 신공장 착공", iso(_pnow), iso(_pnow), "rss",
+                '["포스코퓨처엠"]', "한경", iso(_pnow), "active", 1, ""))
+    _tmp.save_summary({"id": new_id(), "article_id": "pt-7", "summary_text": "포스코퓨처엠이 신공장 착공식을 열었다.",
+                       "perspective_text": "", "summary_source": "fulltext", "model": "m",
+                       "token_usage": None, "created_at": iso(_pnow)})
+    cmd_pfmtone(_tctx, limit=10)
+    check("백필 — 제목에 이름이 있는 '본문 언급 없음' 기사도 제목 기준으로 논조를 채운다",
+          _tmp._one("select pfm_tone from articles where id='pt-7'")["pfm_tone"], "중립")
     # 본문이 없고 원문 재접속도 안 되는 기사 — 저장된 요약문의 언급 문장으로 논조만 판정한다
     _tmp._exec(
         "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
@@ -13439,6 +13657,7 @@ USAGE = """사용법: python backend/main.py <명령>
   tagassoc [--dry]  이미 저장된 기사에 빠진 그룹사 태그 보충('배터리협회'·'포스코퓨처엠', 띄어쓴 표기 포함, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
                     분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
+  unrated [N]  언론사 탭 '미판정' 기사를 원인별로 목록 보기 (점검용, 쓰지 않음)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
                       --dry 는 대상 수만 보여주고 쓰지 않음)
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
@@ -13530,6 +13749,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_tagassoc(ctx, dry="--dry" in argv[2:])
     elif command == "addkw":
         cmd_addkw(ctx, argv[2] if len(argv) > 2 else "", argv[3:])
+    elif command == "unrated":
+        nums = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_unrated(ctx, nums[0] if nums else 40)
     elif command == "pfmtone":
         rest = argv[2:]
         nums = [int(a) for a in rest if a.isdigit()]
