@@ -415,6 +415,35 @@ function syncChipStates() {
 
 /* ── 카드 렌더링 (F6.2) ─────────────────────────────────────────── */
 
+/* 인사·부고 카드 본문 — 'ㆍ이름 · 직책 (소속·구분)' 줄에서 이름을 굵게, 출처 주소(http…)는 링크로 만든다. */
+const URL_IN_TEXT_RE = /(https?:\/\/[^\s)]+)/g;
+function appendLinked(parent, text) {
+  text.split(URL_IN_TEXT_RE).forEach((chunk, i) => {
+    if (i % 2 === 1) {
+      const a = el('a', 'people-src', '출처');
+      a.href = chunk; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      parent.append(a);
+    } else if (chunk) {
+      parent.append(document.createTextNode(chunk));
+    }
+  });
+}
+function renderPeopleLines(p, text) {
+  const lines = String(text).split('\n');
+  lines.forEach((ln, i) => {
+    const m = /^ㆍ([^·(]+?)( · | \(|$)(.*)$/.exec(ln);
+    const row = el('span', 'people-line');
+    if (m && m[1].length <= 12) {
+      row.append('ㆍ', el('b', 'people-name', m[1].trim()));
+      appendLinked(row, ln.slice(1 + m[1].length));
+    } else {
+      appendLinked(row, ln);
+    }
+    p.append(row);
+    if (i < lines.length - 1) p.append('\n');
+  });
+}
+
 function buildCard(item) {
   const card = el('article', 'card');
 
@@ -501,7 +530,8 @@ function buildCard(item) {
     if (item.summary_header) {
       p.append(el('span', 'summary-head', item.summary_header + (isPeople ? '\n' : ' ')));
     }
-    p.append(document.createTextNode(item.summary_text));
+    if (isPeople) renderPeopleLines(p, item.summary_text);
+    else p.append(document.createTextNode(item.summary_text));
     card.append(p);
     /* 인사가 수십 명이면(검사 인사 등) 카드가 너무 길어지므로 처음 10줄만 보이고 펼친다. 내용은 전부 있다. */
     const lineCount = item.summary_text.split('\n').filter((l) => l.trim()).length;
@@ -1417,7 +1447,7 @@ function fillSentiTip(tip, item, d) {
   dl.append(el('dt', null, `왜 ${senti}인가요?`));
   dl.append(el('dd', null, d.sentiment_reason
     ? `AI 판단 근거: ${d.sentiment_reason}`
-    : '이 기사는 개별 근거가 저장되기 전에 분석되어 기준만 표시합니다.'));
+    : 'AI 근거를 지금 만들지 못했습니다(잠시 후 다시 올려 보세요). 아래 기준으로 분류됩니다.'));
   dl.append(el('dd', 'tip-sub', SENTI_CRITERIA));
 
   dl.append(el('dt', null, `왜 ${d.score}점인가요? (중요도 0~100)`));
@@ -1438,7 +1468,7 @@ async function showSentiTip(chip, item) {
   const tip = $('swotTip');
   const token = ++sentiTipToken;
   tip.replaceChildren(el('h4', null, `${item.sentiment || '중립'} · ${item.importance_score}점`),
-    el('p', 'tip-sub', '이유를 불러오는 중…'));
+    el('p', 'tip-sub', '이유를 불러오는 중… (처음 열 때는 AI가 근거를 만드느라 몇 초 걸립니다)'));
   tip.hidden = false;
   placeTip(chip, tip);
   let d = scoreDetailCache.get(item.id);
@@ -1447,7 +1477,7 @@ async function showSentiTip(chip, item) {
       const res = await fetch(`${API}/api/articles/${encodeURIComponent(item.id)}/score-detail`);
       d = await res.json();
       if (!d.ok) throw new Error(d.error || 'fail');
-      scoreDetailCache.set(item.id, d);
+      if (d.sentiment_reason) scoreDetailCache.set(item.id, d);   // 근거가 비었으면 다음에 다시 만들어 본다
     } catch {
       if (token === sentiTipToken) {
         tip.replaceChildren(el('h4', null, `${item.sentiment || '중립'} · ${item.importance_score}점`),

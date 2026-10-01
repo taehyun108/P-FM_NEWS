@@ -4985,6 +4985,19 @@ PFM_TONE_PROMPT = """[판정 대상] 포스코퓨처엠
 형식: {{"tone":"긍정|중립|부정","reason":"..."}}"""
 
 
+# ── 감성(긍정·중립·부정) 근거 사후 생성 — 예전 기사는 근거를 저장하기 전에 분석돼 비어 있다(2026-10-02) ──
+SENTI_REASON_SYSTEM = ("당신은 기업 홍보팀의 언론 모니터링 담당자다. 이미 정해진 감성 판정의 근거를 "
+                       "기사 속 표현으로 설명하고 JSON 으로만 답한다.")
+SENTI_REASON_PROMPT = """[기사 제목] {title}
+[기사 내용]
+{text}
+
+이 기사는 포스코 그룹의 대외협력 대응 필요성 기준으로 '{sentiment}'(긍정=우호적 보도, 부정=대응이 필요한 비판·리스크,
+중립=단순 사실 전달)으로 분류돼 있다. 그렇게 분류된 근거를 기사 속 표현을 인용해 한 줄(70자 이내)로 쓰라.
+- 판정을 바꾸지 말고, 기사에 없는 내용을 지어내지 않는다.
+형식: {{"reason":"..."}}"""
+
+
 TRANSLATE_SYSTEM = ("당신은 영한 뉴스 번역가다. 원문의 뜻을 바꾸거나 덧붙이지 않고 자연스러운 한국어 "
                     "뉴스 문체로 옮기며, JSON 으로만 답한다.")
 TRANSLATE_PROMPT = """아래 영어 기사의 제목과 발췌를 한국어로 번역하라.
@@ -5249,6 +5262,27 @@ class LLMClient:
                     log.warning("포스코퓨처엠 논조 판정 실패(미판정으로 둠): %s", exc)
         return "", ""
 
+    def sentiment_reason(self, title: str, text: str, sentiment: str) -> str:
+        """이미 정해진 감성(긍정|중립|부정)의 근거 한 줄을 만든다. 실패하면 ''."""
+        if not (text or "").strip() or sentiment not in PFM_TONES:
+            return ""
+        prompt = SENTI_REASON_PROMPT.format(title=(title or "")[:200], text=text.strip()[:1500],
+                                            sentiment=sentiment)
+        for attempt in range(2):
+            try:
+                content, _ = self._chat(SENTI_REASON_SYSTEM, prompt)
+                data = _parse_json_object(content) or {}
+                reason = _pp(data.get("reason"))[:120]
+                if reason:
+                    return reason
+                raise ValueError("근거가 비어 있음")
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                else:
+                    log.warning("감성 근거 생성 실패: %s", exc)
+        return ""
+
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -5393,6 +5427,28 @@ def _perspective_field(row: dict, tag: str) -> str:
 def sentiment_reason_of(row: dict) -> str:
     """summaries.perspective_text 에 머리말과 함께 저장된 감성 판단 근거. 없으면 ''."""
     return _perspective_field(row, SENTIMENT_REASON_TAG)
+
+
+def ensure_sentiment_reason(ctx: "Context", row: dict) -> str:
+    """감성 근거가 없는 옛 기사에 근거를 만들어 저장하고 돌려준다. 만들 수 없으면 ''.
+
+    근거는 본문(30일 보관) → 없으면 요약문으로 만든다. 저장은 perspective_text 의 [감성근거] 줄이라
+    DB 칸을 더하지 않는다. 원제([원제]) 줄은 그대로 보존한다.
+    """
+    have = sentiment_reason_of(row)
+    if have:
+        return have
+    senti = row.get("sentiment") or ""
+    if senti not in PFM_TONES:
+        return ""
+    aid = row.get("id") or ""
+    basis = (ctx.storage.body_of(aid) or "") if aid else ""
+    basis = basis or (row.get("summary_text") or "")
+    reason = ctx.llm.sentiment_reason(row.get("title") or "", basis, senti)
+    if reason and aid:
+        ctx.storage.set_perspective(aid, pack_perspective(
+            reason, title_original_of(row), row.get("perspective_text") or ""))
+    return reason
 
 
 def title_original_of(row: dict) -> str:
@@ -5825,6 +5881,21 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "created_at": iso(now_utc()),
     })
     return bool(model) and model != PEOPLE_RULE_MODEL   # 규칙 정리는 LLM 예산을 쓰지 않는다
+
+
+SENTI_LAZY_PER_HOUR = get_env_int("SENTI_LAZY_PER_HOUR", 40, 0)
+_senti_lazy_times: list[float] = []
+
+
+def _senti_lazy_allow() -> bool:
+    """화면에서 감성 근거를 즉석 생성하는 횟수를 시간당 SENTI_LAZY_PER_HOUR 로 제한한다(AI 비용 보호)."""
+    now = time.monotonic()
+    while _senti_lazy_times and now - _senti_lazy_times[0] > 3600:
+        _senti_lazy_times.pop(0)
+    if len(_senti_lazy_times) >= SENTI_LAZY_PER_HOUR:
+        return False
+    _senti_lazy_times.append(now)
+    return True
 
 
 @dataclass
@@ -8238,6 +8309,12 @@ def _weekly_pick(rows: list[dict], kind: str, key: str,
     시황·기관수급 기사(제목은 다른 종목)가 상위를 차지하는 것을 막는다.
     tags = 기사별 card_tags 결과(섹션 7개가 공유한다. 없으면 그때그때 계산).
     """
+    return [r for r in _weekly_hits(rows, kind, key, tags)[:WEEKLY_ARTICLES_PER_SECTION]]
+
+
+def _weekly_hits(rows: list[dict], kind: str, key: str,
+                 tags: dict[str, tuple] | None = None) -> list[dict]:
+    """섹션에 해당하는 기사 전부를 '제목에 회사명 → 중요도 → 최신' 순으로 정렬해 돌려준다."""
     aliases = _GROUP_ALIASES_LOWER.get(key, [key.lower()]) if kind == "group" else []
     hits = []
     for r in rows:
@@ -8252,7 +8329,33 @@ def _weekly_pick(rows: list[dict], kind: str, key: str,
         hits.append((title_hit, r))
     hits.sort(key=lambda t: (t[0], int(t[1].get("importance_score") or 0),
                              t[1].get("published_at") or ""), reverse=True)
-    return [r for _, r in hits[:WEEKLY_ARTICLES_PER_SECTION]]
+    return [r for _, r in hits]
+
+
+def weekly_group_score(hits: list[dict]) -> dict:
+    """그룹사 한 곳의 주간 점수(0~100)와 그 이유. 규칙 계산이라 AI 를 쓰지 않고, 이유에 계산 내역을 그대로 적는다.
+
+    점수 = 최고 기사 중요도×0.5 + 상위 5건 평균 중요도×0.3 + min(기사 수, 10)×2
+      · 가장 큰 사건 하나가 점수의 절반을 정하고, 꾸준한 보도량(최대 20점)이 나머지를 보탠다.
+      · 기사 중요도는 카드의 '긍정 · 22' 와 같은 점수(제목·본문·언론사 규칙으로 계산)다.
+    """
+    n = len(hits)
+    if not n:
+        return {"value": 0, "count": 0, "reason": "이번 주 해당 기사가 없습니다."}
+    scores = sorted((int(r.get("importance_score") or 0) for r in hits), reverse=True)
+    top = scores[0]
+    top5 = scores[:5]
+    avg5 = sum(top5) / len(top5)
+    vol = min(n, 10) * 2
+    value = int(clamp(round(top * 0.5 + avg5 * 0.3 + vol), 0, 100))
+    tone = {t: sum(1 for r in hits if (r.get("sentiment") or "중립") == t) for t in PFM_TONES}
+    top_row = max(hits, key=lambda r: int(r.get("importance_score") or 0))
+    reason = (f"기사 {n}건(긍정 {tone['긍정']} · 중립 {tone['중립']} · 부정 {tone['부정']}). "
+              f"가장 높은 기사 {top}점 → {top * 0.5:.0f}점 + 상위 {len(top5)}건 평균 {avg5:.0f}점 → {avg5 * 0.3:.0f}점 "
+              f"+ 보도량 {n}건 → {vol}점 = {value}점. 최고 기사: {(top_row.get('title') or '')[:40]}")
+    if n and tone["부정"] / n >= 0.3:
+        reason += f" · 부정 보도가 {tone['부정']}건({tone['부정'] * 100 // n}%)이라 대응 검토가 필요합니다."
+    return {"value": value, "count": n, "tone": tone, "reason": reason}
 
 
 def _weekly_article_view(r: dict) -> dict:
@@ -8281,7 +8384,8 @@ def build_weekly_report(ctx: Context) -> dict:
 
     sections = []
     for label, kind, key in WEEKLY_SECTIONS:
-        picked = _weekly_pick(rows, kind, key, tags)
+        hits = _weekly_hits(rows, kind, key, tags)
+        picked = hits[:WEEKLY_ARTICLES_PER_SECTION]
         brief = ctx.llm.weekly_brief(
             "swot" if kind == "group" else "impact", label, picked) if picked else {}
         sections.append({
@@ -8290,6 +8394,7 @@ def build_weekly_report(ctx: Context) -> dict:
             "articles": [_weekly_article_view(r) for r in picked],
             "swot": {k: brief.get(k, "") for k in ("s", "w", "o", "t")} if kind == "group" else None,
             "impact": brief.get("impact", "") if kind == "topic" else None,
+            "score": weekly_group_score(hits) if kind == "group" else None,
         })
     return {
         "period_start": iso(start),
@@ -8332,6 +8437,15 @@ def render_weekly_html(payload: dict) -> str:
             f'<span style="background:#16337A;color:#fff;border-radius:5px;'
             f'padding:1px 8px;font-size:13px;margin-right:7px;">{i}</span>{esc(sec["label"])}</h2>')
         arts = sec.get("articles") or []
+        sc = sec.get("score")
+        if sc and sc.get("count"):
+            # 그룹사 이름 옆 주간 점수 + 계산 이유 (사용자 지정 2026-10-02)
+            out[-1] = out[-1].replace(
+                '</h2>',
+                f'<span style="float:right;background:#eef2fb;color:#16337A;border-radius:14px;'
+                f'padding:2px 12px;font-size:13px;font-weight:700;">주간 {sc["value"]}점</span></h2>')
+            out.append(f'<p class="wr-score-why" style="margin:0 0 10px;color:#667085;font-size:12px;'
+                       f'line-height:1.55;">{esc(sc.get("reason") or "")}</p>')
         if not arts:
             out.append('<p style="color:#98a2b3;font-size:13px;">이번 주 해당 기사가 없습니다.</p>')
             continue
@@ -9931,6 +10045,10 @@ def create_app(ctx: Context):
         row = ctx.storage.article_detail(article_id)
         if row is None:
             return JSONResponse({"ok": False, "error": "기사를 찾을 수 없습니다."}, status_code=404)
+        # 옛 기사는 감성 근거가 비어 있다 — 처음 열릴 때 한 번 만들어 저장한다(시간당 상한으로 비용 관리).
+        reason_now = sentiment_reason_of(row)
+        if not reason_now and _senti_lazy_allow():
+            reason_now = ensure_sentiment_reason(ctx, row)
         body = ctx.storage.body_of(article_id) or ""
         basis = body or (row.get("summary_text") or "")
         groups = normalize_group_list(jload(row.get("group_companies"), []))
@@ -9948,7 +10066,7 @@ def create_app(ctx: Context):
         return JSONResponse({
             "ok": True,
             "sentiment": row.get("sentiment") or "중립",
-            "sentiment_reason": sentiment_reason_of(row),
+            "sentiment_reason": reason_now,
             "score": stored,
             "computed": computed,
             "items": [{"label": label, "points": p} for label, p in items],
@@ -10582,6 +10700,31 @@ def cmd_unrated(ctx: Context, limit: int = 40) -> None:
         for r in lst[:limit]:
             log.info("      - %s | %s | %s", (r.get("press_name") or "")[:10], (r.get("title") or "")[:46],
                      (r.get("url_canonical") or r.get("url_original") or "")[:70])
+
+
+def cmd_sentireason(ctx: Context, limit: int = 100, dry: bool = False, days: int = 90) -> None:
+    """감성 근거([감성근거])가 비어 있는 옛 기사에 근거를 채운다(일회성, 2026-10-02).
+
+    카드의 '긍정 · 22' 툴팁이 '개별 근거가 저장되기 전에 분석되어…' 로만 나오던 문제를 없앤다.
+    최근 days 일 기사 중 감성이 있고 근거가 없는 것만 대상이며, limit 건까지 AI 를 부른다(비용 관리).
+    """
+    since = now_utc() - timedelta(days=days)
+    rows = ctx.storage.list_articles(5000, 0, since, "")
+    todo = [r for r in rows if (r.get("sentiment") in PFM_TONES) and not sentiment_reason_of(r)
+            and (r.get("summary_text") or "").strip()]
+    log.info("감성 근거 없는 기사 %d건 (최근 %d일 %d건 중)%s", len(todo), days, len(rows),
+             " — 미리보기, 쓰지 않음" if dry else "")
+    if dry:
+        log.info("[미리보기] 이번 실행 AI 호출은 최대 %d건입니다. 실제로 채우려면 --dry 없이 다시 실행하세요.",
+                 min(len(todo), limit))
+        return
+    done = failed = 0
+    for r in todo[:limit]:
+        if ensure_sentiment_reason(ctx, r):
+            done += 1
+        else:
+            failed += 1
+    log.info("감성 근거 생성 완료: 성공 %d · 실패 %d · 남은 대상 %d건", done, failed, max(0, len(todo) - limit))
 
 
 def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 365) -> None:
@@ -12020,6 +12163,12 @@ def cmd_selftest() -> int:
         def pfm_tone(self, excerpt: str) -> tuple[str, str]:
             return ("긍정", "x") if excerpt else ("", "")
 
+        calls_reason = 0
+
+        def sentiment_reason(self, title: str, text: str, sentiment: str) -> str:
+            _EnLLM.calls_reason += 1
+            return "공장 증설을 호의적으로 보도" if text else ""
+
     _en_body = ("POSCO Future M will expand its cathode plant in Gwangyang, the company said on Tuesday. "
                 "The expansion is expected to be completed next year. ") * 4
     _et = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "en.db"))
@@ -12058,6 +12207,23 @@ def cmd_selftest() -> int:
     _e2b = _et.article_detail("e2")
     check("retranslate — 영어로 남은 기사를 번역하고 원제를 남긴다",
           (_e2b["title"], title_original_of(_e2b)), ("포스코퓨처엠, 광양 양극재 공장 증설", "POSCO Future M to expand plant too"))
+    # 감성 근거가 빈 옛 기사 — 화면에서 열면 한 번 만들어 저장하고, 원제 줄은 보존한다(2026-10-02)
+    _et.set_perspective("e2", TITLE_ORIGINAL_TAG + "POSCO Future M to expand plant too")
+    _EnLLM.calls_reason = 0
+    cmd_sentireason(_ectx, 10, dry=True)
+    check("sentireason --dry — AI 를 부르지 않고 아무것도 쓰지 않는다",
+          (_EnLLM.calls_reason, sentiment_reason_of(_et.article_detail("e2"))), (0, ""))
+    _r_now = ensure_sentiment_reason(_ectx, _et.article_detail("e2"))
+    _e2c = _et.article_detail("e2")
+    check("감성 근거 사후 생성 — 저장되고 원제 줄도 그대로",
+          (_r_now, sentiment_reason_of(_e2c), title_original_of(_e2c)),
+          ("공장 증설을 호의적으로 보도", "공장 증설을 호의적으로 보도", "POSCO Future M to expand plant too"))
+    _EnLLM.calls_reason = 0
+    ensure_sentiment_reason(_ectx, _e2c)
+    check("이미 근거가 있으면 AI 를 다시 부르지 않는다", _EnLLM.calls_reason, 0)
+    _et.set_perspective("e2", "")
+    cmd_sentireason(_ectx, 10)
+    check("sentireason — 근거가 빈 기사를 채운다", sentiment_reason_of(_et.article_detail("e2")), "공장 증설을 호의적으로 보도")
     check("retranslate — 번역한 기사의 감성 근거는 지워지지 않는다(e1 재실행 대상 아님)",
           sentiment_reason_of(_et.article_detail("e1")), "증설 보도")
     cmd_retranslate(_ectx, 10)
@@ -13676,6 +13842,21 @@ def cmd_selftest() -> int:
     _ok2, _err2 = send_report_email(_cfg_creds, "제목", "<p>본문</p>", [])
     check("수신자 없으면 발송 스킵", (_ok2, "수신자" in (_err2 or "")), (False, True))
     check("주간 HTML 헤더는 .wr-head 로 감싼다", 'class="wr-head"' in _html, True)
+    # 그룹사 이름 옆 주간 점수 + 이유 (2026-10-02)
+    _hits = _weekly_hits(_rows, "group", "포스코퓨처엠")
+    _sc = weekly_group_score(_hits)
+    # 최고 80×0.5=40 + 상위(80,30)평균 55×0.3=16.5→(반올림 합산) + 보도량 2건×2=4 → 60.5 → 60 또는 61(반올림)
+    check("그룹사 주간 점수 — 계산식(최고×0.5+상위5평균×0.3+보도량)", (_sc["value"], _sc["count"]), (60, 2))
+    check("그룹사 주간 점수 — 이유에 계산 내역이 그대로 있다",
+          all(x in _sc["reason"] for x in ("기사 2건", "80점 → 40점", "평균 55점", "보도량 2건 → 4점")), True)
+    check("그룹사 주간 점수 — 기사 없으면 0점·안내", weekly_group_score([]), {"value": 0, "count": 0, "reason": "이번 주 해당 기사가 없습니다."})
+    check("그룹사 주간 점수 — 부정 30% 이상이면 대응 검토 문구",
+          "대응 검토" in weekly_group_score([{"importance_score": 50, "sentiment": "부정", "title": "a"},
+                                           {"importance_score": 40, "sentiment": "중립", "title": "b"}])["reason"], True)
+    _sh = render_weekly_html({"period_start": "2026-08-31", "period_end": "2026-09-07", "article_count": 2, "sections": [
+        {"label": "포스코퓨처엠", "kind": "group", "score": _sc, "swot": None, "impact": None,
+         "articles": [{"title": "t", "url": "http://a", "press": "p", "published_at": "2026-09-05", "score": 70, "summary": "s"}]}]})
+    check("주간 HTML — 그룹사 이름 옆 점수와 이유", ("주간 60점" in _sh, "wr-score-why" in _sh), (True, True))
 
     print()
     if ea_mod is not None:
@@ -13774,6 +13955,7 @@ USAGE = """사용법: python backend/main.py <명령>
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
                     분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
   unrated [N]  언론사 탭 '미판정' 기사를 원인별로 목록 보기 (점검용, 쓰지 않음)
+  sentireason [N] [--dry]  감성(긍정·중립·부정) 근거가 빈 옛 기사에 AI 근거를 채움(기본 100건)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
                       --dry 는 대상 수만 보여주고 쓰지 않음)
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
@@ -13865,6 +14047,10 @@ def main(argv: Sequence[str]) -> int:
         cmd_tagassoc(ctx, dry="--dry" in argv[2:])
     elif command == "addkw":
         cmd_addkw(ctx, argv[2] if len(argv) > 2 else "", argv[3:])
+    elif command == "sentireason":
+        rest = argv[2:]
+        nums = [int(a) for a in rest if a.isdigit()]
+        cmd_sentireason(ctx, nums[0] if nums else 100, dry="--dry" in rest)
     elif command == "unrated":
         nums = [int(a) for a in argv[2:] if a.isdigit()]
         cmd_unrated(ctx, nums[0] if nums else 40)
