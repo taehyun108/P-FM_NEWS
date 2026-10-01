@@ -3413,7 +3413,9 @@ _NOTICE_HEAD_RE = re.compile(
     r"^.*?(?:구독\s*구독중\s*이전\s*다음|이미지\s*확대.*?자료사진\s*\])\s*")
 _NOTICE_TAIL_RE = re.compile(
     r"\s*(?:\(\S+=\s*연합뉴스\)|※\s*부고\s*요청|&lt;저작권자|<저작권자|제보는\s*카카오톡"
-    r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고).*$")
+    r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고).*$", re.S)
+# 줄글 기사 맨 앞의 '(서울=연합뉴스) 홍길동 기자 =' — 꼬리표 규칙이 본문 전체를 지우지 않게 먼저 뗀다
+_NOTICE_DATELINE_RE = re.compile(r"^\s*\(\S+=\s*연합뉴스\)\s*(?:[가-힣]{2,4}\s*기자\s*=)?\s*")
 
 
 # 이름으로 오인하기 쉬운 흔한 직함 — 항목 끝 토큰이 이 단어면 이름이 아니라 직함이다
@@ -3449,7 +3451,44 @@ _PEOPLE_HEAD_LEVEL = {"◇": 1, "◈": 1, "◆": 2, "◎": 2, "□": 2, "■": 2
 def _clean_people_header(text: str) -> str:
     """'승진<신규 임원>' → '승진 · 신규 임원'. 머리말 끝의 구분 기호를 정리한다."""
     t = re.sub(r"\s*<([^<>]*)>\s*", r" · \1 ", text or "")
+    t = re.sub(r"\(\s*총?\s*\d+\s*명\s*\)", " ", t)       # '(총 3명)' — 인원 표기는 줄 수로 알 수 있다
     return re.sub(r"\s+", " ", t).strip(" ·,;:")
+
+
+_COMMON_SURNAMES = frozenset("김이박최정강조윤장임한오서신권황안송류전홍고문양손배백허유남심노하곽성차주우구민나진지엄채원천방공현함변염여추도소석선설마길연위표명기반왕금옥육인맹제모탁국어은편용예경봉사부가복태목")
+_PEOPLE_NAME_ONLY_RE = re.compile(r"^[가-힣]{2,4}(?:\([^()]*\))?$")
+
+
+def _split_item_people(item: str) -> list[str]:
+    """'김민수, 박인찬, 이경재' → 세 사람. '직책 이름, 직책 이름' 도 사람별로 나눈다.
+
+    쉼표·가운뎃점으로 이은 토막이 전부 '이름(또는 직책+이름)' 모양일 때만 나눈다 —
+    '서울, 부산 지검' 같은 지명 나열을 사람으로 잘못 가르지 않기 위해서다.
+    """
+    parts = [x.strip() for x in re.split(r"\s*[,、，]\s*|\s+·\s+", item) if x.strip()]
+    if len(parts) < 2:
+        # '한화M&S 박대주 배상현 유상현' — 소속 뒤에 이름 세 개 이상이 공백으로만 이어진 경우
+        toks = item.split()
+        tail: list[str] = []
+        for tk in reversed(toks):
+            if len(tk) == 3 and tk[0] in _COMMON_SURNAMES and _PEOPLE_NAME_ONLY_RE.match(tk) \
+                    and tk not in _TITLE_SUFFIXES:
+                tail.insert(0, tk)
+            else:
+                break
+        if len(tail) >= 3 and len(tail) < len(toks):
+            org = " ".join(toks[:len(toks) - len(tail)])
+            return [f"{org} {n}" for n in tail]
+        return [item]
+    def kind_of(x: str) -> str:
+        """'이름' | '직책 이름' | ''(사람 아님)"""
+        if _PEOPLE_NAME_ONLY_RE.match(x) and x[0] in _COMMON_SURNAMES:
+            return "name"
+        pos, name = _split_person_item(x)
+        return "posname" if name and name[0] in _COMMON_SURNAMES else ""
+    kinds = {kind_of(x) for x in parts}
+    # 전부 같은 모양일 때만 사람 나열로 본다 — '서울, 부산 지검 검사장 김철수' 는 지명+직책이라 섞여 있어 나누지 않는다
+    return parts if len(kinds) == 1 and "" not in kinds else [item]
 
 
 def _split_people_sections(text: str) -> list[tuple[str, str]]:
@@ -3458,21 +3497,32 @@ def _split_people_sections(text: str) -> list[tuple[str, str]]:
     머리말은 위계를 잇는다 — 상위(◇·◈ 기관)와 하위(◆·◎·■·□ 구분)를 ' · ' 로 이어 항목마다 붙인다.
     예) '◈한화M&S ◎승진<신규 임원> ▷박대주 ▷배상현' → ('한화M&S · 승진 · 신규 임원', '박대주'), …
     연합뉴스처럼 ◇ 하나뿐이면 그 머리말이 곧 구분이다. 새 상위 머리말이 나오면 하위는 비운다.
+    '▷신규 임원 △김민수 △박인찬' 처럼 ▷·▶ 바로 뒤에 △·▲ 항목이 이어지면 ▷ 글은 사람이 아니라 소제목이다.
     """
     pairs: list[tuple[str, str]] = []
     parts = _PEOPLE_TOKEN_RE.split(text)       # [앞글, 머리표, 항목표, 글, 머리표, 항목표, 글, …]
-    l1 = l2 = ""
+    l1 = l2 = l3 = ""
     for k in range(1, len(parts) - 2, 3):
         head_mark, item_mark, seg = parts[k], parts[k + 1], parts[k + 2]
         if head_mark:
+            l3 = ""
             if _PEOPLE_HEAD_LEVEL[head_mark] == 1:
                 l1, l2 = _clean_people_header(seg), ""
             else:
                 l2 = _clean_people_header(seg)
         elif item_mark:
             item = (seg or "").strip(" ·,;")
-            if item:
-                pairs.append((" · ".join(x for x in (l1, l2) if x), item))
+            if not item:
+                continue
+            nxt = parts[k + 3] or parts[k + 4] if k + 4 < len(parts) else ""
+            if item_mark in "▷▶" and nxt and nxt in "▲△":
+                l3 = _clean_people_header(item)
+                continue
+            if item_mark in "▷▶":
+                l3 = ""
+            head = " · ".join(x for x in (l1, l2, l3) if x)
+            for one in _split_item_people(item):
+                pairs.append((head, one))
     return pairs
 
 
@@ -3582,7 +3632,8 @@ def format_people_notice(body: str, kind: str, title: str = "") -> str:
     lines = []
     for header, item in pairs:
         pos, name = _split_person_item(item)
-        line = f"ㆍ{pos} {name}" if name else f"ㆍ{item}"
+        # 이름을 맨 앞에 둔다(가독성) — 'ㆍ장은익 · 성과경영실장 (1급 승진)'
+        line = f"ㆍ{name} · {pos}" if name else f"ㆍ{item}"
         if header:
             line += f" ({header})"
         lines.append(line)
@@ -3600,14 +3651,24 @@ def _clean_notice_text(body: str) -> str:
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
     # 줄글 기사는 맨 앞에 '(서울=연합뉴스) 홍길동 기자 =' 가 붙는다 — 꼬리표 규칙이 이걸 보고 본문 전체를
     # 지우지 않도록 머리의 것은 먼저 떼어 낸다.
-    text = re.sub(r"^\s*\(\S+=\s*연합뉴스\)\s*(?:[가-힣]{2,4}\s*기자\s*=)?\s*", "", text)
+    text = _NOTICE_DATELINE_RE.sub("", text)
     return _NOTICE_TAIL_RE.sub("", text).strip()
 
 
 def _personnel_pairs(text: str) -> list[tuple[str, str]]:
-    """정리된 공지 본문에서 (헤더, 항목) 목록을 뽑는다. 항목이 없으면 빈 목록."""
+    """정리된 공지 본문에서 (헤더, 항목) 목록을 뽑는다. 항목이 없으면 빈 목록.
+
+    명단 앞에 '<승진>' 처럼 꺾쇠로 묶인 유형 표시가 따로 있으면 모든 항목의 머리말 앞에 붙인다(조선비즈식).
+    """
     m = re.search(r"[◇◈◆◎□■▲△▶▷].*", text)
-    return _split_people_sections(m.group(0)) if m else []
+    if not m:
+        return []
+    pairs = _split_people_sections(m.group(0))
+    lead = re.findall(r"<([^<>]{1,20})>", text[:m.start()])
+    if lead:
+        tag = lead[-1].strip()
+        pairs = [(f"{tag} · {h}" if h else tag, it) for h, it in pairs]
+    return pairs
 
 
 # 제목에서 '이 기사가 무엇에 관한 것인지' 알려 주는 낱말을 고를 때 뺄 일반어
@@ -3626,9 +3687,17 @@ def _title_keywords(title: str) -> list[str]:
     return [w for w in words if len(w) >= 2 and w not in _PEOPLE_GENERIC_WORDS]
 
 
-def _personnel_prose_lines(text: str, title: str) -> str:
-    """명단 표시(◇▲)가 없는 줄글 인사 기사 — 원문 문장을 한 줄씩 그대로 옮긴다(해석 없음).
+_PEOPLE_ACTION_RE = re.compile(r"승진|선임|내정|임명|발탁|보임|위촉|영입|전보|취임|선출|발령|임용|부임")
+# '사장단'·'임원진'처럼 사람 이름이 아닌 집합명은 직책으로 보지 않는다
+_PEOPLE_ROLE_RE = re.compile(
+    r"(?:대표이사|부사장|사장|대표|회장|부회장|본부장|센터장|총괄|부문장|실장|국장|부장|팀장|이사|전무|상무|상임|원장|청장|처장|장관|차관)(?!단|진)")
 
+
+def _personnel_prose_lines(text: str, title: str) -> str:
+    """명단 표시(◇▲)가 없는 줄글 인사 기사 — 사람이 등장하는 인사 문장만 원문 그대로 한 줄씩 옮긴다(해석 없음).
+
+    '사장단 승진 및 보직 인사를 단행했다' 같은 배경 문장이나 인물 소개(경력 서술)는 빼고,
+    '인사 동작(승진·선임…)'과 '직책'이 함께 있는 문장만 남긴다(2026-10-02 에코프로 사례: 승진자만 보이게).
     제목의 주제어가 본문에 하나도 없으면(본문 추출이 사이드바의 엉뚱한 칼럼을 잡은 경우) 빈 문자열.
     """
     if not text:
@@ -3636,8 +3705,11 @@ def _personnel_prose_lines(text: str, title: str) -> str:
     kws = _title_keywords(title)
     if kws and not any(k in text.lower() for k in kws):
         return ""
-    sents = [x for x in _sentences(text) if len(x) >= 8][:PEOPLE_PROSE_LINES]
-    return "\n".join("ㆍ" + _cut_at_word(x, 220) for x in sents)
+    sents = [x for x in _sentences(text) if len(x) >= 8]
+    picked = [x for x in sents if _PEOPLE_ACTION_RE.search(x) and _PEOPLE_ROLE_RE.search(x)]
+    if not picked:       # 직책을 못 잡았으면 동작 문장이라도 — 아무것도 없을 때만 안내 문구로 간다
+        picked = [x for x in sents if _PEOPLE_ACTION_RE.search(x)][:3]
+    return "\n".join("ㆍ" + _cut_at_word(x, 220) for x in picked[:PEOPLE_PROSE_LINES])
 
 
 # ── 인사·부고 LLM 구조화 (사용자 지정 2026-09-09) ──────────────────────
@@ -4500,7 +4572,12 @@ def _notice_text(html: str, body: str, title: str = "") -> str:
             cands.append(seg)
     good = []
     for c in cands:
-        c = _NOTICE_TAIL_RE.sub("", c.strip()).strip() if _PEOPLE_MARK_RE.search(c) else c.strip()
+        c = c.strip()
+        if _PEOPLE_MARK_RE.search(c):
+            # 연합뉴스 명단 뒤에는 '(서울=연합뉴스) / 제보는 카카오톡 / <저작권자…>' 가 줄바꿈을 끼고 붙는다.
+            # 꼬리 규칙이 줄바꿈을 넘어 끝까지 자르도록 DOTALL 이다(2026-10-02 예금보험공사 사례:
+            # 줄바꿈 때문에 꼬리가 안 잘려 본문 후보가 통째로 버려지고 머리말 한 줄만 남았다).
+            c = _NOTICE_TAIL_RE.sub("", _NOTICE_DATELINE_RE.sub("", c)).strip()
         if c and not any(h in c for h in _NOTICE_STRONG_FOOTER + _NOTICE_FOOTER_HINT):
             good.append(c)
     if not good:
@@ -11538,7 +11615,7 @@ def cmd_selftest() -> int:
           "3333" in _capped3, False)
     check("인사 요약 — 직책·이름을 갈라 'ㆍ직책 이름 (부서)' 로 정리",
           format_people_notice("기자 구독 구독중 이전 다음 ◇ 편집국 ▲ 산업본부장 류준형 (서울=연합뉴스)", "personnel"),
-          "ㆍ산업본부장 류준형 (편집국)")
+          "ㆍ류준형 · 산업본부장 (편집국)")
     # 회귀 방지(2026-09-28, 사용자 지적): LLM 예산이 없어 이 규칙 기반으로 빠지면
     # 원문을 그대로 노출해 '요약이 안 된다'는 지적이 있었다 — [인사] 프라임경제 실사례.
     _personnel_dump = (
@@ -11547,12 +11624,12 @@ def cmd_selftest() -> int:
         "▲ 미래산업부 차장 박지혜 ▲ 자본시장부 차장 장민태")
     check("인사 다건(실사례) — 사람마다 한 줄, 헤더는 괄호로",
           format_people_notice(_personnel_dump, "personnel"),
-          "ㆍ정치사회부/생활산업부장 김경태 (부장 승진)\n"
-          "ㆍ건설산업부장 전훈식 (부장 승진)\n"
-          "ㆍ미래산업부장 노병우 (부장 승진)\n"
-          "ㆍ생활산업부 차장 이인영 (차장 승진)\n"
-          "ㆍ미래산업부 차장 박지혜 (차장 승진)\n"
-          "ㆍ자본시장부 차장 장민태 (차장 승진)")
+          "ㆍ김경태 · 정치사회부/생활산업부장 (부장 승진)\n"
+          "ㆍ전훈식 · 건설산업부장 (부장 승진)\n"
+          "ㆍ노병우 · 미래산업부장 (부장 승진)\n"
+          "ㆍ이인영 · 생활산업부 차장 (차장 승진)\n"
+          "ㆍ박지혜 · 미래산업부 차장 (차장 승진)\n"
+          "ㆍ장민태 · 자본시장부 차장 (차장 승진)")
     # 회귀 방지(2026-09-29, 사용자 지적): [인사] 법무부 — 신규 보임 뒤 '전보' 명단이 누락됐다.
     # 원인: LLM 20명 상한 · △ 항목 표시 미인식 · 1600자 상한. 실제 연합뉴스 기사 형식.
     _moj_new = ["법무연수원 기획부장 박진성", "대검찰청 마약·조직범죄부장 홍완희", "대검찰청 공판송무부장 안성희",
@@ -11564,19 +11641,19 @@ def cmd_selftest() -> int:
     _moj_out = format_people_notice(_moj_text, "personnel").splitlines()
     check("인사 대량(검사 인사) — 신규 보임 7 + 전보 25 = 32줄, 뒤 섹션까지 전부",
           (len(_moj_out), _moj_out[0], _moj_out[-1].endswith("(대검검사급 전보)")),
-          (32, "ㆍ법무연수원 기획부장 박진성 (대검검사급 신규 보임)", True))
+          (32, "ㆍ박진성 · 법무연수원 기획부장 (대검검사급 신규 보임)", True))
     check("인사 대량 — 꼬리표 '(서울=연합뉴스)' 는 이름에 안 섞인다",
           any("연합뉴스" in ln for ln in _moj_out), False)
     _moj_tri = ("◇ 공소청 검사급 검사 신규 보임 △ 법무부 법무실장 김남훈 △ 법무연수원 기획부장 구태연 "
                 "◇ 공소청 검사급 검사 전보 △ 법무부 형사사법국장 박지호 △ 서울고검 차장검사 이도윤")
     check("인사 — △ 표시 기사도 한 줄씩(전보 포함)",
           format_people_notice(_moj_tri, "personnel").splitlines(),
-          ["ㆍ법무부 법무실장 김남훈 (공소청 검사급 검사 신규 보임)",
-           "ㆍ법무연수원 기획부장 구태연 (공소청 검사급 검사 신규 보임)",
-           "ㆍ법무부 형사사법국장 박지호 (공소청 검사급 검사 전보)",
-           "ㆍ서울고검 차장검사 이도윤 (공소청 검사급 검사 전보)"])
+          ["ㆍ김남훈 · 법무부 법무실장 (공소청 검사급 검사 신규 보임)",
+           "ㆍ구태연 · 법무연수원 기획부장 (공소청 검사급 검사 신규 보임)",
+           "ㆍ박지호 · 법무부 형사사법국장 (공소청 검사급 검사 전보)",
+           "ㆍ이도윤 · 서울고검 차장검사 (공소청 검사급 검사 전보)"])
     check("인사 — ◆ 헤더도 인식", format_people_notice("◆ 신규 ▲ 서울지검 검사장 김철수", "personnel"),
-          "ㆍ서울지검 검사장 김철수 (신규)")
+          "ㆍ김철수 · 서울지검 검사장 (신규)")
 
     class _NoLLM:
         model = "x"
@@ -12048,11 +12125,13 @@ def cmd_selftest() -> int:
            "◈한화자산운용◎승진<임원>▷김동영▷신정호")
     check("한국경제식 표기(◈ 기관 ◎ 구분 <유형> ▷ 항목) — 위계 머리말을 이어 붙여 한 줄씩",
           format_people_notice(_hk, "personnel").splitlines(),
-          ["ㆍ한화M&S 박대주 배상현 유상현 (한화그룹 M&S부문 · 승진 · 신규 임원)",
+          ["ㆍ박대주 · 한화M&S (한화그룹 M&S부문 · 승진 · 신규 임원)",
+           "ㆍ배상현 · 한화M&S (한화그룹 M&S부문 · 승진 · 신규 임원)",
+           "ㆍ유상현 · 한화M&S (한화그룹 M&S부문 · 승진 · 신규 임원)",
            "ㆍ김동영 (한화자산운용 · 승진 · 임원)", "ㆍ신정호 (한화자산운용 · 승진 · 임원)"])
     check("연합식(◇ 하나) 머리말은 그대로 — 위계 변경이 기존 형식을 바꾸지 않는다",
           format_people_notice("◇ 대검검사급 전보 ▲ 법무부 기획조정실장 차범준", "personnel"),
-          "ㆍ법무부 기획조정실장 차범준 (대검검사급 전보)")
+          "ㆍ차범준 · 법무부 기획조정실장 (대검검사급 전보)")
     check("◇ 아래 ◆ 하위 구분도 이어 붙인다",
           format_people_notice("◇ ㈜한화 ◆ 신규 임원 승진 ▲ 강창수 ▲ 곽원석", "personnel").splitlines(),
           ["ㆍ강창수 (㈜한화 · 신규 임원 승진)", "ㆍ곽원석 (㈜한화 · 신규 임원 승진)"])
@@ -12064,8 +12143,7 @@ def cmd_selftest() -> int:
     _prose = "에코프로는 1일 사장단 승진·보직 인사를 단행했다. 이재영 부사장이 사장으로 승진했다. 김철수 상무는 전무로 승진했다."
     check("줄글 인사 기사는 제목과 관련 있을 때 원문 문장을 한 줄씩 그대로(재서술 없음)",
           format_people_notice(_prose, "personnel", "에코프로, 사장단 승진·보직 인사").splitlines(),
-          ["ㆍ에코프로는 1일 사장단 승진·보직 인사를 단행했다.", "ㆍ이재영 부사장이 사장으로 승진했다.",
-           "ㆍ김철수 상무는 전무로 승진했다."])
+          ["ㆍ이재영 부사장이 사장으로 승진했다.", "ㆍ김철수 상무는 전무로 승진했다."])   # 배경 문장(사장단 인사를 단행했다)은 뺀다
     check("줄글 맨 앞의 연합 dateline 이 본문을 통째로 지우지 않는다",
           "이재영" in format_people_notice("(서울=연합뉴스) 홍길동 기자 = " + _prose, "personnel", "에코프로 인사"), True)
     check("인사는 AI 를 부르지 않고 규칙(rule)으로 처리한다",
@@ -12073,6 +12151,44 @@ def cmd_selftest() -> int:
     check("기자명 — '날씨'·'보도' 같은 화면 낱말은 기자가 아니다",
           ([_valid_author(x, "연합뉴스") for x in ("날씨", "보도", "제보", "속보")],
            [split_authors(x) for x in ("날씨", "보도")]), (["", "", "", ""], [[], []]))
+
+    # 회귀 방지(2026-10-02, 사용자 지적): 한화에너지는 세 사람이 한 줄, 예금보험공사·산업통상부는
+    # 명단이 있는데 '확인 못 함', 에코프로는 승진자만이 아니라 기사 문장 전체. 실제 기사 형식으로 검증한다.
+    _viva = ("◇한화에너지 (총 3명) ▲김민수, 박인찬, 이경재 ◇한화토탈에너지스 (총 1명) ▲임한빈 "
+             "◇한화파워 (총 2명) ▲박성순, 서재호")
+    check("한화에너지 — 쉼표로 이은 세 사람은 한 줄씩, '(총 3명)' 은 머리말에서 뺀다",
+          format_people_notice(_viva, "personnel", "[인사] 한화에너지").splitlines(),
+          ["ㆍ김민수 (한화에너지)", "ㆍ박인찬 (한화에너지)", "ㆍ이경재 (한화에너지)", "ㆍ임한빈 (한화토탈에너지스)",
+           "ㆍ박성순 (한화파워)", "ㆍ서재호 (한화파워)"])
+    check("한화에너지(조선비즈식) — ▲ 이어붙임도 한 줄씩",
+          format_people_notice("<승진> ◇임원 ▲김민수 ▲박인찬 ▲이경재", "personnel", "[인사] 한화에너지").splitlines(),
+          ["ㆍ김민수 (승진 · 임원)", "ㆍ박인찬 (승진 · 임원)", "ㆍ이경재 (승진 · 임원)"])
+    check("뉴데일리식 — '▷신규 임원 △이름' 의 ▷ 글은 사람이 아니라 소제목",
+          format_people_notice("◆한화에너지 ▷신규 임원 △김민수 △박인찬 ◆한화파워 ▷신규 임원 △박성순", "personnel").splitlines(),
+          ["ㆍ김민수 (한화에너지 · 신규 임원)", "ㆍ박인찬 (한화에너지 · 신규 임원)", "ㆍ박성순 (한화파워 · 신규 임원)"])
+    check("지명 나열은 사람으로 가르지 않는다",
+          format_people_notice("◇ 전보 ▲ 서울, 부산 지검 검사장 김철수", "personnel"),
+          "ㆍ김철수 · 서울, 부산 지검 검사장 (전보)")
+    _kdic_html = ('<meta property="og:description" content="◇ 1급 승진"/><article><p>◇ 1급 승진</p>'
+                  '<p>▲ 성과경영실장 장은익 ▲ 금투리스크관리부장 황우진</p><p>◇ 부서장 전보 발령</p>'
+                  '<p>▲ 기획조정부장 진호정 ▲ 은행리스크관리부장\n이지현 (서울=연합뉴스)\n제보는 카카오톡 okjebo\n'
+                  '<저작권자(c) 연합뉴스,\n무단 전재-재배포, AI 학습 및 활용 금지>\n2026/07/23 09:44 송고</p></article>')
+    _kdic_body = ("◇ 1급 승진\n▲ 성과경영실장 장은익 ▲ 금투리스크관리부장 황우진\n◇ 부서장 전보 발령\n"
+                  "▲ 기획조정부장 진호정 ▲ 은행리스크관리부장\n이지현 (서울=연합뉴스)\n제보는 카카오톡 okjebo\n"
+                  "<저작권자(c) 연합뉴스,\n무단 전재-재배포, AI 학습 및 활용 금지>\n2026/07/23 09:44 송고")
+    _kdic_out = format_people_notice(_notice_text(_kdic_html, _kdic_body, "[인사] 예금보험공사"), "personnel", "[인사] 예금보험공사")
+    check("예금보험공사 — 줄바꿈을 낀 저작권 꼬리가 있어도 명단 전부(전보 포함)",
+          (len(_kdic_out.splitlines()), "ㆍ진호정 · 기획조정부장 (부서장 전보 발령)" in _kdic_out,
+           "ㆍ이지현 · 은행리스크관리부장 (부서장 전보 발령)" in _kdic_out),
+          (4, True, True))
+    _eco = ("에코프로는 지난달 30일 사장단 승진 및 보직 인사를 단행했다고 1일 밝혔다. "
+            "이번 인사에서 최상운 에코프로 경영지원본부장과 박종환 에코프로이엠 대표가 각각 사장으로 승진했다. "
+            "최 사장은 에코프로 대표이사로, 박 사장은 에코프로에이치엔 대표이사로 각각 내정됐다. "
+            "최 신임 사장은 그동안 회사의 핵심 기반 업무를 총괄하며 조직 안정과 지속가능한 성장을 이끌었다.")
+    _eco_out = format_people_notice(_eco, "personnel", "에코프로, 사장단 인사 조기 단행…최상운·박종환 사장 승진").splitlines()
+    check("에코프로 — 승진·내정 문장만(배경 설명·인물 칭찬 문장은 뺀다)",
+          (len(_eco_out), "최상운" in _eco_out[0], any("조직 안정" in x for x in _eco_out),
+           any("단행했다고" in x for x in _eco_out)), (2, True, False, False))
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
