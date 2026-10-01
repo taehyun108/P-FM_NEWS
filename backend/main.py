@@ -592,6 +592,11 @@ class Storage(ABC):
     def prune_url_ledger(self, older_than_days: int) -> int: ...
 
     @abstractmethod
+    def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
+        """최근 since_days 일 안에 원장에 오른 항목 중 사유가 reasons 인 것을 지운다(다음 수집 때 다시 판정).
+        반환: 지운 건수. 수집 규칙을 넓힌 뒤 예전에 '무관'으로 걸러진 기사를 되살릴 때 쓴다."""
+
+    @abstractmethod
     def log_telegram(self, entry: dict) -> None:
         """봇으로 나간 메시지 1건을 telegram_log 에 기록. 실패해도 발송에 영향 없어야 한다."""
 
@@ -1144,6 +1149,15 @@ class SqliteStorage(Storage):
     def prune_url_ledger(self, older_than_days: int) -> int:
         cutoff = iso(now_utc() - timedelta(days=older_than_days))
         cur = self._exec("delete from url_ledger where first_seen < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
+        if not reasons:
+            return 0
+        cutoff = iso(now_utc() - timedelta(days=since_days))
+        marks = ",".join("?" * len(reasons))
+        cur = self._exec(f"delete from url_ledger where reason in ({marks}) and first_seen >= ?",
+                         (*reasons, cutoff))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def log_telegram(self, entry: dict) -> None:
@@ -1916,6 +1930,14 @@ class SupabaseStorage(Storage):
         res = self._t("url_ledger").delete().lt("first_seen", cutoff).execute()
         return len(res.data or [])
 
+    def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
+        if not reasons:
+            return 0
+        cutoff = iso(now_utc() - timedelta(days=since_days))
+        res = (self._t("url_ledger").delete().in_("reason", list(reasons))
+               .gte("first_seen", cutoff).execute())
+        return len(res.data or [])
+
     def log_telegram(self, entry: dict) -> None:
         self._t("telegram_log").insert({
             "chat_id": entry.get("chat_id"), "kind": entry.get("kind") or "기타",
@@ -2412,7 +2434,9 @@ SEED_KEYWORDS: list[tuple[str, str]] = (
         "중국 흑연 수출통제", "중국 배터리 소재 수출", "중국 요소 수출제한", "중국 갈륨 게르마늄",
         "미국 철강 관세", "무역확장법 232조 철강", "철강 세이프가드", "US 상호관세 철강",
         "철강 반덤핑", "베트남 철강 반덤핑", "일본 소재 수출규제", "일본 철강 통상",
-        "이차전지 공급망 재편", "배터리 디리스킹", "철강 통상마찰", "글로벌 관세 전쟁"]]
+        "이차전지 공급망 재편", "배터리 디리스킹", "철강 통상마찰", "글로벌 관세 전쟁",
+        # 한미 관세협상·대미투자 (2026-09-30)
+        "트럼프 관세", "대미투자", "한미 관세협상", "상호관세", "자동차 관세", "미국 무역협상"]]
 )
 
 # 수집 소스 시드 — (source_type, name, url, enabled)
@@ -2767,6 +2791,18 @@ TRADE_MEASURE_KW = [
     "요소 수출제한", "반도체 장비 수출통제", "수출허가 대상",
     # 무역구제 (공식 절차)
     "반덤핑 관세", "반덤핑관세", "반덤핑 조사", "상계관세", "덤핑 판정", "긴급수입제한",
+    # 한미 관세협상·대미투자 (2026-09-30 누락 사례: '트럼프 대미투자' 기사를 일일이 수동 등록)
+    "트럼프 관세", "미국 관세", "관세협상", "관세 협상", "관세 합의", "품목관세", "품목별 관세",
+    "자동차 관세", "철강 관세", "대미투자", "대미 투자", "한미 통상", "통상협상", "통상 협상",
+    "무역합의", "무역 합의",
+]
+# 이 낱말이 제목에 있으면 철강·배터리 같은 산업어가 없어도 통상환경 기사로 본다.
+# 국가 단위 관세·투자 협상은 제목에 업종이 안 나오지만(예: '트럼프 대미투자 압박') 철강·배터리·자동차
+# 수출 전반에 영향을 주기 때문이다. 301조처럼 업종이 특정돼야 의미가 있는 조치어는 넣지 않는다.
+TRADE_MACRO_KW = [
+    "트럼프 관세", "미국 관세", "상호관세", "보편관세", "관세협상", "관세 협상", "관세 합의",
+    "품목관세", "품목별 관세", "자동차 관세", "철강 관세", "대미투자", "대미 투자", "한미 통상",
+    "통상협상", "통상 협상", "무역합의", "무역 합의",
 ]
 # 통상 기사가 '포스코 관련 산업'인지 판정.
 TRADE_INDUSTRY_KW = [
@@ -3108,10 +3144,17 @@ NAVER_NEWS_API = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 POLICY_SITE = "site:www.korea.kr"   # '정책' 키워드는 정책브리핑으로만 검색한다
 
 
+GOOGLE_FETCH_WORKERS = 4   # Google News RSS 동시 요청 수 — 네이버(4)와 같은 이유로 낮게 둔다
+
+
 def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[RawItem]:
+    """키워드별 Google News RSS. 키워드마다 독립 호출이라 병렬로 받는다.
+
+    예전엔 순차였다 — 키워드 120여 개 × 응답 1초 안팎 = 회차마다 2분 가까이 이 단계만 기다렸다.
+    결과는 입력 키워드 순서대로 이어 붙여(pool.map) 병렬이어도 항목 순서가 이전과 같다."""
     feedparser = _import("feedparser", "feedparser")
-    items: list[RawItem] = []
-    for row in keyword_rows:
+
+    def _fetch_one(row: dict) -> list[RawItem]:
         keyword = row["keyword"]
         query = f"{POLICY_SITE} {keyword}" if row.get("category") == "정책" else keyword
         url = GOOGLE_NEWS_RSS.format(q=urlencode({"q": query})[2:])
@@ -3120,9 +3163,9 @@ def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[R
             resp.raise_for_status()
         except Exception as exc:
             log.warning("Google RSS 조회 실패 (%s): %s", keyword, exc)
-            continue
-        feed = feedparser.parse(resp.content)
-        for entry in feed.entries:
+            return []
+        out: list[RawItem] = []
+        for entry in feedparser.parse(resp.content).entries:
             link = entry.get("link", "")
             if not link:
                 continue
@@ -3132,15 +3175,24 @@ def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[R
                 continue
             published = parse_feed_datetime(entry.get("published") or entry.get("updated"),
                                             entry.get("published_parsed") or entry.get("updated_parsed"))
-            items.append(RawItem(
+            out.append(RawItem(
                 url_source=normalize_url(link),
                 url_original=link,
                 title=html_mod.unescape(entry.get("title", "")).strip(),
                 published_at=published,
                 source_type="google_rss",
-                press_hint=(entry.get("source", {}) or {}).get("title", ""),
+                press_hint=src_title,
                 snippet=html_mod.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))).strip(),
             ))
+        return out
+
+    rows = list(keyword_rows)
+    if not rows:
+        return []
+    items: list[RawItem] = []
+    with ThreadPoolExecutor(max_workers=min(GOOGLE_FETCH_WORKERS, len(rows))) as pool:
+        for part in pool.map(_fetch_one, rows):
+            items.extend(part)
     return items
 
 
@@ -3193,6 +3245,8 @@ def is_trade_topic(title: str, extra: str = "") -> bool:
     (요약·본문에만 스친 언급은 부차 주제 — 오태깅을 막는다.)
     포스코 관련 산업(철강·배터리)이 제목·요약에 함께 있어야 한다.
     """
+    if _kw_hit_any(title, TRADE_MACRO_KW):
+        return True
     return _kw_hit_any(title, TRADE_MEASURE_KW) and _kw_hit_any(f"{title}\n{extra}", TRADE_INDUSTRY_KW)
 
 
@@ -3639,7 +3693,8 @@ def extract_ministry(html: str, body: str) -> str:
 # 배터리·통상이라 이 단어가 제목에 있으면 관련 기사로 본다(범용 명사는 넣지 않는다).
 _NAVER_BATTERY_TITLE_KW = ["배터리", "이차전지", "2차전지", "전기차", "EV", "충전소", "배터리팩"]
 _NAVER_TRADE_TITLE_KW = ["관세", "반덤핑", "상계관세", "세이프가드", "수출규제", "수출통제",
-                         "무역장벽", "무역분쟁", "무역전쟁", "통상", "FTA", "덤핑", "무역확장법"]
+                         "무역장벽", "무역분쟁", "무역전쟁", "통상", "FTA", "덤핑", "무역확장법",
+                         "대미투자", "대미 투자", "관세협상", "상호관세"]
 
 
 def _naver_item_relevant(title: str, category: str, keyword: str = "",
@@ -9819,8 +9874,29 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     log.info("재정리 완료: 성공 %d · 실패 %d · 건너뜀 %d", done, failed, skipped)
 
 
-def cmd_regroup(ctx: Context, dry: bool = False) -> None:
+def cmd_reopen(ctx: Context, days: int = 3, dry: bool = False) -> None:
+    """수집 규칙을 넓힌 뒤, 예전에 '무관'·'접속 실패'로 제외된 최근 기사를 다시 판정 대상으로 되돌린다.
+
+    url_ledger 의 off_topic·extract_failed 기록은 180일간 영구 제외라, 규칙을 고쳐도 최근 기사는
+    계속 걸러진 채 남는다(2026-09-30 통상 기사 누락 사례). 최근 days 일 분량의 그 기록만 지운다 —
+    stale(오래됨)·no_pubdate 는 규칙과 무관하므로 건드리지 않는다. 지운 뒤 worker 를 재시작해야
+    메모리 캐시(seen_cache)에서도 빠진다.
+    """
+    days = max(1, min(days, 10))   # 신선도 창(72시간)보다 오래된 기사는 어차피 다시 안 받는다
+    reasons = ("off_topic", "extract_failed")
+    if dry:
+        log.info("[미리보기] 최근 %d일의 %s 기록을 지울 예정입니다(실제로는 지우지 않음).",
+                 days, " · ".join(reasons))
+        return
+    n = ctx.storage.clear_ledger(reasons, days)
+    log.info("제외 기록 %d건을 지웠습니다(최근 %d일, %s). worker 를 재시작하면 다음 수집 회차에 다시 판정합니다.",
+             n, days, " · ".join(reasons))
+
+
+def cmd_tagassoc(ctx: Context, dry: bool = False) -> None:
     """이미 저장된 기사에 '배터리협회' 그룹사 태그를 뒤늦게 붙인다(일회성).
+
+    (이름 주의: `regroup` 은 원문 리드 기준 그룹사 재판정이라는 별개의 기존 명령이다.)
 
     제목·요약, 그리고 30일 보관 본문에 협회 이름(별칭)이 있으면 태그를 더한다.
     dry=True 면 대상 건수만 보여 주고 쓰지 않는다.
@@ -11118,6 +11194,66 @@ def cmd_selftest() -> int:
           "글로벌 통상환경" in detect_categories("美 무역확장법 232조 철강 관세 부과"), True)
     check("detect_categories: 요약에만 조치명이면 태깅 안 함",
           "글로벌 통상환경" in detect_categories("포스코 실적 회복세", "CBAM 대응 비용이 변수"), False)
+
+    # 2026-09-30: '트럼프 대미투자' 같은 한미 관세협상·투자 기사가 수집되지 않아 일일이 수동 등록했다
+    print("\n[8-2c2] 한미 관세협상·대미투자 — 업종이 제목에 없어도 통상환경")
+    for _t in ("트럼프, 대미투자 압박 강화…韓 3500억달러 이행 촉구", "한미 관세협상 타결 임박", "트럼프 관세 25%로 인상 예고",
+               "자동차 관세 인하 합의", "상호관세 재협상 돌입"):
+        check(f"통상환경(업종 없이 통과): {_t[:16]}", is_trade_topic(_t), True)
+    check("거시 통상어 기사는 카테고리도 글로벌 통상환경",
+          "글로벌 통상환경" in detect_categories("트럼프, 대미투자 압박 강화"), True)
+    check("301조처럼 업종이 필요한 조치어는 여전히 산업어가 있어야 한다",
+          is_trade_topic("美, 對中 반도체 301조 관세"), False)
+    check("통상 키워드 검색 결과 — 제목에 '대미투자'만 있어도 통과",
+          _naver_item_relevant("트럼프 '韓 대미투자 약속 이행하라'", "통상", "트럼프 관세"), True)
+    check("무관 기사(코스피)는 여전히 제외", is_trade_topic("코스피 7100선 돌파"), False)
+    check("통상 키워드 시드에 한미 관세협상 계열이 있다",
+          {"대미투자", "트럼프 관세", "한미 관세협상"} <= {k for c, k in SEED_KEYWORDS if c == "통상"}, True)
+
+    print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
+    _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
+    _lt.init_schema()
+    _lnow = now_utc()
+    for _u, _r, _d in (("u/off-new", "off_topic", 1), ("u/fail-new", "extract_failed", 2),
+                       ("u/stale-new", "stale", 1), ("u/off-old", "off_topic", 20)):
+        _lt._exec("insert into url_ledger (url_source, reason, first_seen) values (?,?,?)",
+                   (_u, _r, iso(_lnow - timedelta(days=_d))))
+    _lctx = type("C", (), {"storage": _lt})()
+    cmd_reopen(_lctx, 3, dry=True)
+    check("reopen --dry — 아무것도 지우지 않는다", _lt._one("select count(*) as n from url_ledger")["n"], 4)
+    cmd_reopen(_lctx, 3)
+    check("reopen — 최근 무관·접속실패만 지운다(stale·오래된 기록은 그대로)",
+          sorted(r["url_source"] for r in _lt._rows("select url_source from url_ledger")),
+          ["u/off-old", "u/stale-new"])
+    _lt._exec("delete from url_ledger")
+
+    class _GResp:
+        def __init__(self, kw: str) -> None:
+            self.content = (
+                '<?xml version="1.0"?><rss version="2.0"><channel><item>'
+                f"<title>{kw} 기사</title><link>https://g.test/{kw}</link>"
+                "<pubDate>Mon, 14 Sep 2026 00:00:00 +0900</pubDate><description>d</description>"
+                "</item></channel></rss>").encode()
+        def raise_for_status(self) -> None:
+            pass
+
+    class _GHttp:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._lk = threading.Lock()
+        def get(self, url: str, **kw: Any) -> Any:
+            with self._lk:
+                self.calls += 1
+            if "BAD" in url:
+                raise RuntimeError("조회 실패 시뮬레이션")
+            import urllib.parse as _up
+            return _GResp(_up.parse_qs(_up.urlparse(url).query)["q"][0])
+    _grows = [{"keyword": f"k{i}", "category": "산업"} for i in range(9)] + [{"keyword": "BAD", "category": "산업"}]
+    _gh = _GHttp()
+    _gitems = collect_google_rss(_gh, _grows)
+    check("Google RSS 병렬 — 전 키워드 조회·실패 1건은 건너뜀", (_gh.calls, len(_gitems)), (10, 9))
+    check("Google RSS 병렬 — 결과 순서가 키워드 순서와 같다",
+          [i.url_original for i in _gitems], [f"https://g.test/k{i}" for i in range(9)])
 
     print("\n[8-2d] 배터리 생태계 기사 (포스코 미언급 허용)")
     check("전고체 배터리 개발 → 수집",
@@ -12639,7 +12775,8 @@ def cmd_selftest() -> int:
 USAGE = """사용법: python backend/main.py <명령>
 
   initdb     스키마 생성 + 시드 데이터 입력 (최초 1회)
-  regroup [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
+  reopen [일수] [--dry]  규칙을 넓힌 뒤 최근 며칠(기본 3일)의 '무관'·'접속 실패' 제외 기록을 지워 다시 판정(실행 후 worker 재시작)
+  tagassoc [--dry]  이미 저장된 기사에 '배터리협회' 그룹사 태그 보충 (제목·요약·보관 본문 기준, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
                     분류는 그룹사·산업·정책·통상. 마스터 패널 '수집 키워드 관리'와 같은 동작)
   pfmtone [N] [--dry]  기존 포스코퓨처엠 기사에 발췌문·논조(LLM) 채우기 (백필, 기본 LLM 200회,
@@ -12719,8 +12856,11 @@ def main(argv: Sequence[str]) -> int:
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
-    elif command == "regroup":
-        cmd_regroup(ctx, dry="--dry" in argv[2:])
+    elif command == "reopen":
+        nums = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_reopen(ctx, nums[0] if nums else 3, dry="--dry" in argv[2:])
+    elif command == "tagassoc":
+        cmd_tagassoc(ctx, dry="--dry" in argv[2:])
     elif command == "addkw":
         cmd_addkw(ctx, argv[2] if len(argv) > 2 else "", argv[3:])
     elif command == "pfmtone":
