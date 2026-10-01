@@ -95,6 +95,8 @@ def kotra_service_key() -> str:
 
 EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 50, 0)   # noqa: E731
 ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E731
+EA_PRESS_DAYS = lambda: _env_int("EA_PRESS_DAYS", 3, 1, 30)           # noqa: E731  정책브리핑 보도자료 조회 기간(일)
+EA_PRESS_PAGES = lambda: _env_int("EA_PRESS_PAGES", 5, 1, 20)        # noqa: E731  페이지당 약 20건
 
 # 1회 수집에서 상세 조회(HTTP)·분석까지 갈 최대 건수. 기존 파이프라인의
 # MAX_PROCESS_PER_RUN(12) 과 같은 취지 — 실행 시간을 예측 가능하게 묶는다.
@@ -272,6 +274,7 @@ class EaDB:
         for table, col, ddl in (
             ("ea_policy_items", "agency_raw", "TEXT"),
             ("ea_policy_items", "group_companies", "TEXT"),   # JSON 배열. 규칙 기반 판정 결과
+            ("ea_policy_items", "proposers", "TEXT"),         # 의안 발의자 JSON [{name,party,role}]
             ("ea_agencies", "kind", "TEXT"),                  # 'ministry' | 'committee'
         ):
             have = {r["name"] for r in self.rows(f"pragma table_info({table})")}
@@ -580,6 +583,11 @@ class EaSupabaseDB:
             msg = str(exc)
             if "duplicate key" in msg.lower() or "23505" in msg:
                 return False
+            # proposers 칼럼을 아직 만들지 않았다면(SQL 미실행) 그 칸만 빼고 저장한다 — 수집이 멈추면 안 된다.
+            if "proposers" in row and "proposers" in msg:
+                log.warning("ea_policy_items.proposers 칼럼이 없어 발의자 없이 저장합니다 "
+                            "(Supabase SQL Editor 에서 alter table 1회 실행 필요)")
+                return self.insert_item({k: v for k, v in row.items() if k != "proposers"})
             raise
 
     def unanalyzed_items(self, limit: int) -> list[dict]:
@@ -917,6 +925,9 @@ _BILL_FIELDS = {
     "committee": ("COMMITTEE", "COMMITTEE_NM", "committee"),
     "result":    ("PROC_RESULT", "PROC_RESULT_CD", "procResult"),
     "link":      ("DETAIL_LINK", "LINK_URL", "detailLink"),
+    "rst_proposer": ("RST_PROPOSER", "rstProposer"),               # 대표발의자
+    "publ_proposer": ("PUBL_PROPOSER", "publProposer"),            # 공동발의자(쉼표)
+    "member_list": ("MEMBER_LIST", "memberList"),                  # 발의자 명단 페이지 링크
 }
 _logged_bill_keys = False
 
@@ -981,11 +992,113 @@ def fetch_assembly_bills(page_size: int = 100, max_pages: int = 3) -> list[dict]
                 "attachment_urls": [],
                 "published_at": parse_date(_pick(r, _BILL_FIELDS["propose_dt"])),
                 "_proposer": _pick(r, _BILL_FIELDS["proposer"]),
+                "_rst": _pick(r, _BILL_FIELDS["rst_proposer"]),
+                "_pub": _pick(r, _BILL_FIELDS["publ_proposer"]),
+                "_member_link": _pick(r, _BILL_FIELDS["member_list"]),
             })
         if len(rows) < page_size:
             break
     log.info("S3 국회 의안 수집 %d건", len(out))
     return out
+
+
+# ── 의안 발의자 전원(+소속 정당) ─────────────────────────────────────
+# 의안 목록 API 는 대표발의자(RST_PROPOSER)와 공동발의자(PUBL_PROPOSER)를 이름으로 준다. 정당은
+# '국회의원 인적사항' API 로 이름→정당 표를 만들어 붙인다(동명이인은 정당을 비운다 — 틀리게 붙이느니 비운다).
+# 이름 필드가 비어 있으면 MEMBER_LIST(발의자 명단 페이지)를 읽는다. 둘 다 안 되면 빈 목록 — 화면은
+# '의안정보시스템에서 확인' 링크만 보여 준다.
+ROSTER_URL_DEFAULT = "https://open.assembly.go.kr/portal/openapi/nwvrqwxyaytdsfvhu"
+_roster_cache: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _party_roster() -> dict[str, str]:
+    """이름 → 정당. 동명이인은 '' . 하루 한 번만 갱신한다."""
+    key = assembly_key()
+    if not key:
+        return {}
+    if _roster_cache["map"] and time.monotonic() - _roster_cache["at"] < 86400:
+        return _roster_cache["map"]
+    url = _env("EA_ASSEMBLY_ROSTER_URL") or ROSTER_URL_DEFAULT
+    out: dict[str, str] = {}
+    dup: set[str] = set()
+    try:
+        for page in (1, 2):
+            with _http_lock:
+                data = _get_json(url, {"KEY": key, "Type": "json", "pIndex": page, "pSize": 300})
+            rows, _msg = _unwrap_assembly(data)
+            for r in rows:
+                name = _pick(r, ("HG_NM", "NAAS_NM", "name"))
+                party = _pick(r, ("POLY_NM", "PLPT_NM", "party"))
+                if not name:
+                    continue
+                if name in out and out[name] != party:
+                    dup.add(name)
+                out[name] = party
+            if len(rows) < 300:
+                break
+    except Exception as exc:
+        log.warning("국회의원 정당 표 조회 실패(정당 없이 이름만 표시): %s", exc)
+        return {}
+    for n in dup:
+        out[n] = ""
+    _roster_cache.update({"at": time.monotonic(), "map": out})
+    log.info("국회의원 정당 표 %d명", len(out))
+    return out
+
+
+def _split_names(text: str) -> list[str]:
+    """'김철수, 이영희의원 외' → ['김철수', '이영희']. 'N인'·'등'·'의원' 꼬리는 뗀다."""
+    out: list[str] = []
+    text = re.sub(r"\s*[외등]\s*\d+\s*인", "", text or "")       # '외 12인'·'등 12인'
+    for part in re.split(r"[,、，/·\n]+", text):
+        name = re.sub(r"\s*(?:의원|위원장|대표|등|외)\s*$", "", part.strip()).strip()
+        name = re.sub(r"\s+", "", name)
+        if re.fullmatch(r"[가-힣]{2,5}", name) and name not in out:
+            out.append(name)
+    return out
+
+
+def parse_member_list_html(html: str) -> list[dict]:
+    """발의자 명단 페이지(표) → [{name, party}]. 이름 칸(한글 2~5자)과 정당 칸('…당'·무소속)을 찾는다."""
+    try:
+        soup = _crawl()._soup(html)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for tr in soup.find_all("tr"):
+        cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        name = next((c for c in cells if re.fullmatch(r"[가-힣]{2,5}", c)), "")
+        party = next((c for c in cells if re.search(r"당$|힘$|무소속|연합$", c) and len(c) <= 15), "")
+        if name and name not in {o["name"] for o in out} and name not in ("이름", "성명", "의원", "정당"):
+            out.append({"name": name, "party": party})
+    return out
+
+
+def resolve_bill_proposers(it: dict) -> list[dict]:
+    """의안 1건의 발의자 전원 [{name, party, role}] (대표 먼저). 못 구하면 빈 목록."""
+    rep = _split_names(it.get("_rst") or "")
+    pub = _split_names(it.get("_pub") or "")
+    members: list[dict] = []
+    if rep or pub:
+        roster = _party_roster()
+        for i, n in enumerate(dict.fromkeys(rep + pub)):
+            members.append({"name": n, "party": roster.get(n, ""),
+                            "role": "대표" if n in rep[:1] else "공동"})
+    elif it.get("_member_link"):
+        try:
+            with _http_lock:
+                html = _crawl()._get(it["_member_link"])
+            found = parse_member_list_html(html)
+            roster = _party_roster() if any(not m["party"] for m in found) else {}
+            for i, m in enumerate(found):
+                members.append({"name": m["name"], "party": m["party"] or roster.get(m["name"], ""),
+                                "role": "대표" if i == 0 else "공동"})
+        except Exception as exc:
+            log.debug("발의자 명단 페이지 조회 실패 %s: %s", it.get("_member_link"), exc)
+    if not members and it.get("_proposer"):      # '김철수의원 등 12인' — 대표만이라도
+        for n in _split_names(it["_proposer"])[:1]:
+            members.append({"name": n, "party": _party_roster().get(n, ""), "role": "대표"})
+    return members
 
 
 def _unwrap_assembly(data: Any) -> tuple[list[dict], str]:
@@ -1183,12 +1296,22 @@ def fetch_kotra_news() -> list[dict]:
         return []
 
 
+def fetch_korea_press() -> list[dict]:
+    """S6 정책브리핑(korea.kr) 보도자료 — 브리핑룸 > 보도자료 목록 크롤링."""
+    try:
+        return _crawl().crawl_korea_press(EA_PRESS_DAYS(), EA_PRESS_PAGES())
+    except Exception as exc:
+        log.warning("S6 정책브리핑 보도자료 크롤링 실패: %s", exc)
+        return []
+
+
 SOURCES = [
     ("S1 입법예고", fetch_legislation_notices),
     ("S2 행정예고", fetch_admin_notices),
     ("S3 국회 의안", fetch_assembly_bills),
     ("S4 부처 정책뉴스", fetch_ministry_news),
     ("S5 KOTRA 해외시장뉴스", fetch_kotra_news),
+    ("S6 정책브리핑 보도자료", fetch_korea_press),
 ]
 
 
@@ -1327,6 +1450,11 @@ def collect_once(ctx: Any, db: Any) -> dict:
     saved = 0
     fresh: list[tuple[dict, str]] = []   # (저장된 행, API 본문) — 본문은 메모리에만 둔다
     for it in kept:
+        # 정책브리핑 보도자료는 목록에 제목이 비어 있는 일이 있다 — 관련 항목으로 통과한 것만 상세에서 읽는다.
+        if it.get("_title_missing"):
+            real = _crawl().fetch_press_title(it["url_source"])
+            if real:
+                it["title"] = real
         row = {
             "id": new_id(),
             "url_source": it["url_source"],
@@ -1345,6 +1473,14 @@ def collect_once(ctx: Any, db: Any) -> dict:
             "published_at": it.get("published_at") or None,
             "collected_at": iso(now_utc()),
         }
+        if (it.get("item_type") or "") == "bill":
+            try:
+                props = it.get("_proposers") or resolve_bill_proposers(it)
+            except Exception as exc:
+                log.debug("발의자 확보 실패: %s", exc)
+                props = []
+            if props:
+                row["proposers"] = jdump(props)
         # G3·G4 — 상세(개정이유·주요내용) 확보. G2.5 통과분에만 HTTP 가 발생한다.
         body = it.get("_body") or ""
         if not body:
@@ -1670,7 +1806,7 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
     agency = agency or (item.get("agency_raw") or "")
 
-    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news")
+    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news", "policy_press")
     tmpl = EA_NEWS_PROMPT if is_news else EA_PROMPT
     news_period = item.get("published_at") or item.get("notice_start") or "(미상)"
     prompt = tmpl.format(
@@ -1796,8 +1932,64 @@ EA_PAGE_SIZE = 9          # 기존 포토카드와 같은 페이지당 건수
 EA_DUE_SOON_DAYS = 7      # 마감 임박 배너 기준
 
 
+# ── 우선순위 [긴급·중요·관심·일반] — 포스코퓨처엠 영향 기준(규칙, AI 점수 아님) ─────────────
+# 화면의 '중요도 점수'는 기준이 안 보여 없애고, 아래 규칙으로 4단계만 표시한다. 이유 문장도 함께 내려 준다.
+EA_PRIORITIES = ["긴급", "중요", "관심", "일반"]
+_PRIORITY_RANK = {"긴급": 4, "중요": 3, "관심": 2, "일반": 1}
+# 포스코퓨처엠 사업에 직접 닿는 말 — 이차전지 소재·핵심광물, 통상(관세·수출통제·공급망)
+_EA_DIRECT_KW = ["이차전지", "2차전지", "배터리", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
+                 "흑연", "전해액", "분리막", "핵심광물", "희토류", "소재부품장비", "소부장", "전기차",
+                 "국가첨단전략산업", "포스코퓨처엠", "관세", "반덤핑", "상계관세", "수출통제", "공급망",
+                 "원산지", "대미투자", "무역협상"]
+# '곧 영향이 생기는 단계' 신호 — 시행·공포·의결·통과·입법예고·의견수렴 등
+_EA_IMMINENT_RE = re.compile(
+    r"시행|공포|의결|통과|가결|확정|입법예고|행정예고|의견\s*수렴|국무회의|본회의|발효|부과|개정안\s*발의")
+_EA_INTEREST_CATS = ("이차전지·소재", "통상", "환경·안전", "에너지", "철강·산업")
+
+
+def ea_priority(v: dict) -> tuple[str, str]:
+    """항목 뷰 → (긴급|중요|관심|일반, 이유 한 줄).
+
+    긴급 = 포스코퓨처엠에 직접 영향 + 시행·의결·입법예고 같은 임박 단계
+    중요 = 포스코퓨처엠에 직접 영향(단계 무관) 또는 AI 영향도 '높음'
+    관심 = 그룹 다른 사업(철강·건설·에너지·무역 등)에만 영향 또는 AI 영향도 '보통·낮음'·관련 분야 해당
+    일반 = 그 밖
+    """
+    title = v.get("title") or ""
+    text = " ".join(str(v.get(k) or "") for k in ("title", "summary", "impact_rationale", "law_name", "status"))
+    groups = v.get("group_companies") or []
+    impact = v.get("impact_level") or ""
+    kw = next((k for k in _EA_DIRECT_KW if k in title), "")
+    direct = ("포스코퓨처엠" in groups) or bool(kw) or impact == "high"
+    why_direct = ("포스코퓨처엠 관련 분야로 분류" if "포스코퓨처엠" in groups
+                  else f"제목에 '{kw}'" if kw else "AI 영향도 '높음'")
+    im = _EA_IMMINENT_RE.search(text)
+    dd = v.get("d_day")
+    soon = dd is not None and 0 <= dd <= 14
+    imminent = bool(im) or soon
+    why_im = (f"마감 D-{dd}" if soon else f"'{im.group(0)}' 단계") if imminent else ""
+    if direct and imminent:
+        return "긴급", f"{why_direct} + {why_im}"
+    if direct:
+        return "중요", f"{why_direct} (시행·의결 등 임박 단계는 아직 확인되지 않음)"
+    other = [g for g in groups if g != "포스코퓨처엠"]
+    if other or impact in ("medium", "low") or (v.get("category") or "") in _EA_INTEREST_CATS:
+        basis = (f"{', '.join(other)} 사업 관련" if other
+                 else f"AI 영향도 '{'보통' if impact == 'medium' else '낮음'}'" if impact in ("medium", "low")
+                 else f"관련 분야({v.get('category')})")
+        return "관심", f"포스코퓨처엠 직접 영향은 아니고 {basis}"
+    return "일반", "포스코 그룹 사업과의 직접 연결이 확인되지 않음"
+
+
 def _item_view(row: dict) -> dict:
+    view = _item_view_base(row)
+    view["priority"], view["priority_reason"] = ea_priority(view)
+    return view
+
+
+def _item_view_base(row: dict) -> dict:
     return {
+        "proposers": jload(row.get("proposers"), []),
         "id": row["id"],
         "title": row.get("title") or "",
         "url": row.get("url_canonical") or row.get("url_source") or "",
@@ -1893,19 +2085,16 @@ def _ea_telegram_send(ctx: Any, text: str) -> tuple[bool, str | None]:
 
 # 화면 상단 카테고리(=탭). key 는 프런트·필터 API 가 공유한다.
 EA_CATEGORIES = [
-    {"key": "notice", "label": "입법·행정예고"},
-    {"key": "bill", "label": "국회 의안"},
     {"key": "policy", "label": "정책 동향"},
-    {"key": "trade", "label": "통상 환경"},
-    {"key": "ministry", "label": "부처별 동향"},
+    {"key": "bill", "label": "국회 의안"},
 ]
-# 카테고리 → ea_policy_items.item_type 목록. policy 는 기사 재사용이라 비어 있다.
+# 카테고리 → ea_policy_items.item_type 목록. 예전 키(notice·ministry·trade)는 옛 주소·주간레포트 호환용으로만 남긴다.
 EA_CATEGORY_TYPES = {
-    "notice": ["legislation", "admin_notice"],
+    "policy": ["policy_press"],
     "bill": ["bill"],
+    "notice": ["legislation", "admin_notice"],
     "ministry": ["ministry_news"],
     "trade": ["trade_news"],
-    "policy": [],
 }
 _AGENCY_TAIL_RE = re.compile(r"(부|처|청|위원회|위|실|원|단|공사|진흥원|KOTRA)$")
 # 제목 첫머리에 오는 부처 약칭 → 정식명. "산업부, …" / "국토부는 …"
@@ -1935,6 +2124,7 @@ def _article_agency(row: dict) -> str:
 
 # 정렬 옵션 — 화면 드롭다운(§8.4). deadline 이 기본(마감일이 1순위 지표).
 EA_SORTS = [
+    {"key": "priority", "label": "우선순위순"},
     {"key": "deadline", "label": "마감 임박순"},
     {"key": "recent", "label": "최신순"},
     {"key": "impact", "label": "영향도순"},
@@ -1970,12 +2160,23 @@ def register_api(app: Any, ctx: Any) -> None:
     @app.get("/api/ea/items")
     def ea_items(item_type: str = "", agency: str = "", impact: str = "", status: str = "",
                  due: str = "", q: str = "", group: str = "", sort: str = "deadline",
-                 page: int = 1, size: int = EA_PAGE_SIZE):
+                 priority: str = "", page: int = 1, size: int = EA_PAGE_SIZE):
         page = max(1, page)
         size = max(1, min(size, 100))
+        # 우선순위는 저장값이 아니라 규칙 계산이라, 필터·정렬이 있으면 뷰를 만든 뒤 파이썬에서 처리한다.
         rows = db.query_items(item_type=item_type, agency=agency, impact=impact,
-                             status=status, due=due, q=q, group=group, sort=sort)
+                             status=status, due=due, q=q, group=group,
+                             sort="recent" if sort == "priority" else sort)
         start = (page - 1) * size
+        if priority or sort == "priority":
+            views = [_item_view(r) for r in rows]
+            if priority:
+                want = set(priority.split(","))
+                views = [v for v in views if v["priority"] in want]
+            if sort == "priority":     # 같은 단계 안에서는 입력 순서(=최신순)를 유지한다(안정 정렬)
+                views.sort(key=lambda v: -_PRIORITY_RANK.get(v["priority"], 0))
+            return JSONResponse({"total": len(views), "page": page, "size": size,
+                                 "items": views[start:start + size]})
         return JSONResponse({"total": len(rows), "page": page, "size": size,
                              "items": [_item_view(r) for r in rows[start:start + size]]})
 
@@ -2008,7 +2209,7 @@ def register_api(app: Any, ctx: Any) -> None:
         want_kind = "committee" if cat == "bill" else "ministry"
 
         counts = db.filters_agency_counts(types)
-        if cat in ("notice", "bill", "ministry"):
+        if cat in ("notice", "bill", "ministry", "policy"):
             seeded = [a["name"] for a in db.agencies(True) if (a.get("kind") or "") == want_kind]
             names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
         elif cat == "trade":
@@ -2027,6 +2228,7 @@ def register_api(app: Any, ctx: Any) -> None:
             "agency_kind": want_kind,
             "groups": groups,
             "categories": EA_CATEGORIES,
+            "priorities": [{"key": k, "label": k} for k in EA_PRIORITIES],
             "impacts": [{"key": "high", "label": "높음"}, {"key": "medium", "label": "보통"},
                         {"key": "low", "label": "낮음"}, {"key": "none", "label": "해당없음"}],
             "statuses": db.filters_statuses(types),

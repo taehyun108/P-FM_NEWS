@@ -13886,9 +13886,9 @@ def cmd_selftest() -> int:
               ea_mod.detect_ea_groups("건설산업기본법 일부개정법률안"), ["포스코이앤씨"])
         check("무관 제목은 그룹사 없음",
               ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
-        # 카테고리 5개 + item_type 매핑
-        check("카테고리 5개", [c["key"] for c in ea_mod.EA_CATEGORIES],
-              ["notice", "bill", "policy", "trade", "ministry"])
+        # 카테고리는 정책 동향·국회 의안 2개(2026-10-02 개편) + item_type 매핑(옛 키는 호환용으로 남김)
+        check("카테고리 2개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "bill"])
+        check("정책 동향 → policy_press", ea_mod.EA_CATEGORY_TYPES["policy"], ["policy_press"])
         check("부처별 동향 → ministry_news", ea_mod.EA_CATEGORY_TYPES["ministry"], ["ministry_news"])
         check("통상 환경 → trade_news", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_news"])
         # 발표 기관 추출 — author(정책브리핑) 우선, 없으면 제목 첫머리 약칭
@@ -13936,6 +13936,94 @@ def cmd_selftest() -> int:
         _msg = ea_mod._ea_format_message(_ev)
         check("텔레그램 메시지에 제목·기관·요약·영향도·원문 전부 포함",
               all(s in _msg for s in ("산업가속화법", "산업통상부", "요약문", "높음", "x.test/a")), True)
+
+    if ea_mod is not None:
+        print("\n[16-3] 대외협력 개편 — 정책브리핑 보도자료 · 국회의안 발의자 · 우선순위(긴급/중요/관심/일반)")
+        import ea_crawl as _eac
+        _list_html = (
+            '<ul><li><a href="https://www.korea.kr/briefing/pressReleaseView.do?newsId=156784008&amp;pageIndex=1">'
+            '<span class="text"><strong class="is-truncated"></strong>'
+            '<span class="lead is-truncated">K-원전 팀코리아, 미국 진출 시동건다 - 원전수출기획위 개최 산업통상부는 …공급망···</span></span>'
+            '<span class="info"><span>2026.10.01</span><span>산업통상부</span></span></a></li>'
+            '<li><a href="/briefing/pressReleaseView.do?newsId=156784003">'
+            '<span class="text"><strong>(참고자료)배터리 재활용 지원 확대</strong>'
+            '<span class="lead">기후에너지환경부는 전지 재활용…</span></span>'
+            '<span class="info"><span>2026.09.30</span><span>기후에너지환경부</span></span></a></li></ul>')
+        _pr = _eac.parse_korea_press_list(_list_html)
+        check("보도자료 목록 — 링크·날짜·소관 부처 추출",
+              [(r["news_id"], r["date"], r["agency"]) for r in _pr],
+              [("156784008", "2026-10-01", "산업통상부"), ("156784003", "2026-09-30", "기후에너지환경부")])
+        check("보도자료 목록 — 제목이 비면 빈 값(상세에서 채운다), 있으면 그대로",
+              [r["title"] for r in _pr], ["", "(참고자료)배터리 재활용 지원 확대"])
+        check("보도자료 목록 — 본문 앞부분은 말줄임표를 떼고 담는다", _pr[0]["lead"].endswith("공급망"), True)
+        check("보도자료 상세 — h1 제목에서 (참고자료) 말머리를 뗀다",
+              _eac.parse_korea_press_title("<html><h1>(참고자료, 1(목) 16시엠바고)원전수출진흥과 팀코리아 진출</h1></html>"),
+              "원전수출진흥과 팀코리아 진출")
+        check("제목이 비면 본문 첫머리에서 임시 제목",
+              _eac._first_phrase("K-원전 팀코리아, 미국 진출 시동건다 - 원전수출기획위 개최"), "K-원전 팀코리아, 미국 진출 시동건다")
+
+        def _pv(**kw):
+            base = {"title": "", "summary": "", "impact_rationale": "", "law_name": "", "status": "",
+                    "group_companies": [], "impact_level": "", "d_day": None, "category": ""}
+            base.update(kw)
+            return base
+        check("우선순위 긴급 — 퓨처엠 직접(배터리) + 시행 단계",
+              ea_mod.ea_priority(_pv(title="이차전지 핵심광물 지원 확대", summary="내년 1월부터 시행한다"))[0], "긴급")
+        check("우선순위 중요 — 직접 영향이지만 임박 단계 없음",
+              ea_mod.ea_priority(_pv(title="양극재 기술 로드맵 논의", summary="간담회를 열었다"))[0], "중요")
+        check("우선순위 긴급 — 마감 D-7 이내도 임박",
+              ea_mod.ea_priority(_pv(title="배터리 안전 기준 행정예고", d_day=5))[0], "긴급")
+        check("우선순위 관심 — 다른 그룹사 사업만",
+              ea_mod.ea_priority(_pv(title="건설산업 규제 개선", group_companies=["포스코이앤씨"]))[0], "관심")
+        check("우선순위 일반 — 연결 없음", ea_mod.ea_priority(_pv(title="청소년 쉼터 운영 안내"))[0], "일반")
+        check("우선순위 — 이유 문장이 함께 나온다(기준이 보이게)",
+              "배터리" in ea_mod.ea_priority(_pv(title="배터리 규제", summary="공포"))[1], True)
+
+        check("발의자 이름 분리 — '의원'·'외 N인' 꼬리 제거",
+              ea_mod._split_names("김철수의원 외 12인, 이영희 의원, 박민수"), ["김철수", "이영희", "박민수"])
+        _mem_html = ("<table><tr><th>이름</th><th>정당</th></tr>"
+                     "<tr><td>김철수</td><td>더불어민주당</td></tr><tr><td>이영희</td><td>국민의힘</td></tr></table>")
+        check("발의자 명단 페이지 — 이름·정당 파싱",
+              ea_mod.parse_member_list_html(_mem_html),
+              [{"name": "김철수", "party": "더불어민주당"}, {"name": "이영희", "party": "국민의힘"}])
+        _real_roster = ea_mod._party_roster
+        ea_mod._party_roster = lambda: {"김철수": "더불어민주당", "이영희": "국민의힘", "박민수": ""}
+        check("의안 발의자 — 대표 먼저, 공동발의자 전원, 정당은 표에 있는 만큼(동명이인은 비움)",
+              ea_mod.resolve_bill_proposers({"_rst": "김철수", "_pub": "이영희, 박민수"}),
+              [{"name": "김철수", "party": "더불어민주당", "role": "대표"},
+               {"name": "이영희", "party": "국민의힘", "role": "공동"},
+               {"name": "박민수", "party": "", "role": "공동"}])
+        ea_mod._party_roster = _real_roster
+
+        _edb = ea_mod.EaDB(os.path.join(__import__("tempfile").mkdtemp(), "ea.db"))
+        _edb.exec("create table if not exists ea_policy_items (id TEXT primary key, url_source TEXT unique,"
+                  " url_canonical TEXT, item_type TEXT, title TEXT)")
+        _edb._ensure_cols()
+        check("sqlite — proposers 컬럼이 없던 DB 도 자동으로 보강한다",
+              "proposers" in {r["name"] for r in _edb.rows("pragma table_info(ea_policy_items)")}, True)
+
+        class _FakeT:
+            def __init__(self, store, fail):
+                self.store, self.fail = store, fail
+
+            def insert(self, row):
+                self.row = row
+                return self
+
+            def execute(self):
+                if self.fail and "proposers" in self.row:
+                    raise RuntimeError("Could not find the 'proposers' column of 'ea_policy_items' (PGRST204)")
+                self.store.append(self.row)
+
+        _store: list = []
+        _sdb = object.__new__(ea_mod.EaSupabaseDB)
+        _sdb._t = lambda name: _FakeT(_store, True)
+        check("Supabase — proposers 칼럼이 아직 없으면 그 칸만 빼고 저장(수집이 멈추지 않는다)",
+              (_sdb.insert_item({"id": "x", "proposers": "[]"}), _store), (True, [{"id": "x"}]))
+        _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
+                                "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
+                                "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})
+        check("항목 뷰 — 우선순위·발의자 포함", (_v["priority"], _v["proposers"][0]["name"]), ("긴급", "김철수"))
 
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))

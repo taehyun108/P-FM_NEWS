@@ -530,6 +530,143 @@ def crawl_kotra_news(service_key: str, rows: int = 100, pages: int = 2) -> list[
     return out
 
 
+# ── S6 · 정책브리핑(korea.kr) 보도자료 ─────────────────────────────────
+#   브리핑룸 > 보도자료 목록: https://www.korea.kr/briefing/pressReleaseList.do
+#   목록 한 줄(li > a) 에 링크(newsId)·본문 앞부분(span.lead)·날짜·소관 부처가 들어 있다.
+#   제목(strong)은 비어 있는 경우가 있어, 관련 항목으로 확정된 것만 상세(h1)에서 따로 읽는다.
+KOREA_KR = "https://www.korea.kr"
+_KOREA_PRESS_ID = re.compile(r"pressReleaseView\.do\?newsId=(\d+)")
+_KOREA_DATE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})$")
+_PRESS_TAG_WORDS = ("참고", "보도", "해명", "설명", "사진", "보충", "브리핑", "정정", "연합")
+_PRESS_TAG_OPEN = {"(": ")", "[": "]", "（": "）", "【": "】"}
+
+
+def _strip_press_tag(title: str) -> str:
+    """'(참고자료, 1(목) 16시엠바고)제목' → '제목'. 말머리 안에 괄호가 또 있어도 짝을 맞춰 뗀다."""
+    t = (title or "").strip()
+    while t and t[0] in _PRESS_TAG_OPEN and t[1:1 + 2] and any(t[1:].startswith(w) for w in _PRESS_TAG_WORDS):
+        close, depth = _PRESS_TAG_OPEN[t[0]], 0
+        end = -1
+        for i, ch in enumerate(t):
+            if ch in _PRESS_TAG_OPEN:
+                depth += 1
+            elif ch in (")", "]", "）", "】"):
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end < 0:
+            break
+        t = t[end + 1:].strip()
+    return t
+
+
+def _press_url(news_id: str) -> str:
+    return f"{KOREA_KR}/briefing/pressReleaseView.do?newsId={news_id}"
+
+
+def _first_phrase(lead: str, limit: int = 60) -> str:
+    """제목이 비어 있을 때 쓰는 임시 제목 — 본문 첫머리에서 문장·'- ' 구분 앞까지."""
+    t = _clean(lead)
+    t = re.split(r"\s-\s|[.。]\s|□|ㅇ", t, maxsplit=1)[0].strip(" -·")
+    return (t[:limit] + "…") if len(t) > limit else t
+
+
+def parse_korea_press_list(html: str) -> list[dict]:
+    """보도자료 목록 HTML → [{news_id, url, title, lead, date(ISO), agency}]. 순서는 화면 그대로(최신순)."""
+    soup = _soup(html)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        m = _KOREA_PRESS_ID.search(a["href"])
+        if not m or m.group(1) in seen:
+            continue
+        nid = m.group(1)
+        seen.add(nid)
+        strong = a.find("strong")
+        lead_el = a.find("span", class_="lead")
+        lead = _clean(lead_el.get_text(" ")) if lead_el else ""
+        lead = re.sub(r"[·…]{2,}\s*$", "", lead).strip()
+        # 날짜 span 과 그 다음 span(소관 부처)을 찾는다 — '2026.10.01' 다음의 글자가 부처명
+        texts = [_clean(x.get_text(" ")) for x in a.find_all(["span", "em", "b"])]
+        date_iso, agency = None, ""
+        for i, t in enumerate(texts):
+            dm = _KOREA_DATE.match(t)
+            if dm:
+                date_iso = _iso(*dm.groups())
+                for nxt in texts[i + 1:]:
+                    if nxt and not _KOREA_DATE.match(nxt) and "2026" not in nxt[:4] and len(nxt) <= 20:
+                        agency = nxt
+                        break
+                break
+        if not date_iso:        # span 구조가 달라도 글 끝의 '날짜 부처' 로 읽는다
+            full = _clean(a.get_text(" "))
+            tm = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\s*([가-힣A-Za-z·]{2,20})\s*$", full)
+            if tm:
+                date_iso, agency = _iso(*tm.groups()[:3]), tm.group(4)
+        out.append({"news_id": nid, "url": _press_url(nid),
+                    "title": _clean(strong.get_text(" ")) if strong else "",
+                    "lead": lead, "date": date_iso, "agency": agency})
+    return out
+
+
+def parse_korea_press_title(html: str) -> str:
+    """보도자료 상세 HTML 에서 제목(h1 → og:title). '(참고자료)' 같은 말머리는 뗀다."""
+    soup = _soup(html)
+    h1 = soup.find("h1")
+    title = _clean(h1.get_text(" ")) if h1 else ""
+    if not title:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        title = _clean(og.get("content", "")) if og else ""
+    return _strip_press_tag(title)
+
+
+def fetch_press_title(url: str) -> str:
+    """상세 페이지 1건 요청. 실패하면 빈 문자열."""
+    try:
+        return parse_korea_press_title(_get(url))
+    except Exception as exc:
+        log.debug("보도자료 제목 확보 실패 %s: %s", url, exc)
+        return ""
+
+
+def crawl_korea_press(days: int = 3, max_pages: int = 5) -> list[dict]:
+    """최근 days 일 보도자료를 최신순으로 훑는다(페이지당 약 20건, 페이지 수 상한 있음).
+
+    한 페이지가 통째로 기간 밖이면 거기서 멈춘다. 제목이 비어 있으면 _title_missing 로 표시해 둔다
+    (관련 항목으로 통과한 것만 collect_once 가 상세에서 제목을 채운다).
+    """
+    from datetime import timedelta
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=days)).isoformat()
+    end = today.isoformat()
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        try:
+            html = _get(f"{KOREA_KR}/briefing/pressReleaseList.do",
+                        {"pageIndex": page, "startDate": start, "endDate": end})
+        except Exception as exc:
+            log.warning("S6 정책브리핑 보도자료 목록 실패 (page=%d): %s", page, exc)
+            break
+        rows = parse_korea_press_list(html)
+        if not rows:
+            break
+        for r in rows:
+            title = _strip_press_tag(r["title"])
+            out.append({
+                "url_source": r["url"], "url_canonical": r["url"], "item_type": "policy_press",
+                "title": title or _first_phrase(r["lead"]), "_title_missing": not title,
+                "law_name": "", "agency": r["agency"] or "정책브리핑",
+                "notice_start": r["date"], "notice_end": None, "status": "정책 발표",
+                "opinion_url": "", "attachment_urls": [], "published_at": r["date"],
+                "_body": r["lead"],
+            })
+        if all((r["date"] or "9999") < start for r in rows):
+            break
+    log.info("S6 정책브리핑 보도자료 수집 %d건", len(out))
+    return out
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

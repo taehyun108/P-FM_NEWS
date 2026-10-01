@@ -241,7 +241,7 @@ create table if not exists ea_policy_items (
   id              TEXT primary key,
   url_source      TEXT not null unique,   -- 게이트(G2) 판정 키
   url_canonical   TEXT not null,
-  item_type       TEXT not null,          -- 'legislation'|'admin_notice'|'bill'|'ministry_news'|'trade_news'
+  item_type       TEXT not null,          -- 'legislation'|'admin_notice'|'bill'|'ministry_news'|'trade_news'|'policy_press'
   category        TEXT,                   -- 향후 선택 발송용 분류 (지금은 값만 채운다)
   title           TEXT not null,
   agency_id       TEXT references ea_agencies(id),
@@ -254,7 +254,8 @@ create table if not exists ea_policy_items (
   published_at    TEXT,
   collected_at    TEXT default CURRENT_TIMESTAMP,
   agency_raw      TEXT,                   -- 크롤 원문 부처명(시드에 없는 신설 부처 대비)
-  group_companies TEXT default '[]'       -- 규칙으로 판정한 관련 포스코 그룹사 (JSON 배열)
+  group_companies TEXT default '[]',      -- 규칙으로 판정한 관련 포스코 그룹사 (JSON 배열)
+  proposers       TEXT default '[]'       -- 의안 발의자 전원 JSON [{name,party,role}] (2026-10-02)
 );
 
 -- 대외협력 수집 실행 상태. 저장 0건이어도 '실행했다'를 남겨야
