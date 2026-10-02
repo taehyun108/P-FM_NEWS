@@ -3810,6 +3810,238 @@ def format_people_llm(parsed: dict, kind: str) -> str:
     return _join_capped(blocks, "\n\n", 1600)
 
 
+# ── 정부 부처 인사 — 이력(출생연도·학교·시험·경력) 인터넷 검색 보강 (사용자 지정 2026-10-02) ─────────────
+# 기사 본문에 이력이 없으면 인터넷 기사(프로필)에서 찾는다. 틀린 정보가 들어가면 안 되므로 AI 가 지어내지 않고,
+# '△1970년 △부산 △행시41회 △고려대 경제학과 △…' 같은 프로필 표기를 규칙으로만 읽는다.
+#  · 검색 결과 페이지에 '이름 + 소속/직책'이 같이 나와야 같은 사람으로 본다(동명이인 방지).
+#  · 출생연도·학교·시험은 서로 다른 사이트 2곳 이상에서 같으면 '교차확인', 1곳이면 '단일 출처'로 표시한다.
+#    사이트끼리 값이 다르면 그 항목은 아예 빼 버린다.
+#  · 항상 출처 주소를 같이 적어 화면에서 링크로 열 수 있게 한다.
+PEOPLE_CAREER_MAX = get_env_int("PEOPLE_CAREER_MAX", 4, 0)          # 기사 1건당 이력을 찾는 사람 수(0 이면 끔)
+PEOPLE_CAREER_PER_HOUR = get_env_int("PEOPLE_CAREER_PER_HOUR", 40, 0)   # 시간당 검색 인원 상한(비용·속도 보호)
+_career_times: list[float] = []
+_GOV_GRADE_RE = re.compile(r"과장급|국장급|실장급|부이사관|서기관|고위공무원|고공단|사무관|차관|청장|처장|장관|"
+                           r"본부장급|임용|보직\s*인사|인사\s*발령")
+_RANK_ORDER = ("장관", "차관", "청장", "처장", "위원장", "실장", "본부장", "국장", "관", "부이사관", "단장",
+               "과장", "팀장", "서기관")
+_AGENCY_IN_TITLE_RE = re.compile(r"([가-힣]{2,12}(?:부|처|청|위원회|공사|공단|연구원|진흥원|원))(?![가-힣])")
+_BLOCK_MARK_RE = re.compile(r"[△▲▷◆◇●○ㆍ]")
+_EXAM_RE = re.compile(r"(행시|행정고시|기술고시|입법고시|외무고시|외시|사법시험|사시)\s*(\d{1,3})\s*회")
+_SCHOOL_RE = re.compile(r"([가-힣A-Za-z]{2,12}(?:대학교|대학원|대))(?![가-힣])(?:\s*([가-힣]{2,12}(?:학과|과|학부)))?")
+_BIRTH4_RE = re.compile(r"(?<!\d)(19[4-9]\d|20[0-2]\d)\s*년(?:생)?(?![가-힣]*[월일])")
+_BIRTH2_RE = re.compile(r"(?<!\d)(\d{2})\s*년생")
+
+
+def is_gov_personnel(title: str, text: str) -> bool:
+    """정부 부처 인사 공지인가 — 직급 표현(과장급·국장급·부이사관 …)이 있으면 그렇다고 본다."""
+    return bool(_GOV_GRADE_RE.search(f"{title or ''}\n{(text or '')[:1500]}"))
+
+
+def _career_allow() -> bool:
+    now = time.monotonic()
+    while _career_times and now - _career_times[0] > 3600:
+        _career_times.pop(0)
+    if len(_career_times) >= PEOPLE_CAREER_PER_HOUR:
+        return False
+    _career_times.append(now)
+    return True
+
+
+def _rank_of(pos: str) -> int:
+    """직책 문자열의 높낮이(작을수록 높음). 이력을 찾을 사람을 높은 직책부터 고르는 데 쓴다."""
+    for i, w in enumerate(_RANK_ORDER):
+        if w in (pos or ""):
+            return i
+    return len(_RANK_ORDER)
+
+
+def extract_profile_blocks(text: str, name: str) -> list[dict]:
+    """페이지 글에서 '이름 … △1970년 △서울 △행시41회 △○○대 ○○학과 △경력…' 형태의 프로필 블록을 읽는다.
+
+    반환: [{head, birth, exam, school, career[]}] — head 는 이름 앞뒤 글(소속·직책 확인용)이다.
+    """
+    out: list[dict] = []
+    for m in re.finditer(re.escape(name), text or ""):
+        win = text[m.start(): m.start() + 520]
+        head = text[max(0, m.start() - 60): m.start() + 80]
+        marks = len(_BLOCK_MARK_RE.findall(win[:300]))
+        if marks < 2:       # 프로필 표기(△ 나열)가 아니면 본문 속 단순 언급이다
+            continue
+        nxt = re.search(r"\n\s*\n|(?<=[가-힣])\s[가-힣]{2,4}\s+[가-힣]{2,10}(?:장|관|원장|처장|청장)\s*[△▲]", win[len(name):])
+        if nxt:
+            win = win[: len(name) + nxt.start()]
+        rest = win[len(name):]
+        first_mark = _BLOCK_MARK_RE.search(rest)
+        preface = rest[:first_mark.start()] if first_mark else rest     # '국세청 차장' · '부산지방국세청장 70년생'
+        tokens = [t.strip(" ,·\n") for t in _BLOCK_MARK_RE.split(rest[first_mark.start():] if first_mark else "")
+                  if t.strip(" ,·\n")]
+        block: dict[str, Any] = {"head": head, "birth": "", "exam": "", "school": "", "career": []}
+        pb2, pb4 = _BIRTH2_RE.search(preface), _BIRTH4_RE.search(preface)
+        if pb4:
+            block["birth"] = pb4.group(1)
+        elif pb2:
+            yy = int(pb2.group(1))
+            block["birth"] = str((1900 if yy >= 30 else 2000) + yy)
+        for tk in tokens:
+            if not block["birth"]:
+                b4 = _BIRTH4_RE.search(tk)
+                b2 = _BIRTH2_RE.search(tk)
+                if b4 and len(tk) <= 12:
+                    block["birth"] = b4.group(1)
+                    continue
+                if b2 and len(tk) <= 12:
+                    yy = int(b2.group(1))
+                    block["birth"] = str((1900 if yy >= 30 else 2000) + yy)
+                    continue
+            ex = _EXAM_RE.search(tk)
+            if ex and not block["exam"] and len(tk) <= 14:
+                kind = {"행정고시": "행시", "외무고시": "외시", "사법시험": "사시"}.get(ex.group(1), ex.group(1))
+                block["exam"] = f"{kind}{ex.group(2)}회"
+                continue
+            sc = _SCHOOL_RE.search(tk)
+            if sc and not block["school"] and len(tk) <= 40:
+                block["school"] = (sc.group(1) + (" " + sc.group(2) if sc.group(2) else "")).strip()
+                continue
+            if len(tk) >= 3 and len(block["career"]) < 5 and not re.fullmatch(r"[가-힣]{2,4}", tk):
+                block["career"].append(tk[:40])
+        if block["birth"] or block["school"] or block["exam"]:
+            out.append(block)
+    return out
+
+
+def _search_profile_pages(ctx: Any, query: str, limit: int = 5) -> list[str]:
+    """프로필 기사 후보 URL. 네이버 검색 API 가 있으면 그것을, 없으면 Google 뉴스 RSS 를 쓴다."""
+    urls: list[str] = []
+    http = ctx.http
+    cfg = ctx.cfg
+    try:
+        if getattr(cfg, "naver_enabled", False):
+            resp = http.get(NAVER_NEWS_API, params={"query": query, "display": limit, "sort": "sim"},
+                            headers={"X-NCP-APIGW-API-KEY-ID": cfg.naver_client_id,
+                                     "X-NCP-APIGW-API-KEY": cfg.naver_client_secret})
+            resp.raise_for_status()
+            for it in (resp.json().get("items") or []):
+                u = it.get("originallink") or it.get("link") or ""
+                if u:
+                    urls.append(u)
+        else:
+            feedparser = _import("feedparser", "feedparser")
+            resp = http.get(GOOGLE_NEWS_RSS.format(q=urlencode({"q": query})[2:]))
+            resp.raise_for_status()
+            for e in feedparser.parse(resp.content).entries[:limit]:
+                if e.get("link"):
+                    urls.append(e["link"])
+    except Exception as exc:
+        log.debug("인물 이력 검색 실패 (%s): %s", query, exc)
+    return urls[:limit]
+
+
+def lookup_person_career(ctx: Any, name: str, agency: str, pos: str,
+                         search=None, fetch=None) -> dict:
+    """사람 1명의 이력을 인터넷 기사에서 찾아 검증한다. 못 찾으면 {}.
+
+    search(query) → URL 목록, fetch(url) → (최종URL, 본문글) 은 시험을 위해 바꿔 끼울 수 있다.
+    """
+    pos_core = next((w for w in _RANK_ORDER if w in (pos or "")), (pos or "").split()[-1] if pos else "")
+    query = " ".join(x for x in (name, agency, pos_core, "프로필") if x)
+    urls = (search or (lambda q: _search_profile_pages(ctx, q)))(query)
+    if fetch is None:
+        def fetch(u: str) -> tuple[str, str]:
+            final, html = resolve_canonical(ctx.http, u)
+            return final or u, (extract_body(html) if html else "")
+    agency_keys = [k for k in {agency, agency.replace("부", "") if agency.endswith("부") else agency} if k]
+    sources: list[dict] = []
+    seen_hosts: set[str] = set()
+    for u in urls:
+        if len(sources) >= 3:
+            break
+        try:
+            final, text = fetch(u)
+        except Exception as exc:
+            log.debug("프로필 페이지 조회 실패 %s: %s", u, exc)
+            continue
+        host = (urlsplit(final).hostname or "").lower()
+        if not text or host in seen_hosts:
+            continue
+        for blk in extract_profile_blocks(text, name):
+            head = blk["head"]
+            # 같은 사람 확인 — 이름 앞뒤에 소속(부처)이나 직책이 나와야 한다
+            if (agency_keys and any(k in head for k in agency_keys)) or (pos_core and pos_core in head):
+                seen_hosts.add(host)
+                sources.append({"url": final, "host": host, **blk})
+                break
+    if not sources:
+        return {}
+    info: dict[str, Any] = {"sources": [x["url"] for x in sources], "facts": {}}
+    for key in ("birth", "school", "exam"):
+        vals = [(x[key], x["url"]) for x in sources if x.get(key)]
+        distinct = {v for v, _ in vals}
+        if len(distinct) == 1:
+            info["facts"][key] = (vals[0][0], len(vals))
+        # 값이 서로 다르면(동명이인·오기 가능성) 빼 버린다
+    # 경력은 가장 많이 적힌 출처 하나의 것을 그대로 옮긴다(여러 사이트를 섞지 않는다)
+    best = max(sources, key=lambda x: len(x["career"]))
+    info["career"] = best["career"]
+    if not info["facts"] and not info["career"]:
+        return {}
+    return info
+
+
+def format_career_line(info: dict) -> str:
+    """lookup_person_career 결과 → 카드의 '   · 이력: …' 한 줄. 출처 주소를 끝에 붙인다(화면에서 링크가 된다)."""
+    if not info:
+        return ""
+    f = info["facts"]
+    bits = []
+    if "birth" in f:
+        bits.append(f"{f['birth'][0]}년생")
+    if "school" in f:
+        bits.append(f["school"][0])
+    if "exam" in f:
+        bits.append(f["exam"][0])
+    if info.get("career"):
+        bits.append("경력: " + " → ".join(info["career"]))
+    confirmed = [k for k, (_, n) in f.items() if n >= 2]
+    tag = f"교차확인 {len(info['sources'])}곳" if confirmed and len(confirmed) == len(f) \
+        else "단일 출처 — 원문 확인 필요" if len(info["sources"]) == 1 else f"출처 {len(info['sources'])}곳"
+    return "   · 이력: " + " · ".join(bits) + f" ({tag}) " + " ".join(info["sources"][:3])
+
+
+def enrich_people_careers(ctx: Any, text: str, title: str, lookup=None) -> str:
+    """정부 부처 인사 명단 텍스트의 높은 직책 사람 아래에 '이력' 줄을 끼워 넣는다. 못 찾으면 원문 그대로."""
+    if not text or PEOPLE_CAREER_MAX <= 0 or not is_gov_personnel(title, text):
+        return text
+    lines = text.splitlines()
+    people: list[tuple[int, int, str, str]] = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"^ㆍ([가-힣]{2,4}) · (.+?)(?: \(|$)", ln)
+        if m:
+            people.append((_rank_of(m.group(2)), i, m.group(1), m.group(2)))
+    people.sort(key=lambda t: (t[0], t[1]))
+    am = _AGENCY_IN_TITLE_RE.search(re.sub(r"\[[^\]]*\]", "", title or ""))
+    agency = am.group(1) if am else ""
+    found: dict[int, str] = {}
+    for _rank, i, name, pos in people[:PEOPLE_CAREER_MAX]:
+        if lookup is None and not _career_allow():
+            break
+        try:
+            info = (lookup or (lambda n, a, p: lookup_person_career(ctx, n, a, p)))(name, agency, pos)
+        except Exception as exc:
+            log.debug("이력 검색 실패 %s: %s", name, exc)
+            continue
+        line = format_career_line(info)
+        if line:
+            found[i] = line
+    if not found:
+        return text
+    out: list[str] = []
+    for i, ln in enumerate(lines):
+        out.append(ln)
+        if i in found:
+            out.append(found[i])
+    return "\n".join(out)
+
+
 def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
                    use_llm: bool, html: str = "") -> tuple[str, str, dict]:
     """인사·부고 요약 텍스트를 만든다. 반환: (요약, 사용 모델, 토큰 usage).
@@ -3822,7 +4054,10 @@ def people_summary(ctx: Context, kind: str, title: str, press: str, body: str,
     # 20명에서 끊어 뒤 섹션(전보)이 빠졌고, 사이드바의 엉뚱한 글을 요약하기도 했다(2026-10-01).
     # 명단을 못 찾으면 지어내지 않고 그 사실을 알린다. LLM 비용도 0이다.
     if kind == "personnel":
-        return (format_people_notice(notice, kind, title) or PEOPLE_NO_LIST_MSG), PEOPLE_RULE_MODEL, {}
+        text = format_people_notice(notice, kind, title)
+        if text and hasattr(ctx, "http"):
+            text = enrich_people_careers(ctx, text, title)     # 정부 부처 인사면 이력 보강(검증·출처 포함)
+        return (text or PEOPLE_NO_LIST_MSG), PEOPLE_RULE_MODEL, {}
     if use_llm:
         parsed, usage = ctx.llm.people_notice(kind, title, press, notice)
         text = format_people_llm(parsed, kind) if parsed else ""
@@ -10469,6 +10704,8 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
     이미 구조화된(요약이 'ㆍ'로 시작) 카드는 건너뛴다 — `repeople all` 이면 전부 다시.
     limit 로 LLM 호출 수를 제한한다(비용 관리). `repeople 20` 처럼 쓴다.
     """
+    global PEOPLE_CAREER_PER_HOUR
+    PEOPLE_CAREER_PER_HOUR = max(PEOPLE_CAREER_PER_HOUR, 400)   # 일회성 재정리는 시간당 검색 상한을 넉넉히
     rows = [r for r in ctx.storage.list_articles(8000, 0, None, "")
             if PEOPLE_NEWS_CATEGORY in jload(r.get("categories"), [])]
     if not force:
@@ -12355,6 +12592,52 @@ def cmd_selftest() -> int:
     check("에코프로 — 승진·내정 문장만(배경 설명·인물 칭찬 문장은 뺀다)",
           (len(_eco_out), "최상운" in _eco_out[0], any("조직 안정" in x for x in _eco_out),
            any("단행했다고" in x for x in _eco_out)), (2, True, False, False))
+
+    # 정부 부처 인사 이력 보강(2026-10-02) — 프로필 기사 표기(△1970년 △부산 △행시41회 △○○대 …)를 규칙으로만 읽고,
+    # 같은 사람인지(이름+소속·직책)·사이트 간 일치 여부를 검증한 뒤 출처 링크와 함께 쓴다.
+    _pf1 = ("고위공무원 가급(4명) 이성진 국세청 차장 △1970년 △부산 △행시41회 △해운대고, 고려대 경제학과 "
+            "△목포세무서장 △미국, Nelson mullins(교육훈련) △국세청 법인납세국장\n\n다른 문단")
+    _pf2 = "이성진 국세청 차장 70년생 △부산 △해운대고 △고려대 경제학과 △행시41회 △목포세무서장 △국세청 법인납세국장"
+    _pf3 = "이성진 국세청 차장 71년생 △부산 △행시41회 △고려대 경제학과"
+    _pfb = extract_profile_blocks(_pf1, "이성진")[0]
+    check("프로필 표기 읽기 — 출생·시험·학교·경력(소속 직책 머리말은 경력에 안 섞인다)",
+          (_pfb["birth"], _pfb["exam"], _pfb["school"], _pfb["career"][0]),
+          ("1970", "행시41회", "고려대 경제학과", "목포세무서장"))
+    check("프로필 표기 읽기 — '70년생' 두 자리 연도는 1970 으로",
+          extract_profile_blocks("이동운 부산지방국세청장 70년생 △서울 △서울대 경영학과 △행시37회", "이동운")[0]["birth"], "1970")
+    check("본문 속 단순 언급(△ 나열 아님)은 프로필로 안 읽는다",
+          extract_profile_blocks("이성진 차장은 어제 기자간담회를 열었다.", "이성진"), [])
+    _pages = {"https://a.example/p": _pf1, "https://b.example/p": _pf2}
+    _info = lookup_person_career(None, "이성진", "국세청", "차장", search=lambda q: list(_pages),
+                                 fetch=lambda u: (u, _pages[u]))
+    check("이력 검증 — 두 사이트가 같으면 교차확인, 출처 둘",
+          (_info["facts"]["birth"], _info["facts"]["school"], len(_info["sources"])),
+          (("1970", 2), ("고려대 경제학과", 2), 2))
+    _line = format_career_line(_info)
+    check("이력 줄 — 교차확인 표시 + 출처 주소 + 경력", ("교차확인 2곳" in _line, "https://a.example/p" in _line, "목포세무서장" in _line),
+          (True, True, True))
+    _pages2 = {"https://a.example/p": _pf1, "https://c.example/p": _pf3}
+    _info2 = lookup_person_career(None, "이성진", "국세청", "차장", search=lambda q: list(_pages2),
+                                  fetch=lambda u: (u, _pages2[u]))
+    check("이력 검증 — 사이트끼리 출생연도가 다르면 그 항목은 뺀다(나머지는 일치하면 유지)",
+          ("birth" in _info2["facts"], _info2["facts"]["school"][0]), (False, "고려대 경제학과"))
+    _other = {"https://d.example/p": "이성진 △1980년 △서울 △행시50회 △서울대 법학과 △법무법인 대표"}
+    check("같은 이름이라도 소속·직책이 안 나오면 다른 사람으로 보고 버린다",
+          lookup_person_career(None, "이성진", "국세청", "차장", search=lambda q: list(_other),
+                               fetch=lambda u: (u, _other[u])), {})
+    check("검색이 아무것도 못 찾으면 빈 결과(지어내지 않는다)",
+          lookup_person_career(None, "이성진", "국세청", "차장", search=lambda q: [], fetch=lambda u: (u, "")), {})
+    _gov_txt = "ㆍ김태현 · 첨단민군협력과장 (과장급 승진)\nㆍ이도윤 · 서울고검 차장검사 (전보)"
+    _enr = enrich_people_careers(None, _gov_txt, "[인사] 산업통상부 과장급 전보",
+                                 lookup=lambda n, a, p: {"facts": {"birth": ("1975", 2)}, "sources": ["https://x/1", "https://y/1"],
+                                                         "career": ["산업정책과장"]} if n == "김태현" else {})
+    check("이력 보강 — 해당자 줄 바로 아래에 이력 줄, 못 찾은 사람은 그대로",
+          _enr.splitlines()[:3], ["ㆍ김태현 · 첨단민군협력과장 (과장급 승진)",
+                                  "   · 이력: 1975년생 · 경력: 산업정책과장 (교차확인 2곳) https://x/1 https://y/1",
+                                  "ㆍ이도윤 · 서울고검 차장검사 (전보)"])
+    check("이력 보강 — 정부 직급 표현이 없는 기업 인사는 건드리지 않는다",
+          enrich_people_careers(None, "ㆍ김민수 (한화에너지)", "[인사] 한화에너지", lookup=lambda *a: {"facts": {}, "sources": ["u"], "career": ["x"]}),
+          "ㆍ김민수 (한화에너지)")
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))
