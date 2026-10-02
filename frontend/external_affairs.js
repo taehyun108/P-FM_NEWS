@@ -13,23 +13,20 @@
   // 카테고리(예전의 상단 탭) — 이제 필터의 '카테고리' 칩 행이다. 단일 선택.
   //  kind 'items' : /api/ea/items          kind 'news' : /api/ea/{news}(기사 재사용)
   var CATS = [
-    { key: 'notice',   label: '입법·행정예고', kind: 'items', types: 'legislation,admin_notice',
-      sort: 'deadline', hasDeadline: true },
-    { key: 'bill',     label: '국회 의안',     kind: 'items', types: 'bill',
-      sort: 'deadline', hasDeadline: true },
-    { key: 'policy',   label: '정책 동향',     kind: 'news',  news: '/api/ea/policy-news' },
-    { key: 'trade',    label: '통상 환경',     kind: 'news',  news: '/api/ea/trade-news' },
-    { key: 'ministry', label: '부처별 동향',   kind: 'items', types: 'ministry_news',
-      sort: 'recent', hasDeadline: false }
+    { key: 'policy', label: '정책 동향', kind: 'items', types: 'policy_press',
+      sort: 'priority', hasDeadline: false, layout: 'policy' },
+    { key: 'bill',   label: '국회 의안', kind: 'items', types: 'bill',
+      sort: 'priority', hasDeadline: false, layout: 'bill' }
   ];
-  var IMPACT_LABEL = { high: '영향 높음', medium: '영향 보통', low: '영향 낮음', none: '영향 없음' };
+  // 우선순위 4단계 — 기준은 화면의 '기준 보기'와 같은 말이다(백엔드 ea_priority 규칙).
+  var PRIORITIES = ['긴급', '중요', '관심', '일반'];
+  var PRIORITY_CLASS = { '긴급': 'is-urgent', '중요': 'is-important', '관심': 'is-interest', '일반': 'is-normal' };
 
   var eaState = {
-    open: false, loaded: false, cat: 'notice',
-    agency: new Set(), impact: new Set(), group: new Set(),   // 중복 선택 (칩)
-    status: '', due: '', sort: 'deadline', q: '',              // 단일 (드롭다운/검색)
-    page: 1, loading: false, filterCollapsed: false,
-    newsAgencies: []   // policy·trade 에서 로드한 항목으로 채운 기관 칩 목록
+    open: false, loaded: false, cat: 'policy',
+    agency: new Set(), priority: new Set(), group: new Set(),   // 중복 선택 (칩)
+    status: '', due: '', sort: 'priority', q: '',              // 단일 (드롭다운/검색)
+    page: 1, loading: false, filterCollapsed: false
   };
 
   function $(id) { return document.getElementById(id); }
@@ -77,25 +74,28 @@
       b.type = 'button';
       b.setAttribute('aria-pressed',
         String(single ? selected === key : selected.has(key)));
-      b.addEventListener('click', function () { onToggle(key); });
+      b.addEventListener('click', function () {
+        onToggle(key);
+        if (!single) { b.setAttribute('aria-pressed', String(selected.has(key))); }   // 선택 표시를 바로 반영
+      });
       return b;
     }));
   }
 
   /* ── URL: 경로(/ea) + ea_ 접두사 쿼리 ── */
-  var EA_KEYS = ['ea_cat', 'ea_agency', 'ea_group', 'ea_impact', 'ea_status', 'ea_due',
+  var EA_KEYS = ['ea_cat', 'ea_agency', 'ea_group', 'ea_priority', 'ea_status', 'ea_due',
     'ea_q', 'ea_sort', 'ea_page'];
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
-    eaState.cat = p.get('ea_cat') || 'notice';
+    eaState.cat = p.get('ea_cat') === 'bill' ? 'bill' : 'policy';
     eaState.agency = new Set((p.get('ea_agency') || '').split(',').filter(Boolean));
     eaState.group = new Set((p.get('ea_group') || '').split(',').filter(Boolean));
-    eaState.impact = new Set((p.get('ea_impact') || '').split(',').filter(Boolean));
+    eaState.priority = new Set((p.get('ea_priority') || '').split(',').filter(Boolean));
     eaState.status = p.get('ea_status') || '';
     eaState.due = p.get('ea_due') || '';
     eaState.q = p.get('ea_q') || '';
-    eaState.sort = p.get('ea_sort') || currentCat().sort || 'deadline';
+    eaState.sort = p.get('ea_sort') || currentCat().sort || 'priority';
     eaState.page = Math.max(1, parseInt(p.get('ea_page') || '1', 10) || 1);
   }
 
@@ -105,10 +105,10 @@
     var path = location.pathname;
     if (eaState.open) {
       path = EA_PATH;
-      if (eaState.cat !== 'notice') { p.set('ea_cat', eaState.cat); }
+      if (eaState.cat !== 'policy') { p.set('ea_cat', eaState.cat); }
       if (eaState.agency.size) { p.set('ea_agency', csv(eaState.agency)); }
       if (eaState.group.size) { p.set('ea_group', csv(eaState.group)); }
-      if (eaState.impact.size) { p.set('ea_impact', csv(eaState.impact)); }
+      if (eaState.priority.size) { p.set('ea_priority', csv(eaState.priority)); }
       if (eaState.status) { p.set('ea_status', eaState.status); }
       if (eaState.due) { p.set('ea_due', eaState.due); }
       if (eaState.q) { p.set('ea_q', eaState.q); }
@@ -124,7 +124,7 @@
   }
 
   function activeFilterCount() {
-    return eaState.agency.size + eaState.impact.size + eaState.group.size
+    return eaState.agency.size + eaState.priority.size + eaState.group.size
       + (eaState.status ? 1 : 0) + (eaState.due ? 1 : 0) + (eaState.q ? 1 : 0);
   }
 
@@ -149,30 +149,6 @@
     box.hidden = false;
   }
 
-  /* ── 포토카드 상단 배너 (썸네일 자리) ── */
-  function eaThumb(cat, big, sub, cls) {
-    var t = el('div', 'ea-thumb ' + (cls || 'is-open'));
-    t.append(el('span', 'ea-thumb-cat', cat));
-    var m = el('div', 'ea-thumb-metric');
-    m.append(el('b', null, big));
-    if (sub) { m.append(el('span', null, sub)); }
-    t.append(m);
-    return t;
-  }
-
-  /* 예고·부처동향 항목의 D-day → 배너 문구 */
-  function ddayThumb(it) {
-    var d = it.d_day;
-    if (d === null || d === undefined) {
-      return eaThumb(currentCat().label, '상시', it.status || '기한 없음', 'is-closed');
-    }
-    if (d < 0) { return eaThumb(currentCat().label, '마감', fmtDate(it.notice_end), 'is-closed'); }
-    var end = fmtDate(it.notice_end);
-    if (d <= 3) { return eaThumb(currentCat().label, 'D-' + d, '제출 마감 임박', 'is-urgent'); }
-    if (d <= 7) { return eaThumb(currentCat().label, 'D-' + d, end + ' 까지', 'is-soon'); }
-    return eaThumb(currentCat().label, 'D-' + d, end + ' 까지', 'is-open');
-  }
-
   /* 텔레그램 전송 버튼 — 뉴스 카드의 '↗ 직접 전송'과 같은 direct-send 방식.
      endpoint 만 다르게 넘긴다(기사=/api/articles/.., 대외협력 항목=/api/ea/items/..). */
   function telegramButton(endpoint) {
@@ -195,100 +171,99 @@
     return btn;
   }
 
-  /* ── 항목 카드 (예고·부처동향) — 뉴스 포토카드와 같은 세로 카드 ── */
-  function buildCard(it) {
-    var card = el('article', 'ea-card');
-    card.append(ddayThumb(it));
+  /* ── 우선순위 배지 — 마우스를 올리면(또는 눌러서) 그렇게 분류한 이유가 나온다 ── */
+  function prioBadge(it) {
+    var b = el('span', 'ea-prio ' + (PRIORITY_CLASS[it.priority] || 'is-normal'), it.priority || '일반');
+    if (it.priority_reason) { b.title = it.priority_reason; }
+    return b;
+  }
 
+  /* 긴 요약은 접어 둔다 — '주요 내용'은 끝까지 읽을 수 있어야 한다 */
+  function foldable(textEl, maxLines) {
+    var wrap = el('div', 'ea-fold');
+    wrap.append(textEl);
+    var text = textEl.textContent || '';
+    if (text.length > 160) {
+      textEl.classList.add('is-folded');
+      textEl.style.setProperty('--fold-lines', String(maxLines));
+      var more = el('button', 'ea-fold-btn', '더보기 ▾');
+      more.type = 'button';
+      more.addEventListener('click', function () {
+        var folded = textEl.classList.toggle('is-folded');
+        more.textContent = folded ? '더보기 ▾' : '접기 ▴';
+      });
+      wrap.append(more);
+    }
+    return wrap;
+  }
+
+  function party(p) { return p.party ? p.name + '(' + p.party + ')' : p.name; }
+
+  /* ── 항목 카드 — 정책 동향: [등급] 제목 / 소관 / 주요 내용 · 국회 의안: [등급] 제목 / 발의 의원 전원 / 주요 내용 ── */
+  function buildCard(it) {
+    var isBill = currentCat().layout === 'bill';
+    var card = el('article', 'ea-card ea-card--flat');
     var body = el('div', 'ea-card-body');
+
+    var head = el('div', 'ea-card-head');
+    head.append(prioBadge(it));
+    head.append(el('span', 'ea-card-date', fmtDate(it.published_at || it.notice_start)));
+    body.append(head);
+
     var h = el('h3', 'ea-card-title');
     h.append(link(it.title, it.url));
     body.append(h);
 
-    var bits = [];
-    if (it.agency) { bits.push(it.agency); }
-    if (it.law_name) { bits.push(it.law_name); }
-    if (it.notice_start || it.notice_end) {
-      bits.push(fmtDate(it.notice_start) + ' ~ ' + (fmtDate(it.notice_end) || '미정'));
+    if (!isBill) {
+      // 기자명 자리에 '소관: 부처'
+      var own = el('p', 'ea-card-sub');
+      own.append(el('b', null, '소관: '), document.createTextNode(it.agency || '확인 불가'));
+      body.append(own);
+    } else {
+      var ps = it.proposers || [];
+      var who = el('div', 'ea-proposers');
+      if (ps.length) {
+        var rep = ps[0];
+        who.append(el('b', null, '발의: '));
+        who.append(document.createTextNode(party(rep) + (ps.length > 1 ? ' 외 ' + (ps.length - 1) + '인' : '')));
+        if (ps.length > 1) {
+          var all = el('p', 'ea-proposer-all is-folded', ps.map(party).join(', '));
+          var tog = el('button', 'ea-fold-btn', '발의 의원 ' + ps.length + '명 전원 보기 ▾');
+          tog.type = 'button';
+          tog.addEventListener('click', function () {
+            var f = all.classList.toggle('is-folded');
+            tog.textContent = f ? '발의 의원 ' + ps.length + '명 전원 보기 ▾' : '접기 ▴';
+          });
+          who.append(tog, all);
+        }
+      } else {
+        who.append(el('b', null, '발의: '));
+        who.append(document.createTextNode('발의 의원 정보를 가져오지 못했습니다 — 의안정보시스템 원문에서 확인하세요'));
+      }
+      body.append(who);
+      var sub = [it.agency && ('소관위: ' + it.agency), it.status].filter(Boolean).join(' · ');
+      if (sub) { body.append(el('p', 'ea-card-sub', sub)); }
     }
-    if (it.status) { bits.push(it.status); }
-    body.append(el('p', 'ea-card-sub', bits.join(' · ')));
 
     var tags = el('div', 'ea-tags');
     var seen = {};
     (it.group_companies || []).forEach(function (g) {
       if (g && !seen[g]) { seen[g] = 1; tags.append(el('span', 'ea-tag is-group', g)); }
     });
-    if (it.category && !seen[it.category]) {
-      seen[it.category] = 1; tags.append(el('span', 'ea-tag is-cat', it.category));
-    }
-    if (it.impact_level) {
-      tags.append(el('span', 'ea-tag ea-impact-' + it.impact_level,
-        IMPACT_LABEL[it.impact_level] || it.impact_level));
-    }
-    (it.affected_areas || []).forEach(function (x) {
-      if (x && !seen[x]) { seen[x] = 1; tags.append(el('span', 'ea-tag', x)); }
-    });
     if (tags.childNodes.length) { body.append(tags); }
 
-    if (it.summary) { body.append(el('p', 'ea-summary', it.summary)); }
-    if (it.impact_rationale) {
-      var r = el('div', 'ea-rationale');
-      r.append(el('b', null, '근거 '));
-      r.append(document.createTextNode(it.impact_rationale));
-      body.append(r);
-    }
-    if (it.suggested_action) {
-      var s = el('div', 'ea-rationale');
-      s.append(el('b', null, '대응(초안) '));
-      s.append(document.createTextNode(it.suggested_action));
-      body.append(s);
+    var sum = el('p', 'ea-summary', it.summary || '요약을 아직 만들지 못했습니다 — 원문에서 확인하세요');
+    var sumBox = el('div', 'ea-summary-box');
+    sumBox.append(el('b', 'ea-summary-label', '주요 내용'));
+    sumBox.append(foldable(sum, 5));
+    body.append(sumBox);
+    if (it.priority_reason) {
+      body.append(el('p', 'ea-prio-why', '분류 이유: ' + it.priority_reason));
     }
 
     var acts = el('div', 'ea-actions');
-    acts.append(link('원문', it.url));
-    if (it.opinion_url) { acts.append(link('의견 제출', it.opinion_url, 'is-primary')); }
-    (it.attachment_urls || []).forEach(function (u, i) {
-      acts.append(link('첨부 ' + (i + 1), u));
-    });
+    acts.append(link(isBill ? '의안정보시스템 원문' : '정책브리핑 원문', it.url));
     acts.append(telegramButton('/api/ea/items/' + it.id + '/telegram'));
-    body.append(acts);
-
-    card.append(body);
-    return card;
-  }
-
-  /* ── 정책/통상 뉴스 카드 — 같은 포토카드 형식 ── */
-  function buildNewsCard(n) {
-    var card = el('article', 'ea-card');
-    var s = Number(n.score) || 0;
-    var cls = s >= 66 ? 'is-urgent' : (s >= 40 ? 'is-soon' : 'is-open');
-    card.append(eaThumb(currentCat().label, String(s), '중요도', cls));
-
-    var body = el('div', 'ea-card-body');
-    var h = el('h3', 'ea-card-title');
-    h.append(link(n.title, n.url));
-    body.append(h);
-    body.append(el('p', 'ea-card-sub',
-      [n.agency || n.press, fmtDate(n.published_at)].filter(Boolean).join(' · ')));
-
-    var tags = el('div', 'ea-tags');
-    (n.group_companies || []).forEach(function (g) {
-      tags.append(el('span', 'ea-tag is-group', g));
-    });
-    if (n.impact_level) {
-      tags.append(el('span', 'ea-tag ea-impact-' + n.impact_level,
-        IMPACT_LABEL[n.impact_level] || n.impact_level));
-    }
-    if (tags.childNodes.length) { body.append(tags); }
-
-    if (n.summary) { body.append(el('p', 'ea-summary', n.summary)); }
-    var acts = el('div', 'ea-actions');
-    acts.append(link('원문', n.url));
-    var sendUrl = n.source === 'article'
-      ? '/api/articles/' + n.id + '/telegram'
-      : '/api/ea/items/' + n.id + '/telegram';
-    acts.append(telegramButton(sendUrl));
     body.append(acts);
 
     card.append(body);
@@ -301,9 +276,9 @@
       if (eaState.cat === key) { return; }
       eaState.cat = key;
       eaState.page = 1;
-      eaState.agency.clear(); eaState.impact.clear(); eaState.group.clear();
+      eaState.agency.clear(); eaState.priority.clear(); eaState.group.clear();
       eaState.status = ''; eaState.due = '';
-      eaState.sort = currentCat().sort || 'deadline';
+      eaState.sort = currentCat().sort || 'priority';
       renderCatChips();
       applyRowVisibility();
       loadFilters().then(load);
@@ -313,14 +288,15 @@
 
   function applyRowVisibility() {
     var c = currentCat();
-    var isNews = c.kind === 'news';
-    $('eaAgencyRow').hidden = false;                     // 기관은 모든 카테고리
-    $('eaImpactRow').hidden = isNews;                    // 영향도·그룹사는 예고·부처동향만
-    $('eaGroupRow').hidden = isNews;
-    $('eaMiscRow').hidden = isNews;                      // 정렬·상태·마감은 items 만
-    $('eaSort').hidden = isNews;
-    $('eaStatus').hidden = isNews || !c.hasDeadline;
-    $('eaDue').hidden = isNews || !c.hasDeadline;
+    $('eaAgencyRow').hidden = false;
+    $('eaPriorityRow').hidden = false;
+    $('eaGroupRow').hidden = false;
+    $('eaMiscRow').hidden = false;
+    $('eaSort').hidden = false;
+    $('eaStatus').hidden = c.layout !== 'bill';     // 의안만 '상태'(심사 단계)가 의미 있다
+    $('eaDue').hidden = true;
+    var lab = document.querySelector('#eaAgencyRow .filter-label');
+    if (lab) { lab.firstChild.textContent = c.layout === 'bill' ? '소관위 ' : '소관 부처 '; }
   }
 
   function fillSelect(sel, options, value, placeholder) {
@@ -343,9 +319,7 @@
       }), eaState.status, '상태 전체');
       fillSelect($('eaDue'), d.dues || [], eaState.due, '마감 전체');
 
-      var agencies = c.kind === 'news'
-        ? eaState.newsAgencies.map(function (a) { return { key: a, label: a }; })
-        : (d.agencies || []);
+      var agencies = d.agencies || [];
       // 카테고리가 바뀌어 선택된 기관이 목록에 없으면 해제
       Array.from(eaState.agency).forEach(function (k) {
         if (!agencies.some(function (a) { return a.key === k; })) { eaState.agency.delete(k); }
@@ -353,9 +327,8 @@
       renderChips($('eaAgencyChips'), agencies, eaState.agency, function (key) {
         toggleSet(eaState.agency, key); load();
       });
-      renderChips($('eaImpactChips'), d.impacts || [], eaState.impact, function (key) {
-        toggleSet(eaState.impact, key); load();
-      });
+      renderChips($('eaPriorityChips'), d.priorities || PRIORITIES.map(function (k) { return { key: k, label: k }; }),
+        eaState.priority, function (key) { toggleSet(eaState.priority, key); load(); });
       renderChips($('eaGroupChips'), d.groups || [], eaState.group, function (key) {
         toggleSet(eaState.group, key); load();
       });
@@ -429,41 +402,15 @@
     }));
     var done = function () { eaState.loading = false; };
 
-    if (c.kind === 'news') {
-      var np = new URLSearchParams();
-      np.set('limit', '80');
-      if (eaState.agency.size) { np.set('agency', csv(eaState.agency)); }
-      getJSON(c.news + '?' + np.toString()).then(function (d) {
-        var items = d.items || [];
-        if (!eaState.agency.size) {
-          var set = {};
-          items.forEach(function (x) { if (x.agency) { set[x.agency] = 1; } });
-          eaState.newsAgencies = Object.keys(set).sort();
-          renderChips($('eaAgencyChips'),
-            eaState.newsAgencies.map(function (a) { return { key: a, label: a }; }),
-            eaState.agency, function (key) { toggleSet(eaState.agency, key); load(); });
-        }
-        var start = (eaState.page - 1) * EA_PAGE_SIZE;
-        $('eaCount').textContent = items.length.toLocaleString('ko-KR') + '건';
-        renderPager(items.length);
-        if (!items.length) { showState('', '최근 45일 내 해당 자료가 없습니다.'); return; }
-        $('eaList').replaceChildren.apply($('eaList'),
-          items.slice(start, start + EA_PAGE_SIZE).map(buildNewsCard));
-      }).catch(function () {
-        showState('is-error', '자료를 불러오지 못했습니다.');
-      }).finally(done);
-      return;
-    }
-
     var p = new URLSearchParams();
     p.set('item_type', c.types);
     if (eaState.agency.size) { p.set('agency', csv(eaState.agency)); }
     if (eaState.group.size) { p.set('group', csv(eaState.group)); }
-    if (eaState.impact.size) { p.set('impact', csv(eaState.impact)); }
+    if (eaState.priority.size) { p.set('priority', csv(eaState.priority)); }
     if (eaState.status) { p.set('status', eaState.status); }
     if (eaState.due) { p.set('due', eaState.due); }
     if (eaState.q) { p.set('q', eaState.q); }
-    p.set('sort', eaState.sort || c.sort || 'deadline');
+    p.set('sort', eaState.sort || c.sort || 'priority');
     p.set('page', String(eaState.page));
     p.set('size', String(EA_PAGE_SIZE));
 
@@ -486,18 +433,14 @@
   function loadStats() {
     return getJSON('/api/ea/stats').then(function (s) {
       renderAlert(s);
-      var msg = '수집 ' + s.total + '건 · 예고중 ' + s.open + '건 · 분석 ' + s.analyzed + '건';
-      var rest = s.sources_rest || {};
-      var api = Object.keys(rest).filter(function (k) { return rest[k]; });
-      msg += api.length ? ' · API: ' + api.join(',') : ' · 수집: 크롤링';
-      $('eaMeta').textContent = msg;
+      $('eaMeta').textContent = '수집 ' + s.total + '건 · 분석 ' + s.analyzed + '건 · 매일 09시·15시 갱신';
     }).catch(function () {
       $('eaMeta').textContent = '현황을 불러오지 못했습니다.';
     });
   }
 
   function clearAll() {
-    eaState.agency.clear(); eaState.impact.clear(); eaState.group.clear();
+    eaState.agency.clear(); eaState.priority.clear(); eaState.group.clear();
     eaState.status = ''; eaState.due = ''; eaState.q = '';
     eaState.page = 1;
     $('eaSearch').value = '';

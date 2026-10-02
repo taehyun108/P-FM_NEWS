@@ -150,3 +150,27 @@
 @media (max-width: 660px) {
   .ea-thumb { aspect-ratio: 16 / 6; }
 }
+
+/* ── 개편(2026-10-02): 정책 동향·국회 의안 카드 — 썸네일 없이 [등급] 제목 / 소관·발의 / 주요 내용 ── */
+.ea-card--flat { min-height: 0; }
+.ea-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.ea-card-date { font-size: 11.5px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.ea-prio { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 800; cursor: help; }
+.ea-prio.is-urgent    { background: #b3261e; color: #fff; }
+.ea-prio.is-important { background: #a35a08; color: #fff; }
+.ea-prio.is-interest  { background: #e8eefb; color: #16337a; }
+.ea-prio.is-normal    { background: #eef1f6; color: var(--ink-mid); font-weight: 600; }
+.ea-summary-box { margin: 4px 0 6px; }
+.ea-summary-label { display: block; font-size: 11.5px; color: var(--ink-soft); margin-bottom: 2px; }
+.ea-summary.is-folded { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: var(--fold-lines, 5); overflow: hidden; }
+.ea-fold-btn { margin-top: 3px; padding: 2px 10px; border: 1px solid var(--navy-line); background: #fff;
+  color: var(--navy); border-radius: 999px; font-size: 11.5px; cursor: pointer; }
+.ea-proposers { font-size: 13px; line-height: 1.55; margin: 0 0 4px; word-break: keep-all; }
+.ea-proposer-all { margin: 4px 0 0; font-size: 12.5px; color: var(--ink-mid); line-height: 1.6; }
+.ea-proposer-all.is-folded { display: none; }
+.ea-prio-why { margin: 2px 0 4px; font-size: 11.5px; color: var(--ink-soft); }
+.ea-criteria { margin: 8px 0 12px; border: 1px solid var(--navy-line); border-radius: 10px; background: #fff; }
+.ea-criteria > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; font-weight: 600; color: var(--navy); }
+.ea-criteria-body { padding: 0 14px 12px; font-size: 12.5px; line-height: 1.7; color: var(--ink-mid); }
+.ea-criteria-body ul { margin: 6px 0 8px; padding-left: 18px; }
+.ea-criteria-body li { margin-bottom: 4px; }

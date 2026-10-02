@@ -305,7 +305,7 @@
         <div class="filter-row">
           <label class="filter-label" for="eaSearch">검색</label>
           <input type="search" id="eaSearch" class="search"
-                 placeholder="제목·법령명·요약 검색" autocomplete="off">
+                 placeholder="제목·소관·주요 내용 검색" autocomplete="off">
         </div>
         <div class="filter-row">
           <span class="filter-label">카테고리 <em>단일 선택</em></span>
@@ -315,9 +315,9 @@
           <span class="filter-label">기관 <em>중복 선택</em></span>
           <div class="chips" id="eaAgencyChips"></div>
         </div>
-        <div class="filter-row" id="eaImpactRow">
-          <span class="filter-label">영향도 <em>중복 선택</em></span>
-          <div class="chips" id="eaImpactChips"></div>
+        <div class="filter-row" id="eaPriorityRow">
+          <span class="filter-label">우선순위 <em>중복 선택</em></span>
+          <div class="chips" id="eaPriorityChips"></div>
         </div>
         <div class="filter-row" id="eaGroupRow">
           <span class="filter-label">그룹사 <em>중복 선택</em></span>
@@ -333,6 +333,21 @@
         </div>
       </div>
     </section>
+
+    <details class="ea-criteria">
+      <summary>긴급 · 중요 · 관심 · 일반 — 어떤 기준으로 나눴나요?</summary>
+      <div class="ea-criteria-body">
+        <p>AI 점수가 아니라 아래 규칙으로 나눕니다. 카드의 등급 글자에 마우스를 올리거나 카드 아래 '분류 이유'를 보면 그 항목이 왜 그렇게 나뉘었는지 나옵니다.</p>
+        <ul>
+          <li><b class="ea-prio is-urgent">긴급</b> 포스코퓨처엠에 <b>직접</b> 영향(이차전지 소재·핵심광물·전기차, 관세·수출통제·공급망 등 통상)이면서,
+            <b>시행·공포·의결·통과·입법예고·의견수렴</b> 같은 <b>임박한 단계</b>이거나 마감이 D-14 이내</li>
+          <li><b class="ea-prio is-important">중요</b> 포스코퓨처엠에 직접 영향이지만 아직 임박한 단계는 아님(논의·계획 단계), 또는 AI 영향도 '높음'</li>
+          <li><b class="ea-prio is-interest">관심</b> 포스코퓨처엠에는 직접 영향이 없고, 포스코 그룹의 다른 사업(철강·건설·에너지·무역 등)에 관련</li>
+          <li><b class="ea-prio is-normal">일반</b> 그 밖 — 포스코 그룹 사업과의 연결이 확인되지 않음</li>
+        </ul>
+        <p>정책 동향은 <b>정책브리핑(korea.kr) 브리핑룸 &gt; 보도자료</b>, 국회 의안은 <b>국회 의안정보시스템</b> 자료입니다. 요약은 AI가 만든 초안이니 원문을 꼭 확인하세요.</p>
+      </div>
+    </details>
 
     <div class="ea-list" id="eaList"></div>
     <nav class="ea-pager" id="eaPager" aria-label="페이지" hidden></nav>
