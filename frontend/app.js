@@ -1645,8 +1645,32 @@ function buildPressTable(items, windows) {
     cell.colSpan = 11;
     detail.append(cell);
     // 언론사 기사 목록 — 필터(기간·논조)를 바꿀 때마다 같은 칸에서 다시 그린다
-    const render = (filter) => cell.replaceChildren(
-      buildPressArticles(it, { filter: filter || {}, windows, onFilter: render }));
+    // 언론사를 펼치면 맨 위에 '이 언론사는 포스코퓨처엠을 전반적으로 이렇게 평가한다' 한 줄(AI 요약, 처음 한 번만 불러온다)
+    const overview = el('div', 'press-overview');
+    let overviewLoaded = false;
+    const loadOverview = async () => {
+      if (overviewLoaded) return;
+      overviewLoaded = true;
+      overview.replaceChildren(el('b', 'press-ov-label', '전반적 평가'), el('span', 'press-ov-text', '기사들을 읽고 요약하는 중…'));
+      try {
+        const res = await fetch(`${API}/api/press-stats/overview?press=${encodeURIComponent(it.press)}`);
+        const d = await res.json();
+        if (!d.ok) throw new Error(d.error || 'fail');
+        overview.replaceChildren(
+          el('b', 'press-ov-label', '전반적 평가'),
+          el('span', 'press-ov-text', d.overview),
+          el('span', 'press-ov-src', d.source === 'ai' ? `AI 요약 · 기사 ${d.articles}건 기준` : '논조 분포 기준(AI 요약을 지금 만들지 못함)'));
+        if (d.source !== 'ai') overviewLoaded = false;     // 다음에 열 때 AI 요약을 다시 시도한다
+      } catch {
+        overviewLoaded = false;
+        overview.replaceChildren(el('b', 'press-ov-label', '전반적 평가'), el('span', 'press-ov-text', '불러오지 못했습니다.'));
+      }
+    };
+    const render = (filter) => {
+      cell.replaceChildren(overview,
+        buildPressArticles(it, { filter: filter || {}, windows, onFilter: render }));
+      loadOverview();
+    };
     const showAll = () => render({});   // 언론사 전체 기사
     const setOpen = (open) => {
       detail.hidden = !open;

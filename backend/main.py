@@ -5233,6 +5233,21 @@ SENTI_REASON_PROMPT = """[기사 제목] {title}
 형식: {{"reason":"..."}}"""
 
 
+# ── 언론사 탭: 언론사가 포스코퓨처엠을 전반적으로 어떻게 평가하는지 한 줄 (2026-10-02) ──
+PRESS_OVERVIEW_SYSTEM = ("당신은 기업 홍보팀의 언론 모니터링 담당자다. 한 언론사의 포스코퓨처엠 기사 제목과 논조 근거만 보고 "
+                         "그 언론사의 전반적 시각을 한 줄로 요약하며, JSON 으로만 답한다.")
+PRESS_OVERVIEW_PROMPT = """[언론사] {press}
+[논조 분포] {dist}
+[최근 기사 — 제목 | 논조 | 판정 근거]
+{lines}
+
+이 언론사가 포스코퓨처엠을 전반적으로 어떻게 평가·보도하는지 **한 줄(80자 이내)** 로 써라.
+- 위 제목·근거에 실제로 나타난 내용만 쓴다. 기사에 없는 평가를 지어내지 않는다.
+- 논조가 갈리면 갈린다고 쓰고(예: 실적은 호의적, 투자 부담은 비판적), 주로 다루는 주제를 한두 개 넣는다.
+- 기사가 1~2건뿐이면 '(기사 N건 기준)' 을 덧붙인다.
+형식: {{"overview":"..."}}"""
+
+
 TRANSLATE_SYSTEM = ("당신은 영한 뉴스 번역가다. 원문의 뜻을 바꾸거나 덧붙이지 않고 자연스러운 한국어 "
                     "뉴스 문체로 옮기며, JSON 으로만 답한다.")
 TRANSLATE_PROMPT = """아래 영어 기사의 제목과 발췌를 한국어로 번역하라.
@@ -5516,6 +5531,28 @@ class LLMClient:
                     time.sleep(1)
                 else:
                     log.warning("감성 근거 생성 실패: %s", exc)
+        return ""
+
+    def press_overview(self, press: str, articles: list[dict], tone: dict) -> str:
+        """한 언론사의 포스코퓨처엠 보도를 한 줄로 요약한다. 실패하면 ''."""
+        if not articles:
+            return ""
+        lines = "\n".join(f"- {(a.get('title') or '')[:80]} | {a.get('tone') or '미판정'} | "
+                          f"{(a.get('tone_reason') or '')[:70]}" for a in articles[:25])
+        dist = " · ".join(f"{k} {tone.get(k, 0)}" for k in ("긍정", "중립", "부정", "미판정"))
+        prompt = PRESS_OVERVIEW_PROMPT.format(press=press, dist=dist, lines=lines)
+        for attempt in range(2):
+            try:
+                content, _ = self._chat(PRESS_OVERVIEW_SYSTEM, prompt)
+                text = _pp((_parse_json_object(content) or {}).get("overview"))[:140]
+                if text:
+                    return text
+                raise ValueError("빈 응답")
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                else:
+                    log.warning("언론사 한줄 평가 생성 실패 (%s): %s", press, exc)
         return ""
 
     def chat_text(self, system: str, user: str) -> str:
@@ -6119,6 +6156,7 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
 
 
 SENTI_LAZY_PER_HOUR = get_env_int("SENTI_LAZY_PER_HOUR", 40, 0)
+OVERVIEW_PER_HOUR = get_env_int("PRESS_OVERVIEW_PER_HOUR", 60, 0)   # 언론사 한줄 평가 AI 호출 시간당 상한
 _senti_lazy_times: list[float] = []
 
 
@@ -8518,6 +8556,17 @@ def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> 
     return out
 
 
+def press_overview_fallback(entry: dict) -> str:
+    """AI 를 못 쓸 때의 한 줄 — 논조 분포만으로 만든다(기사 내용은 읽지 않았다는 점을 문장에 밝힌다)."""
+    t = entry.get("tone") or {}
+    rated = sum(t.get(k, 0) for k in PFM_TONES)
+    if not rated:
+        return f"논조가 판정된 기사가 아직 없습니다(전체 {entry.get('year', 0)}건)."
+    top = reporter_tone(t) or "중립"
+    return (f"판정된 {rated}건 중 {top} 보도가 가장 많습니다"
+            f"(긍정 {t.get('긍정', 0)} · 중립 {t.get('중립', 0)} · 부정 {t.get('부정', 0)}) — 논조 분포만 반영한 요약입니다.")
+
+
 def reporter_tone(tone: dict[str, int]) -> str:
     """기자의 대표 논조 — 긍정·중립·부정 중 가장 많은 쪽(동률이면 중립). 판정된 기사가 없으면 ''.
 
@@ -10327,6 +10376,38 @@ def create_app(ctx: Context):
         }
         _press_stats_cache.update(at=mono, data=data)
         return JSONResponse(data)
+
+    _overview_cache: dict[str, tuple[str, str, str]] = {}      # 언론사 → (기사 서명, 문장, 출처)
+    _overview_times: list[float] = []
+
+    @app.get("/api/press-stats/overview")
+    def api_press_overview(press: str = ""):
+        """언론사 한 곳이 포스코퓨처엠을 전반적으로 어떻게 평가하는지 한 줄. 기사 구성이 바뀔 때만 다시 만든다(AI 비용 보호)."""
+        data = _press_stats_cache["data"]
+        if not data or time.monotonic() - _press_stats_cache["at"] >= PRESS_STATS_TTL_SEC:
+            api_press_stats()
+            data = _press_stats_cache["data"]
+        entry = next((e for e in data["items"] if e["press"] == press), None)
+        if entry is None:
+            return JSONResponse({"ok": False, "error": "언론사를 찾을 수 없습니다."}, status_code=404)
+        arts = entry["articles"][:25]
+        sig = hashlib.sha1("|".join(f"{a['id']}:{a['tone']}" for a in arts).encode("utf-8")).hexdigest()
+        hit = _overview_cache.get(press)
+        if hit and hit[0] == sig:
+            return JSONResponse({"ok": True, "press": press, "overview": hit[1], "source": hit[2], "articles": len(arts)})
+        text, source = "", "rule"
+        now_m = time.monotonic()
+        while _overview_times and now_m - _overview_times[0] > 3600:
+            _overview_times.pop(0)
+        if len(_overview_times) < OVERVIEW_PER_HOUR:
+            _overview_times.append(now_m)
+            text = ctx.llm.press_overview(press, arts, entry["tone"])
+            source = "ai"
+        if not text:
+            text, source = press_overview_fallback(entry), "rule"
+        else:
+            _overview_cache[press] = (sig, text, source)     # AI 결과만 저장 — 규칙 문장은 다음에 AI 를 다시 시도한다
+        return JSONResponse({"ok": True, "press": press, "overview": text, "source": source, "articles": len(arts)})
 
     @app.get("/api/weekly")
     def api_weekly(id: str = ""):
@@ -12638,6 +12719,28 @@ def cmd_selftest() -> int:
     check("이력 보강 — 정부 직급 표현이 없는 기업 인사는 건드리지 않는다",
           enrich_people_careers(None, "ㆍ김민수 (한화에너지)", "[인사] 한화에너지", lookup=lambda *a: {"facts": {}, "sources": ["u"], "career": ["x"]}),
           "ㆍ김민수 (한화에너지)")
+
+    # 언론사 탭 — 언론사가 포스코퓨처엠을 전반적으로 어떻게 평가하는지 한 줄(2026-10-02)
+    _po = object.__new__(LLMClient)
+    _po_seen: list[str] = []
+
+    def _po_chat(system, prompt):
+        _po_seen.append(prompt)
+        return '{"overview":"실적·증설은 호의적으로, 투자 부담은 비판적으로 다룸"}', {}
+    _po._chat = _po_chat
+    _po_tone = {"긍정": 2, "중립": 1, "부정": 1, "미판정": 0}
+    _po_arts = [{"title": "포스코퓨처엠 양극재 증설", "tone": "긍정", "tone_reason": "증설을 호의적으로 보도"},
+                {"title": "포스코퓨처엠 적자 전환", "tone": "부정", "tone_reason": "실적 악화"}]
+    check("언론사 한줄 평가 — 제목·논조·근거를 AI 에 주고 한 줄을 받는다",
+          (_po.press_overview("머니투데이", _po_arts, _po_tone), "양극재 증설" in _po_seen[0], "실적 악화" in _po_seen[0],
+           "긍정 2" in _po_seen[0]),
+          ("실적·증설은 호의적으로, 투자 부담은 비판적으로 다룸", True, True, True))
+    check("언론사 한줄 평가 — 기사가 없으면 AI 를 부르지 않는다", (_po.press_overview("x", [], _po_tone), len(_po_seen)), ("", 1))
+    check("언론사 한줄 평가 — AI 불가 시 논조 분포만 반영한 문장(그렇다고 밝힌다)",
+          ("긍정 보도가 가장 많습니다" in press_overview_fallback({"tone": {"긍정": 3, "중립": 1, "부정": 0, "미판정": 0}, "year": 4}),
+           "논조 분포만 반영" in press_overview_fallback({"tone": {"긍정": 3, "중립": 1, "부정": 0, "미판정": 0}, "year": 4}),
+           "판정된 기사가 아직 없습니다" in press_overview_fallback({"tone": {"긍정": 0, "중립": 0, "부정": 0, "미판정": 2}, "year": 2})),
+          (True, True, True))
 
     print("\n[8-2c3] 원장 되살리기(reopen) · Google RSS 병렬 수집")
     _lt = SqliteStorage(os.path.join(__import__("tempfile").mkdtemp(), "ledger.db"))

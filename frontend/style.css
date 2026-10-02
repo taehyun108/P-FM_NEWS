@@ -885,3 +885,10 @@ img, video { max-width: 100%; }
 /* 인사·부고 카드 — 이름 굵게, 이력 출처 링크 */
 .people-name { font-weight: 700; }
 .people-src { margin-left: 4px; font-size: 11px; color: var(--navy); text-decoration: underline; }
+
+/* 언론사 펼침 — 전반적 평가 한 줄 */
+.press-overview { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 2px 0 8px; padding: 8px 12px;
+  background: #f1f5fd; border-left: 3px solid var(--navy); border-radius: 6px; line-height: 1.55; }
+.press-ov-label { color: var(--navy); font-size: 12.5px; white-space: nowrap; }
+.press-ov-text { font-size: 13.5px; font-weight: 600; word-break: keep-all; }
+.press-ov-src { width: 100%; font-size: 11px; color: var(--ink-soft); }
