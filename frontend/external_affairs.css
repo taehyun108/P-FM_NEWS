@@ -178,3 +178,50 @@
 /* 통상 환경 포토카드 — 월간 통상 기사 대표 사진 */
 .ea-photo { display: block; aspect-ratio: 16 / 9; overflow: hidden; background: #e8eefb; }
 .ea-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* 입법·행정예고 D-day 칩 · 일정 캘린더 */
+.ea-dday { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 12px; font-weight: 800;
+  font-variant-numeric: tabular-nums; }
+.ea-dday.is-urgent { background: #b3261e; color: #fff; }
+.ea-dday.is-soon   { background: #a35a08; color: #fff; }
+.ea-dday.is-open   { background: #16337a; color: #fff; }
+.ea-dday.is-closed { background: #5b6472; color: #fff; }
+.ea-dday.is-none   { background: #eef1f6; color: var(--ink-soft); font-weight: 600; }
+.ea-card-head { flex-wrap: wrap; }
+.ea-cal { margin-top: 6px; }
+.ea-cal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ea-cal-title { font-size: 16px; min-width: 96px; text-align: center; }
+.ea-cal-nav, .ea-cal-today { border: 1px solid var(--navy-line); background: #fff; color: var(--navy); border-radius: 8px;
+  padding: 4px 12px; font-size: 15px; cursor: pointer; }
+.ea-cal-today { font-size: 12.5px; margin-left: auto; }
+.ea-cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }
+.ea-cal-wd { text-align: center; font-size: 12px; font-weight: 700; color: var(--ink-soft); padding: 4px 0; }
+.ea-cal-wd.is-sun { color: #b3261e; }
+.ea-cal-cell { min-height: 64px; border: 1px solid var(--navy-line); background: #fff; border-radius: 8px; padding: 4px 5px;
+  display: flex; flex-direction: column; gap: 2px; text-align: left; font: inherit; color: inherit; cursor: default; }
+.ea-cal-cell.is-empty { border: 0; background: none; }
+.ea-cal-cell.has-ev { cursor: pointer; background: #f7f9fe; }
+.ea-cal-cell.is-today { border-color: #16337a; box-shadow: inset 0 0 0 1px #16337a; }
+.ea-cal-cell.is-sel { background: #e8eefb; }
+.ea-cal-num { font-size: 12.5px; font-weight: 700; }
+.ea-cal-dots { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
+.ea-cal-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.ea-cal-dot.is-urgent { background: #b3261e; } .ea-cal-dot.is-important { background: #a35a08; }
+.ea-cal-dot.is-interest { background: #16337a; } .ea-cal-dot.is-normal { background: #98a2b3; }
+.ea-cal-dots em { font-size: 10.5px; font-style: normal; color: var(--ink-soft); }
+.ea-cal-count { font-size: 11px; color: var(--ink-mid); }
+.ea-agenda { margin-top: 12px; }
+.ea-ag-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ea-ag-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.ea-ag-item { border: 1px solid var(--navy-line); border-radius: 10px; background: #fff; padding: 9px 12px; }
+.ea-ag-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 3px; }
+.ea-ag-kind { font-size: 11.5px; color: var(--ink-mid); }
+.ea-ag-date { margin-left: auto; font-size: 11.5px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.ea-ag-title a { color: var(--ink); text-decoration: none; font-weight: 600; line-height: 1.45; }
+.ea-ag-sub { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+.ea-ag-act { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--navy); }
+@media (max-width: 640px) {
+  .ea-cal-cell { min-height: 52px; padding: 3px; }
+  .ea-cal-count { display: none; }
+  .ea-cal-title { min-width: 0; flex: 1; }
+}

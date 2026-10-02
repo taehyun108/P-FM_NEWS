@@ -14170,7 +14170,7 @@ def cmd_selftest() -> int:
         check("무관 제목은 그룹사 없음",
               ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
         # 카테고리는 정책 동향·국회 의안 2개(2026-10-02 개편) + item_type 매핑(옛 키는 호환용으로 남김)
-        check("카테고리 3개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "bill", "trade"])
+        check("카테고리 5개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "notice", "bill", "trade", "calendar"])
         check("정책 동향 → policy_press", ea_mod.EA_CATEGORY_TYPES["policy"], ["policy_press"])
         check("부처별 동향 → ministry_news", ea_mod.EA_CATEGORY_TYPES["ministry"], ["ministry_news"])
         check("통상 환경 → trade_webzine(월간 통상)", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_webzine"])
@@ -14334,6 +14334,43 @@ def cmd_selftest() -> int:
         check("월간 통상은 관련성 검사 없이 통과(출처가 통상 자료)",
               len(_gt.filter([{"url_source": "u1", "title": "분류명", "_trusted": True},
                               {"url_source": "u2", "title": "청소년 쉼터 안내"}])), 1)
+        try:
+            from fastapi import FastAPI as _FA
+            from fastapi.testclient import TestClient as _TC
+        except Exception:
+            _TC = None
+        if _TC is not None:
+            _cdir = __import__("tempfile").mkdtemp()
+            _cpath = os.path.join(_cdir, "cal.db")
+            _cc = sqlite3.connect(_cpath)
+            _cc.executescript(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_sqlite.sql"),
+                                   encoding="utf-8").read())
+            _cc.commit()
+            _cc.close()
+            _cctx = type("C", (), {"cfg": type("G", (), {"db_backend": "sqlite", "sqlite_path": _cpath})()})()
+            _capp = _FA()
+            ea_mod.register_api(_capp, _cctx)
+            _cdb = ea_mod.EaDB(_cpath)
+            _ct = datetime.now(KST).date()
+            for _i, (_ty, _tt, _off) in enumerate([("legislation", "산업안전보건법 시행령 입법예고", 3),
+                                                   ("admin_notice", "배터리 안전 행정예고", 20),
+                                                   ("legislation", "지난 예고", -400)]):
+                _cdb.insert_item({"id": f"c{_i}", "url_source": f"cu{_i}", "url_canonical": f"cu{_i}", "item_type": _ty,
+                                  "title": _tt, "notice_end": (_ct + timedelta(days=_off)).isoformat(),
+                                  "collected_at": "2026-10-01T00:00:00Z"})
+            _cl = _TC(_capp)
+            _cal = _cl.get("/api/ea/calendar", params={"month": (_ct + timedelta(days=3)).strftime("%Y-%m")}).json()
+            check("일정 API — 마감일이 있는 항목을 달별로, 종류 라벨·D-day 포함",
+                  (any(e["kind"] == "입법예고 마감" and e["d_day"] == 3 for e in _cal["events"]),
+                   any(e["title"] == "지난 예고" for e in _cal["events"])), (True, False))
+            check("일정 API — 오늘 이후 마감만 '다가오는 마감'(가까운 순)",
+                  [e["title"] for e in _cal["upcoming"]], ["산업안전보건법 시행령 입법예고", "배터리 안전 행정예고"])
+            check("일정 API — 달 형식이 틀리면 이번 달로", _cl.get("/api/ea/calendar", params={"month": "xx"}).json()["month"],
+                  _ct.strftime("%Y-%m"))
+            check("입법·행정예고 목록 — 두 유형을 마감 임박순으로",
+                  [i["title"] for i in _cl.get("/api/ea/items", params={"item_type": "legislation,admin_notice",
+                                                                         "sort": "deadline"}).json()["items"]][:2],
+                  ["지난 예고", "산업안전보건법 시행령 입법예고"])
         _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
                                 "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
                                 "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})

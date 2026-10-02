@@ -15,10 +15,13 @@
   var CATS = [
     { key: 'policy', label: '정책 동향', kind: 'items', types: 'policy_press',
       sort: 'priority', hasDeadline: false, layout: 'policy' },
+    { key: 'notice', label: '입법·행정예고', kind: 'items', types: 'legislation,admin_notice',
+      sort: 'deadline', hasDeadline: true, layout: 'notice' },    // 의견제출 마감(D-day) 중심
     { key: 'bill',   label: '국회 의안', kind: 'items', types: 'bill',
       sort: 'priority', hasDeadline: false, layout: 'bill' },
     { key: 'trade',  label: '통상 환경', kind: 'items', types: 'trade_webzine',
-      sort: 'priority', hasDeadline: false, layout: 'trade' }   // 산업통상부 월간 통상(tongsangnews.kr)
+      sort: 'priority', hasDeadline: false, layout: 'trade' },   // 산업통상부 월간 통상(tongsangnews.kr)
+    { key: 'calendar', label: '일정', kind: 'calendar', layout: 'calendar' }   // 모든 마감일을 달력으로
   ];
   // 우선순위 4단계 — 기준은 화면의 '기준 보기'와 같은 말이다(백엔드 ea_priority 규칙).
   var PRIORITIES = ['긴급', '중요', '관심', '일반'];
@@ -28,7 +31,8 @@
     open: false, loaded: false, cat: 'policy',
     agency: new Set(), priority: new Set(), group: new Set(),   // 중복 선택 (칩)
     status: '', due: '', sort: 'priority', q: '',              // 단일 (드롭다운/검색)
-    page: 1, loading: false, filterCollapsed: false
+    page: 1, loading: false, filterCollapsed: false,
+    month: '', day: ''     // 일정 화면: 보고 있는 달(YYYY-MM)·선택한 날(YYYY-MM-DD)
   };
 
   function $(id) { return document.getElementById(id); }
@@ -90,7 +94,7 @@
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
-    eaState.cat = ['bill', 'trade'].indexOf(p.get('ea_cat')) >= 0 ? p.get('ea_cat') : 'policy';
+    eaState.cat = ['notice', 'bill', 'trade', 'calendar'].indexOf(p.get('ea_cat')) >= 0 ? p.get('ea_cat') : 'policy';
     eaState.agency = new Set((p.get('ea_agency') || '').split(',').filter(Boolean));
     eaState.group = new Set((p.get('ea_group') || '').split(',').filter(Boolean));
     eaState.priority = new Set((p.get('ea_priority') || '').split(',').filter(Boolean));
@@ -173,6 +177,130 @@
     return btn;
   }
 
+  /* 마감 D-day 칩 — 3일 이내 빨강, 7일 이내 주황 */
+  function ddayChip(it) {
+    var d = it.d_day;
+    if (d === null || d === undefined) { return el('span', 'ea-dday is-none', '기한 없음'); }
+    if (d < 0) { return el('span', 'ea-dday is-closed', '마감'); }
+    return el('span', 'ea-dday ' + (d <= 3 ? 'is-urgent' : d <= 7 ? 'is-soon' : 'is-open'),
+      d === 0 ? 'D-DAY' : 'D-' + d);
+  }
+
+  /* ── 일정 캘린더 — 의견제출 마감일을 월간 달력 + 목록으로 ── */
+  var WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  function shiftMonth(ym, delta) {
+    var y = parseInt(ym.slice(0, 4), 10), m = parseInt(ym.slice(5, 7), 10) - 1 + delta;
+    y += Math.floor(m / 12); m = ((m % 12) + 12) % 12;
+    return y + '-' + pad2(m + 1);
+  }
+
+  function agendaRow(e) {
+    var li = el('li', 'ea-ag-item');
+    var d = e.d_day;
+    var chip = el('span', 'ea-dday ' + (d === null || d === undefined ? 'is-none' : d < 0 ? 'is-closed'
+      : d <= 3 ? 'is-urgent' : d <= 7 ? 'is-soon' : 'is-open'),
+      d === null || d === undefined ? '' : d < 0 ? '마감' : d === 0 ? 'D-DAY' : 'D-' + d);
+    var top = el('div', 'ea-ag-top');
+    top.append(chip, prioBadge(e), el('span', 'ea-ag-kind', e.kind), el('span', 'ea-ag-date', e.date));
+    li.append(top);
+    var t = el('div', 'ea-ag-title');
+    t.append(link(e.title, e.url));
+    li.append(t);
+    var sub = [e.agency, e.status].filter(Boolean).join(' · ');
+    if (sub) { li.append(el('div', 'ea-ag-sub', sub)); }
+    if (e.opinion_url) { li.append(link('의견 제출', e.opinion_url, 'ea-ag-act')); }
+    return li;
+  }
+
+  function renderCalendar(d) {
+    var box = el('div', 'ea-cal');
+    var ym = d.month;
+    var head = el('div', 'ea-cal-head');
+    var prev = el('button', 'ea-cal-nav', '‹'); prev.type = 'button'; prev.setAttribute('aria-label', '이전 달');
+    var next = el('button', 'ea-cal-nav', '›'); next.type = 'button'; next.setAttribute('aria-label', '다음 달');
+    var todayBtn = el('button', 'ea-cal-today', '오늘'); todayBtn.type = 'button';
+    prev.addEventListener('click', function () { eaState.month = shiftMonth(ym, -1); eaState.day = ''; loadCalendar(); });
+    next.addEventListener('click', function () { eaState.month = shiftMonth(ym, 1); eaState.day = ''; loadCalendar(); });
+    todayBtn.addEventListener('click', function () { eaState.month = ''; eaState.day = ''; loadCalendar(); });
+    head.append(prev, el('b', 'ea-cal-title', ym.slice(0, 4) + '년 ' + parseInt(ym.slice(5, 7), 10) + '월'), next, todayBtn);
+    box.append(head);
+
+    var byDay = {};
+    d.events.forEach(function (e) { (byDay[e.date] = byDay[e.date] || []).push(e); });
+    var grid = el('div', 'ea-cal-grid');
+    WEEKDAYS.forEach(function (w, i) { grid.append(el('div', 'ea-cal-wd' + (i === 0 ? ' is-sun' : ''), w)); });
+    var first = new Date(parseInt(ym.slice(0, 4), 10), parseInt(ym.slice(5, 7), 10) - 1, 1);
+    var days = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    for (var i = 0; i < first.getDay(); i += 1) { grid.append(el('div', 'ea-cal-cell is-empty')); }
+    for (var day = 1; day <= days; day += 1) {
+      var iso = ym + '-' + pad2(day);
+      var evs = byDay[iso] || [];
+      var cell = el('button', 'ea-cal-cell' + (iso === d.today ? ' is-today' : '') + (iso === eaState.day ? ' is-sel' : '')
+        + (evs.length ? ' has-ev' : ''));
+      cell.type = 'button';
+      cell.append(el('span', 'ea-cal-num', String(day)));
+      if (evs.length) {
+        var dots = el('span', 'ea-cal-dots');
+        evs.slice(0, 4).forEach(function (e) {
+          dots.append(el('i', 'ea-cal-dot ' + (PRIORITY_CLASS[e.priority] || 'is-normal')));
+        });
+        if (evs.length > 4) { dots.append(el('em', null, '+' + (evs.length - 4))); }
+        cell.append(dots, el('span', 'ea-cal-count', evs.length + '건'));
+        cell.title = evs.map(function (e) { return '[' + e.priority + '] ' + e.title; }).join('\n');
+      }
+      (function (isoDay, n) {
+        cell.addEventListener('click', function () {
+          if (!n) { return; }
+          eaState.day = eaState.day === isoDay ? '' : isoDay;
+          renderCalendar(d);
+        });
+      }(iso, evs.length));
+      grid.append(cell);
+    }
+    box.append(grid);
+
+    var agenda = el('div', 'ea-agenda');
+    var list = el('ul', 'ea-ag-list');
+    var rows, title;
+    if (eaState.day) {
+      rows = byDay[eaState.day] || [];
+      title = eaState.day + ' 마감 ' + rows.length + '건';
+    } else if (ym === d.today.slice(0, 7) || !d.events.length) {
+      rows = d.upcoming; title = '다가오는 마감 ' + rows.length + '건';
+    } else {
+      rows = d.events; title = ym.slice(5) + '월 마감 ' + rows.length + '건';
+    }
+    var ah = el('div', 'ea-ag-head');
+    ah.append(el('b', null, title));
+    if (eaState.day) {
+      var clr = el('button', 'ea-fold-btn', '선택 해제'); clr.type = 'button';
+      clr.addEventListener('click', function () { eaState.day = ''; renderCalendar(d); });
+      ah.append(clr);
+    }
+    agenda.append(ah);
+    if (!rows.length) { agenda.append(el('p', 'ea-state', '표시할 마감 일정이 없습니다.')); }
+    rows.forEach(function (e) { list.append(agendaRow(e)); });
+    agenda.append(list);
+    box.append(agenda);
+    $('eaList').replaceChildren(box);
+    $('eaCount').textContent = d.events.length + '건 (이 달)';
+  }
+
+  function loadCalendar() {
+    if (eaState.loading) { return; }
+    eaState.loading = true;
+    $('eaPager').hidden = true;
+    getJSON('/api/ea/calendar' + (eaState.month ? '?month=' + eaState.month : '')).then(function (d) {
+      eaState.month = d.month;
+      renderCalendar(d);
+    }).catch(function () {
+      showState('is-error', '일정을 불러오지 못했습니다.');
+    }).finally(function () { eaState.loading = false; });
+  }
+
   /* ── 우선순위 배지 — 마우스를 올리면(또는 눌러서) 그렇게 분류한 이유가 나온다 ── */
   function prioBadge(it) {
     var b = el('span', 'ea-prio ' + (PRIORITY_CLASS[it.priority] || 'is-normal'), it.priority || '일반');
@@ -206,6 +334,7 @@
     var layout = currentCat().layout;
     var isBill = layout === 'bill';
     var isTrade = layout === 'trade';
+    var isNotice = layout === 'notice';
     var card = el('article', 'ea-card ea-card--flat');
     if (isTrade && it.thumbnail) {          // 통상 환경 — 포토카드(월간 통상 기사 대표 사진)
       var ph = el('a', 'ea-photo');
@@ -220,14 +349,20 @@
 
     var head = el('div', 'ea-card-head');
     head.append(prioBadge(it));
-    head.append(el('span', 'ea-card-date', fmtDate(it.published_at || it.notice_start)));
+    if (isNotice) { head.append(ddayChip(it)); }
+    head.append(el('span', 'ea-card-date', isNotice
+      ? (fmtDate(it.notice_start) + ' ~ ' + (fmtDate(it.notice_end) || '미정'))
+      : fmtDate(it.published_at || it.notice_start)));
     body.append(head);
 
     var h = el('h3', 'ea-card-title');
     h.append(link(it.title, it.url));
     body.append(h);
 
-    if (isTrade) {
+    if (isNotice) {
+      var nb = [it.agency && ('소관: ' + it.agency), it.law_name, it.status].filter(Boolean);
+      body.append(el('p', 'ea-card-sub', nb.join(' · ')));
+    } else if (isTrade) {
       // 기자명이 없는 정부 발행물 — 출처를 산업통상부(월간 통상)로 적는다
       var src = el('p', 'ea-card-sub');
       src.append(el('b', null, '출처: '), document.createTextNode((it.agency || '산업통상부') + ' · 월간 통상'
@@ -281,7 +416,11 @@
     }
 
     var acts = el('div', 'ea-actions');
-    acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : '정책브리핑 원문', it.url));
+    acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : isNotice ? '원문' : '정책브리핑 원문', it.url));
+    if (isNotice && it.opinion_url) { acts.append(link('의견 제출', it.opinion_url, 'is-primary')); }
+    if (isNotice) {
+      (it.attachment_urls || []).forEach(function (u, i) { acts.append(link('첨부 ' + (i + 1), u)); });
+    }
     acts.append(telegramButton('/api/ea/items/' + it.id + '/telegram'));
     body.append(acts);
 
@@ -307,13 +446,15 @@
 
   function applyRowVisibility() {
     var c = currentCat();
-    $('eaAgencyRow').hidden = false;
-    $('eaPriorityRow').hidden = false;
-    $('eaGroupRow').hidden = false;
-    $('eaMiscRow').hidden = false;
+    var cal = c.layout === 'calendar';
+    $('eaSearch').closest('.filter-row').hidden = cal;
+    $('eaAgencyRow').hidden = cal;
+    $('eaPriorityRow').hidden = cal;
+    $('eaGroupRow').hidden = cal;
+    $('eaMiscRow').hidden = cal;
     $('eaSort').hidden = false;
-    $('eaStatus').hidden = c.layout !== 'bill';     // 의안만 '상태'(심사 단계)가 의미 있다
-    $('eaDue').hidden = true;
+    $('eaStatus').hidden = !(c.layout === 'bill' || c.layout === 'notice');   // 심사 단계·예고 상태
+    $('eaDue').hidden = c.layout !== 'notice';                                  // 마감 D-7/14/30
     var lab = document.querySelector('#eaAgencyRow .filter-label');
     if (lab) { lab.firstChild.textContent = c.layout === 'bill' ? '소관위 ' : c.layout === 'trade' ? '출처 ' : '소관 부처 '; }
   }
@@ -331,6 +472,7 @@
 
   function loadFilters() {
     var c = currentCat();
+    if (c.layout === 'calendar') { return Promise.resolve(); }
     return getJSON('/api/ea/filters?category=' + encodeURIComponent(c.key)).then(function (d) {
       fillSelect($('eaSort'), d.sorts || [], eaState.sort || c.sort || 'deadline', null);
       fillSelect($('eaStatus'), (d.statuses || []).map(function (s) {
@@ -416,6 +558,7 @@
     syncFilterHead();
 
     var c = currentCat();
+    if (c.layout === 'calendar') { eaState.loading = false; loadCalendar(); return; }
     $('eaList').replaceChildren.apply($('eaList'), [0, 1, 2].map(function () {
       return el('div', 'ea-skeleton');
     }));

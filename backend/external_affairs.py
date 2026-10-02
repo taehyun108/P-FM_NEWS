@@ -2114,8 +2114,10 @@ def _ea_telegram_send(ctx: Any, text: str) -> tuple[bool, str | None]:
 # 화면 상단 카테고리(=탭). key 는 프런트·필터 API 가 공유한다.
 EA_CATEGORIES = [
     {"key": "policy", "label": "정책 동향"},
+    {"key": "notice", "label": "입법·행정예고"},
     {"key": "bill", "label": "국회 의안"},
     {"key": "trade", "label": "통상 환경"},
+    {"key": "calendar", "label": "일정"},
 ]
 # 카테고리 → ea_policy_items.item_type 목록. 예전 키(notice·ministry·trade)는 옛 주소·주간레포트 호환용으로만 남긴다.
 EA_CATEGORY_TYPES = {
@@ -2123,6 +2125,7 @@ EA_CATEGORY_TYPES = {
     "bill": ["bill"],
     "notice": ["legislation", "admin_notice"],
     "ministry": ["ministry_news"],
+    "calendar": [],                   # 일정은 모든 유형의 마감일을 모아 보여 준다
     "trade": ["trade_webzine"],       # 월간 통상(산업통상부 웹진). KOTRA(trade_news)는 주간 레포트가 따로 쓴다
 }
 _AGENCY_TAIL_RE = re.compile(r"(부|처|청|위원회|위|실|원|단|공사|진흥원|KOTRA)$")
@@ -2208,6 +2211,39 @@ def register_api(app: Any, ctx: Any) -> None:
                                  "items": views[start:start + size]})
         return JSONResponse({"total": len(rows), "page": page, "size": size,
                              "items": [_item_view(r) for r in rows[start:start + size]]})
+
+    _CAL_LABEL = {"legislation": "입법예고 마감", "admin_notice": "행정예고 마감", "bill": "국회 의안",
+                  "policy_press": "정책 발표", "trade_webzine": "통상", "ministry_news": "부처 동향"}
+
+    @app.get("/api/ea/calendar")
+    def ea_calendar(month: str = ""):
+        """일정 캘린더 — 의견제출 마감일(notice_end)이 있는 모든 항목을 월별로 모은다.
+
+        month='YYYY-MM'(없으면 이번 달). 응답: events(그 달), upcoming(오늘부터 가까운 마감 15건).
+        공모·수요조사 같은 새 유형도 notice_end 만 채우면 이 화면에 자동으로 나온다.
+        """
+        today = datetime.now(KST).date()
+        try:
+            y, m = (int(x) for x in month.split("-"))
+            first = date(y, m, 1)
+        except Exception:
+            first = date(today.year, today.month, 1)
+        nxt = date(first.year + (first.month == 12), first.month % 12 + 1, 1)
+        rows = [r for r in db.query_items(sort="recent") if r.get("notice_end")]
+
+        def ev(r: dict) -> dict:
+            v = _item_view(r)
+            return {"date": v["notice_end"], "title": v["title"], "url": v["url"],
+                    "opinion_url": v["opinion_url"], "agency": v["agency"], "d_day": v["d_day"],
+                    "kind": _CAL_LABEL.get(v["item_type"], "마감"), "priority": v["priority"],
+                    "priority_reason": v["priority_reason"], "status": v["status"]}
+
+        month_ev = [ev(r) for r in rows if first.isoformat() <= r["notice_end"] < nxt.isoformat()]
+        month_ev.sort(key=lambda e: (e["date"], -_PRIORITY_RANK.get(e["priority"], 0)))
+        up = [ev(r) for r in rows if r["notice_end"] >= today.isoformat()]
+        up.sort(key=lambda e: (e["date"], -_PRIORITY_RANK.get(e["priority"], 0)))
+        return JSONResponse({"month": first.strftime("%Y-%m"), "today": today.isoformat(),
+                             "events": month_ev, "upcoming": up[:15]})
 
     @app.get("/api/ea/stats")
     def ea_stats():
