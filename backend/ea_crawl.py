@@ -744,6 +744,197 @@ def crawl_tongsang(max_items: int = 60) -> list[dict]:
     return out
 
 
+# ── S8 · 공모·수요조사·지원사업 공고 — 산업부 사업공고 · 기후부 공지·공고 · IRIS(범부처통합연구지원시스템) ────
+#   서비스키 없이 공개 페이지만 읽는다. 목록은 최근 몇 쪽만 본다(요청 간 1초).
+#   마감일(접수 마감)은 IRIS 상세의 '접수기간' 칸이나 공고문 글 속 '접수기간 … ~ …' 에서만 읽고, 못 읽으면 비워 둔다
+#   (정부 부처 공고문은 본문이 짧고 기간은 첨부(hwp·pdf)에 있는 일이 많다 — 첨부는 열지 않는다).
+MOTIR_NOTICE_LIST = "https://www.motir.go.kr/kor/article/ATCL2826a2625"       # 산업통상부 알림·뉴스 > 사업공고
+MCEE = "https://www.mcee.go.kr"
+MCEE_NOTICE_LIST = MCEE + "/home/web/board/list.do"                              # 기후에너지환경부 공지·공고(boardMasterId=39)
+IRIS = "https://www.iris.go.kr"
+_DATE_ANY = re.compile(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})")
+_DEADLINE_KEY = re.compile(r"(접수|신청|제출|공모|모집|마감)\s*(기간|기한|일시|일정|마감)?")
+
+
+def deadline_from_text(text: str) -> str | None:
+    """공고문 글에서 접수 마감일(ISO)을 찾는다. '접수기간 2026.9.22 ~ 2026.10.21' · '~ 2026. 10. 21.(수) 18:00까지' 형태.
+
+    '접수·신청·제출·마감' 같은 낱말 뒤 120자 안의 날짜만 본다 — 공고일·시행일을 마감으로 오인하지 않으려는 것이다.
+    기간이면 뒤쪽 날짜를, 날짜 하나뿐이면 그것을 쓴다. 못 찾으면 None.
+    """
+    t = re.sub(r"\s+", " ", text or "")
+    best: str | None = None
+    for m in _DEADLINE_KEY.finditer(t):
+        win = t[m.end(): m.end() + 120]
+        dates = [_iso(*d) for d in _DATE_ANY.findall(win)]
+        dates = [d for d in dates if d]
+        if not dates:
+            continue
+        cand = dates[1] if ("~" in win[:win.find(_DATE_ANY.findall(win)[0][2]) + 40] and len(dates) > 1) else dates[-1] \
+            if "~" in win[:80] and len(dates) > 1 else dates[0]
+        if best is None or cand > best:
+            best = cand
+    return best
+
+
+def parse_motir_notice_list(html: str) -> list[dict]:
+    """산업부 사업공고 목록 → [{no, title, url, dept, date, attachments[]}] (표의 data-cell-header 로 읽는다)."""
+    soup = _soup(html)
+    out: list[dict] = []
+    for tr in soup.select("table tbody tr"):
+        cell = {td.get("data-cell-header", ""): td for td in tr.find_all("td")}
+        a = cell.get("제목").find("a", href=True) if cell.get("제목") else None
+        if not a:
+            continue
+        date = _clean(cell["등록일"].get_text(" ")) if cell.get("등록일") else ""
+        att = [x["href"] for x in (cell["첨부파일"].find_all("a", href=True) if cell.get("첨부파일") else [])]
+        out.append({"no": _clean(cell["공고번호"].get_text(" ")) if cell.get("공고번호") else "",
+                    "title": _clean(a.get_text(" ")), "url": a["href"].split("?")[0],
+                    "dept": _clean(cell["담당부서"].get_text(" ")) if cell.get("담당부서") else "",
+                    "date": date if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else None, "attachments": att})
+    return out
+
+
+def parse_mcee_notice_list(html: str) -> list[dict]:
+    """기후부 공지·공고 목록 → [{id, title, url, dept, date}]. jsessionid 는 주소에서 뗀다."""
+    soup = _soup(html)
+    out: list[dict] = []
+    for tr in soup.find_all("tr"):
+        a = tr.find("a", href=re.compile(r"board/read\.do"))
+        if not a:
+            continue
+        m = re.search(r"boardId=(\d+)", a["href"])
+        if not m:
+            continue
+        cells = [_clean(td.get_text(" ")) for td in tr.find_all("td")]
+        date = next((c for c in cells if re.fullmatch(r"\d{4}-\d{2}-\d{2}", c)), None)
+        dept = cells[2] if len(cells) > 2 and not re.fullmatch(r"[\d,]+", cells[2]) else ""
+        out.append({"id": m.group(1), "title": _clean(a.get_text(" ")) or a.get("title", ""),
+                    "url": f"{MCEE}/home/web/board/read.do?menuId=10524&boardId={m.group(1)}&boardMasterId=39",
+                    "dept": dept, "date": date})
+    return out
+
+
+def parse_iris_detail(html: str) -> dict:
+    """IRIS 공고 상세 → {period_end(ISO)|None, body}. '접수기간' 칸에서 마감일을 읽는다."""
+    soup = _soup(html)
+    text = _clean(soup.get_text(" "))
+    i = text.find("접수기간")
+    seg = text[i: i + 160] if i >= 0 else ""
+    dates = [_iso(*d) for d in _DATE_ANY.findall(seg)]
+    dates = [d for d in dates if d]
+    body_i = text.find("■ 공고문")
+    return {"period_end": dates[-1] if dates else deadline_from_text(text),
+            "body": text[body_i: body_i + 4000] if body_i >= 0 else text[:2000]}
+
+
+def fetch_notice_detail(url: str, kind: str = "") -> dict:
+    """공고 상세 1건 → {deadline, body}. 실패하면 {}."""
+    try:
+        html = _get(url)
+        if kind == "iris":
+            d = parse_iris_detail(html)
+            return {"deadline": d["period_end"], "body": d["body"]}
+        soup = _soup(html)
+        node = soup.select_one(".board-detail, .board_view, .bbs_view, .view_cont, #contents") or soup
+        body = _clean(node.get_text(" "))
+        return {"deadline": deadline_from_text(body), "body": body[:4000]}
+    except Exception as exc:
+        log.debug("공고 상세 조회 실패 %s: %s", url, exc)
+        return {}
+
+
+def crawl_motir_notices(max_pages: int = 2) -> list[dict]:
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        try:
+            rows = parse_motir_notice_list(_get(MOTIR_NOTICE_LIST, {"pageIndex": page}))
+        except Exception as exc:
+            log.warning("S8 산업부 사업공고 목록 실패 (page=%d): %s", page, exc)
+            break
+        if not rows:
+            break
+        for r in rows:
+            out.append({"url_source": r["url"], "url_canonical": r["url"], "item_type": "grant_notice",
+                        "title": r["title"], "_grant": True, "_detail_kind": "motir", "law_name": r["dept"],
+                        "agency": "산업통상부", "notice_start": r["date"], "notice_end": None,
+                        "status": "공고", "opinion_url": "", "attachment_urls": r["attachments"][:3],
+                        "published_at": r["date"]})
+    return out
+
+
+def crawl_mcee_notices(max_pages: int = 3) -> list[dict]:
+    out: list[dict] = []
+    for page in range(max_pages):
+        try:
+            rows = parse_mcee_notice_list(_get(MCEE_NOTICE_LIST, {
+                "menuId": 10524, "boardMasterId": 39, "maxPageItems": 10, "pagerOffset": page * 10}))
+        except Exception as exc:
+            log.warning("S8 기후부 공지·공고 목록 실패 (page=%d): %s", page + 1, exc)
+            break
+        if not rows:
+            break
+        for r in rows:
+            out.append({"url_source": r["url"], "url_canonical": r["url"], "item_type": "grant_notice",
+                        "title": r["title"], "_grant": True, "_detail_kind": "mcee", "law_name": r["dept"],
+                        "agency": "기후에너지환경부", "notice_start": r["date"], "notice_end": None,
+                        "status": "공고", "opinion_url": "", "attachment_urls": [], "published_at": r["date"]})
+    return out
+
+
+_iris_logged = [False]
+
+
+def crawl_iris_notices(max_pages: int = 2) -> list[dict]:
+    """IRIS 사업공고(접수중). 목록은 화면이 부르는 JSON(POST) 을 그대로 쓴다.
+
+    요청 항목명은 화면 소스에서 읽은 값이다. 응답이 예상과 다르면 첫 응답의 키를 로그에 남기고 빈 목록을 돌려준다.
+    """
+    import requests
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        gap = _REQ_GAP - (time.monotonic() - _last_req[0])
+        if gap > 0:
+            time.sleep(gap)
+        try:
+            resp = requests.post(IRIS + "/contents/retrieveBsnsAncmBtinSituList.do", timeout=20,
+                                 headers={"User-Agent": _UA, "X-Requested-With": "XMLHttpRequest",
+                                          "Referer": IRIS + "/contents/retrieveBsnsAncmBtinSituListView.do"},
+                                 data={"pageIndex": page, "ancmPrg": "ancmIng", "bsnsTl": "", "blngGovdSeArr": "",
+                                       "sorgnIdArr": "", "techFildArr": "", "ancmSttArr": "", "pbofrTpArr": "",
+                                       "qualCndtArr": ""})
+            _last_req[0] = time.monotonic()
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("S8 IRIS 사업공고 목록 실패 (page=%d): %s", page, exc)
+            break
+        rows = data.get("listBsnsAncmBtinSitu") or []
+        if not _iris_logged[0]:
+            log.info("S8 IRIS 응답 키: %s · 첫 행 키: %s", sorted(data.keys()), sorted(rows[0].keys()) if rows else [])
+            _iris_logged[0] = True
+        if not rows:
+            break
+        for r in rows:
+            aid = str(r.get("ancmId") or "")
+            if not aid:
+                continue
+            url = f"{IRIS}/contents/retrieveBsnsAncmView.do?ancmId={aid}&ancmPrg=ancmIng"
+            ad = str(r.get("ancmDe") or "")[:10]
+            out.append({"url_source": url, "url_canonical": url, "item_type": "grant_notice",
+                        "title": _clean(str(r.get("ancmTl") or "")), "_grant": True, "_detail_kind": "iris",
+                        "law_name": _clean(str(r.get("sorgnNm") or "")),
+                        "agency": _clean(str(r.get("blngGovdSeNm") or "")) or "범부처",
+                        "notice_start": ad or None, "notice_end": None,
+                        "status": "접수중", "opinion_url": "", "attachment_urls": [],
+                        "published_at": ad or None, "_ancm_no": str(r.get("ancmNo") or "")})
+        pg = data.get("paginationInfo") or {}
+        if page >= int(pg.get("totalPageCount") or page):
+            break
+    log.info("S8 IRIS 사업공고 목록 %d건", len(out))
+    return out
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

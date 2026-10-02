@@ -21,6 +21,8 @@
       sort: 'priority', hasDeadline: false, layout: 'bill' },
     { key: 'trade',  label: '통상 환경', kind: 'items', types: 'trade_webzine',
       sort: 'priority', hasDeadline: false, layout: 'trade' },   // 산업통상부 월간 통상(tongsangnews.kr)
+    { key: 'grant',  label: '공모·수요조사', kind: 'items', types: 'grant_notice',
+      sort: 'deadline', hasDeadline: true, layout: 'grant' },     // 산업부·기후부 사업공고 + IRIS
     { key: 'calendar', label: '일정', kind: 'calendar', layout: 'calendar' }   // 모든 마감일을 달력으로
   ];
   // 우선순위 4단계 — 기준은 화면의 '기준 보기'와 같은 말이다(백엔드 ea_priority 규칙).
@@ -94,7 +96,7 @@
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
-    eaState.cat = ['notice', 'bill', 'trade', 'calendar'].indexOf(p.get('ea_cat')) >= 0 ? p.get('ea_cat') : 'policy';
+    eaState.cat = ['notice', 'bill', 'trade', 'grant', 'calendar'].indexOf(p.get('ea_cat')) >= 0 ? p.get('ea_cat') : 'policy';
     eaState.agency = new Set((p.get('ea_agency') || '').split(',').filter(Boolean));
     eaState.group = new Set((p.get('ea_group') || '').split(',').filter(Boolean));
     eaState.priority = new Set((p.get('ea_priority') || '').split(',').filter(Boolean));
@@ -334,7 +336,8 @@
     var layout = currentCat().layout;
     var isBill = layout === 'bill';
     var isTrade = layout === 'trade';
-    var isNotice = layout === 'notice';
+    var isGrant = layout === 'grant';
+    var isNotice = layout === 'notice' || isGrant;
     var card = el('article', 'ea-card ea-card--flat');
     if (isTrade && it.thumbnail) {          // 통상 환경 — 포토카드(월간 통상 기사 대표 사진)
       var ph = el('a', 'ea-photo');
@@ -351,7 +354,8 @@
     head.append(prioBadge(it));
     if (isNotice) { head.append(ddayChip(it)); }
     head.append(el('span', 'ea-card-date', isNotice
-      ? (fmtDate(it.notice_start) + ' ~ ' + (fmtDate(it.notice_end) || '미정'))
+      ? (isGrant ? ('공고 ' + fmtDate(it.notice_start) + (it.notice_end ? ' · 접수 마감 ' + fmtDate(it.notice_end) : ' · 접수 마감일 미확인'))
+        : (fmtDate(it.notice_start) + ' ~ ' + (fmtDate(it.notice_end) || '미정')))
       : fmtDate(it.published_at || it.notice_start)));
     body.append(head);
 
@@ -360,7 +364,8 @@
     body.append(h);
 
     if (isNotice) {
-      var nb = [it.agency && ('소관: ' + it.agency), it.law_name, it.status].filter(Boolean);
+      var nb = [it.agency && ('소관: ' + it.agency),
+        it.law_name && ((isGrant ? '담당·전문기관: ' : '') + it.law_name), it.status].filter(Boolean);
       body.append(el('p', 'ea-card-sub', nb.join(' · ')));
     } else if (isTrade) {
       // 기자명이 없는 정부 발행물 — 출처를 산업통상부(월간 통상)로 적는다
@@ -416,7 +421,7 @@
     }
 
     var acts = el('div', 'ea-actions');
-    acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : isNotice ? '원문' : '정책브리핑 원문', it.url));
+    acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : isGrant ? '공고 원문' : isNotice ? '원문' : '정책브리핑 원문', it.url));
     if (isNotice && it.opinion_url) { acts.append(link('의견 제출', it.opinion_url, 'is-primary')); }
     if (isNotice) {
       (it.attachment_urls || []).forEach(function (u, i) { acts.append(link('첨부 ' + (i + 1), u)); });

@@ -14170,7 +14170,7 @@ def cmd_selftest() -> int:
         check("무관 제목은 그룹사 없음",
               ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
         # 카테고리는 정책 동향·국회 의안 2개(2026-10-02 개편) + item_type 매핑(옛 키는 호환용으로 남김)
-        check("카테고리 5개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "notice", "bill", "trade", "calendar"])
+        check("카테고리 6개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "notice", "bill", "trade", "grant", "calendar"])
         check("정책 동향 → policy_press", ea_mod.EA_CATEGORY_TYPES["policy"], ["policy_press"])
         check("부처별 동향 → ministry_news", ea_mod.EA_CATEGORY_TYPES["ministry"], ["ministry_news"])
         check("통상 환경 → trade_webzine(월간 통상)", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_webzine"])
@@ -14371,6 +14371,45 @@ def cmd_selftest() -> int:
                   [i["title"] for i in _cl.get("/api/ea/items", params={"item_type": "legislation,admin_notice",
                                                                          "sort": "deadline"}).json()["items"]][:2],
                   ["지난 예고", "산업안전보건법 시행령 입법예고"])
+        # 공모·수요조사 공고(산업부 사업공고 · 기후부 공지·공고 · IRIS) — 서비스키 없이 공개 페이지만 읽는다
+        _mt = ('<table><tbody><tr><td data-cell-header="공고번호">2026-613</td><td class="ta-l" data-cell-header="제목">'
+               '<div class="board-link"><a href="https://www.motir.go.kr/kor/article/ATCL2826a2625/71333/view?mno=&amp;pageIndex=1">'
+               '<i>2026년도 소재부품기술개발사업(4차) 신규지원 대상과제 공고</i></a></div></td>'
+               '<td data-cell-header="담당부서">산업공급망정책과</td><td data-cell-header="등록일">2026-09-22</td>'
+               '<td data-cell-header="조회수">4,815</td><td data-cell-header="첨부파일"><a href="https://www.motir.go.kr/attach/down/x1">f</a></td></tr></tbody></table>')
+        _mtr = _eac.parse_motir_notice_list(_mt)
+        check("산업부 사업공고 목록 — 공고번호·제목·담당부서·등록일·첨부(주소의 쿼리는 뗀다)",
+              (_mtr[0]["no"], _mtr[0]["title"], _mtr[0]["dept"], _mtr[0]["date"], _mtr[0]["url"], len(_mtr[0]["attachments"])),
+              ("2026-613", "2026년도 소재부품기술개발사업(4차) 신규지원 대상과제 공고", "산업공급망정책과", "2026-09-22",
+               "https://www.motir.go.kr/kor/article/ATCL2826a2625/71333/view", 1))
+        _mc = ('<table><tr><td>11880</td><td><a href="/home/web/board/read.do;jsessionid=AB.mehome1?pagerOffset=0&amp;menuId=10524'
+               '&amp;boardId=1894540&amp;boardMasterId=39">2026년도 3차 「전력정보화 및 정책지원사업」 신규지원 대상과제 공고</a></td>'
+               '<td>재생에너지<br>정책과</td><td>고진희</td><td>2026-09-29</td><td>1,011</td></tr></table>')
+        _mcr = _eac.parse_mcee_notice_list(_mc)
+        check("기후부 공지·공고 목록 — 세션 주소를 뗀 깨끗한 상세 주소·부서·등록일",
+              (_mcr[0]["id"], _mcr[0]["url"], _mcr[0]["dept"], _mcr[0]["date"]),
+              ("1894540", "https://www.mcee.go.kr/home/web/board/read.do?menuId=10524&boardId=1894540&boardMasterId=39",
+               "재생에너지 정책과", "2026-09-29"))
+        check("공고문에서 접수 마감일 — 기간이면 뒤쪽, 공고일·시행일은 마감으로 오인하지 않는다",
+              (_eac.deadline_from_text("접수기간 2026. 9. 22.(화) ~ 2026. 10. 21.(수) 18:00까지"),
+               _eac.deadline_from_text("신청기한: ~ 2026년 10월 21일까지"),
+               _eac.deadline_from_text("공고일 2026.9.1 시행일 2026.12.1")), ("2026-10-21", "2026-10-21", None))
+        check("IRIS 상세 — 접수기간 칸의 끝 날짜가 마감",
+              _eac.parse_iris_detail("<div><li>공고번호 제2026-613호</li><li>접수기간 2026-09-22 ~ 2026-10-21</li>"
+                                     "<li>사업담당자 홍길동</li><p>■ 공고문 소재부품 신규과제를 공고합니다</p></div>")["period_end"],
+              "2026-10-21")
+        _gg = ea_mod.Gates.__new__(ea_mod.Gates)
+        _gg.db = type("D", (), {"known_url_sources": lambda self, u: set(), "upsert_ledger": lambda *a: None})()
+        _gg.seen, _gg.agency_names, _gg.extra_terms = set(), set(), []
+        _gg.counts = {"fetched": 0, "g0": 0, "g1": 0, "g2": 0, "g2_5": 0, "off_topic": 0}
+        check("공모 공고 — 소재부품·수요조사 같은 낱말이 제목에 있으면 관련으로 통과(일반 공고는 제외)",
+              [x["url_source"] for x in _gg.filter([
+                  {"url_source": "g1", "title": "2026년도 소재부품기술개발사업(4차) 신규지원 대상과제 공고", "_grant": True},
+                  {"url_source": "g2", "title": "비영리법인 설립허가 공고 (사단법인 주한덴마크상공회의소)", "_grant": True},
+                  {"url_source": "g3", "title": "2027년 사전 수요조사 공고", "_grant": True}])], ["g1", "g3"])
+        check("공모 공고 마감일이 있으면 달력·D-day 에 올라간다(항목 뷰)",
+              ea_mod._item_view({"id": "g", "title": "소재부품 공고", "item_type": "grant_notice",
+                                 "notice_end": (datetime.now(KST).date() + timedelta(days=5)).isoformat()})["d_day"], 5)
         _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
                                 "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
                                 "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})

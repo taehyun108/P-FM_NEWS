@@ -842,6 +842,14 @@ def is_relevant(title: str, law_name: str = "", agency: str = "",
     return bool(_kw_in(probe, EA_RELEVANCE_KW) or _kw_in(probe, extra_terms))
 
 
+# 공모·수요조사·지원사업 공고에서 더 넓게 보는 낱말(제목에 이 중 하나라도 있으면 관련으로 본다)
+EA_GRANT_KW: list[str] = [
+    "소재부품", "연구개발", "R&D", "수요조사", "기술개발", "신규지원", "실증", "투자지원", "세액공제", "할당관세",
+    "에너지", "재활용", "순환경제", "전지", "탄소", "녹색", "첨단전략", "규제샌드박스", "절충교역", "공급망",
+    "수출바우처", "산업융합", "신산업", "연구용역", "기술나눔", "소부장",
+]
+
+
 # ── 게이트 G0 ~ G2.5 ────────────────────────────────────────────────
 class Gates:
     """기존 파이프라인과 같은 순서로 거른다. HTTP·LLM 은 G2.5 통과분에만 쓴다."""
@@ -887,9 +895,10 @@ class Gates:
             if it.get("_trusted"):      # 산업통상부 발행 통상 웹진 — 출처 자체가 통상 자료라 관련성 검사를 건너뛴다
                 kept.append(it)
                 continue
-            if is_relevant(it.get("title", ""), it.get("law_name", ""), it.get("agency", ""),
-                           self.agency_names, self.extra_terms) \
-                    or (body_probe and is_relevant(body_probe, extra_terms=self.extra_terms)):
+            extra = list(self.extra_terms) + (EA_GRANT_KW if it.get("_grant") else [])
+            if is_relevant(it.get("title", ""), "" if it.get("_grant") else it.get("law_name", ""),
+                           it.get("agency", ""), self.agency_names, extra) \
+                    or (body_probe and is_relevant(body_probe, extra_terms=extra)):
                 kept.append(it)
             else:
                 self.db.upsert_ledger(it["url_source"], "off_topic")
@@ -1317,6 +1326,19 @@ def fetch_tongsang() -> list[dict]:
         return []
 
 
+def fetch_grants() -> list[dict]:
+    """S8 공모·수요조사·지원사업 공고 — 산업부 사업공고 · 기후부 공지·공고 · IRIS. 하나가 실패해도 나머지는 계속."""
+    out: list[dict] = []
+    for label, fn in (("IRIS", lambda: _crawl().crawl_iris_notices()),
+                      ("산업부", lambda: _crawl().crawl_motir_notices()),
+                      ("기후부", lambda: _crawl().crawl_mcee_notices())):
+        try:
+            out.extend(fn())
+        except Exception as exc:
+            log.warning("S8 %s 공고 수집 실패: %s", label, exc)
+    return out
+
+
 SOURCES = [
     ("S1 입법예고", fetch_legislation_notices),
     ("S2 행정예고", fetch_admin_notices),
@@ -1325,6 +1347,7 @@ SOURCES = [
     ("S5 KOTRA 해외시장뉴스", fetch_kotra_news),
     ("S6 정책브리핑 보도자료", fetch_korea_press),
     ("S7 월간 통상", fetch_tongsang),
+    ("S8 공모·수요조사 공고", fetch_grants),
 ]
 
 
@@ -1468,6 +1491,13 @@ def collect_once(ctx: Any, db: Any) -> dict:
             real = _crawl().fetch_press_title(it["url_source"])
             if real:
                 it["title"] = real
+        if it.get("_grant"):              # 공모·공고 — 새 항목만 상세를 읽어 본문·접수 마감일을 채운다
+            d = _crawl().fetch_notice_detail(it["url_source"], it.get("_detail_kind", ""))
+            it["_body"] = d.get("body") or it.get("title") or ""
+            if d.get("deadline"):
+                it["notice_end"] = d["deadline"]
+                if d["deadline"] < datetime.now(KST).date().isoformat():
+                    it["status"] = "마감"
         if it.get("_need_detail"):        # 월간 통상 — 새 항목만 상세를 읽어 제목·본문·썸네일을 채운다
             d = _crawl().fetch_tongsang_detail(it["url_source"])
             if not d or len(d.get("body") or "") < _crawl().TONGSANG_MIN_BODY or not d.get("title"):
@@ -1520,9 +1550,10 @@ def collect_once(ctx: Any, db: Any) -> dict:
             except Exception as exc:
                 log.debug("상세 확보 실패 %s: %s", it.get("url_source", ""), exc)
         # 본문(개정이유·주요내용)까지 확인해 여전히 산업 키워드가 없으면 저장하지 않는다
-        if body and not it.get("_trusted") and not is_relevant(row["title"], row.get("law_name") or "",
-                                    extra_terms=gates.extra_terms) \
-                and not is_relevant(body[:2000], extra_terms=gates.extra_terms):
+        _extra = list(gates.extra_terms) + (EA_GRANT_KW if it.get("_grant") else [])
+        if body and not it.get("_trusted") and not is_relevant(row["title"], "" if it.get("_grant") else (row.get("law_name") or ""),
+                                                          extra_terms=_extra) \
+                and not is_relevant(body[:2000], extra_terms=_extra):
             db.upsert_ledger(it["url_source"], "off_topic")
             gates.counts["off_topic"] += 1
             gates.seen.add(it["url_source"])
@@ -1831,7 +1862,7 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
     agency = agency or (item.get("agency_raw") or "")
 
-    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news", "policy_press", "trade_webzine")
+    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news", "policy_press", "trade_webzine", "grant_notice")
     tmpl = EA_NEWS_PROMPT if is_news else EA_PROMPT
     news_period = item.get("published_at") or item.get("notice_start") or "(미상)"
     prompt = tmpl.format(
@@ -2117,6 +2148,7 @@ EA_CATEGORIES = [
     {"key": "notice", "label": "입법·행정예고"},
     {"key": "bill", "label": "국회 의안"},
     {"key": "trade", "label": "통상 환경"},
+    {"key": "grant", "label": "공모·수요조사"},
     {"key": "calendar", "label": "일정"},
 ]
 # 카테고리 → ea_policy_items.item_type 목록. 예전 키(notice·ministry·trade)는 옛 주소·주간레포트 호환용으로만 남긴다.
@@ -2125,6 +2157,7 @@ EA_CATEGORY_TYPES = {
     "bill": ["bill"],
     "notice": ["legislation", "admin_notice"],
     "ministry": ["ministry_news"],
+    "grant": ["grant_notice"],        # 산업부·기후부 사업공고 + IRIS
     "calendar": [],                   # 일정은 모든 유형의 마감일을 모아 보여 준다
     "trade": ["trade_webzine"],       # 월간 통상(산업통상부 웹진). KOTRA(trade_news)는 주간 레포트가 따로 쓴다
 }
@@ -2213,7 +2246,8 @@ def register_api(app: Any, ctx: Any) -> None:
                              "items": [_item_view(r) for r in rows[start:start + size]]})
 
     _CAL_LABEL = {"legislation": "입법예고 마감", "admin_notice": "행정예고 마감", "bill": "국회 의안",
-                  "policy_press": "정책 발표", "trade_webzine": "통상", "ministry_news": "부처 동향"}
+                  "policy_press": "정책 발표", "trade_webzine": "통상", "ministry_news": "부처 동향",
+                  "grant_notice": "공모·접수 마감"}
 
     @app.get("/api/ea/calendar")
     def ea_calendar(month: str = ""):
