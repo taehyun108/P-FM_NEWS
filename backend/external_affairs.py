@@ -1332,7 +1332,9 @@ def fetch_grants() -> list[dict]:
     out: list[dict] = []
     for label, fn in (("IRIS", lambda: _crawl().crawl_iris_notices()),
                       ("산업부", lambda: _crawl().crawl_motir_notices()),
-                      ("기후부", lambda: _crawl().crawl_mcee_notices())):
+                      ("기후부", lambda: _crawl().crawl_mcee_notices()),
+                      ("동적 사이트(KOTRA 등)", lambda: [x for _n, fn in _crawl().RENDERED_SITES for x in fn()]
+                       if _env_on("EA_RENDER_ENABLED", True) else [])):
         try:
             out.extend(fn())
         except Exception as exc:
@@ -1493,7 +1495,10 @@ def collect_once(ctx: Any, db: Any) -> dict:
             if real:
                 it["title"] = real
         if it.get("_grant"):              # 공모·공고 — 새 항목만 상세를 읽어 본문·접수 마감일을 채운다
-            d = _crawl().fetch_notice_detail(it["url_source"], it.get("_detail_kind", ""))
+            if it.get("_detail_kind") == "none":       # 목록 정보만으로 충분한 소스(KOTRA 입찰공고 등)
+                d = {"body": it.get("_body") or it.get("title") or ""}
+            else:
+                d = _crawl().fetch_notice_detail(it["url_source"], it.get("_detail_kind", ""))
             it["_body"] = d.get("body") or it.get("title") or ""
             if d.get("deadline"):
                 it["notice_end"] = d["deadline"]

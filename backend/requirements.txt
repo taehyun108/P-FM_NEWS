@@ -14,3 +14,5 @@ uvicorn>=0.29,<1
 supabase>=2.4,<3
 # LANGSMITH_TRACING=true 일 때만 필요 (LLM 호출 추적)
 langsmith>=0.11,<1
+# 화면이 자바스크립트로 그려지는 사이트(KOTRA 입찰공고 등) 읽기 — 대외협력 수집 전용(2026-10-02 사용자 승인)
+playwright>=1.40,<2

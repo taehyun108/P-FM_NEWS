@@ -935,6 +935,128 @@ def crawl_iris_notices(max_pages: int = 2) -> list[dict]:
     return out
 
 
+# ── 화면이 자바스크립트로 그려지는 사이트(KOTRA 등) — 브라우저(Playwright·Chromium)로 읽기 ─────────────
+#   일반 요청으로는 껍데기만 오는 사이트용이다(2026-10-02 승인된 라이브러리: playwright).
+#   · 설치돼 있지 않으면 경고 한 번만 남기고 건너뛴다 — 다른 소스 수집은 영향이 없다.
+#   · 하루 두 번뿐인 대외협력 수집에서만 쓰고, 사이트당 브라우저를 한 번 띄워 쪽을 넘기며 읽는다.
+#   · 사이트를 더 늘리려면 RENDERED_SITES 에 (이름·주소·기다릴 요소·읽는 함수)만 추가한다.
+_render_warned = [False]
+
+
+def render_snapshots(url: str, wait_selector: str, pages: int = 1, next_page=None,
+                     timeout_ms: int = 30000) -> list[str]:
+    """브라우저로 url 을 열고 wait_selector 가 나타나면 HTML 을 한 장 찍는다. pages>1 이면 next_page(page, n) 로 쪽을 넘겨 더 찍는다.
+
+    실패(미설치·타임아웃 등)는 지금까지 찍은 것만 돌려준다(없으면 빈 목록).
+    """
+    import os
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        if not _render_warned[0]:
+            log.warning("playwright 미설치 — 화면이 동적으로 그려지는 사이트(KOTRA 등)는 건너뜁니다")
+            _render_warned[0] = True
+        return []
+    snaps: list[str] = []
+    try:
+        with sync_playwright() as pw:
+            exe = os.environ.get("EA_CHROMIUM_PATH", "").strip() or None
+            browser = pw.chromium.launch(
+                executable_path=exe,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+            try:
+                page = browser.new_page(user_agent=_UA, locale="ko-KR")
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_selector(wait_selector, timeout=timeout_ms)
+                snaps.append(page.content())
+                for n in range(2, pages + 1):
+                    if not next_page or not next_page(page, n):
+                        break
+                    page.wait_for_timeout(1500)
+                    snaps.append(page.content())
+            finally:
+                browser.close()
+    except Exception as exc:
+        log.warning("브라우저 읽기 실패 (%s): %s", url, exc)
+    return snaps
+
+
+KOTRA_BID_URL = "https://www.kotra.or.kr/subList/20000005958?tabid=1092"      # 알림·홍보 > 입찰공고
+
+
+def parse_kotra_bids(html: str) -> list[dict]:
+    """KOTRA 입찰공고 목록(다 그려진 HTML) → [{title, date, deadline, method, extra, nttseq}]. 마감일은 ISO."""
+    import hashlib
+    soup = _soup(html)
+    out: list[dict] = []
+    for tr in soup.select("table tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 3:
+            continue
+        cells = [_clean(td.get_text(" ")) for td in tds]
+        title = re.sub(r"^제목\s*:\s*", "", cells[0])
+        if not title:
+            continue
+        dates = [_iso(*d) for d in _DATE_ANY.findall(cells[1])]
+        date = next((d for d in dates if d), None)
+        dl = [_iso(*d) for d in _DATE_ANY.findall(cells[2])]
+        deadline = next((d for d in dl if d), None)
+        method = re.sub(r"^입찰방법\s*:\s*", "", cells[3]) if len(cells) > 3 else ""
+        extra = re.sub(r"^기타\s*:\s*", "", cells[4]) if len(cells) > 4 else ""
+        # 상세 주소가 있으면 쓰고(onclick 의 번호), 없으면 제목+작성일로 만든 고유값을 붙인다
+        ntt = ""
+        for tag in [tr] + tr.find_all(True):
+            blob = " ".join(str(tag.get(k, "")) for k in ("onclick", "href", "data-nttseq", "data-ntt-seq"))
+            m = re.search(r"(\d{3,})", blob)
+            if m:
+                ntt = m.group(1)
+                break
+        if not ntt:
+            ntt = "h" + hashlib.sha1((title + (date or "")).encode("utf-8")).hexdigest()[:10]
+        out.append({"title": title, "date": date, "deadline": deadline, "method": method, "extra": extra,
+                    "nttseq": ntt})
+    return out
+
+
+def _kotra_next_page(page, n: int) -> bool:
+    """입찰공고 목록 하단 쪽 번호 n 을 눌러 이동한다. 없으면 False."""
+    try:
+        link = page.locator("#detail_area .paging a, #detail_area .pagination a, #detail_area [class*=page] a").filter(
+            has_text=re.compile(rf"^\s*{n}\s*$")).first
+        if link.count() == 0:
+            return False
+        link.click(timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+def crawl_kotra_bids(pages: int = 2) -> list[dict]:
+    """KOTRA 입찰공고 — 아직 마감 전인 것만. 상세 페이지는 열지 않고 목록 정보(입찰방법·계약방식)로 본문을 만든다."""
+    snaps = render_snapshots(KOTRA_BID_URL, "table tbody tr td", pages=pages, next_page=_kotra_next_page)
+    today = datetime.now(timezone.utc).date().isoformat()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for html in snaps:
+        for r in parse_kotra_bids(html):
+            if r["nttseq"] in seen or (r["deadline"] and r["deadline"] < today):
+                continue
+            seen.add(r["nttseq"])
+            url = f"{KOTRA_BID_URL}&nttSeq={r['nttseq']}"
+            out.append({"url_source": url, "url_canonical": KOTRA_BID_URL, "item_type": "grant_notice",
+                        "title": r["title"], "_grant": True, "_detail_kind": "none",
+                        "_body": f"{r['title']} · 입찰방법 {r['method']} · {r['extra']} · 마감 {r['deadline'] or '미정'}",
+                        "law_name": r["method"], "agency": "KOTRA", "notice_start": r["date"],
+                        "notice_end": r["deadline"], "status": "입찰 접수중", "opinion_url": "",
+                        "attachment_urls": [], "published_at": r["date"]})
+    log.info("S8 KOTRA 입찰공고 %d건(마감 전)", len(out))
+    return out
+
+
+# 더 늘리려면 여기에 한 줄 — 화면이 동적으로 그려지는 사이트(이름, 수집 함수)
+RENDERED_SITES = [("KOTRA 입찰공고", crawl_kotra_bids)]
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

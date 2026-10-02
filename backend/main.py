@@ -14412,6 +14412,47 @@ def cmd_selftest() -> int:
         check("공모 공고 마감일이 있으면 달력·D-day 에 올라간다(항목 뷰)",
               ea_mod._item_view({"id": "g", "title": "소재부품 공고", "item_type": "grant_notice",
                                  "notice_end": (datetime.now(KST).date() + timedelta(days=5)).isoformat()})["d_day"], 5)
+        # KOTRA 입찰공고 — 화면이 동적으로 그려지는 사이트(브라우저로 읽는다). 파서는 항상, 브라우저 읽기는 설치돼 있을 때만 시험한다.
+        _kb = ('<table><tbody><tr onclick="fnDetail(\'7301\')"><td>2026년 경제안보품목 수입처 다변화 지원사업 운영 대행</td><td>작성일 : 2026-09-20</td>'
+               '<td>마감일 : <br> <br> 2026. 10. 12. (월) 18:00</td><td>입찰방법 : 제한경쟁(총액)</td><td>기타 : 협상에 의한 계약</td></tr>'
+               '<tr><td>제목 없는 번호 행</td><td>작성일 : 2026-09-01</td><td>마감일 : 2026. 9. 9.</td></tr></tbody></table>')
+        _kbr = _eac.parse_kotra_bids(_kb)
+        check("KOTRA 입찰공고 파서 — 제목·작성일·마감일(ISO)·입찰방법·계약방식·상세 번호",
+              (_kbr[0]["title"], _kbr[0]["date"], _kbr[0]["deadline"], _kbr[0]["method"], _kbr[0]["extra"], _kbr[0]["nttseq"]),
+              ("2026년 경제안보품목 수입처 다변화 지원사업 운영 대행", "2026-09-20", "2026-10-12", "제한경쟁(총액)",
+               "협상에 의한 계약", "7301"))
+        check("KOTRA 입찰공고 파서 — 상세 번호가 없으면 제목+작성일로 고유값을 만든다",
+              _kbr[1]["nttseq"].startswith("h") and len(_kbr[1]["nttseq"]) == 11, True)
+        _pw_exe = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+        try:
+            import playwright  # noqa: F401
+            _has_pw = os.path.exists(os.environ.get("EA_CHROMIUM_PATH") or _pw_exe)
+        except ImportError:
+            _has_pw = False
+        if _has_pw:
+            _site = os.path.join(__import__("tempfile").mkdtemp(), "kotra.html")
+            open(_site, "w", encoding="utf-8").write(
+                '<html><body><div id="detail_area"></div><script>const P={1:[["일반 용역 입찰","2026-09-21","2099. 11. 3.","일반경쟁","x"]],'
+                '2:[["경제안보품목 수입처 다변화 대행","2026-09-20","2099. 10. 12.","제한경쟁","y"],["지난 입찰","2026-01-01","2026. 1. 5.","일반","z"]]};'
+                'function draw(n){document.getElementById("detail_area").innerHTML="<table><tbody>"+P[n].map((r,i)=>"<tr onclick=\\"f("+(5000+n*10+i)+")\\">"'
+                '+r.map((c,j)=>"<td>"+["","작성일 : ","마감일 : ","입찰방법 : ","기타 : "][j]+c+"</td>").join("")+"</tr>").join("")+"</tbody></table>"'
+                '+"<div class=paging><a href=# onclick=\\"draw(1);return false\\">1</a><a href=# onclick=\\"draw(2);return false\\">2</a></div>";}'
+                'setTimeout(()=>draw(1),500);</script></body></html>')
+            _old_url, _old_exe = _eac.KOTRA_BID_URL, os.environ.get("EA_CHROMIUM_PATH")
+            _eac.KOTRA_BID_URL = "file://" + _site
+            os.environ["EA_CHROMIUM_PATH"] = _old_exe or _pw_exe
+            try:
+                _kc = _eac.crawl_kotra_bids(pages=2)
+            finally:
+                _eac.KOTRA_BID_URL = _old_url
+                if _old_exe is None:
+                    os.environ.pop("EA_CHROMIUM_PATH", None)
+                else:
+                    os.environ["EA_CHROMIUM_PATH"] = _old_exe
+            check("KOTRA 입찰공고 — 브라우저로 늦게 그려지는 목록을 읽고 2쪽까지 넘기며, 마감 지난 건은 뺀다",
+                  [x["title"] for x in _kc], ["일반 용역 입찰", "경제안보품목 수입처 다변화 대행"])
+        else:
+            print("  - (브라우저 읽기 시험은 playwright·Chromium 이 있을 때만 — 이 환경에서는 건너뜀)")
         _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
                                 "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
                                 "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})

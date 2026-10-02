@@ -14,6 +14,11 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
+# 동적 사이트(KOTRA 등) 수집용 브라우저(Chromium)와 시스템 라이브러리. 이미지가 수백 MB 커진다.
+# 브라우저 경로를 고정해 두면 실행 계정과 상관없이 같은 곳을 쓴다.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 # 스케줄 판단(야간 억제·주간 레포트·대외협력)은 이 값을 기준으로 한다.
