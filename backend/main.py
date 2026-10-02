@@ -14406,7 +14406,9 @@ def cmd_selftest() -> int:
               [x["url_source"] for x in _gg.filter([
                   {"url_source": "g1", "title": "2026년도 소재부품기술개발사업(4차) 신규지원 대상과제 공고", "_grant": True},
                   {"url_source": "g2", "title": "비영리법인 설립허가 공고 (사단법인 주한덴마크상공회의소)", "_grant": True},
-                  {"url_source": "g3", "title": "2027년 사전 수요조사 공고", "_grant": True}])], ["g1", "g3"])
+                  {"url_source": "g3", "title": "2027년 사전 수요조사 공고", "_grant": True},
+                  {"url_source": "g4", "title": "2026년 경제안보품목 수입처 다변화 지원사업 공고", "_grant": True}])],
+              ["g1", "g3", "g4"])
         check("공모 공고 마감일이 있으면 달력·D-day 에 올라간다(항목 뷰)",
               ea_mod._item_view({"id": "g", "title": "소재부품 공고", "item_type": "grant_notice",
                                  "notice_end": (datetime.now(KST).date() + timedelta(days=5)).isoformat()})["d_day"], 5)
