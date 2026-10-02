@@ -174,3 +174,7 @@
 .ea-criteria-body { padding: 0 14px 12px; font-size: 12.5px; line-height: 1.7; color: var(--ink-mid); }
 .ea-criteria-body ul { margin: 6px 0 8px; padding-left: 18px; }
 .ea-criteria-body li { margin-bottom: 4px; }
+
+/* 통상 환경 포토카드 — 월간 통상 기사 대표 사진 */
+.ea-photo { display: block; aspect-ratio: 16 / 9; overflow: hidden; background: #e8eefb; }
+.ea-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }

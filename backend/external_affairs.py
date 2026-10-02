@@ -884,6 +884,9 @@ class Gates:
         kept: list[dict] = []
         for it in g2:
             body_probe = (it.get("_body") or "")[:2000]
+            if it.get("_trusted"):      # 산업통상부 발행 통상 웹진 — 출처 자체가 통상 자료라 관련성 검사를 건너뛴다
+                kept.append(it)
+                continue
             if is_relevant(it.get("title", ""), it.get("law_name", ""), it.get("agency", ""),
                            self.agency_names, self.extra_terms) \
                     or (body_probe and is_relevant(body_probe, extra_terms=self.extra_terms)):
@@ -1305,6 +1308,15 @@ def fetch_korea_press() -> list[dict]:
         return []
 
 
+def fetch_tongsang() -> list[dict]:
+    """S7 월간 통상(tongsangnews.kr, 산업통상부 웹진) — 이번 호 기사 목록."""
+    try:
+        return _crawl().crawl_tongsang()
+    except Exception as exc:
+        log.warning("S7 월간 통상 크롤링 실패: %s", exc)
+        return []
+
+
 SOURCES = [
     ("S1 입법예고", fetch_legislation_notices),
     ("S2 행정예고", fetch_admin_notices),
@@ -1312,6 +1324,7 @@ SOURCES = [
     ("S4 부처 정책뉴스", fetch_ministry_news),
     ("S5 KOTRA 해외시장뉴스", fetch_kotra_news),
     ("S6 정책브리핑 보도자료", fetch_korea_press),
+    ("S7 월간 통상", fetch_tongsang),
 ]
 
 
@@ -1455,6 +1468,16 @@ def collect_once(ctx: Any, db: Any) -> dict:
             real = _crawl().fetch_press_title(it["url_source"])
             if real:
                 it["title"] = real
+        if it.get("_need_detail"):        # 월간 통상 — 새 항목만 상세를 읽어 제목·본문·썸네일을 채운다
+            d = _crawl().fetch_tongsang_detail(it["url_source"])
+            if not d or len(d.get("body") or "") < _crawl().TONGSANG_MIN_BODY or not d.get("title"):
+                db.upsert_ledger(it["url_source"], "extract_failed")     # 글이 거의 없는 꼭지(인포그래픽 등)
+                gates.seen.add(it["url_source"])
+                continue
+            it["title"] = d["title"]
+            it["_body"] = d["body"]
+            it["attachment_urls"] = [d["thumb"]] if d.get("thumb") else []
+            it["_cat_label"] = d.get("category") or it.get("_cat_label") or ""
         row = {
             "id": new_id(),
             "url_source": it["url_source"],
@@ -1473,6 +1496,8 @@ def collect_once(ctx: Any, db: Any) -> dict:
             "published_at": it.get("published_at") or None,
             "collected_at": iso(now_utc()),
         }
+        if (it.get("item_type") or "") == "trade_webzine" and it.get("_cat_label"):
+            row["category"] = it["_cat_label"]      # 웹진 분류명(글로벌 통상 뉴스 등)
         if (it.get("item_type") or "") == "bill":
             try:
                 props = it.get("_proposers") or resolve_bill_proposers(it)
@@ -1495,7 +1520,7 @@ def collect_once(ctx: Any, db: Any) -> dict:
             except Exception as exc:
                 log.debug("상세 확보 실패 %s: %s", it.get("url_source", ""), exc)
         # 본문(개정이유·주요내용)까지 확인해 여전히 산업 키워드가 없으면 저장하지 않는다
-        if body and not is_relevant(row["title"], row.get("law_name") or "",
+        if body and not it.get("_trusted") and not is_relevant(row["title"], row.get("law_name") or "",
                                     extra_terms=gates.extra_terms) \
                 and not is_relevant(body[:2000], extra_terms=gates.extra_terms):
             db.upsert_ledger(it["url_source"], "off_topic")
@@ -1806,7 +1831,7 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     # 카드에는 부처가 보이는데 프롬프트에는 '(미상)' 이 들어가는 어긋남이 없다.
     agency = agency or (item.get("agency_raw") or "")
 
-    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news", "policy_press")
+    is_news = (item.get("item_type") or "") in ("ministry_news", "trade_news", "policy_press", "trade_webzine")
     tmpl = EA_NEWS_PROMPT if is_news else EA_PROMPT
     news_period = item.get("published_at") or item.get("notice_start") or "(미상)"
     prompt = tmpl.format(
@@ -1983,6 +2008,9 @@ def ea_priority(v: dict) -> tuple[str, str]:
 
 def _item_view(row: dict) -> dict:
     view = _item_view_base(row)
+    if view.get("item_type") == "trade_webzine":
+        view["thumbnail"] = (view.get("attachment_urls") or [""])[0]
+        view["attachment_urls"] = []
     view["priority"], view["priority_reason"] = ea_priority(view)
     return view
 
@@ -2087,6 +2115,7 @@ def _ea_telegram_send(ctx: Any, text: str) -> tuple[bool, str | None]:
 EA_CATEGORIES = [
     {"key": "policy", "label": "정책 동향"},
     {"key": "bill", "label": "국회 의안"},
+    {"key": "trade", "label": "통상 환경"},
 ]
 # 카테고리 → ea_policy_items.item_type 목록. 예전 키(notice·ministry·trade)는 옛 주소·주간레포트 호환용으로만 남긴다.
 EA_CATEGORY_TYPES = {
@@ -2094,7 +2123,7 @@ EA_CATEGORY_TYPES = {
     "bill": ["bill"],
     "notice": ["legislation", "admin_notice"],
     "ministry": ["ministry_news"],
-    "trade": ["trade_news"],
+    "trade": ["trade_webzine"],       # 월간 통상(산업통상부 웹진). KOTRA(trade_news)는 주간 레포트가 따로 쓴다
 }
 _AGENCY_TAIL_RE = re.compile(r"(부|처|청|위원회|위|실|원|단|공사|진흥원|KOTRA)$")
 # 제목 첫머리에 오는 부처 약칭 → 정식명. "산업부, …" / "국토부는 …"
@@ -2213,7 +2242,7 @@ def register_api(app: Any, ctx: Any) -> None:
             seeded = [a["name"] for a in db.agencies(True) if (a.get("kind") or "") == want_kind]
             names = sorted(set(seeded) | set(counts), key=lambda n: (-counts.get(n, 0), n))
         elif cat == "trade":
-            names = sorted(set(["KOTRA"]) | set(counts), key=lambda n: (-counts.get(n, 0), n))
+            names = sorted(set(["산업통상부"]) | set(counts), key=lambda n: (-counts.get(n, 0), n))
         else:   # policy — 발표 부처는 기사에서 뽑는다(클라이언트가 목록으로 채움). 여기선 빈 목록.
             names = []
         agencies = [{"key": n, "label": f"{n} ({counts.get(n, 0)})" if n in counts else n,

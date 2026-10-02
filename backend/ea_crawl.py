@@ -667,6 +667,83 @@ def crawl_korea_press(days: int = 3, max_pages: int = 5) -> list[dict]:
     return out
 
 
+# ── S7 · 월간 통상(tongsangnews.kr) — 산업통상부가 발행하는 통상 웹진 ──────────────
+#   기자명이 없는 정부 발행물이라 소관은 '산업통상부'로 적는다. 메인 페이지 메뉴에 이번 호 기사 링크
+#   (/webzine/YYYYMM/YYYYMMDDnnnnn.html)와 분류명이 전부 들어 있다. 기사 id 앞 8자리가 날짜다.
+TONGSANG = "https://tongsangnews.kr"
+_TS_LINK = re.compile(r"/webzine/(\d{6})/(\d{8})(\d{5})\.html")
+TONGSANG_MIN_BODY = 150     # 인포그래픽·캘린더처럼 글이 거의 없는 꼭지는 카드로 만들지 않는다
+
+
+def parse_tongsang_index(html: str) -> list[dict]:
+    """메인 페이지 → [{id, url, category, date}] (중복 제거, 등장 순서)."""
+    soup = _soup(html)
+    found: dict[str, dict] = {}
+    for a in soup.find_all("a", href=True):
+        m = _TS_LINK.search(a["href"])
+        if not m:
+            continue
+        aid = m.group(2) + m.group(3)
+        label = _clean(a.get_text(" "))
+        em = a.find("em")
+        if em:
+            label = _clean(em.get_text(" "))
+        cur = found.get(aid)
+        if cur is None:
+            d = m.group(2)
+            found[aid] = {"id": aid, "url": f"{TONGSANG}/webzine/{m.group(1)}/{aid}.html",
+                          "category": label if len(label) <= 24 else "", "date": f"{d[:4]}-{d[4:6]}-{d[6:]}"}
+        elif not cur["category"] and label and len(label) <= 24:
+            cur["category"] = label
+    return list(found.values())
+
+
+def parse_tongsang_article(html: str) -> dict:
+    """기사 페이지 → {title, sub, category, thumb, body}. 본문은 문단 글만 이어 붙인다(광고·메뉴 제외)."""
+    soup = _soup(html)
+    main = soup.select_one(".contents-tit .main")
+    title = _clean(main.get_text(" ")) if main else ""
+    if not title:
+        mt = soup.find("meta", attrs={"name": "title"}) or soup.find("meta", attrs={"property": "og:title"})
+        title = _clean(mt.get("content", "")) if mt else ""
+    sub = soup.select_one(".contents-tit .sub")
+    cat = soup.select_one(".nav-guide .cat_name")
+    category = " ".join(_clean(cat.get_text(" ")).split(" ")[1:]) if cat else ""    # '이달의뉴스 > 글로벌 통상 뉴스' → 뒤쪽
+    og = soup.find("meta", attrs={"property": "og:image"})
+    paras = [_clean(p.get_text(" ")) for p in soup.select(".editor-template .par p")]
+    body = "\n".join(x for x in paras if x)
+    if not body:
+        md = soup.find("meta", attrs={"name": "description"})
+        body = _clean(md.get("content", "")) if md else ""
+    return {"title": title, "sub": _clean(sub.get_text(" ")) if sub else "", "category": category,
+            "thumb": og.get("content", "") if og else "", "body": body}
+
+
+def fetch_tongsang_detail(url: str) -> dict:
+    try:
+        return parse_tongsang_article(_get(url))
+    except Exception as exc:
+        log.debug("월간 통상 기사 조회 실패 %s: %s", url, exc)
+        return {}
+
+
+def crawl_tongsang(max_items: int = 60) -> list[dict]:
+    """이번 호 기사 목록(제목은 상세에서 채운다 — collect_once 가 새 항목만 읽는다)."""
+    try:
+        rows = parse_tongsang_index(_get(TONGSANG + "/"))
+    except Exception as exc:
+        log.warning("S7 월간 통상 목록 실패: %s", exc)
+        return []
+    out = [{"url_source": r["url"], "url_canonical": r["url"], "item_type": "trade_webzine",
+            "title": r["category"] or "월간 통상", "_need_detail": True, "_trusted": True,
+            "_cat_label": r["category"], "law_name": "", "agency": "산업통상부",
+            "notice_start": r["date"], "notice_end": None, "status": "월간 통상",
+            "opinion_url": "", "attachment_urls": [], "published_at": r["date"]}
+           for r in rows[:max_items]]
+    log.info("S7 월간 통상 목록 %d건", len(out))
+    return out
+
+
 def _law_name(title: str) -> str:
     t = re.sub(r"\s*\d{7}\b.*$", "", title or "")
     t = re.sub(r"\s*(일부개정|전부개정|제정)?(법률안|령안|규칙안|안)?\s*"

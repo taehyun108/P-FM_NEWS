@@ -16,7 +16,9 @@
     { key: 'policy', label: '정책 동향', kind: 'items', types: 'policy_press',
       sort: 'priority', hasDeadline: false, layout: 'policy' },
     { key: 'bill',   label: '국회 의안', kind: 'items', types: 'bill',
-      sort: 'priority', hasDeadline: false, layout: 'bill' }
+      sort: 'priority', hasDeadline: false, layout: 'bill' },
+    { key: 'trade',  label: '통상 환경', kind: 'items', types: 'trade_webzine',
+      sort: 'priority', hasDeadline: false, layout: 'trade' }   // 산업통상부 월간 통상(tongsangnews.kr)
   ];
   // 우선순위 4단계 — 기준은 화면의 '기준 보기'와 같은 말이다(백엔드 ea_priority 규칙).
   var PRIORITIES = ['긴급', '중요', '관심', '일반'];
@@ -88,7 +90,7 @@
 
   function readUrl() {
     var p = new URLSearchParams(location.search);
-    eaState.cat = p.get('ea_cat') === 'bill' ? 'bill' : 'policy';
+    eaState.cat = ['bill', 'trade'].indexOf(p.get('ea_cat')) >= 0 ? p.get('ea_cat') : 'policy';
     eaState.agency = new Set((p.get('ea_agency') || '').split(',').filter(Boolean));
     eaState.group = new Set((p.get('ea_group') || '').split(',').filter(Boolean));
     eaState.priority = new Set((p.get('ea_priority') || '').split(',').filter(Boolean));
@@ -201,8 +203,19 @@
 
   /* ── 항목 카드 — 정책 동향: [등급] 제목 / 소관 / 주요 내용 · 국회 의안: [등급] 제목 / 발의 의원 전원 / 주요 내용 ── */
   function buildCard(it) {
-    var isBill = currentCat().layout === 'bill';
+    var layout = currentCat().layout;
+    var isBill = layout === 'bill';
+    var isTrade = layout === 'trade';
     var card = el('article', 'ea-card ea-card--flat');
+    if (isTrade && it.thumbnail) {          // 통상 환경 — 포토카드(월간 통상 기사 대표 사진)
+      var ph = el('a', 'ea-photo');
+      ph.href = it.url; ph.target = '_blank'; ph.rel = 'noopener noreferrer';
+      var img = el('img');
+      img.src = it.thumbnail; img.alt = ''; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
+      img.addEventListener('error', function () { ph.remove(); });
+      ph.append(img);
+      card.append(ph);
+    }
     var body = el('div', 'ea-card-body');
 
     var head = el('div', 'ea-card-head');
@@ -214,7 +227,13 @@
     h.append(link(it.title, it.url));
     body.append(h);
 
-    if (!isBill) {
+    if (isTrade) {
+      // 기자명이 없는 정부 발행물 — 출처를 산업통상부(월간 통상)로 적는다
+      var src = el('p', 'ea-card-sub');
+      src.append(el('b', null, '출처: '), document.createTextNode((it.agency || '산업통상부') + ' · 월간 통상'
+        + (it.category ? ' · ' + it.category : '')));
+      body.append(src);
+    } else if (!isBill) {
       // 기자명 자리에 '소관: 부처'
       var own = el('p', 'ea-card-sub');
       own.append(el('b', null, '소관: '), document.createTextNode(it.agency || '확인 불가'));
@@ -262,7 +281,7 @@
     }
 
     var acts = el('div', 'ea-actions');
-    acts.append(link(isBill ? '의안정보시스템 원문' : '정책브리핑 원문', it.url));
+    acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : '정책브리핑 원문', it.url));
     acts.append(telegramButton('/api/ea/items/' + it.id + '/telegram'));
     body.append(acts);
 
@@ -296,7 +315,7 @@
     $('eaStatus').hidden = c.layout !== 'bill';     // 의안만 '상태'(심사 단계)가 의미 있다
     $('eaDue').hidden = true;
     var lab = document.querySelector('#eaAgencyRow .filter-label');
-    if (lab) { lab.firstChild.textContent = c.layout === 'bill' ? '소관위 ' : '소관 부처 '; }
+    if (lab) { lab.firstChild.textContent = c.layout === 'bill' ? '소관위 ' : c.layout === 'trade' ? '출처 ' : '소관 부처 '; }
   }
 
   function fillSelect(sel, options, value, placeholder) {

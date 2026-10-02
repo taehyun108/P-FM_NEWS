@@ -14170,10 +14170,10 @@ def cmd_selftest() -> int:
         check("무관 제목은 그룹사 없음",
               ea_mod.detect_ea_groups("국토교통부와 그 소속기관 직제"), [])
         # 카테고리는 정책 동향·국회 의안 2개(2026-10-02 개편) + item_type 매핑(옛 키는 호환용으로 남김)
-        check("카테고리 2개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "bill"])
+        check("카테고리 3개", [c["key"] for c in ea_mod.EA_CATEGORIES], ["policy", "bill", "trade"])
         check("정책 동향 → policy_press", ea_mod.EA_CATEGORY_TYPES["policy"], ["policy_press"])
         check("부처별 동향 → ministry_news", ea_mod.EA_CATEGORY_TYPES["ministry"], ["ministry_news"])
-        check("통상 환경 → trade_news", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_news"])
+        check("통상 환경 → trade_webzine(월간 통상)", ea_mod.EA_CATEGORY_TYPES["trade"], ["trade_webzine"])
         # 발표 기관 추출 — author(정책브리핑) 우선, 없으면 제목 첫머리 약칭
         check("author 가 부처면 기관으로", ea_mod._article_agency({"author": "산업통상부", "title": "x"}),
               "산업통상부")
@@ -14303,6 +14303,37 @@ def cmd_selftest() -> int:
         _sdb._t = lambda name: _FakeT(_store, True)
         check("Supabase — proposers 칼럼이 아직 없으면 그 칸만 빼고 저장(수집이 멈추지 않는다)",
               (_sdb.insert_item({"id": "x", "proposers": "[]"}), _store), (True, [{"id": "x"}]))
+        _ts_home = ('<nav><ul><li><a href="https://tongsangnews.kr/webzine/202609/2026090180044.html" class="on">글로벌 통상 뉴스</a></li>'
+                    '<li><a href="https://tongsangnews.kr/webzine/202609/2026090180116.html">통상 트렌드</a></li></ul></nav>'
+                    '<div><a href="https://tongsangnews.kr/webzine/202609/2026090180044.html"><span class="img_enlarg"><img src="x.png"></span>'
+                    '<div class="text"><em>글로벌 통상 뉴스</em><strong>한국 기업 반사이익</strong></div></a></div>')
+        _tsl = _eac.parse_tongsang_index(_ts_home)
+        check("월간 통상 목록 — 링크·분류·날짜(기사 id 앞 8자리)·중복 제거",
+              [(r["id"], r["category"], r["date"]) for r in _tsl],
+              [("2026090180044", "글로벌 통상 뉴스", "2026-09-01"), ("2026090180116", "통상 트렌드", "2026-09-01")])
+        _ts_art = ('<html><meta name="title" content="한국 기업, 반사이익 기대 속 산업부 긴급 대응 나서"/>'
+                   '<meta property="og:image" content="https://tongsangnews.kr/site/data/img/2026/09/2026090180044_0.jpg"/>'
+                   '<div class="nav-guide"><div class="cat_name">이달의뉴스 <svg></svg> 글로벌 통상 뉴스</div></div>'
+                   '<div class="contents-tit"><span class="sub">폴리실리콘에 232조 관세 15%</span>'
+                   '<strong class="main">한국 기업, 반사이익 기대 속 산업부 긴급 대응 나서</strong></div>'
+                   '<div class="editor-template"><div class="par"><p>미국 정부가 폴리실리콘에 관세를 도입했다.</p>'
+                   '<p>산업통상부는 긴급 대책 회의를 열었다.</p></div></div></html>')
+        _tsa = _eac.parse_tongsang_article(_ts_art)
+        check("월간 통상 기사 — 제목·분류·썸네일·본문 문단",
+              (_tsa["title"], _tsa["category"], _tsa["thumb"].endswith("2026090180044_0.jpg"),
+               _tsa["body"].count("\n"), _tsa["sub"]),
+              ("한국 기업, 반사이익 기대 속 산업부 긴급 대응 나서", "글로벌 통상 뉴스", True, 1, "폴리실리콘에 232조 관세 15%"))
+        _tv = ea_mod._item_view({"id": "t1", "title": "관세 대응", "item_type": "trade_webzine",
+                                 "attachment_urls": '["https://tongsangnews.kr/a.jpg"]', "agency_raw": "산업통상부"})
+        check("월간 통상 뷰 — 썸네일은 thumbnail 로, 소관은 산업통상부", (_tv["thumbnail"], _tv["agency"]),
+              ("https://tongsangnews.kr/a.jpg", "산업통상부"))
+        _gt = ea_mod.Gates.__new__(ea_mod.Gates)
+        _gt.db = type("D", (), {"known_url_sources": lambda self, u: set(), "upsert_ledger": lambda *a: None})()
+        _gt.seen, _gt.agency_names, _gt.extra_terms = set(), set(), []
+        _gt.counts = {"fetched": 0, "g0": 0, "g1": 0, "g2": 0, "g2_5": 0, "off_topic": 0}
+        check("월간 통상은 관련성 검사 없이 통과(출처가 통상 자료)",
+              len(_gt.filter([{"url_source": "u1", "title": "분류명", "_trusted": True},
+                              {"url_source": "u2", "title": "청소년 쉼터 안내"}])), 1)
         _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
                                 "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
                                 "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})
