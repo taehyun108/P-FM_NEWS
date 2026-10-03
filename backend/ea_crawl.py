@@ -885,6 +885,18 @@ def crawl_mcee_notices(max_pages: int = 3) -> list[dict]:
 _iris_logged = [False]
 
 
+def _iris_date(v) -> str | None:
+    """IRIS 날짜 값 → ISO. '2026-10-21'·'20261021'·'2026.10.21 18:00' 모두 읽는다. 못 읽으면 None."""
+    t = str(v or "").strip()
+    if not t:
+        return None
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})", t)
+    if m:
+        return _iso(*m.groups())
+    d = _DATE_ANY.search(t)
+    return _iso(*d.groups()) if d else None
+
+
 def crawl_iris_notices(max_pages: int = 2) -> list[dict]:
     """IRIS 사업공고(접수중). 목록은 화면이 부르는 JSON(POST) 을 그대로 쓴다.
 
@@ -921,11 +933,19 @@ def crawl_iris_notices(max_pages: int = 2) -> list[dict]:
                 continue
             url = f"{IRIS}/contents/retrieveBsnsAncmView.do?ancmId={aid}&ancmPrg=ancmIng"
             ad = str(r.get("ancmDe") or "")[:10]
+            # 2026-10-02 서버 로그로 확인: 목록 응답에 접수 시작·마감일(rcveStrDe·rcveEndDe)이 이미 들어 있다 — 상세를 열 필요가 없다
+            end_iso = _iris_date(r.get("rcveEndDe"))
+            str_iso = _iris_date(r.get("rcveStrDe")) or (ad or None)
+            title = _clean(str(r.get("ancmTl") or ""))
+            sorgn = _clean(str(r.get("sorgnNm") or ""))
             out.append({"url_source": url, "url_canonical": url, "item_type": "grant_notice",
-                        "title": _clean(str(r.get("ancmTl") or "")), "_grant": True, "_detail_kind": "iris",
-                        "law_name": _clean(str(r.get("sorgnNm") or "")),
+                        "title": title, "_grant": True,
+                        "_detail_kind": "none" if end_iso else "iris",
+                        "_body": f"{title} · 전문기관 {sorgn} · 공모유형 {_clean(str(r.get('pbofrTpSeNmLst') or ''))}"
+                                 f" · 접수 {str_iso or '?'} ~ {end_iso or '?'}",
+                        "law_name": sorgn,
                         "agency": _clean(str(r.get("blngGovdSeNm") or "")) or "범부처",
-                        "notice_start": ad or None, "notice_end": None,
+                        "notice_start": str_iso, "notice_end": end_iso,
                         "status": "접수중", "opinion_url": "", "attachment_urls": [],
                         "published_at": ad or None, "_ancm_no": str(r.get("ancmNo") or "")})
         pg = data.get("paginationInfo") or {}

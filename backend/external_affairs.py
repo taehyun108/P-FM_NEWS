@@ -338,6 +338,12 @@ class EaDB:
         self.exec("update ea_policy_items set group_companies=? where id=?",
                   (groups_json, item_id))
 
+    def fill_notice_end(self, url_source: str, end_iso: str) -> int:
+        """이미 저장됐지만 마감일이 비어 있는 항목에 마감일을 채운다(목록에서 마감일을 뒤늦게 읽게 된 경우)."""
+        cur = self.exec("update ea_policy_items set notice_end=? where url_source=? and notice_end is null",
+                        (end_iso, url_source))
+        return cur.rowcount or 0
+
     def last_item_collected_at_raw(self) -> str | None:
         row = self.one("select max(collected_at) as t from ea_policy_items")
         return row.get("t") if row else None
@@ -575,6 +581,11 @@ class EaSupabaseDB:
         pass
 
     # ── 항목 ──
+    def fill_notice_end(self, url_source: str, end_iso: str) -> int:
+        res = (self._t("ea_policy_items").update({"notice_end": end_iso})
+               .eq("url_source", url_source).is_("notice_end", "null").execute())
+        return len(res.data or [])
+
     def insert_item(self, row: dict) -> bool:
         try:
             self._t("ea_policy_items").insert(row).execute()
@@ -1453,6 +1464,17 @@ def collect_once(ctx: Any, db: Any) -> dict:
         if got:
             active_sources.append(label)
             raw.extend(got)
+
+    # 목록에서 마감일을 읽는 공고(IRIS·KOTRA)는 이미 저장된 같은 항목의 빈 마감일도 채운다 — 달력에 올라가게
+    filled_end = 0
+    for it in raw:
+        if it.get("_grant") and it.get("notice_end"):
+            try:
+                filled_end += db.fill_notice_end(it["url_source"], it["notice_end"])
+            except Exception as exc:
+                log.debug("마감일 보강 실패: %s", exc)
+    if filled_end:
+        log.info("대외협력: 저장된 공고 %d건의 빈 마감일을 채움", filled_end)
 
     try:
         keyword_rows = ctx.storage.enabled_keywords()

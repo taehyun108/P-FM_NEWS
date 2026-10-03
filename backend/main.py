@@ -14501,6 +14501,19 @@ def cmd_selftest() -> int:
               _eac.parse_iris_detail("<div><li>공고번호 제2026-613호</li><li>접수기간 2026-09-22 ~ 2026-10-21</li>"
                                      "<li>사업담당자 홍길동</li><p>■ 공고문 소재부품 신규과제를 공고합니다</p></div>")["period_end"],
               "2026-10-21")
+        check("IRIS 날짜 — 하이픈·붙은 숫자·점 표기 모두 ISO 로, 비면 None",
+              [_eac._iris_date(x) for x in ("2026-10-21", "20261021", "2026.10.21 18:00", "", None, "미정")],
+              ["2026-10-21", "2026-10-21", "2026-10-21", None, None, None])
+        _fdb = ea_mod.EaDB(os.path.join(__import__("tempfile").mkdtemp(), "fill.db"))
+        _fdb.exec("create table if not exists ea_policy_items (id TEXT primary key, url_source TEXT unique,"
+                  " url_canonical TEXT, item_type TEXT, title TEXT, notice_end TEXT)")
+        _fdb.exec("insert into ea_policy_items (id,url_source,url_canonical,item_type,title,notice_end) values "
+                  "('a','u-null','u','grant_notice','t',null),('b','u-has','u','grant_notice','t','2026-01-01')")
+        check("저장된 공고의 빈 마감일만 채우고 이미 있는 값은 덮어쓰지 않는다",
+              (_fdb.fill_notice_end("u-null", "2026-10-21"), _fdb.fill_notice_end("u-has", "2026-12-31"),
+               _fdb.one("select notice_end from ea_policy_items where id='a'")["notice_end"],
+               _fdb.one("select notice_end from ea_policy_items where id='b'")["notice_end"]),
+              (1, 0, "2026-10-21", "2026-01-01"))
         _gg = ea_mod.Gates.__new__(ea_mod.Gates)
         _gg.db = type("D", (), {"known_url_sources": lambda self, u: set(), "upsert_ledger": lambda *a: None})()
         _gg.seen, _gg.agency_names, _gg.extra_terms = set(), set(), []
