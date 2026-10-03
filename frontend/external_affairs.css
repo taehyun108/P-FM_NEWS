@@ -225,3 +225,18 @@
   .ea-cal-count { display: none; }
   .ea-cal-title { min-width: 0; flex: 1; }
 }
+
+/* 일정 캘린더 크기 보정(2026-10-03) — 카드 격자 한 칸에 갇혀 좁아지고 칸이 잘리던 문제 */
+.ea-list > .ea-cal { grid-column: 1 / -1; width: 100%; max-width: 100%; }
+.ea-cal-grid { gap: 5px; }
+.ea-cal-cell { min-height: 92px; padding: 6px 7px; overflow: hidden; }
+.ea-cal-num { font-size: 13px; }
+.ea-cal-dots { gap: 4px; min-height: 12px; }
+.ea-cal-dot { width: 9px; height: 9px; flex: 0 0 auto; }
+.ea-cal-count { margin-top: auto; font-size: 11.5px; line-height: 1.2; }
+.ea-ag-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 8px; }
+@media (max-width: 640px) {
+  .ea-cal-cell { min-height: 56px; padding: 4px; }
+  .ea-cal-dot { width: 7px; height: 7px; }
+  .ea-ag-list { grid-template-columns: 1fr; }
+}
