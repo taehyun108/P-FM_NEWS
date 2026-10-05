@@ -621,6 +621,27 @@ def parse_korea_press_title(html: str) -> str:
     return _strip_press_tag(title)
 
 
+def parse_press_body(html: str, title: str = "") -> str:
+    """정책브리핑 보도자료 상세 → 본문 앞부분. 본문은 첨부(문서뷰어)로만 오는 일이 많아, 페이지 머리의
+    description(제목 + ' - ' + 본문 첫머리, 1천 자 이상)을 쓴다. 제목 접두는 뗀다."""
+    soup = _soup(html)
+    md = soup.find("meta", attrs={"name": "description"})
+    text = _clean(md.get("content", "")) if md else ""
+    if title and text.startswith(title):
+        text = text[len(title):].lstrip(" -·:")
+    elif " - " in text[:200]:
+        text = text.split(" - ", 1)[1]
+    return text
+
+
+def fetch_press_body(url: str, title: str = "") -> str:
+    try:
+        return parse_press_body(_get(url), title)
+    except Exception as exc:
+        log.debug("보도자료 본문 조회 실패 %s: %s", url, exc)
+        return ""
+
+
 def fetch_press_title(url: str) -> str:
     """상세 페이지 1건 요청. 실패하면 빈 문자열."""
     try:

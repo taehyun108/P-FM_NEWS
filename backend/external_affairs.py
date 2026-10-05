@@ -305,6 +305,16 @@ class EaDB:
         marks = ",".join("?" * len(row))
         self.exec(f"insert into ea_analyses ({cols}) values ({marks})", list(row.values()))
 
+    def placeholder_items(self, limit: int) -> list[dict]:
+        """요약이 '원문을 확보하지 못했습니다'로 저장된 항목(본문 없이 분석된 것) — 다시 분석할 대상."""
+        return self.rows(
+            "select p.* from ea_policy_items p join ea_analyses a on a.policy_item_id = p.id"
+            " where a.summary like ? order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc limit ?",
+            (PLACEHOLDER_SUMMARY + "%", limit))
+
+    def delete_analysis(self, item_id: str) -> None:
+        self.exec("delete from ea_analyses where policy_item_id=?", (item_id,))
+
     def analyses_today(self) -> int:
         return int((self.one(
             "select count(*) as n from ea_analyses where created_at >= ?",
@@ -611,6 +621,18 @@ class EaSupabaseDB:
 
     def save_analysis(self, row: dict) -> None:
         self._t("ea_analyses").insert(row).execute()
+
+    def placeholder_items(self, limit: int) -> list[dict]:
+        bad = self._t("ea_analyses").select("policy_item_id").like("summary", PLACEHOLDER_SUMMARY + "%").execute().data
+        ids = {r["policy_item_id"] for r in bad}
+        if not ids:
+            return []
+        items = [r for r in self._t("ea_policy_items").select("*").execute().data if r["id"] in ids]
+        items.sort(key=lambda r: r.get("notice_start") or (r.get("collected_at") or "")[:10], reverse=True)
+        return items[:limit]
+
+    def delete_analysis(self, item_id: str) -> None:
+        self._t("ea_analyses").delete().eq("policy_item_id", item_id).execute()
 
     def analyses_today(self) -> int:
         midnight = iso(now_utc().replace(hour=0, minute=0, second=0, microsecond=0))
@@ -1867,6 +1889,32 @@ def _kotra_rule_analysis(db: Any, item: dict) -> bool:
     return True
 
 
+PLACEHOLDER_SUMMARY = "원문을 확보하지 못했습니다"
+
+
+def fetch_body_for_item(item: dict) -> str:
+    """수집 때 본문을 저장하지 않는 유형(정책브리핑·월간 통상·공모 공고)을 나중에 분석할 때 본문을 다시 확보한다.
+
+    예전엔 이 유형이 일반 예고 상세 규칙으로 흘러 본문이 비었고, 요약이 '원문을 확보하지 못했습니다'로 저장됐다(2026-10-05).
+    """
+    t = item.get("item_type") or ""
+    url = item.get("url_source") or item.get("url_canonical") or ""
+    try:
+        if t == "policy_press":
+            return _crawl().fetch_press_body(url, item.get("title") or "")
+        if t == "trade_webzine":
+            return (_crawl().fetch_tongsang_detail(url) or {}).get("body") or ""
+        if t == "grant_notice":
+            if "kotra.or.kr" in url:      # 입찰공고는 상세 없이 목록 정보만 있다
+                return f"{item.get('title') or ''} · 입찰방법 {item.get('law_name') or ''} · 마감 {item.get('notice_end') or '미정'}"
+            kind = "iris" if "iris.go.kr" in url else "motir" if "motir.go.kr" in url else "mcee" if "mcee.go.kr" in url else ""
+            body = (_crawl().fetch_notice_detail(url, kind) or {}).get("body") or ""
+            return body or (item.get("title") or "")
+    except Exception as exc:
+        log.debug("본문 재확보 실패 %s: %s", url, exc)
+    return ""
+
+
 def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     """항목 1건 분석 후 ea_analyses 에 저장. 성공하면 True.
 
@@ -1876,7 +1924,7 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
     """
     if (item.get("item_type") or "") == "trade_news":
         return _kotra_rule_analysis(db, item)   # 본문 없음 — LLM 안 씀
-    body = source_text.strip()
+    body = source_text.strip() or fetch_body_for_item(item)
     if not body:
         try:
             body = _crawl().fetch_detail(item).get("body") or ""
@@ -1979,6 +2027,30 @@ def _news_body_map(items: list[dict]) -> dict[str, str]:
     except Exception as exc:   # pragma: no cover
         log.debug("뉴스 본문 재확보 실패(무시): %s", exc)
     return out
+
+
+def reanalyze_placeholders(ctx: Any, db: Any, limit: int = 40, dry: bool = False) -> dict:
+    """'원문을 확보하지 못했습니다' 요약을 본문을 다시 받아 새로 분석한다(일회성). limit 건까지, 오늘 AI 상한 안에서."""
+    items = db.placeholder_items(500)
+    res = {"targets": len(items), "fixed": 0, "no_body": 0, "failed": 0}
+    if dry or not items:
+        return res
+    budget = min(limit, analysis_budget(ctx, db))
+    for it in items:
+        if res["fixed"] + res["failed"] >= budget:
+            break
+        body = fetch_body_for_item(it)
+        if len(body.strip()) < 40:
+            res["no_body"] += 1
+            continue
+        db.delete_analysis(it["id"])
+        if analyze_item(ctx, db, it, body):
+            res["fixed"] += 1
+        else:
+            res["failed"] += 1       # 분석 실패면 지운 상태로 남는다 — 다음 ea-collect 가 미분석으로 다시 시도한다
+    log.info("대외협력 재분석: 대상 %d · 성공 %d · 본문 못 구함 %d · 실패 %d", res["targets"], res["fixed"],
+             res["no_body"], res["failed"])
+    return res
 
 
 def analyze_backlog(ctx: Any, db: Any) -> int:

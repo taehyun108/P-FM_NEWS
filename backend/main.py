@@ -14514,6 +14514,34 @@ def cmd_selftest() -> int:
                _fdb.one("select notice_end from ea_policy_items where id='a'")["notice_end"],
                _fdb.one("select notice_end from ea_policy_items where id='b'")["notice_end"]),
               (1, 0, "2026-10-21", "2026-01-01"))
+        # 정책 동향 '원문을 확보하지 못했습니다' (2026-10-05) — 본문을 저장하지 않는 유형은 분석 때 본문을 다시 받아야 한다
+        _pb = ('<html><meta name="description" content="K-원전 팀코리아, 미국 진출 시동건다 - 한-미 원전 프레임워크 체결의 후속 조치로 '
+               '미국내 대형원전 8기 건설 추진방안을 논의했다. 팀코리아 주도 노형 건설 방안과 공급망 참여를 다뤘다."></html>')
+        check("보도자료 본문 — 페이지 머리 description 에서 제목 접두를 떼고 본문 첫머리를 얻는다",
+              _eac.parse_press_body(_pb, "K-원전 팀코리아, 미국 진출 시동건다").startswith("한-미 원전 프레임워크"), True)
+        _real_pb = _eac.fetch_press_body
+        _eac.fetch_press_body = lambda url, title="": "본문 첫머리 " * 20
+        check("본문 재확보 — 정책브리핑은 상세 description, 월간 통상·공모는 각자 규칙, KOTRA 입찰은 목록 정보",
+              (len(ea_mod.fetch_body_for_item({"item_type": "policy_press", "url_source": "u", "title": "t"})) > 40,
+               "입찰방법 제한경쟁" in ea_mod.fetch_body_for_item({"item_type": "grant_notice", "title": "대행",
+                                                          "url_source": "https://www.kotra.or.kr/x", "law_name": "제한경쟁(총액)"})),
+              (True, True))
+        _eac.fetch_press_body = _real_pb
+        _rdb = ea_mod.EaDB(os.path.join(__import__("tempfile").mkdtemp(), "re.db"))
+        _rc = sqlite3.connect(_rdb.path)
+        _rc.executescript(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_sqlite.sql"),
+                               encoding="utf-8").read())
+        _rc.commit()
+        _rc.close()
+        for _i, _sm in enumerate(("원문을 확보하지 못했습니다 — 원문 링크로 확인하세요", "정상 요약")):
+            _rdb.insert_item({"id": f"r{_i}", "url_source": f"ru{_i}", "url_canonical": f"ru{_i}", "item_type": "policy_press",
+                              "title": "t", "collected_at": "2026-10-01T00:00:00Z"})
+            _rdb.save_analysis({"id": f"ra{_i}", "policy_item_id": f"r{_i}", "summary": _sm, "impact_level": "none", "model": "m"})
+        check("재분석 대상 — 요약이 '원문을 확보하지 못했습니다'인 항목만",
+              [x["id"] for x in _rdb.placeholder_items(10)], ["r0"])
+        _rdb.delete_analysis("r0")
+        check("재분석 — 분석을 지우면 미분석 목록으로 돌아가 다음 수집이 다시 분석한다",
+              [x["id"] for x in _rdb.unanalyzed_items(10)], ["r0"])
         _gg = ea_mod.Gates.__new__(ea_mod.Gates)
         _gg.db = type("D", (), {"known_url_sources": lambda self, u: set(), "upsert_ledger": lambda *a: None})()
         _gg.seen, _gg.agency_names, _gg.extra_terms = set(), set(), []
@@ -14622,6 +14650,7 @@ USAGE = """사용법: python backend/main.py <명령>
   kakao-auth   카카오 '나에게 보내기' 최초 토큰 발급 (브라우저 동의 → code 붙여넣기, 1회)
   kakao-test   카카오 '나에게 보내기' 시험 발송 1건
   ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
+  ea-reanalyze [N] [--dry]  '원문을 확보하지 못했습니다'로 저장된 대외협력 요약을 본문을 다시 받아 재분석(기본 40건, AI 일일 상한 안에서)
   migrate    SQLite → Supabase 전체 이관 (schema.sql 배포 + DB_BACKEND=supabase 후, 일회성)
   weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
   selftest   내장 검증 (DB · 네트워크 · API 키 불필요)
@@ -14728,6 +14757,14 @@ def main(argv: Sequence[str]) -> int:
         if ea_mod is None:
             raise SystemExit("external_affairs 모듈을 불러오지 못했습니다.")
         ea_mod.collect_once(ctx, ea_mod.make_ea_db(ctx))
+    elif command == "ea-reanalyze":
+        if ea_mod is None:
+            raise SystemExit("external_affairs 모듈을 불러오지 못했습니다.")
+        _rest = argv[2:]
+        _nums = [int(a) for a in _rest if a.isdigit()]
+        _edb = ea_mod.make_ea_db(ctx)
+        _edb.ensure_ready()
+        ea_mod.reanalyze_placeholders(ctx, _edb, _nums[0] if _nums else 40, dry="--dry" in _rest)
     elif command == "migrate":
         cmd_migrate(ctx)
     elif command == "serve":
