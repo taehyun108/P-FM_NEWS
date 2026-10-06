@@ -7791,6 +7791,7 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
 PUBLIC_CHANNEL = "telegram_public"
 PUBLIC_TONES = ("긍정", "중립")
 PUBLIC_SEND_PER_CYCLE = 6
+_PUBLIC_SEEN: set[tuple[str, str]] = set()   # 이미 큐에 올린 (기사 id, 대화방) — 회차마다 DB 중복 삽입 시도를 막는다
 
 
 def public_bot_token() -> str:
@@ -7831,8 +7832,17 @@ def queue_public_notifications(ctx: Context) -> int:
             continue
         if _kw_hit_any(r.get("title") or "", excl):
             continue      # 제목에 '제외' 키워드 → 웹에만
-        if ctx.storage.queue_notification(r["id"], public_chat_id(), "queued", 0, channel=PUBLIC_CHANNEL):
+        # 이미 큐에 올린 기사는 5분마다 DB 에 중복 삽입을 시도하지 않는다(Supabase 는 삽입 실패도 HTTP 1회다).
+        key = (r["id"], public_chat_id())
+        if key in _PUBLIC_SEEN:
+            continue
+        queue_notification_ok = ctx.storage.queue_notification(r["id"], public_chat_id(), "queued", 0,
+                                                              channel=PUBLIC_CHANNEL)
+        _PUBLIC_SEEN.add(key)            # 새로 올렸든 이미 있든 — 다시 시도할 필요가 없다
+        if queue_notification_ok:
             queued += 1
+    if len(_PUBLIC_SEEN) > 5000:         # 메모리 상한 — 넘으면 비운다(중복은 DB 제약이 어차피 막는다)
+        _PUBLIC_SEEN.clear()
     return queued
 
 
@@ -13030,6 +13040,7 @@ def cmd_selftest() -> int:
                   (_pid, "u/" + _pid, "https://x.test/" + _pid, "https://x.test/" + _pid, "포스코퓨처엠 기사 " + _pid,
                    iso(_pn2 - timedelta(hours=_hrs)), iso(_pn2), "rss", 10, '["포스코퓨처엠"]', "[]", "연합뉴스",
                    iso(_pn2), "active", 1, _pex, _ptone))
+    _PUBLIC_SEEN.clear()
     _tg = _FakeTG()
     _pctx = Context(cfg=_ectx.cfg, storage=_et, http=_tg)
     _orig_now_local, _orig_sleep = now_local, RATE_LIMIT_SLEEP
@@ -13047,6 +13058,12 @@ def cmd_selftest() -> int:
           {(u, c) for u, c, _ in _tg.sent}, {(TELEGRAM_API.format(token="PUB:TOKEN"), "-100999")})
     _n_again = send_public_notifications(_pctx)
     check("일반용 — 이미 보낸 기사는 다시 보내지 않는다(중복 방지)", (_n_again, len(_tg.sent)), (0, 5))
+    _ins_calls: list[str] = []
+    _orig_q = _et.queue_notification
+    _et.queue_notification = lambda *a, **k: (_ins_calls.append(a[0]), _orig_q(*a, **k))[1]   # type: ignore[method-assign]
+    queue_public_notifications(_pctx)
+    _et.queue_notification = _orig_q   # type: ignore[method-assign]
+    check("일반용 — 이미 올린 기사는 DB 중복 삽입을 다시 시도하지 않는다(캐시)", _ins_calls, [])
     _et.queue_notification("e1", "-1", "queued", 0)
     check("부서용 큐와 일반용 큐는 섞이지 않는다",
           ([r["chat_id"] for r in _et.pending_notifications(10)], [r["chat_id"] for r in _et.pending_notifications(10, channel=PUBLIC_CHANNEL)]),
