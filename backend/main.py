@@ -8602,6 +8602,7 @@ def aggregate_press_stats(rows: Iterable[dict], now: datetime | None = None) -> 
         e["reporters"] = [{"name": n, "count": c, "tone": tones[n], "color": reporter_tone(tones[n])}
                           for n, c in e.pop("_rep").most_common()]
         e["articles"].sort(key=lambda a: a.get("published_at") or "", reverse=True)
+        e["color"] = press_tone_color(e["tone"])   # 언론사 이름 색(긍정=파랑·부정=빨강·그 외 검정, 판정 없음=회색)
         out.append(e)
     out.sort(key=lambda e: (-e["year"], -e["month"], -e["week"], e["press"]))
     for i, e in enumerate(out, 1):
@@ -8618,6 +8619,29 @@ def press_overview_fallback(entry: dict) -> str:
     top = reporter_tone(t) or "중립"
     return (f"판정된 {rated}건 중 {top} 보도가 가장 많습니다"
             f"(긍정 {t.get('긍정', 0)} · 중립 {t.get('중립', 0)} · 부정 {t.get('부정', 0)}) — 논조 분포만 반영한 요약입니다.")
+
+
+PRESS_COLOR_GAP = 0.6   # 언론사 이름 색 — 긍정·부정 차이가 (긍정+부정)의 60% 를 넘어야 파랑·빨강
+
+
+def press_tone_color(tone: dict[str, int]) -> str:
+    """언론사 이름 색을 정하는 논조 — '긍정' | '중립' | '부정' | ''(판정 기사 없음 → 회색).
+
+    긍정과 부정의 차이가 (긍정+부정)의 60% 를 **넘을 때만** 많은 쪽 색(파랑·빨강)이다.
+    예) 긍정 9·부정 1 → 차이 8 ÷ 합 10 = 80% → 파랑 / 긍정 3·부정 2 → 20% → 검정.
+    긍정·부정이 하나도 없고 중립만 있으면 검정, 판정된 기사가 아예 없으면 회색('').
+    (기자 이름 색은 '가장 많은 쪽' 규칙 reporter_tone 을 그대로 쓴다.)
+    """
+    pos, neg, neu = tone.get("긍정", 0), tone.get("부정", 0), tone.get("중립", 0)
+    if pos + neg + neu <= 0:
+        return ""
+    if pos + neg > 0:
+        gap = (pos - neg) / (pos + neg)
+        if gap > PRESS_COLOR_GAP:
+            return "긍정"
+        if gap < -PRESS_COLOR_GAP:
+            return "부정"
+    return "중립"
 
 
 def reporter_tone(tone: dict[str, int]) -> str:
@@ -14526,6 +14550,12 @@ def cmd_selftest() -> int:
                   {"n": 9, "tone": "긍정", "impact": "범위 밖 번호는 무시"},
                   {"n": "x", "tone": "긍정", "impact": "숫자 아님"},
                   "문자열", {"n": 3, "tone": "긍정", "impact": "   "}]}, 3)
+    check("언론사 색 — 긍정 9·부정 1(차이 80%) → 긍정", press_tone_color({"긍정": 9, "부정": 1, "중립": 5}), "긍정")
+    check("언론사 색 — 부정 8·긍정 2(차이 60%, 넘지 않음) → 중립", press_tone_color({"긍정": 2, "부정": 8}), "중립")
+    check("언론사 색 — 부정 9·긍정 1(차이 80%) → 부정", press_tone_color({"긍정": 1, "부정": 9}), "부정")
+    check("언론사 색 — 긍정 3·부정 2(차이 20%) → 중립", press_tone_color({"긍정": 3, "부정": 2}), "중립")
+    check("언론사 색 — 긍정 1건만 → 긍정(차이 100%)", press_tone_color({"긍정": 1}), "긍정")
+    check("언론사 색 — 중립만 → 중립, 판정 없음 → ''", (press_tone_color({"중립": 4}), press_tone_color({"미판정": 3})), ("중립", ""))
     check("주간 영향 — 종합 톤·공백 정리", (_ov["tone"], "\n" in _ov["text"], _ov["text"].startswith("핵심광물")), ("긍정", False, True))
     check("주간 영향 — 기사별 톤", [i and i["tone"] for i in _its], ["부정", "중립", None])
     check("주간 영향 — 중복·범위 밖·빈 본문은 버린다", (_its[1]["text"], _its[2]), ("직접 영향 없음", None))

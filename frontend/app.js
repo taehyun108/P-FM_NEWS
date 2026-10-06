@@ -1611,7 +1611,11 @@ function buildPressTable(items, windows) {
     tr.setAttribute('aria-expanded', 'false');
     // 순위는 별도 칸으로 맨 왼쪽에 둔다(언급 건수 많은 순 — 연간 → 월간 → 주간).
     tr.append(el('td', 'press-rank-cell', it.rank ? String(it.rank) : '—'));
-    const name = el('td', 'press-name');
+    // 언론사 이름 색: 긍정·부정 차이가 (긍정+부정)의 60% 를 넘으면 파랑·빨강, 그 외 검정, 판정 없음 회색(백엔드 press_tone_color)
+    const nameTone = it.color ? `name-${TONE_CLASS[it.color]}` : 'name-none';
+    const name = el('td', `press-name ${nameTone}`);
+    const tt = it.tone || {};
+    name.title = `논조 긍정 ${tt['긍정'] || 0} · 중립 ${tt['중립'] || 0} · 부정 ${tt['부정'] || 0} — 긍정·부정 차이가 60%를 넘으면 파랑·빨강`;
     name.append(el('span', 'press-caret', '▸'), document.createTextNode(' ' + it.press));
     tr.append(name);
     // data-label — 모바일에서 표를 카드로 쌓을 때 각 숫자 위에 '주간·월간…' 라벨로 쓴다

@@ -668,6 +668,10 @@ a.fav-tab { text-decoration: none; display: inline-flex; align-items: center; }
 .press-row:hover, .press-row:focus { background: #f5f7fc; outline: none; }
 .press-row[aria-expanded="true"] { background: var(--navy-soft); }
 .press-name { font-weight: 600; color: var(--navy); white-space: nowrap; }
+.press-table td.press-name.name-pos { color: #1a56db; }
+.press-table td.press-name.name-neg { color: #d92d20; }
+.press-table td.press-name.name-neu { color: #111; }
+.press-table td.press-name.name-none { color: #98a2b3; }
 .press-caret { display: inline-block; width: 12px; color: var(--ink-soft); }
 .press-reporters { color: var(--ink-mid); font-size: 12.5px; min-width: 180px; }
 /* 언론사 탭 논조 색 — 긍정=파랑, 중립=검정, 부정=빨강 (기자 이름 색과 같은 규칙) */
