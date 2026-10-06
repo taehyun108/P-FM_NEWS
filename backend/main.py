@@ -759,10 +759,12 @@ class Storage(ABC):
         """모든 기사의 id·press_id·press_name·URL 만 가볍게 읽는다 (언론사명 정비용)."""
 
     @abstractmethod
-    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool: ...
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0,
+                           channel: str = "telegram") -> bool: ...
 
     @abstractmethod
-    def pending_notifications(self, limit: int) -> list[dict]: ...
+    def pending_notifications(self, limit: int, channel: str = "telegram") -> list[dict]:
+        """발송 대기 큐. channel='telegram' = 부서용(기본), 'telegram_public' = 일반용 — 서로 섞이지 않는다."""
 
     @abstractmethod
     def mark_notification(self, notif_id: str, status: str, error: str | None) -> None: ...
@@ -1535,19 +1537,20 @@ class SqliteStorage(Storage):
         )
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool:
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0,
+                           channel: str = "telegram") -> bool:
         try:
             self._exec(
                 "insert into notifications (id,article_id,channel,chat_id,status,priority,retry_count,created_at)"
                 " values (?,?,?,?,?,?,0,?)",
-                (new_id(), article_id, "telegram", chat_id, status, int(priority), iso(now_utc())),
+                (new_id(), article_id, channel, chat_id, status, int(priority), iso(now_utc())),
             )
             return True
         except sqlite3.IntegrityError:
             # 이미 큐에 있음 = 중복 발송 방지가 작동한 것. (§6 정합성)
             return False
 
-    def pending_notifications(self, limit: int) -> list[dict]:
+    def pending_notifications(self, limit: int, channel: str = "telegram") -> list[dict]:
         return self._rows(
             "select n.*, a.title, a.url_canonical, a.url_original, a.press_name, a.author,"
             " a.importance_score, a.published_at, a.group_companies, a.source_type, a.pfm_excerpt,"
@@ -1555,9 +1558,9 @@ class SqliteStorage(Storage):
             " from notifications n"
             " join articles a on a.id = n.article_id"
             " left join summaries s on s.article_id = a.id"
-            " where n.status='queued' and n.retry_count < 3"
+            " where n.status='queued' and n.retry_count < 3 and n.channel = ?"
             " order by a.importance_score desc, n.created_at asc limit ?",
-            (limit,),
+            (channel, limit),
         )
 
     def mark_notification(self, notif_id: str, status: str, error: str | None) -> None:
@@ -2293,10 +2296,11 @@ class SupabaseStorage(Storage):
                 changed += 1
         return changed
 
-    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0) -> bool:
+    def queue_notification(self, article_id: str, chat_id: str, status: str, priority: int = 0,
+                           channel: str = "telegram") -> bool:
         try:
             self._t("notifications").insert({
-                "article_id": article_id, "channel": "telegram", "chat_id": chat_id,
+                "article_id": article_id, "channel": channel, "chat_id": chat_id,
                 "status": status, "priority": int(priority), "retry_count": 0,
                 "created_at": iso(now_utc()),
             }).execute()
@@ -2306,7 +2310,7 @@ class SupabaseStorage(Storage):
                 return False
             raise
 
-    def pending_notifications(self, limit: int) -> list[dict]:
+    def pending_notifications(self, limit: int, channel: str = "telegram") -> list[dict]:
         # PostgREST 는 notifications->articles 처럼 다대일로 임베드된 테이블의 컬럼으로
         # 부모 행을 정렬하지 못한다(foreign_table 정렬은 1:N 임베드 배열 내부 정렬용).
         # 그래서 importance_score 내림차순 정렬은 파이썬에서 한다 — 단, .limit(limit) 을
@@ -2319,7 +2323,7 @@ class SupabaseStorage(Storage):
             .select("*, articles(title,url_canonical,url_original,press_name,author,"
                     "importance_score,published_at,group_companies,source_type,pfm_excerpt,"
                     "summaries(summary_text))")
-            .eq("status", "queued").lt("retry_count", 3)
+            .eq("status", "queued").lt("retry_count", 3).eq("channel", channel)
             .order("created_at")
         ), cap=2000)
         out = []
@@ -7777,6 +7781,140 @@ def send_notifications(ctx: Context, limit: int = 20) -> int:
         return _send_notifications(ctx, limit)
 
 
+# ── 일반용 텔레그램 (모든 직원) — 부서용(승인자)과 별개의 봇·채널 (사용자 지정 2026-10-06) ─────────────
+# · 포스코퓨처엠 기사 중 포스코퓨처엠 논조(언론사 탭의 긍정/중립/부정)가 '긍정' 또는 '중립'인 것만 보낸다.
+#   부정·논조 미판정 기사는 절대 보내지 않는다(판정이 끝난 뒤에 대상이 된다).
+# · 부서용과 같은 규칙 — 6시간 이내 기사만·'제외 키워드' 제외·/stop 일시중지·야간 억제·플러드 보류.
+# · 메시지에는 중요도·SWOT·대응 필요성 같은 내부용 내용을 넣지 않는다.
+# · 큐는 같은 notifications 표를 쓰되 channel='telegram_public' 으로 구분한다(부서용 발송과 섞이지 않는다).
+# · 켜는 법: .env(AWS pfm-news-env)에 TELEGRAM_PUBLIC_BOT_TOKEN · TELEGRAM_PUBLIC_CHAT_ID 를 넣는다.
+PUBLIC_CHANNEL = "telegram_public"
+PUBLIC_TONES = ("긍정", "중립")
+PUBLIC_SEND_PER_CYCLE = 6
+
+
+def public_bot_token() -> str:
+    return get_env("TELEGRAM_PUBLIC_BOT_TOKEN")
+
+
+def public_chat_id() -> str:
+    return get_env("TELEGRAM_PUBLIC_CHAT_ID")
+
+
+def public_enabled() -> bool:
+    """호출 시점에 환경변수를 읽는다 — 토큰과 채널 번호가 둘 다 있어야 켜진다."""
+    return bool(public_bot_token() and public_chat_id())
+
+
+def is_public_candidate(row: dict) -> bool:
+    """일반용에 올릴 기사인가 — 포스코퓨처엠 논조가 긍정·중립이고, 포스코퓨처엠 언급 근거(발췌 또는 제목)가 있다."""
+    if row.get("pfm_tone") not in PUBLIC_TONES:
+        return False
+    if (row.get("pfm_excerpt") or "").strip():
+        return True
+    title = (row.get("title") or "").lower()
+    return any(a in title for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
+
+
+def queue_public_notifications(ctx: Context) -> int:
+    """최근 N시간 포스코퓨처엠 기사 중 일반용 대상(긍정·중립)을 큐에 올린다. 반환: 새로 올린 건수.
+
+    같은 기사는 (기사, 채널, 대화방) 유일 제약이 막아 두 번 올라가지 않는다."""
+    if not public_enabled():
+        return 0
+    since = now_utc() - timedelta(hours=max(1, int(ctx.cfg.fresh_cutoff_hours or 6)))
+    excl = [k for k in jload(ctx.storage.get_run_state().get("exclude_notify_keywords"), []) if k]
+    queued = 0
+    for r in ctx.storage.pfm_articles(iso(since), with_excerpt=True):
+        pub = parse_dt(r.get("published_at"))
+        if pub is None or pub < since or not is_public_candidate(r):
+            continue
+        if _kw_hit_any(r.get("title") or "", excl):
+            continue      # 제목에 '제외' 키워드 → 웹에만
+        if ctx.storage.queue_notification(r["id"], public_chat_id(), "queued", 0, channel=PUBLIC_CHANNEL):
+            queued += 1
+    return queued
+
+
+def format_public_message(row: dict) -> str:
+    """일반용 메시지 — 제목·언론사/기자·요약·포스코퓨처엠 언급·원문 링크만(내부용 정보 없음)."""
+    press = press_display_name(row.get("press_name") or "",
+                               row.get("url_canonical") or row.get("url_original") or "")
+    header = format_summary_header(press, row.get("author") or "")
+    lines = [f"📰 [포스코퓨처엠] {esc(row.get('title') or '')}", ""]
+    summary = (row.get("summary_text") or "").strip()
+    if summary:
+        lines.append(f"{esc(header)} {esc(summary)}".strip())
+    excerpt = excerpt_for_message(row.get("pfm_excerpt") or "")
+    if excerpt:
+        lines += ["", f"포스코퓨처엠 언급: {esc(excerpt)}"]
+    link = row.get("url_canonical") or row.get("url_original") or ""
+    if link:
+        lines += ["", f'🔗 <a href="{esc_attr(link)}">원문 보기</a>']
+    return "\n".join(lines)
+
+
+def send_public_notifications(ctx: Context, limit: int = PUBLIC_SEND_PER_CYCLE) -> int:
+    """일반용 큐 적재 + 발송. 부서용 발송과 같은 락을 써서 겹치지 않는다. 반환: 보낸 건수."""
+    if not public_enabled():
+        return 0
+    with _SEND_LOCK:
+        try:
+            queue_public_notifications(ctx)
+            return _send_public_notifications(ctx, limit)
+        except Exception as exc:   # 일반용 실패가 부서용 파이프라인을 멈추면 안 된다
+            log.warning("일반용 텔레그램 처리 실패: %s", exc)
+            return 0
+
+
+def _send_public_notifications(ctx: Context, limit: int) -> int:
+    state = ctx.storage.get_run_state()
+    if str(state.get("notify_paused") or "0") not in ("0", "False", "false", ""):
+        return 0       # 봇 /stop 으로 일시중지됨 — 일반용도 함께 멈춘다
+    if _flood_remaining() > 0:
+        return 0
+    pending = ctx.storage.pending_notifications(max(limit, 1) * 4, channel=PUBLIC_CHANNEL)
+    if not pending:
+        return 0
+    # 큐에 오른 뒤 마스터가 '제외 키워드'를 추가했을 수 있다 — 발송 직전에 한 번 더 거른다.
+    excl = [k for k in jload(state.get("exclude_notify_keywords"), []) if k]
+    if excl:
+        pending = [p for p in pending if not _kw_hit_any(p.get("title") or "", excl)]
+    # 야간 억제 — 부서용과 같은 규칙(밤에는 중요도 n_min 이상만)
+    n_start, n_end, n_min = effective_night(ctx, state)
+    if _in_night_window(now_local().hour, n_start, n_end):
+        pending = [p for p in pending if int(p.get("importance_score") or 0) >= n_min]
+    if not pending:
+        return 0
+    url = TELEGRAM_API.format(token=public_bot_token())
+    sent = 0
+    for row in pending[:limit]:
+        if _flood_remaining() > 0:
+            break
+        # 발송 직전 재확인 — 보관 처리됐거나 논조가 바뀐 기사는 보내지 않는다.
+        detail = ctx.storage.article_detail(row["article_id"]) or {}
+        if detail.get("status") != "active" or detail.get("pfm_tone") not in PUBLIC_TONES:
+            ctx.storage.mark_notification(row["id"], "skipped", "일반용 조건 불충족(논조·상태)")
+            continue
+        _rate_gate()
+        ok, err = _telegram_send(ctx, url, clamp_message(format_public_message(row)),
+                                 chat_id=public_chat_id(),
+                                 kind=f"일반용 · 포스코퓨처엠 논조 {detail.get('pfm_tone')}",
+                                 article_id=row.get("article_id"))
+        if ok:
+            ctx.storage.mark_notification(row["id"], "sent", None)
+            sent += 1
+        elif _notify_too_old(row):
+            ctx.storage.mark_notification(row["id"], "failed", err)
+        elif _is_transient_tg_error(err):
+            ctx.storage.touch_notification(row["id"], err)
+        else:
+            status = "queued" if int(row.get("retry_count") or 0) < 2 else "failed"
+            ctx.storage.mark_notification(row["id"], status, err)
+        time.sleep(RATE_LIMIT_SLEEP)
+    return sent
+
+
 def _send_notifications(ctx: Context, limit: int = 20) -> int:
     cfg = ctx.cfg
     if not cfg.telegram_enabled:
@@ -7904,11 +8042,12 @@ def warn_if_bad_chat_id(chat_id: str) -> None:
         )
 
 
-def cmd_chatid(ctx: Context) -> None:
-    """봇이 받은 최근 메시지에서 chat_id 를 찾아 보여준다."""
-    if not ctx.cfg.telegram_bot_token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN 이 비어 있습니다.")
-    url = f"https://api.telegram.org/bot{ctx.cfg.telegram_bot_token}/getUpdates"
+def cmd_chatid(ctx: Context, public: bool = False) -> None:
+    """봇이 받은 최근 메시지에서 chat_id 를 찾아 보여준다. public=True 면 일반용 봇(TELEGRAM_PUBLIC_BOT_TOKEN)."""
+    token = public_bot_token() if public else ctx.cfg.telegram_bot_token
+    if not token:
+        raise SystemExit(("TELEGRAM_PUBLIC_BOT_TOKEN" if public else "TELEGRAM_BOT_TOKEN") + " 이 비어 있습니다.")
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
     try:
         data = ctx.http.get(url).json()
     except Exception as exc:
@@ -7931,9 +8070,10 @@ def cmd_chatid(ctx: Context) -> None:
             "그 다음 이 명령을 다시 실행하세요."
         )
         return
-    print("아래 값을 .env 의 TELEGRAM_CHAT_ID 에 넣으세요.\n")
+    name = "TELEGRAM_PUBLIC_CHAT_ID" if public else "TELEGRAM_CHAT_ID"
+    print(f"아래 값을 .env 의 {name} 에 넣으세요.\n")
     for chat_id, desc in found.items():
-        print(f"  TELEGRAM_CHAT_ID={chat_id}    ({desc})")
+        print(f"  {name}={chat_id}    ({desc})")
 
 
 def cmd_sendtest(ctx: Context) -> None:
@@ -7949,6 +8089,35 @@ def cmd_sendtest(ctx: Context) -> None:
         log.info("시험 메시지 발송 성공. 텔레그램에서 확인하세요.")
     else:
         raise SystemExit(f"발송 실패: {err}")
+
+
+def cmd_public_test(ctx: Context) -> None:
+    """일반용 텔레그램 설정이 맞는지 시험 메시지 1건을 일반용 채널로 보낸다."""
+    if not public_enabled():
+        raise SystemExit("TELEGRAM_PUBLIC_BOT_TOKEN 또는 TELEGRAM_PUBLIC_CHAT_ID 가 비어 있습니다.")
+    url = TELEGRAM_API.format(token=public_bot_token())
+    text = ("✅ <b>P-FM NEWS 일반용</b> 연결 확인\n\n"
+            "이 채널에는 포스코퓨처엠 관련 긍정·중립 기사만 올라옵니다.\n"
+            f"시각: {esc(iso(now_utc()))}")
+    ok, err = _telegram_send(ctx, url, text, chat_id=public_chat_id(), kind="일반용 연결 테스트")
+    if ok:
+        log.info("일반용 시험 메시지 발송 성공. 일반용 채널에서 확인하세요.")
+    else:
+        raise SystemExit(f"발송 실패: {err}")
+
+
+def cmd_public_check(ctx: Context) -> None:
+    """일반용으로 올라갈 기사를 미리 본다(큐 적재·발송 없음). 최근 N시간 포스코퓨처엠 기사를 논조별로 센다."""
+    since = now_utc() - timedelta(hours=max(1, int(ctx.cfg.fresh_cutoff_hours or 6)))
+    rows = ctx.storage.pfm_articles(iso(since), with_excerpt=True)
+    cnt = Counter((r.get("pfm_tone") or "미판정") for r in rows)
+    cands = [r for r in rows if is_public_candidate(r)]
+    log.info("일반용 점검 — 설정 %s · 최근 %d시간 포스코퓨처엠 기사 %d건 (긍정 %d · 중립 %d · 부정 %d · 미판정 %d)",
+             "켜짐" if public_enabled() else "꺼짐(토큰/채널 번호 없음)", int(ctx.cfg.fresh_cutoff_hours or 6), len(rows),
+             cnt["긍정"], cnt["중립"], cnt["부정"], cnt["미판정"])
+    log.info("일반용 발송 대상(긍정·중립) %d건 — 부정·미판정은 보내지 않습니다", len(cands))
+    for r in cands[:15]:
+        log.info("  · [%s] %s | %s", r.get("pfm_tone"), (r.get("press_name") or "")[:10], (r.get("title") or "")[:50])
 
 
 def _telegram_send(ctx: Context, url: str, text: str,
@@ -11630,6 +11799,8 @@ def cmd_once(ctx: Context, max_llm: int | None) -> None:
     result = run_once(ctx, max_llm=max_llm, force_naver=True)
     sent = send_notifications(ctx)
     log.info("텔레그램 발송 %d건", sent)
+    if public_enabled():
+        log.info("일반용 텔레그램 발송 %d건", send_public_notifications(ctx))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -11687,6 +11858,7 @@ def pipeline_loop(ctx: Context, stop: threading.Event) -> None:
             run_once(ctx)
             # 한 회차에 12건까지만 — 억제 해제 등으로 큐가 밀려도 분당 한도를 넘기지 않는다.
             send_notifications(ctx, limit=SEND_BATCH_PER_CYCLE)
+            send_public_notifications(ctx)      # 일반용(모든 직원) — 긍정·중립만, 설정이 없으면 아무 일도 안 한다
             maybe_run_weekly(ctx)
             # 목록 스캔 스토어를 델타로 갱신해 둔다(웹 요청 시 DB 재조회 없음).
             refresh_scan_store(ctx.storage)
@@ -12813,6 +12985,80 @@ def cmd_selftest() -> int:
     _e3 = _et.article_detail("e3")
     check("fixexcerpt — 보관 본문으로 발췌·논조를 채운다",
           ("포스코퓨처엠은 광양 양극재 공장 증설을" in _e3["pfm_excerpt"], _e3["pfm_tone"]), (True, "긍정"))
+
+    # 일반용 텔레그램 — 긍정·중립만, 부서용 큐와 분리 (2026-10-06)
+    class _FakeTGResp:
+        status_code = 200
+        def json(self) -> dict:
+            return {"ok": True}
+
+    class _FakeTG:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str, str]] = []
+        def post(self, url: str, **kw: Any) -> Any:
+            j = kw.get("json") or {}
+            self.sent.append((url, str(j.get("chat_id")), str(j.get("text"))))
+            return _FakeTGResp()
+
+    _pub_env = {k: os.environ.get(k) for k in ("TELEGRAM_PUBLIC_BOT_TOKEN", "TELEGRAM_PUBLIC_CHAT_ID")}
+    for _k in _pub_env:
+        os.environ.pop(_k, None)
+    check("일반용 — 토큰·채널 번호가 없으면 꺼짐", public_enabled(), False)
+    os.environ["TELEGRAM_PUBLIC_BOT_TOKEN"] = "PUB:TOKEN"
+    check("일반용 — 토큰만 있으면 아직 꺼짐", public_enabled(), False)
+    os.environ["TELEGRAM_PUBLIC_CHAT_ID"] = "-100999"
+    check("일반용 — 둘 다 있으면 켜짐", public_enabled(), True)
+    check("일반용 대상 — 긍정·중립 + 언급 근거 있음만",
+          [is_public_candidate({"pfm_tone": t, "pfm_excerpt": "포스코퓨처엠은 증설한다.", "title": "x"}) for t in ("긍정", "중립", "부정", "", None)],
+          [True, True, False, False, False])
+    check("일반용 대상 — 언급 근거(발췌·제목) 둘 다 없으면 제외",
+          (is_public_candidate({"pfm_tone": "긍정", "pfm_excerpt": "", "title": "코스피 마감"}),
+           is_public_candidate({"pfm_tone": "중립", "pfm_excerpt": "", "title": "포스코퓨처엠 신공장"})), (False, True))
+    _pm = format_public_message({"title": "포스코퓨처엠 <신공장>", "summary_text": "요약문", "press_name": "머니투데이",
+                                 "author": "홍길동", "importance_score": 90, "pfm_excerpt": "포스코퓨처엠은 증설한다.",
+                                 "url_canonical": "https://x.test/a", "group_companies": '["포스코퓨처엠"]'})
+    check("일반용 메시지 — 제목·요약·언급·링크 포함, 중요도·SWOT 같은 내부 정보 없음",
+          ("&lt;신공장&gt;" in _pm, "요약문" in _pm, "포스코퓨처엠 언급" in _pm, "원문 보기" in _pm,
+           "🔴" in _pm or "🟠" in _pm, "SWOT" in _pm, "중요도" in _pm), (True, True, True, True, False, False, False))
+    _pn2 = now_utc()
+    for _pid, _ptone, _hrs, _pex in (("pu1", "긍정", 1, "포스코퓨처엠은 LFP 양극재를 공급한다."), ("pu2", "부정", 1, "포스코퓨처엠은 적자를 냈다."),
+                                     ("pu3", None, 1, "포스코퓨처엠은 투자한다."), ("pu4", "중립", 1, "포스코퓨처엠은 협약했다."),
+                                     ("pu5", "긍정", 12, "포스코퓨처엠은 오래된 기사다.")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative,pfm_excerpt,pfm_tone) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_pid, "u/" + _pid, "https://x.test/" + _pid, "https://x.test/" + _pid, "포스코퓨처엠 기사 " + _pid,
+                   iso(_pn2 - timedelta(hours=_hrs)), iso(_pn2), "rss", 10, '["포스코퓨처엠"]', "[]", "연합뉴스",
+                   iso(_pn2), "active", 1, _pex, _ptone))
+    _tg = _FakeTG()
+    _pctx = Context(cfg=_ectx.cfg, storage=_et, http=_tg)
+    _orig_now_local, _orig_sleep = now_local, RATE_LIMIT_SLEEP
+    globals()["now_local"] = lambda: datetime(2026, 10, 6, 2, 0)      # 새벽 2시 — 야간 억제 구간
+    globals()["RATE_LIMIT_SLEEP"] = 0
+    _n_night = send_public_notifications(_pctx)
+    check("일반용 — 야간(중요도 낮음)에는 큐에만 쌓고 보내지 않는다", (_n_night, len(_tg.sent)), (0, 0))
+    globals()["now_local"] = lambda: datetime(2026, 10, 6, 12, 0)
+    _n_day = send_public_notifications(_pctx)
+    _texts = " ".join(t for _, _, t in _tg.sent)
+    check("일반용 — 낮에는 긍정·중립(pu1·pu4와 앞선 테스트의 e1·e2·e3)만 발송, 부정·미판정·오래된 기사는 제외",
+          (_n_day, "pu1" in _texts, "pu4" in _texts, "pu2" in _texts, "pu3" in _texts, "pu5" in _texts),
+          (5, True, True, False, False, False))
+    check("일반용 — 일반용 봇 토큰·채널 번호로 나간다",
+          {(u, c) for u, c, _ in _tg.sent}, {(TELEGRAM_API.format(token="PUB:TOKEN"), "-100999")})
+    _n_again = send_public_notifications(_pctx)
+    check("일반용 — 이미 보낸 기사는 다시 보내지 않는다(중복 방지)", (_n_again, len(_tg.sent)), (0, 5))
+    _et.queue_notification("e1", "-1", "queued", 0)
+    check("부서용 큐와 일반용 큐는 섞이지 않는다",
+          ([r["chat_id"] for r in _et.pending_notifications(10)], [r["chat_id"] for r in _et.pending_notifications(10, channel=PUBLIC_CHANNEL)]),
+          (["-1"], []))
+    _et._exec("update notifications set status='sent' where chat_id='-1'")
+    globals()["now_local"] = _orig_now_local
+    globals()["RATE_LIMIT_SLEEP"] = _orig_sleep
+    for _k, _v in _pub_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
 
     print("\n[8-2c6] 띄어쓴 회사명 인식 · 태그 복구 (2026-10-01)")
     check("띄어쓴 표기도 그룹사로 인식 — 포스코 퓨처엠·POSCO 퓨처엠·포스코 홀딩스·포스코 인터내셔널",
@@ -15087,7 +15333,11 @@ def main(argv: Sequence[str]) -> int:
         n = ctx.storage.requeue_failed_notifications()
         log.info("발송 실패 %d건을 큐로 되돌렸습니다. 다음 발송 주기(또는 notify 명령)에 재시도됩니다.", n)
     elif command == "chatid":
-        cmd_chatid(ctx)
+        cmd_chatid(ctx, public="public" in argv[2:])
+    elif command == "public-test":
+        cmd_public_test(ctx)
+    elif command == "public-check":
+        cmd_public_check(ctx)
     elif command == "sendtest":
         cmd_sendtest(ctx)
     elif command == "kakao-auth":
