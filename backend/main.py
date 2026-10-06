@@ -3171,6 +3171,31 @@ NAVER_NEWS_API = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 POLICY_SITE = "site:www.korea.kr"   # '정책' 키워드는 정책브리핑으로만 검색한다
 
 
+# ── 다음(Daum) 뉴스 수집 (사용자 지정 2026-10-06) ───────────────────────────────
+# 다음에는 공식 뉴스 검색 API 가 없고 직접 크롤링은 약관상 하지 않는다(PRD §7-4).
+# 그래서 이미 쓰는 Google 뉴스 RSS 에 'site:v.daum.net 키워드' 로 검색해 다음에 실린 기사만 가져온다.
+# 호출량 때문에 '그룹사' 키워드만 쓰고, .env 의 DAUM_ENABLED=true 일 때만 켠다(기본 꺼짐).
+# 같은 기사가 언론사 원문에도 있으면 기존 중복 판정(URL·본문 해시·제목 유사도)이 하나로 합친다.
+DAUM_SITE = "site:v.daum.net"
+DAUM_CATEGORY = "다음"      # 내부 표시용 분류(마스터 키워드 분류가 아니다 — 저장하지 않는다)
+
+
+def daum_enabled() -> bool:
+    """호출 시점에 환경변수를 읽는다(실행 방식에 따라 동작이 갈리지 않게)."""
+    return get_env("DAUM_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+
+def daum_keyword_rows(keyword_rows: Sequence[dict]) -> list[dict]:
+    """다음 검색용 키워드 — 활성 '그룹사' 키워드만(중복 제거). 산업·정책·통상은 호출량 때문에 뺀다."""
+    out, seen = [], set()
+    for r in keyword_rows:
+        kw = (r.get("keyword") or "").strip() if isinstance(r, dict) else ""
+        if kw and r.get("category") == NAVER_ALWAYS_CATEGORY and kw not in seen:
+            seen.add(kw)
+            out.append({"keyword": kw, "category": DAUM_CATEGORY})
+    return out
+
+
 GOOGLE_FETCH_WORKERS = 4   # Google News RSS 동시 요청 수 — 네이버(4)와 같은 이유로 낮게 둔다
 
 
@@ -3183,7 +3208,9 @@ def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[R
 
     def _fetch_one(row: dict) -> list[RawItem]:
         keyword = row["keyword"]
-        query = f"{POLICY_SITE} {keyword}" if row.get("category") == "정책" else keyword
+        category = row.get("category")
+        query = (f"{POLICY_SITE} {keyword}" if category == "정책"
+                 else f"{DAUM_SITE} {keyword}" if category == DAUM_CATEGORY else keyword)
         url = GOOGLE_NEWS_RSS.format(q=urlencode({"q": query})[2:])
         try:
             resp = http.get(url)
@@ -4953,7 +4980,10 @@ def extract_pfm_excerpt(body: str) -> str:
     언급 부분이 밀려났다(2026-10-01 지적). 이제는 한 덩어리의 이어진 글이고, 앞의 '(서울=연합뉴스) 홍길동 기자 ='
     같은 작성 표기와 헤드라인성 줄은 걷어 낸다. 언급이 없으면 빈 문자열(카드는 이 영역을 그리지 않는다).
     """
-    text = re.sub(r"[ \t\r\f\v]+", " ", (body or "")).strip()
+    # 줄바꿈 아닌 공백류(NBSP·전각 공백 등)는 한 칸으로, 폭 없는 문자(ZWSP·BOM 등)는 지운다 —
+    # '포스코\xa0퓨처엠'·'포스코​퓨처엠' 처럼 눈에 안 보이는 문자가 끼면 별칭 매칭이 빗나가 언급이 통째로 빠졌다.
+    text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]", "", body or "")
+    text = re.sub(r"[ \t\r\f\v\u00a0\u3000\u2002-\u200a\u202f]+", " ", text).strip()
     if not text:
         return ""
     aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
@@ -6557,6 +6587,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     raw: list[RawItem] = []
     if "google_rss" in feed_types:
         raw += collect_google_rss(http, keyword_rows)
+        if daum_enabled():
+            raw += collect_google_rss(http, daum_keyword_rows(keyword_rows))
     if "naver_api" in feed_types and cfg.naver_enabled:
         # 하루 25,000회 한도 때문에 매 실행이 아니라 일정 간격으로만 호출한다.
         due = force_naver or (time.monotonic() - ctx.last_naver_fetch) >= cfg.naver_interval_sec
@@ -11222,6 +11254,101 @@ def cmd_pfmtone(ctx: Context, limit: int = 200, dry: bool = False, days: int = 3
              excerpted, no_mention, toned, failed, llm_used, len(todo) - visited)
 
 
+def cmd_fixexcerpt(ctx: Context, press: str = "", limit: int = 60, dry: bool = False) -> None:
+    """'포스코퓨처엠' 기사인데 카드에 언급 발췌가 비어 있는 것을 점검·복구한다(2026-10-06 머니투데이 사례).
+
+    대상: 발췌가 NULL(아직 못 만듦) 또는 ''(분석 때 본문에서 언급을 못 찾음)인 포스코퓨처엠 기사.
+    press 를 주면 그 언론사(부분 일치)만. dry 면 원인별 건수만 보여 주고 아무것도 쓰지 않는다.
+    복구: 보관 본문(30일)이 있으면 그것으로, 없거나 언급이 안 잡히면 원문 페이지를 다시 받아
+    발췌를 만든다. 논조가 비어 있으면 함께 채운다(AI 최대 limit 회). 원문에도 언급이 없으면 그대로 둔다.
+    """
+    rows = ctx.storage.pfm_articles(iso(now_utc() - timedelta(days=365)), with_excerpt=True)
+    todo = []
+    for r in rows:
+        if r.get("pfm_excerpt") not in (None, ""):
+            continue
+        url = r.get("url_canonical") or r.get("url_original") or ""
+        name = press_display_name(r.get("press_name") or "", url) or "(언론사 미상)"
+        if press and press not in name:
+            continue
+        todo.append((name, r))
+    by_press = Counter(n for n, _ in todo)
+    log.info("발췌 비어 있는 포스코퓨처엠 기사 %d건%s — 언론사별: %s", len(todo),
+             f" (언론사 '{press}')" if press else "",
+             ", ".join(f"{n} {c}" for n, c in by_press.most_common(8)) or "없음")
+    if dry:
+        for name, r in todo[:15]:
+            body = ctx.storage.body_of(r["id"]) or ""
+            has = any(a in re.sub(r"\s+", " ", body).lower() for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
+            state = "NULL" if r.get("pfm_excerpt") is None else "''"
+            log.info("  - [%s] %s | 발췌 %s · 보관본문 %d자 · 본문에 언급 %s | %s", name[:8], (r.get("title") or "")[:40],
+                     state, len(body), "있음" if has else "없음", (r.get("url_canonical") or r.get("url_original") or "")[:60])
+        log.info("[미리보기] 실제로 복구하려면 --dry 없이 다시 실행하세요(이번 AI 호출은 최대 %d회).", limit)
+        return
+    fixed = still_none = nobody = toned = llm_used = 0
+    for name, r in todo:
+        body = ctx.storage.body_of(r["id"]) or ""
+        excerpt = extract_pfm_excerpt(body) if body else ""
+        if not excerpt:
+            target = r.get("url_canonical") or r.get("url_original") or ""
+            try:
+                _, html = resolve_canonical(ctx.http, target)
+                fresh = extract_body(html) if html else ""
+            except Exception as exc:
+                log.debug("원문 재수집 실패 %s: %s", target, exc)
+                fresh = ""
+            if len(fresh) < 50 and not body:
+                nobody += 1
+                log.info("  ✗ 본문 확보 못함: [%s] %s", name[:8], (r.get("title") or "")[:40])
+                continue
+            excerpt = extract_pfm_excerpt(fresh)
+        if not excerpt:
+            still_none += 1
+            ctx.storage.update_article(r["id"], {"pfm_excerpt": ""})
+            log.info("  · 원문에도 언급 없음: [%s] %s", name[:8], (r.get("title") or "")[:40])
+            continue
+        if looks_english(excerpt):
+            _, e_ko = ctx.llm.translate_to_korean("", excerpt)
+            excerpt = e_ko or excerpt
+        patch: dict[str, Any] = {"pfm_excerpt": excerpt}
+        if not r.get("pfm_tone") and llm_used < limit:
+            tone, reason = ctx.llm.pfm_tone(excerpt)
+            llm_used += 1
+            if tone:
+                patch.update(pfm_tone=tone, pfm_tone_reason=reason)
+                toned += 1
+        ctx.storage.update_article(r["id"], patch)
+        fixed += 1
+        log.info("  ✓ 발췌 복구: [%s] %s", name[:8], (r.get("title") or "")[:40])
+    log.info("발췌 복구 완료: 복구 %d건(논조 %d건) · 원문에도 언급 없음 %d건 · 본문 확보 못함 %d건 · AI %d회",
+             fixed, toned, still_none, nobody, llm_used)
+
+
+def cmd_daum_test(ctx: Context, show: int = 12) -> None:
+    """다음 수집을 미리 점검한다(저장·분석 없음). 그룹사 키워드로 'site:v.daum.net' 검색 결과를 받아
+    몇 건이 나오는지, 그중 제목이 이미 DB 에 있는 기사(중복 추정)와 새 후보가 몇 건인지 보여 준다."""
+    rows = ctx.storage.enabled_keywords()
+    drows = daum_keyword_rows(rows)
+    log.info("다음 점검 — 그룹사 키워드 %d개: %s", len(drows), ", ".join(r["keyword"] for r in drows))
+    items = collect_google_rss(ctx.http, drows)
+    uniq: dict[str, RawItem] = {}
+    for it in items:
+        uniq.setdefault(it.url_source, it)
+    cands = ctx.storage.recent_articles_for_dedup(now_utc() - timedelta(days=7))
+    known = {normalize_title(c.get("title") or "") for c in cands}
+    dup, fresh = [], []
+    for it in uniq.values():
+        (dup if normalize_title(it.title) in known else fresh).append(it)
+    log.info("다음 검색 결과 %d건(중복 제거 후 %d건) → 제목이 이미 있는 기사 %d건 · 새 후보 %d건 (최근 7일 기준)",
+             len(items), len(uniq), len(dup), len(fresh))
+    for it in fresh[:show]:
+        log.info("  + [%s] %s | %s", (it.press_hint or "")[:12], it.title[:60],
+                 it.published_at.strftime("%m-%d %H:%M") if it.published_at else "발행시각 없음")
+    if not items:
+        log.warning("결과가 0건입니다 — 구글 RSS 가 site: 검색을 막았거나 키워드가 없습니다. 켜지 않는 편이 좋습니다.")
+    log.info("켜려면 서버 .env 에 DAUM_ENABLED=true 를 넣고 컨테이너를 다시 시작하세요(켠 뒤 첫 회차부터 수집).")
+
+
 def cmd_fixlinks(ctx: Context) -> None:
     """홈페이지 루트로 잘못 저장된 url_canonical 을 바로잡는다 (일회성).
 
@@ -12639,6 +12766,23 @@ def cmd_selftest() -> int:
           ("포스코퓨처엠은 광양 양극재 공장 증설을" in _et.article_detail("e1")["pfm_excerpt"],
            "정부가 이차전지" in _et.article_detail("e1")["pfm_excerpt"]), (True, False))
 
+    # fixexcerpt — 발췌가 비어 있는 포스코퓨처엠 기사를 점검·복구 (머니투데이 사례, 2026-10-06)
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("e3", "u/e3", "https://www.mt.co.kr/x/e3", "https://www.mt.co.kr/x/e3", "포스코퓨처엠 계약", iso(_pn), iso(_pn),
+               "rss", 10, '["포스코퓨처엠"]', "[]", "머니투데이", iso(_pn), "active", 1))
+    _et._exec("update articles set pfm_excerpt='' where id='e3'")
+    _et.save_body("e3", _mp, "fulltext")
+    cmd_fixexcerpt(_ectx, "머니투데이", 10, dry=True)
+    check("fixexcerpt --dry — 쓰지 않는다", _et.article_detail("e3")["pfm_excerpt"], "")
+    cmd_fixexcerpt(_ectx, "없는언론사", 10)
+    check("fixexcerpt — 다른 언론사 지정이면 건드리지 않는다", _et.article_detail("e3")["pfm_excerpt"], "")
+    cmd_fixexcerpt(_ectx, "머니투데이", 10)
+    _e3 = _et.article_detail("e3")
+    check("fixexcerpt — 보관 본문으로 발췌·논조를 채운다",
+          ("포스코퓨처엠은 광양 양극재 공장 증설을" in _e3["pfm_excerpt"], _e3["pfm_tone"]), (True, "긍정"))
+
     print("\n[8-2c6] 띄어쓴 회사명 인식 · 태그 복구 (2026-10-01)")
     check("띄어쓴 표기도 그룹사로 인식 — 포스코 퓨처엠·POSCO 퓨처엠·포스코 홀딩스·포스코 인터내셔널",
           [detect_group_companies(t) for t in ("포스코 퓨처엠, 태양열 지원", "POSCO 퓨처엠 신공장",
@@ -12868,6 +13012,41 @@ def cmd_selftest() -> int:
     check("Google RSS 병렬 — 전 키워드 조회·실패 1건은 건너뜀", (_gh.calls, len(_gitems)), (10, 9))
     check("Google RSS 병렬 — 결과 순서가 키워드 순서와 같다",
           [i.url_original for i in _gitems], [f"https://g.test/k{i}" for i in range(9)])
+
+    # 다음(Daum) 수집 — Google RSS 'site:v.daum.net' (2026-10-06)
+    _drows = daum_keyword_rows([
+        {"keyword": "포스코퓨처엠", "category": "그룹사"}, {"keyword": "포스코퓨처엠", "category": "그룹사"},
+        {"keyword": "포스코DX", "category": "그룹사"}, {"keyword": "정부", "category": "정책"},
+        {"keyword": "양극재", "category": "산업"}, {"keyword": "관세", "category": "통상"}])
+    check("다음 키워드 — 그룹사만·중복 제거", [(r["keyword"], r["category"]) for r in _drows],
+          [("포스코퓨처엠", "다음"), ("포스코DX", "다음")])
+    _queries: list[str] = []
+    class _QHttp(_GHttp):
+        def get(self, url: str, **kw: Any) -> Any:
+            import urllib.parse as _up
+            _queries.append(_up.parse_qs(_up.urlparse(url).query)["q"][0])
+            return super().get(url, **kw)
+    collect_google_rss(_QHttp(), _drows + [{"keyword": "양극재", "category": "산업"},
+                                           {"keyword": "정부", "category": "정책"}])
+    check("다음 검색어 — site:v.daum.net 은 다음 분류만, 정책은 korea.kr, 나머지는 키워드 그대로",
+          sorted(_queries), sorted(["site:v.daum.net 포스코퓨처엠", "site:v.daum.net 포스코DX",
+                                    "양극재", f"{POLICY_SITE} 정부"]))
+    _old_daum = os.environ.pop("DAUM_ENABLED", None)
+    check("DAUM_ENABLED 기본은 꺼짐", daum_enabled(), False)
+    os.environ["DAUM_ENABLED"] = "true"
+    check("DAUM_ENABLED=true 면 켜짐", daum_enabled(), True)
+    os.environ["DAUM_ENABLED"] = "no"
+    check("DAUM_ENABLED=no 면 꺼짐", daum_enabled(), False)
+    if _old_daum is None:
+        os.environ.pop("DAUM_ENABLED", None)
+    else:
+        os.environ["DAUM_ENABLED"] = _old_daum
+    # 눈에 안 보이는 문자가 끼어도 포스코퓨처엠 언급 발췌가 빠지지 않는다 (머니투데이 사례 점검)
+    _inv = ("이번 계약은 양극재 시장에 의미가 크다는 평가다. 업계는 주목하고 있다.\n"
+            "포스코\u00a0퓨처엠은 SK온과 1조원 규모 공급계약을 체결했다고 22일 밝혔다. 계약기간은 3년이다.\n"
+            "포스코\u200b퓨처엠 관계자는 \"고객 포트폴리오를 확대하겠다\"고 설명했다. 다른 설명은 없었다.")
+    _ex_inv = extract_pfm_excerpt(_inv)
+    check("발췌 — NBSP·폭 없는 문자가 끼어도 언급을 찾는다", ("SK온과 1조원" in _ex_inv, "포스코 퓨처엠 관계자" in _ex_inv or "포스코퓨처엠 관계자" in _ex_inv), (True, True))
 
     print("\n[8-2d] 배터리 생태계 기사 (포스코 미언급 허용)")
     check("전고체 배터리 개발 → 수집",
@@ -14842,6 +15021,14 @@ def main(argv: Sequence[str]) -> int:
         rest = argv[2:]
         nums = [int(a) for a in rest if a.isdigit()]
         cmd_pfmtone(ctx, nums[0] if nums else 200, dry="--dry" in rest)
+    elif command == "fixexcerpt":
+        rest = argv[2:]
+        nums = [int(a) for a in rest if a.isdigit()]
+        names = [a for a in rest if not a.isdigit() and not a.startswith("--")]
+        cmd_fixexcerpt(ctx, names[0] if names else "", nums[0] if nums else 60, dry="--dry" in rest)
+    elif command == "daum-test":
+        nums = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_daum_test(ctx, nums[0] if nums else 12)
     elif command == "fixlinks":
         cmd_fixlinks(ctx)
     elif command == "fixdates":
