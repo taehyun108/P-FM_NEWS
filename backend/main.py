@@ -5575,14 +5575,16 @@ class LLMClient:
         """주간 레포트 섹션 1건을 합성한다.
 
         kind='swot'  → {"s","w","o","t"} 각 2~3문장 (그룹사 섹션)
-        kind='impact'→ {"impact": 3~4문장}          (정부/정책·글로벌 통상 섹션)
+        kind='impact'→ {"impact": 3~4문장,                       (정부/정책·글로벌 통상 섹션)
+                        "pfm": {"tone","text"},                  주간 포스코퓨처엠 영향(긍정·중립·부정)
+                        "items": [{"tone","text"} …기사 순서대로]}  기사별 포스코퓨처엠 영향
         기사가 없으면 빈 dict. 실패해도 레포트 전체가 죽지 않도록 예외를 삼킨다.
         """
         if not articles:
             return {}
         digest = "\n".join(
-            f"- ({a.get('published_at','')[:10]}) {a.get('title','')}\n  {a.get('summary_text') or ''}"
-            for a in articles)
+            f"[{i}] ({a.get('published_at','')[:10]}) {a.get('title','')}\n  {a.get('summary_text') or ''}"
+            for i, a in enumerate(articles, 1))
         if kind == "swot":
             system = ("당신은 포스코 그룹 전략 담당 애널리스트다. 아래 한 주간 기사만 근거로 "
                       "해당 계열사 관점의 주간 SWOT 를 한국어로 작성하고 JSON 으로만 답한다.")
@@ -5592,11 +5594,23 @@ class LLMClient:
                     '{"s":"...","w":"...","o":"...","t":"..."}')
         else:
             system = ("당신은 포스코 그룹 대외전략 담당이다. 아래 한 주간 기사만 근거로 "
-                      "이 이슈들이 포스코 그룹(철강·이차전지소재·인프라)에 미치는 영향을 "
+                      "이 이슈들이 포스코 그룹(철강·이차전지소재·인프라)과 포스코퓨처엠에 미치는 영향을 "
                       "한국어로 정리하고 JSON 으로만 답한다.")
+            n = len(articles)
             user = (f"[주제] {name}\n[이번 주 주요 기사]\n{digest}\n\n"
-                    "3~4문장으로 영향과 대응 관점을 정리한다. 단정하지 말고 검토 필요 톤. "
-                    '형식: {"impact":"..."}')
+                    "포스코퓨처엠은 이차전지 소재(양극재·음극재·전구체)와 원료(리튬·니켈 등 핵심광물) 조달, "
+                    "전기차·배터리 수요, 관세·수출통제·공급망·보조금 규제에 영향을 받는 회사다.\n"
+                    "[작성 규칙]\n"
+                    "- impact: 포스코 그룹 전체에 미치는 영향과 대응 관점 3~4문장. 단정하지 말고 검토 필요 톤.\n"
+                    "- pfm_tone / pfm_impact: 이번 주 이 주제가 **포스코퓨처엠에** 미치는 영향 종합. "
+                    "pfm_tone 은 \"긍정\"(매출·원가·규제 면에서 도움) | \"부정\"(비용 증가·규제·수출 제약 등 불리) | "
+                    "\"중립\"(영향이 불분명하거나 직접 관련 없음) 중 하나. pfm_impact 는 2~3문장, 왜 그렇게 봤는지 기사 내용으로 설명.\n"
+                    f"- items: 기사 {n}건 각각에 대해 [번호] 순서대로 n(번호)·tone·impact(1~2문장, 쉬운 말). "
+                    "그 기사가 포스코퓨처엠에 미치는 영향만 쓴다.\n"
+                    "- 기사에 없는 사실은 추측하지 않는다. 포스코퓨처엠과 직접 관련이 없으면 tone 은 \"중립\", "
+                    'impact 는 "포스코퓨처엠에 직접 영향은 확인되지 않음"과 이유 한 줄로 쓴다.\n'
+                    '형식: {"impact":"...","pfm_tone":"긍정|중립|부정","pfm_impact":"...",'
+                    '"items":[{"n":1,"tone":"중립","impact":"..."}]}')
         try:
             content, _ = self._chat(system, user)
             return _parse_json_object(content) or {}
@@ -8642,6 +8656,36 @@ def weekly_group_score(hits: list[dict]) -> dict:
     return {"value": value, "count": n, "tone": tone, "reason": reason}
 
 
+def normalize_pfm_impact(brief: dict, n: int) -> tuple[dict | None, list[dict | None]]:
+    """LLM 이 준 주간 포스코퓨처엠 영향을 안전한 형태로 다듬는다.
+
+    반환: (섹션 종합 {"tone","text"} 또는 None, 기사별 [{"tone","text"} 또는 None] × n)
+    · tone 이 긍정·중립·부정이 아니면 '중립' 으로 둔다(임의 값이 화면에 나가지 않게).
+    · 본문이 빈 값이면 None — 근거 없는 칸을 만들어 내지 않는다.
+    · 기사 번호(n)가 범위를 벗어나거나 중복이면 무시한다.
+    """
+    def _one(tone: Any, text: Any) -> dict | None:
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not text:
+            return None
+        tone = str(tone or "").strip()
+        return {"tone": tone if tone in PFM_TONES else "중립", "text": text[:400]}
+
+    brief = brief or {}
+    overall = _one(brief.get("pfm_tone"), brief.get("pfm_impact"))
+    items: list[dict | None] = [None] * n
+    for it in (brief.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("n")) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < n and items[idx] is None:
+            items[idx] = _one(it.get("tone"), it.get("impact"))
+    return overall, items
+
+
 def _weekly_article_view(r: dict) -> dict:
     """레포트 payload 에 담을 기사 1건의 표시용 형태."""
     return {
@@ -8672,10 +8716,17 @@ def build_weekly_report(ctx: Context) -> dict:
         picked = hits[:WEEKLY_ARTICLES_PER_SECTION]
         brief = ctx.llm.weekly_brief(
             "swot" if kind == "group" else "impact", label, picked) if picked else {}
+        pfm_all, pfm_items = (normalize_pfm_impact(brief, len(picked))
+                              if kind == "topic" else (None, [None] * len(picked)))
+        views = [_weekly_article_view(r) for r in picked]
+        for v, pi in zip(views, pfm_items):
+            if pi:
+                v["pfm"] = pi          # 기사별 포스코퓨처엠 영향(긍정·중립·부정)
         sections.append({
             "label": label,
             "kind": kind,
-            "articles": [_weekly_article_view(r) for r in picked],
+            "articles": views,
+            "pfm": pfm_all,            # 주간 포스코퓨처엠 영향 종합(정부/정책·통상 섹션만)
             "swot": {k: brief.get(k, "") for k in ("s", "w", "o", "t")} if kind == "group" else None,
             "impact": brief.get("impact", "") if kind == "topic" else None,
             "score": weekly_group_score(hits) if kind == "group" else None,
@@ -8696,6 +8747,20 @@ _SWOT_QUADRANTS = {
     "o": ("기회", "Opportunities", "#1D63C4", "#e8f1fc", "#20344f"),
     "t": ("위협", "Threats",    "#C0392B", "#fbeae8", "#4a2723"),
 }
+
+
+# 포스코퓨처엠 영향 톤 색 — 긍정=파랑, 중립=회색, 부정=빨강 (카드·언론사 탭과 같은 약속)
+_PFM_TONE_STYLE = {
+    "긍정": ("#e8f0ff", "#1a56db"),
+    "중립": ("#eef1f6", "#344054"),
+    "부정": ("#fdecea", "#d92d20"),
+}
+
+
+def _pfm_tone_badge(tone: str) -> str:
+    bg, fg = _PFM_TONE_STYLE.get(tone, _PFM_TONE_STYLE["중립"])
+    return (f'<span style="display:inline-block;background:{bg};color:{fg};border-radius:10px;'
+            f'padding:0 8px;font-size:11.5px;font-weight:700;margin-right:6px;">{esc(tone)}</span>')
 
 
 def render_weekly_html(payload: dict) -> str:
@@ -8741,7 +8806,12 @@ def render_weekly_html(payload: dict) -> str:
                 f'<a href="{esc_attr(a["url"])}" style="color:#16337A;text-decoration:none;font-weight:600;">'
                 f'{esc(a["title"])}</a>'
                 f'<br><span style="color:#98a2b3;font-size:12px;">{esc(a["press"])} · {esc(d)} · 중요도 {a["score"]}</span>'
-                f'<br><span style="color:#475467;font-size:13px;">{esc(a["summary"])}</span></li>')
+                f'<br><span style="color:#475467;font-size:13px;">{esc(a["summary"])}</span>'
+                + (f'<br><span class="wr-pfm-item" style="display:block;margin-top:4px;color:#2b3a55;font-size:12.5px;'
+                   f'background:#f6f8fc;border-radius:6px;padding:5px 8px;">'
+                   f'<b style="color:#16337A;">포스코퓨처엠 영향</b> {_pfm_tone_badge(a["pfm"]["tone"])}'
+                   f'{esc(a["pfm"]["text"])}</span>' if a.get("pfm") else '')
+                + '</li>')
         out.append('</ol>')
 
         if sec.get("kind") == "group" and sec.get("swot"):
@@ -8763,7 +8833,7 @@ def render_weekly_html(payload: dict) -> str:
                         f'{esc(sw.get(k) or "이번 주 해당 신호 없음")}</div></td>')
                 out.append('</tr>')
             out.append('</table>')
-        elif sec.get("kind") == "topic" and sec.get("impact"):
+        if sec.get("kind") == "topic" and sec.get("impact"):
             out.append(
                 '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
                 'style="margin:10px 0 6px;">'
@@ -8773,6 +8843,18 @@ def render_weekly_html(payload: dict) -> str:
                 '<tr><td style="background:#eef2fb;padding:14px 16px;border-radius:0 0 8px 8px;'
                 'color:#2b3a55;font-size:13.5px;line-height:1.75;">'
                 f'{esc(sec["impact"])}</td></tr></table>')
+        if sec.get("kind") == "topic" and sec.get("pfm"):
+            pf = sec["pfm"]
+            bg, fg = _PFM_TONE_STYLE.get(pf["tone"], _PFM_TONE_STYLE["중립"])
+            out.append(
+                '<table class="wr-pfm-week" role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                'style="margin:10px 0 6px;">'
+                f'<tr><td style="background:{fg};padding:9px 16px;border-radius:8px 8px 0 0;">'
+                '<span style="color:#fff;font-weight:700;font-size:13px;">'
+                f'🔋 이번 주 포스코퓨처엠에 미치는 영향 · {esc(pf["tone"])}</span></td></tr>'
+                f'<tr><td style="background:{bg};padding:14px 16px;border-radius:0 0 8px 8px;'
+                'color:#2b3a55;font-size:13.5px;line-height:1.75;">'
+                f'{esc(pf["text"])}</td></tr></table>')
     out.append('<p style="color:#98a2b3;font-size:11px;margin-top:32px;border-top:1px solid #e4e7ec;'
                'padding-top:12px;">이 레포트는 수집·요약된 공개 기사와 AI 분석을 기반으로 자동 생성되었습니다. '
                '원문 저작권은 각 언론사에 있습니다.</p>')
@@ -14243,6 +14325,42 @@ def cmd_selftest() -> int:
         {"label": "포스코퓨처엠", "kind": "group", "score": _sc, "swot": None, "impact": None,
          "articles": [{"title": "t", "url": "http://a", "press": "p", "published_at": "2026-09-05", "score": 70, "summary": "s"}]}]})
     check("주간 HTML — 그룹사 이름 옆 점수와 이유", ("주간 60점" in _sh, "wr-score-why" in _sh), (True, True))
+    # 정부/정책·통상 섹션 — 기사별·주간 포스코퓨처엠 영향(긍정·중립·부정) (2026-10-06)
+    _ov, _its = normalize_pfm_impact({
+        "pfm_tone": "긍정", "pfm_impact": "  핵심광물 비축 지원으로\n원료 조달 부담이 줄 수 있다. ",
+        "items": [{"n": 1, "tone": "부정", "impact": "관세 인상으로 수출 부담"},
+                  {"n": 2, "tone": "엉터리", "impact": "직접 영향 없음"},
+                  {"n": 2, "tone": "긍정", "impact": "중복 번호는 무시"},
+                  {"n": 9, "tone": "긍정", "impact": "범위 밖 번호는 무시"},
+                  {"n": "x", "tone": "긍정", "impact": "숫자 아님"},
+                  "문자열", {"n": 3, "tone": "긍정", "impact": "   "}]}, 3)
+    check("주간 영향 — 종합 톤·공백 정리", (_ov["tone"], "\n" in _ov["text"], _ov["text"].startswith("핵심광물")), ("긍정", False, True))
+    check("주간 영향 — 기사별 톤", [i and i["tone"] for i in _its], ["부정", "중립", None])
+    check("주간 영향 — 중복·범위 밖·빈 본문은 버린다", (_its[1]["text"], _its[2]), ("직접 영향 없음", None))
+    check("주간 영향 — 빈 응답이면 전부 None", normalize_pfm_impact({}, 2), (None, [None, None]))
+    check("주간 영향 — 잘못된 톤은 중립", normalize_pfm_impact({"pfm_tone": "good", "pfm_impact": "x"}, 0)[0]["tone"], "중립")
+    _ph = render_weekly_html({"period_start": "2026-08-31", "period_end": "2026-09-07", "article_count": 1, "sections": [
+        {"label": "정부/정책", "kind": "topic", "swot": None, "score": None, "impact": "그룹 영향 문단",
+         "pfm": {"tone": "부정", "text": "수출 부담 <b>커짐</b>"},
+         "articles": [{"title": "t", "url": "http://a", "press": "p", "published_at": "2026-09-05", "score": 70,
+                       "summary": "s", "pfm": {"tone": "긍정", "text": "원료 조달 숨통"}}]}]})
+    check("주간 HTML — 기사별 영향 줄(긍정 배지)", ("wr-pfm-item" in _ph, "원료 조달 숨통" in _ph, "긍정" in _ph), (True, True, True))
+    check("주간 HTML — 주간 포스코퓨처엠 영향 박스(부정) + 이스케이프",
+          ("wr-pfm-week" in _ph, "이번 주 포스코퓨처엠에 미치는 영향 · 부정" in _ph, "&lt;b&gt;커짐" in _ph), (True, True, True))
+    check("주간 HTML — 기존 그룹 영향 문단도 유지", "그룹 영향 문단" in _ph, True)
+    _po = render_weekly_html({"period_start": "2026-08-31", "period_end": "2026-09-07", "article_count": 1, "sections": [
+        {"label": "정부/정책", "kind": "topic", "swot": None, "score": None, "impact": "",
+         "articles": [{"title": "t", "url": "http://a", "press": "p", "published_at": "2026-09-05", "score": 70, "summary": "s"}]}]})
+    check("주간 HTML — 예전 레포트(영향 필드 없음)도 렌더", ("wr-pfm-item" in _po, "wr-pfm-week" in _po), (False, False))
+
+    class _FakeWeeklyLLM:
+        def weekly_brief(self, kind, name, arts):
+            return {"impact": "그룹 영향", "pfm_tone": "중립", "pfm_impact": "종합",
+                    "items": [{"n": i, "tone": "긍정", "impact": f"영향{i}"} for i in range(1, len(arts) + 1)]}
+    _fk = _FakeWeeklyLLM()
+    _fb = _fk.weekly_brief("impact", "정부/정책", _rows[:2])
+    _fo, _fi = normalize_pfm_impact(_fb, 2)
+    check("주간 영향 — LLM 응답 형식 → 정규화 연결", (_fo["tone"], [i["text"] for i in _fi]), ("중립", ["영향1", "영향2"]))
 
     print()
     if ea_mod is not None:
