@@ -3362,6 +3362,12 @@ BATTERY_SCOPE_KW = [
 ]
 
 
+# 제목에 이 말이 있으면 포스코 미언급이어도 수집한다 — 전기차·배터리·이차전지 기사는 결국 포스코퓨처엠(양극재·음극재)의
+# 전방 수요라 전부 포토카드 대상이다(사용자 지정 2026-10-06). '전기차' '배터리' 처럼 흔한 낱말이라
+# 본문 앞부분에 스치는 것까지 받으면 잡음이 크므로 **제목**에 있을 때만 인정한다.
+BATTERY_TITLE_KW = ["전기차", "전기 자동차", "전기자동차", "배터리", "이차전지", "2차전지", "전기차충전", "EV "]
+
+
 def is_battery_scope(title: str, extra: str = "") -> bool:
     """포스코퓨처엠 전·후방(소재·셀·전기차·ESS·원료) 기사인가.
 
@@ -3369,7 +3375,8 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
     지명과 겹치는 짧은 회사명은 battery_company_hit 이 가드와 함께 판정한다.
     """
     probe = f"{title}\n{extra}"
-    return _kw_hit_any(probe, BATTERY_SCOPE_KW) or battery_company_hit(probe)
+    return (_kw_hit_any(probe, BATTERY_SCOPE_KW) or _kw_hit_any(title or "", BATTERY_TITLE_KW)
+            or battery_company_hit(probe))
 
 
 # 배터리 생태계 '회사명'만 추린 고정밀 신호.
@@ -13049,6 +13056,12 @@ def cmd_selftest() -> int:
     check("발췌 — NBSP·폭 없는 문자가 끼어도 언급을 찾는다", ("SK온과 1조원" in _ex_inv, "포스코 퓨처엠 관계자" in _ex_inv or "포스코퓨처엠 관계자" in _ex_inv), (True, True))
 
     print("\n[8-2d] 배터리 생태계 기사 (포스코 미언급 허용)")
+    check("제목에 '전기차' 만 있어도 수집(포스코 미언급)", is_battery_scope("전기차 신차 출시 앞두고 가격 인하 경쟁"), True)
+    check("제목에 '배터리' 만 있어도 수집", is_battery_scope("배터리 화재 예방 위한 점검 확대"), True)
+    check("제목에 '이차전지' 만 있어도 수집", is_battery_scope("이차전지 업종 강세"), True)
+    check("본문 앞부분에 '전기차' 가 스치기만 하면 수집하지 않음(제목 기준)",
+          is_battery_scope("서울 아파트 매매 동향", "단지 내 전기차 충전기 설치"), False)
+    check("제목에 무관 낱말만 있으면 수집 안 함", is_battery_scope("코스피 상승 마감"), False)
     check("전고체 배터리 개발 → 수집",
           is_battery_scope("전고체 배터리 상온 구동 성공…에너지밀도 2배"), True)
     check("황-리튬 배터리 연구 → 수집",

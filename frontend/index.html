@@ -462,7 +462,7 @@
     <div class="filter-body" id="filterBody">
       <div class="filter-row">
         <label class="filter-label" for="searchInput">검색</label>
-        <input type="search" id="searchInput" class="search" placeholder="제목·요약·기자·언론사 검색" autocomplete="off">
+        <input type="search" id="searchInput" class="search" placeholder="제목·요약·기자·언론사 검색" autocomplete="off" enterkeyhint="search">
         <button type="button" class="adv-toggle" id="advToggle" aria-expanded="false" aria-controls="advSearch">상세 검색 ▾</button>
       </div>
 
@@ -470,10 +470,15 @@
       <div class="filter-row adv-search" id="advSearch" hidden>
         <span class="filter-label">상세 검색 <em>입력칸 모두 만족</em></span>
         <div class="adv-fields">
-          <input type="search" id="advTitle" class="search adv-input" placeholder="제목" aria-label="제목 검색" autocomplete="off">
-          <input type="search" id="advBody" class="search adv-input" placeholder="본문 (최근 30일 원문 + 요약)" aria-label="본문 검색" autocomplete="off">
-          <input type="search" id="advPress" class="search adv-input" placeholder="언론사" aria-label="언론사 검색" autocomplete="off">
-          <input type="search" id="advAuthor" class="search adv-input" placeholder="기자 (이름 전체, 정확히 일치)" aria-label="기자 검색" autocomplete="off">
+          <input type="search" id="advTitle" class="search adv-input" enterkeyhint="search" placeholder="제목" aria-label="제목 검색" autocomplete="off">
+          <input type="search" id="advBody" class="search adv-input" enterkeyhint="search" placeholder="본문 (최근 30일 원문 + 요약)" aria-label="본문 검색" autocomplete="off">
+          <input type="search" id="advPress" class="search adv-input" enterkeyhint="search" placeholder="언론사" aria-label="언론사 검색" autocomplete="off">
+          <input type="search" id="advAuthor" class="search adv-input" enterkeyhint="search" placeholder="기자 (이름 전체, 정확히 일치)" aria-label="기자 검색" autocomplete="off">
+        </div>
+        <!-- 폰에서는 결과 목록이 필터 아래로 길게 밀려 있어 검색이 안 되는 것처럼 보였다 — 버튼·결과 바로가기를 둔다 -->
+        <div class="adv-actions">
+          <button type="button" class="url-add-btn adv-go" id="advGo">검색</button>
+          <button type="button" class="adv-jump" id="advJump" hidden></button>
         </div>
       </div>
 

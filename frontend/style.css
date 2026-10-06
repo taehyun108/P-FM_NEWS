@@ -256,6 +256,11 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 .adv-search[hidden] { display: none; }
 .adv-fields { flex: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .adv-input { min-width: 0; }
+.adv-actions { flex: none; display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.adv-go { white-space: nowrap; }
+.adv-jump { border: 1px solid var(--navy); background: var(--navy-soft, #eef2fb); color: var(--navy); border-radius: 9px;
+  padding: 7px 10px; font-size: 12.5px; font-weight: 700; cursor: pointer; font-family: inherit; }
+.adv-jump[hidden] { display: none; }
 @media (max-width: 760px) { .adv-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 /* ── 카드 그리드 (F6.2) ───────────────────────────────────────────── */
@@ -784,6 +789,9 @@ img, video { max-width: 100%; }
   .adv-toggle { padding: 10px 12px; }
   .adv-fields { flex: 1 0 100%; grid-template-columns: 1fr; }
   .adv-input { font-size: 16px; }
+  .adv-actions { flex: 1 0 100%; flex-direction: row; }
+  .adv-actions .adv-go { flex: 0 0 90px; padding: 11px 12px; }
+  .adv-actions .adv-jump { flex: 1 1 0; padding: 11px 12px; font-size: 13.5px; }
   .btn-clear { padding: 7px 12px; }
 
   /* URL 등록 */

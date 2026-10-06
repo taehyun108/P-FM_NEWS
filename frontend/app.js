@@ -1988,6 +1988,13 @@ async function refresh(reset) {
     }
     $('grid').replaceChildren(...data.items.map(buildCard));
     $('resultCount').textContent = `${data.total.toLocaleString('ko-KR')}건`;
+    // 상세 검색 칸 옆 '결과 N건 보기 ↓' — 폰에서 결과가 어디 있는지 바로 알 수 있게
+    const jump = $('advJump');
+    if (jump) {
+      const searching = !!state.q || advActive().length > 0;
+      jump.hidden = !searching;
+      jump.textContent = `검색 결과 ${data.total.toLocaleString('ko-KR')}건 보기 ↓`;
+    }
     $('emptyMsg').hidden = data.total !== 0;
     renderPagination(state.page, data.total);
     updateActiveFilterCount();
@@ -2223,17 +2230,36 @@ function init() {
   // 모든 칸을 다시 읽는다 — 안 그러면 빠르게 두 칸을 입력할 때 앞 칸 조건이 사라진다.
   let timer;
   const applySearch = () => {
+    clearTimeout(timer);
     state.q = $('searchInput').value.trim();
     ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = $(id).value.trim(); });
     updateActiveFilterCount();
     refresh(true);
   };
+  // 폰: 필터 패널이 길어 결과 목록이 화면 아래로 밀려 있다 — 검색을 확정(Enter·검색 버튼)하면
+  // 키보드를 닫고 결과 첫 줄로 스크롤한다.
+  const searchAndShow = () => {
+    applySearch();
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    $('grid').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  const debounced = () => {
+    clearTimeout(timer);
+    timer = setTimeout(applySearch, 300);
+  };
   ['searchInput', ...ADV_FIELDS.map(([, id]) => id)].forEach((id) => {
-    $(id).addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(applySearch, 300);
+    const input = $(id);
+    input.addEventListener('input', debounced);
+    // 일부 모바일 키보드(한글 조합)는 조합이 끝날 때·지우기 버튼에서 input 이벤트가 빠지는 경우가 있어 함께 듣는다.
+    input.addEventListener('compositionend', debounced);
+    input.addEventListener('change', debounced);
+    input.addEventListener('search', debounced);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); searchAndShow(); }
     });
   });
+  $('advGo').addEventListener('click', searchAndShow);
+  $('advJump').addEventListener('click', () => $('grid').scrollIntoView({ behavior: 'smooth', block: 'start' }));
 
   const goHome = () => {
     if (weeklyView) toggleWeeklyView();     // 주간동향 화면이면 전체 목록으로
