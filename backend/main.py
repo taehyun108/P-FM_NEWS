@@ -4979,6 +4979,24 @@ def _head_sentences(par: str, limit: int = 170) -> str:
     return " ".join(out)
 
 
+# 증권 기사 본문에는 종목명 바로 아래 줄에 시세 위젯 '(203,500원 ▲16,600 +8.88%)' 이 끼어 있다(머니투데이 등).
+# 그러면 '포스코퓨처엠' 한 줄·시세 한 줄·'·' 한 줄로 쪼개져, 15자 미만 줄을 버리는 발췌 규칙이 종목명을 통째로 버렸다
+# (2026-10-06 머니투데이 '이차전지주 장중 강세…' 사례). 시세 위젯 줄과 그 앞의 종목명 줄을 앞뒤 글에 이어 붙인다.
+_QUOTE_WIDGET_RE = re.compile(r"\n([^\n]{1,20})\n(\([\d,]+원[^)\n]*\))[ \t]*(?:\n|$)")
+
+
+def _reflow_quote_widgets(text: str) -> str:
+    """'종목명 \\n (시세) \\n 은 …' 처럼 쪼개진 줄을 한 문장으로 잇는다. 시세 위젯이 없는 글은 그대로 돌려준다."""
+    if "원 " not in text or "(" not in text:
+        return text
+    prev = None
+    while prev != text:                       # 한 번에 하나씩 이어 붙이므로 더 줄지 않을 때까지 반복
+        prev = text
+        text = _QUOTE_WIDGET_RE.sub(r" \1 \2 ", text)
+    text = re.sub(r"[ \t]*\n·[ \t]*\n", " · ", text)          # 종목 사이 가운뎃점만 있는 줄
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
 def extract_pfm_excerpt(body: str) -> str:
     """본문에서 포스코퓨처엠(옛 사명·영문·띄어쓴 표기 포함) 언급을 **원문 순서 그대로 이어지게** 발췌한다.
 
@@ -4997,6 +5015,7 @@ def extract_pfm_excerpt(body: str) -> str:
     text = re.sub(r"[ \t\r\f\v\u00a0\u3000\u2002-\u200a\u202f]+", " ", text).strip()
     if not text:
         return ""
+    text = _reflow_quote_widgets(text)
     aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
     paras = [_strip_byline_prefix(p.strip(), aliases) for p in text.split("\n") if len(p.strip()) >= 15] or [text]
     hits = [i for i, p in enumerate(paras) if any(a in p.lower() for a in aliases)]
@@ -7817,6 +7836,43 @@ def is_public_candidate(row: dict) -> bool:
     return any(a in title for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
 
 
+# 같은 사건을 여러 언론사가 다룬 기사(예: 삼성SDI 6조 LFP 계약 20건)가 일반 채널에 줄줄이 올라가면 직원들에게 스팸이다.
+# 제목의 '핵심어'(회사 이름·'계약' 같은 흔한 말 제외)가 2개 이상 겹치면 같은 사건으로 보고, 먼저 나온 기사 1건만 올린다.
+_EVENT_STOP = frozenset({
+    "포스코퓨처엠", "포스코", "posco", "퓨처엠", "계약", "체결", "공급", "확대", "맞손", "협력", "장기", "규모", "소식",
+    "속보", "단독", "종합", "그룹", "기업", "관련", "이상", "올해", "내년", "오늘", "발표", "추진", "나선다", "본격",
+    # 사건이 아니라 '주제'를 가리키는 말 — 이것만 겹쳐서는 같은 사건이 아니다(SK온 LFP 계약 ≠ 삼성SDI LFP 계약)
+    "lfp", "양극재", "음극재", "배터리", "이차전지", "2차전지", "전기차", "전고체", "소재", "공급계약", "투자", "증설",
+})
+_JOSA_RE = re.compile(r"(?:으로|에서|까지|부터|과|와|에|의|은|는|이|가|을|를|도|로|만)$")
+PUBLIC_EVENT_SHARED = 2          # 이만큼 핵심어가 겹치면 같은 사건
+PUBLIC_MAX_PER_HOUR = 5          # 일반 채널에 시간당 최대 발송 건수(넘치면 다음 시간에)
+_PUBLIC_SENT_AT: list[float] = []
+
+
+def event_tokens(title: str) -> set[str]:
+    """제목에서 사건을 가리키는 핵심어만 뽑는다 — 조사를 떼고, 회사 이름·흔한 말은 뺀다."""
+    out: set[str] = set()
+    for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", unicodedata.normalize("NFKC", (title or "").replace("兆", "조"))):
+        t = t.lower()
+        base = _JOSA_RE.sub("", t) if len(t) > 2 else t
+        base = base if len(base) >= 2 else t
+        if base in _EVENT_STOP or t in _EVENT_STOP:
+            continue
+        out.add(base)
+    return out
+
+
+def same_event(a: str, b: str) -> bool:
+    """두 기사 제목이 같은 사건을 다루는가 — 핵심어가 PUBLIC_EVENT_SHARED 개 이상 겹치면 True('6조'≈'6조원' 처럼 앞부분이 같으면 같은 말)."""
+    ta, tb = event_tokens(a), event_tokens(b)
+    shared = 0
+    for x in ta:
+        if any(x == y or (min(len(x), len(y)) >= 2 and (x.startswith(y) or y.startswith(x))) for y in tb):
+            shared += 1
+    return shared >= PUBLIC_EVENT_SHARED
+
+
 def queue_public_notifications(ctx: Context) -> int:
     """최근 N시간 포스코퓨처엠 기사 중 일반용 대상(긍정·중립)을 큐에 올린다. 반환: 새로 올린 건수.
 
@@ -7826,12 +7882,19 @@ def queue_public_notifications(ctx: Context) -> int:
     since = now_utc() - timedelta(hours=max(1, int(ctx.cfg.fresh_cutoff_hours or 6)))
     excl = [k for k in jload(ctx.storage.get_run_state().get("exclude_notify_keywords"), []) if k]
     queued = 0
-    for r in ctx.storage.pfm_articles(iso(since), with_excerpt=True):
+    # 같은 사건 판정은 최근 24시간 후보와 비교한다(6시간 창 밖으로 밀려난 첫 기사 때문에 같은 사건이 다시 올라가지 않게).
+    pool = [r for r in ctx.storage.pfm_articles(iso(now_utc() - timedelta(hours=24)), with_excerpt=True)
+            if is_public_candidate(r) and parse_dt(r.get("published_at")) is not None]
+    pool.sort(key=lambda r: parse_dt(r.get("published_at")))
+    for r in pool:
         pub = parse_dt(r.get("published_at"))
-        if pub is None or pub < since or not is_public_candidate(r):
+        if pub < since:
             continue
         if _kw_hit_any(r.get("title") or "", excl):
             continue      # 제목에 '제외' 키워드 → 웹에만
+        if any(o["id"] != r["id"] and parse_dt(o.get("published_at")) <= pub and same_event(o.get("title") or "", r.get("title") or "")
+               for o in pool if o is not r and (parse_dt(o.get("published_at")), o["id"]) < (pub, r["id"])):
+            continue      # 같은 사건을 먼저 다룬 기사가 있다 — 그 기사 1건만 올린다
         # 이미 큐에 올린 기사는 5분마다 DB 에 중복 삽입을 시도하지 않는다(Supabase 는 삽입 실패도 HTTP 1회다).
         key = (r["id"], public_chat_id())
         if key in _PUBLIC_SEEN:
@@ -7898,7 +7961,10 @@ def _send_public_notifications(ctx: Context, limit: int) -> int:
         return 0
     url = TELEGRAM_API.format(token=public_bot_token())
     sent = 0
-    for row in pending[:limit]:
+    nowm = time.monotonic()
+    _PUBLIC_SENT_AT[:] = [t for t in _PUBLIC_SENT_AT if nowm - t < 3600]
+    room = max(0, PUBLIC_MAX_PER_HOUR - len(_PUBLIC_SENT_AT))     # 이번 시간에 더 보낼 수 있는 건수
+    for row in pending[:min(limit, room)]:
         if _flood_remaining() > 0:
             break
         # 발송 직전 재확인 — 보관 처리됐거나 논조가 바뀐 기사는 보내지 않는다.
@@ -7914,6 +7980,7 @@ def _send_public_notifications(ctx: Context, limit: int) -> int:
         if ok:
             ctx.storage.mark_notification(row["id"], "sent", None)
             sent += 1
+            _PUBLIC_SENT_AT.append(time.monotonic())
         elif _notify_too_old(row):
             ctx.storage.mark_notification(row["id"], "failed", err)
         elif _is_transient_tg_error(err):
@@ -11489,9 +11556,9 @@ def cmd_fixexcerpt(ctx: Context, press: str = "", limit: int = 60, dry: bool = F
     if dry:
         for name, r in todo[:15]:
             body = ctx.storage.body_of(r["id"]) or ""
-            has = any(a in re.sub(r"\s+", " ", body).lower() for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
+            has = bool(extract_pfm_excerpt(body)) if body else False      # 실제 발췌 규칙으로 판정
             state = "NULL" if r.get("pfm_excerpt") is None else "''"
-            log.info("  - [%s] %s | 발췌 %s · 보관본문 %d자 · 본문에 언급 %s | %s", name[:8], (r.get("title") or "")[:40],
+            log.info("  - [%s] %s | 발췌 %s · 보관본문 %d자 · 발췌 가능 %s | %s", name[:8], (r.get("title") or "")[:40],
                      state, len(body), "있음" if has else "없음", (r.get("url_canonical") or r.get("url_original") or "")[:60])
         log.info("[미리보기] 실제로 복구하려면 --dry 없이 다시 실행하세요(이번 AI 호출은 최대 %d회).", limit)
         return
@@ -13051,13 +13118,13 @@ def cmd_selftest() -> int:
     globals()["now_local"] = lambda: datetime(2026, 10, 6, 12, 0)
     _n_day = send_public_notifications(_pctx)
     _texts = " ".join(t for _, _, t in _tg.sent)
-    check("일반용 — 낮에는 긍정·중립(pu1·pu4와 앞선 테스트의 e1·e2·e3)만 발송, 부정·미판정·오래된 기사는 제외",
+    check("일반용 — 낮에는 긍정·중립만 발송(앞선 테스트의 e1·e2는 제목이 같은 사건이라 1건), 부정·미판정·오래된 기사는 제외",
           (_n_day, "pu1" in _texts, "pu4" in _texts, "pu2" in _texts, "pu3" in _texts, "pu5" in _texts),
-          (5, True, True, False, False, False))
+          (4, True, True, False, False, False))
     check("일반용 — 일반용 봇 토큰·채널 번호로 나간다",
           {(u, c) for u, c, _ in _tg.sent}, {(TELEGRAM_API.format(token="PUB:TOKEN"), "-100999")})
     _n_again = send_public_notifications(_pctx)
-    check("일반용 — 이미 보낸 기사는 다시 보내지 않는다(중복 방지)", (_n_again, len(_tg.sent)), (0, 5))
+    check("일반용 — 이미 보낸 기사는 다시 보내지 않는다(중복 방지)", (_n_again, len(_tg.sent)), (0, 4))
     _ins_calls: list[str] = []
     _orig_q = _et.queue_notification
     _et.queue_notification = lambda *a, **k: (_ins_calls.append(a[0]), _orig_q(*a, **k))[1]   # type: ignore[method-assign]
@@ -13069,6 +13136,39 @@ def cmd_selftest() -> int:
           ([r["chat_id"] for r in _et.pending_notifications(10)], [r["chat_id"] for r in _et.pending_notifications(10, channel=PUBLIC_CHANNEL)]),
           (["-1"], []))
     _et._exec("update notifications set status='sent' where chat_id='-1'")
+    # 같은 사건(삼성SDI 6조 LFP 계약)을 여러 언론사가 쓴 기사 → 먼저 나온 1건만, 다른 사건(SK온)은 따로 (2026-10-06)
+    _EV = ["포스코퓨처엠·삼성SDI … LFP 양극재 6조원 계약", "포스코퓨처엠, 삼성SDI와 '6조' LFP 공급계약…협력 확대",
+           "LFP 6兆 '빅딜' 포스코퓨처엠, 삼성SDI 핵심 공급사로 도약", "포스코퓨처엠, SK온에 1조 LFP 양극재 공급"]
+    for _i, (_eid2, _eti) in enumerate(zip(("ev1", "ev2", "ev3", "ev4"), _EV)):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative,pfm_excerpt,pfm_tone) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_eid2, "u/" + _eid2, "https://x.test/" + _eid2, "https://x.test/" + _eid2, _eti,
+                   iso(_pn2 - timedelta(minutes=50 - _i * 10)), iso(_pn2), "rss", 10, '["포스코퓨처엠"]', "[]", "연합뉴스",
+                   iso(_pn2), "active", 1, "포스코퓨처엠은 계약했다.", "긍정"))
+    _tg.sent.clear()
+    _PUBLIC_SENT_AT.clear()
+    _n_ev = send_public_notifications(_pctx)
+    _etx = " ".join(t for _, _, t in _tg.sent)
+    check("일반용 — 같은 사건 기사는 먼저 나온 1건만(ev1), 다른 사건(ev4)은 따로 보낸다",
+          (_n_ev, "6조원 계약" in _etx, "6조' LFP" in _etx, "6兆" in _etx, "SK온" in _etx), (2, True, False, False, True))
+    check("일반용 — 같은 사건 판정: 삼성SDI 6조 계약 기사끼리는 같은 사건, SK온·다른 주제는 아님",
+          (same_event(_EV[0], _EV[1]), same_event(_EV[0], _EV[2]), same_event(_EV[0], _EV[3]),
+           same_event(_EV[0], "포스코퓨처엠 광양 음극재 공장 증설")), (True, True, False, False))
+    # 시간당 상한 — 한도에 닿으면 다음 시간으로 미룬다
+    _old_cap = PUBLIC_MAX_PER_HOUR
+    globals()["PUBLIC_MAX_PER_HOUR"] = 1
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative,pfm_excerpt,pfm_tone) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("cap1", "u/cap1", "https://x.test/cap1", "https://x.test/cap1", "포스코퓨처엠 광양 음극재 공장 증설 착공", iso(_pn2),
+               iso(_pn2), "rss", 10, '["포스코퓨처엠"]', "[]", "연합뉴스", iso(_pn2), "active", 1, "포스코퓨처엠은 증설한다.", "긍정"))
+    _tg.sent.clear()
+    _PUBLIC_SENT_AT[:] = [time.monotonic()]            # 방금 1건 보냈다 → 한도 1건 소진
+    check("일반용 — 시간당 상한에 닿으면 이번엔 보내지 않는다", (send_public_notifications(_pctx), len(_tg.sent)), (0, 0))
+    _PUBLIC_SENT_AT.clear()
+    check("일반용 — 상한이 풀리면(1시간 지나면) 다시 보낸다", (send_public_notifications(_pctx), len(_tg.sent)), (1, 1))
+    globals()["PUBLIC_MAX_PER_HOUR"] = _old_cap
     globals()["now_local"] = _orig_now_local
     globals()["RATE_LIMIT_SLEEP"] = _orig_sleep
     for _k, _v in _pub_env.items():
@@ -13340,6 +13440,18 @@ def cmd_selftest() -> int:
             "포스코\u00a0퓨처엠은 SK온과 1조원 규모 공급계약을 체결했다고 22일 밝혔다. 계약기간은 3년이다.\n"
             "포스코\u200b퓨처엠 관계자는 \"고객 포트폴리오를 확대하겠다\"고 설명했다. 다른 설명은 없었다.")
     _ex_inv = extract_pfm_excerpt(_inv)
+    # 머니투데이 증권 기사 — 종목명·시세 위젯·'·' 가 줄마다 쪼개져 15자 미만 줄이 버려지던 문제 (2026-10-06)
+    _mt = ("[특징주]\n국내 이차전지주가 6일 장중 강세다. 미국 테슬라의 인도량이 시장 예상을 뛰어넘었다.\n"
+           "이날 오후 한국거래소에서 KRX 2차전지 TOP10 지수는 4.70% 오른 3793.31로 산출됐다.\n지수 구성종목 가운데\n에코프로비엠\n(128,300원 ▲12,600 +10.89%)\n"
+           "은 1만800원 오른 12만6500원,\n삼성SDI\n(574,500원 ▲45,500 +8.6%)\n는 4만1000원 오른 57만원이다.\n"
+           "포스코퓨처엠\n(203,500원 ▲16,600 +8.88%)\n·\nLG화학\n(276,500원 ▲14,000 +5.33%)\n은 5%대,\n"
+           "POSCO홀딩스\n(317,000원 ▲6,000 +1.93%)\n는 1%대 강세다.\n지난 2일 테슬라는 차량 48만6천532대를 인도했다고 발표했다.")
+    _mt_ex = extract_pfm_excerpt(_mt)
+    check("발췌 — 시세 위젯으로 쪼개진 종목명도 언급으로 잡는다(머니투데이 증권 기사)",
+          ("포스코퓨처엠 (203,500원 ▲16,600 +8.88%)" in _mt_ex, "은 5%대" in _mt_ex), (True, True))
+    check("시세 위젯 이음 — 조사가 아닌 일반 문단(이날 …)은 앞 문장에 붙이지 않는다",
+          "다.\n이날" in _reflow_quote_widgets(_mt) or "다.이날" not in _reflow_quote_widgets(_mt), True)
+    check("시세 위젯 이음 — 위젯이 없는 글은 그대로", _reflow_quote_widgets("가나다\n라마바"), "가나다\n라마바")
     check("발췌 — NBSP·폭 없는 문자가 끼어도 언급을 찾는다", ("SK온과 1조원" in _ex_inv, "포스코 퓨처엠 관계자" in _ex_inv or "포스코퓨처엠 관계자" in _ex_inv), (True, True))
 
     print("\n[8-2d] 배터리 생태계 기사 (포스코 미언급 허용)")
