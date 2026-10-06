@@ -240,3 +240,17 @@
   .ea-cal-dot { width: 7px; height: 7px; }
   .ea-ag-list { grid-template-columns: 1fr; }
 }
+
+/* 우선순위 배지 설명 말풍선(PC: 올리면, 모바일: 누르면) */
+button.ea-prio { border: 0; font-family: inherit; line-height: 1.5; }
+.ea-prio-tip { position: fixed; z-index: 1200; max-width: 380px; max-height: 70vh; overflow: auto;
+  background: #fff; color: #1f2937; border: 1px solid #cfd6e6; border-radius: 12px; padding: 12px 14px;
+  box-shadow: 0 10px 30px rgba(15, 30, 70, .22); font-size: 12.5px; line-height: 1.6; }
+.ea-prio-tip.is-sheet { max-width: none; width: auto; max-height: 75vh; }
+.ea-prio-tip h4 { margin: 0 0 4px; font-size: 14px; color: var(--navy); }
+.ea-prio-tip h5 { margin: 10px 0 2px; font-size: 12.5px; color: var(--navy); }
+.ea-prio-tip p { margin: 0; }
+.ea-prio-tip ul { margin: 2px 0 0; padding-left: 18px; }
+.ea-prio-tip li { margin: 2px 0; }
+.ea-tip-easy { background: #f4f7ff; border-radius: 8px; padding: 6px 8px; }
+.ea-tip-note { margin-top: 8px !important; font-size: 11px; color: var(--ink-soft); }
