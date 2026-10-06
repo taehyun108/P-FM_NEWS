@@ -892,3 +892,20 @@ img, video { max-width: 100%; }
 .press-ov-label { color: var(--navy); font-size: 12.5px; white-space: nowrap; }
 .press-ov-text { font-size: 13.5px; font-weight: 600; word-break: keep-all; }
 .press-ov-src { width: 100%; font-size: 11px; color: var(--ink-soft); }
+
+/* 수집 키워드 분류 설명 · 카드 보는 법(ELI5) 안내 */
+.kw-guide { margin: 6px 0 10px; font-size: 12.5px; color: var(--ink-mid); }
+.kw-guide > summary { cursor: pointer; font-weight: 700; color: var(--navy); }
+.kw-guide-body { margin-top: 6px; line-height: 1.6; }
+.kw-guide-table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+.kw-guide-table th, .kw-guide-table td { border: 1px solid var(--line, #dde2ee); padding: 6px 8px; vertical-align: top; text-align: left; }
+.kw-guide-table th { background: #f1f3f8; }
+.eli5-guide { margin-bottom: 10px; }
+.eli5-guide > summary { cursor: pointer; }
+.eli5-guide h4 { margin: 12px 0 2px; font-size: 13px; color: var(--navy); }
+.eli5-guide ul { margin: 2px 0 6px; padding-left: 20px; }
+@media (max-width: 640px) {
+  .kw-guide-table, .kw-guide-table tbody, .kw-guide-table tr, .kw-guide-table td { display: block; width: 100%; }
+  .kw-guide-table thead { display: none; }
+  .kw-guide-table tr { margin-bottom: 8px; }
+}
