@@ -921,3 +921,16 @@ img, video { max-width: 100%; }
   .kw-guide-table thead { display: none; }
   .kw-guide-table tr { margin-bottom: 8px; }
 }
+
+/* 마스터 '텔레그램 연동' */
+.tg-links { display: grid; gap: 8px; margin: 8px 0; }
+.tg-link-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fff; }
+.tg-link-row > div { flex: 1 1 220px; min-width: 0; }
+.tg-link-row small { display: block; color: var(--ink-soft); margin-top: 2px; }
+.tg-tag { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 999px; padding: 1px 8px; margin-left: 4px; }
+.tg-tag.tg-dept { background: #fde8e6; color: #b3261e; }
+.tg-tag.tg-pub { background: #e6eeff; color: #1a56db; }
+.tg-state { font-size: 12px; font-weight: 700; color: var(--ink-soft); }
+.tg-state.ok { color: #0e6e4a; }
+.tg-state.off { color: #b3261e; }
+.tg-open { text-decoration: none; padding: 7px 14px; font-size: 12.5px; white-space: nowrap; }

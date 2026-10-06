@@ -7826,6 +7826,58 @@ def public_enabled() -> bool:
     return bool(public_bot_token() and public_chat_id())
 
 
+# ── 텔레그램 바로가기 주소 ─────────────────────────────────────────────
+# · 헤더 '✈ Telegram 채널' 버튼 = 일반용(모든 직원) 채널 — 누구나 볼 수 있다.
+# · 부서용(승인자 전용) 채널 주소는 마스터 패널 '텔레그램 연동' 에서만 보인다 — 일반 사용자에게 내보내지 않는다.
+_TG_LINK_CACHE: dict[str, str] = {}
+
+
+def _tg_get(ctx: Context, token: str, method: str, **params: Any) -> dict:
+    resp = ctx.http.get(f"https://api.telegram.org/bot{token}/{method}", params=params or None, timeout=8)
+    return ((resp.json() or {}).get("result")) or {}
+
+
+def dept_telegram_link(ctx: Context) -> tuple[str, str]:
+    """부서용 채널 주소 (url, kind). TELEGRAM_CHANNEL_URL 이 있으면 그 값, 없으면 부서용 봇 대화방. 없으면 ('', '')."""
+    if ctx.cfg.telegram_channel_url:
+        return ctx.cfg.telegram_channel_url, "channel"
+    if not ctx.cfg.telegram_enabled:
+        return "", ""
+    url = _TG_LINK_CACHE.get("dept")
+    if not url:
+        try:
+            uname = _tg_get(ctx, ctx.cfg.telegram_bot_token, "getMe").get("username")
+            if uname:
+                url = _TG_LINK_CACHE["dept"] = f"https://t.me/{uname}"
+        except Exception as exc:
+            log.debug("부서용 봇 주소 조회 실패: %s", exc)
+    return (url, "bot") if url else ("", "")
+
+
+def public_telegram_link(ctx: Context) -> tuple[str, str]:
+    """일반용 채널 주소 (url, kind). TELEGRAM_PUBLIC_CHANNEL_URL(초대 링크) 이 있으면 그 값.
+    없으면 일반용 봇이 채널 정보를 알려 주는 대로(공개 채널이면 t.me/<채널이름>, 비공개면 초대 링크). 못 찾으면 ('', '').
+    부서용 주소로는 절대 대체하지 않는다."""
+    url = get_env("TELEGRAM_PUBLIC_CHANNEL_URL")
+    if url:
+        return url, "channel"
+    if not public_enabled():
+        return "", ""
+    url = _TG_LINK_CACHE.get("public")
+    if not url:
+        try:
+            chat = _tg_get(ctx, public_bot_token(), "getChat", chat_id=public_chat_id())
+            if chat.get("username"):
+                url = f"https://t.me/{chat['username']}"
+            elif chat.get("invite_link"):
+                url = chat["invite_link"]
+            if url:
+                _TG_LINK_CACHE["public"] = url
+        except Exception as exc:
+            log.debug("일반용 채널 주소 조회 실패: %s", exc)
+    return (url, "channel") if url else ("", "")
+
+
 def is_public_candidate(row: dict) -> bool:
     """일반용에 올릴 기사인가 — 포스코퓨처엠 논조가 긍정·중립이고, 포스코퓨처엠 언급 근거(발췌 또는 제목)가 있다."""
     if row.get("pfm_tone") not in PUBLIC_TONES:
@@ -10169,33 +10221,13 @@ def create_app(ctx: Context):
             return JSONResponse({"ok": True})
         return JSONResponse({"ok": False, "error": err or "발송에 실패했습니다."}, status_code=502)
 
-    _tg_link_cache: dict[str, str] = {}
-
     @app.get("/api/telegram-link")
     def api_telegram_link():
-        """헤더 Telegram 버튼용 주소.
-
-        TELEGRAM_CHANNEL_URL 이 있으면 그 값(채널 초대 링크 등)을,
-        없으면 봇 대화방(t.me/<봇아이디>)을 돌려준다.
-        """
-        if ctx.cfg.telegram_channel_url:
-            return JSONResponse({"ok": True, "url": ctx.cfg.telegram_channel_url, "kind": "channel"})
-        if not ctx.cfg.telegram_enabled:
-            return JSONResponse({"ok": False, "error": "텔레그램이 설정되지 않았습니다."})
-        url = _tg_link_cache.get("url")
+        """헤더 Telegram 버튼용 주소 — **일반용(모든 직원) 채널**. 부서용 주소는 여기서 내보내지 않는다."""
+        url, kind = public_telegram_link(ctx)
         if not url:
-            try:
-                resp = ctx.http.get(
-                    f"https://api.telegram.org/bot{ctx.cfg.telegram_bot_token}/getMe", timeout=8)
-                uname = ((resp.json() or {}).get("result") or {}).get("username")
-                if uname:
-                    url = f"https://t.me/{uname}"
-                    _tg_link_cache["url"] = url
-            except Exception as exc:
-                log.debug("텔레그램 봇 주소 조회 실패: %s", exc)
-        if not url:
-            return JSONResponse({"ok": False, "error": "봇 주소를 확인하지 못했습니다."})
-        return JSONResponse({"ok": True, "url": url, "kind": "bot"})
+            return JSONResponse({"ok": False, "error": "일반용 텔레그램 채널이 설정되지 않았습니다."})
+        return JSONResponse({"ok": True, "url": url, "kind": kind})
 
     def _kakao_cb_page(title: str, body: str, ok: bool):
         color = "#156082" if ok else "#c0392b"
@@ -10604,6 +10636,17 @@ def create_app(ctx: Context):
     # ── 수집 키워드 관리 (마스터 패널, 2026-09-15) ───────────────────────
     # keyword_sets 는 collect_naver/collect_google_rss 가 매 회차 읽는 표라,
     # 여기서 켜고 끄거나 추가·삭제하면 다음 수집 사이클부터 바로 반영된다.
+    @app.get("/api/master/telegram")
+    def api_master_telegram(x_master_token: str = fastapi.Header(default="")):
+        """마스터 패널 '텔레그램 연동' — 부서용(승인자 전용)·일반용(모든 직원) 채널 상태와 바로가기 주소."""
+        if (err := _master_guard(x_master_token)):
+            return err
+        d_url, d_kind = dept_telegram_link(ctx)
+        p_url, p_kind = public_telegram_link(ctx)
+        return JSONResponse({"ok": True,
+                             "dept": {"enabled": bool(ctx.cfg.telegram_enabled), "url": d_url, "kind": d_kind},
+                             "public": {"enabled": public_enabled(), "url": p_url, "kind": p_kind}})
+
     @app.get("/api/master/keywords")
     async def api_master_keywords_get(x_master_token: str = fastapi.Header(default="")):
         if (err := _master_guard(x_master_token)):
@@ -13080,6 +13123,40 @@ def cmd_selftest() -> int:
     _pub_env = {k: os.environ.get(k) for k in ("TELEGRAM_PUBLIC_BOT_TOKEN", "TELEGRAM_PUBLIC_CHAT_ID")}
     for _k in _pub_env:
         os.environ.pop(_k, None)
+    # 텔레그램 바로가기 — 헤더 버튼=일반용, 부서용은 마스터에서만 (2026-10-06)
+    class _LinkResp:
+        def __init__(self, result: dict) -> None:
+            self._r = result
+        def json(self) -> dict:
+            return {"ok": True, "result": self._r}
+
+    class _LinkHttp:
+        def __init__(self, result: dict) -> None:
+            self.result, self.urls = result, []
+        def get(self, url: str, **kw: Any) -> Any:
+            self.urls.append(url)
+            return _LinkResp(self.result)
+
+    _lcfg = replace(_ectx.cfg, telegram_bot_token="DEPT:T", telegram_chat_id="-1", telegram_channel_url="https://t.me/+DEPTINVITE")
+    _TG_LINK_CACHE.clear()
+    _lk_env = {k: os.environ.pop(k, None) for k in ("TELEGRAM_PUBLIC_BOT_TOKEN", "TELEGRAM_PUBLIC_CHAT_ID", "TELEGRAM_PUBLIC_CHANNEL_URL")}
+    _lctx = Context(cfg=_lcfg, storage=_et, http=_LinkHttp({"username": "pfm_public"}))
+    check("부서용 주소 — TELEGRAM_CHANNEL_URL 이 있으면 그것", dept_telegram_link(_lctx), ("https://t.me/+DEPTINVITE", "channel"))
+    check("일반용 주소 — 설정이 없으면 없음(부서용 주소로 대체하지 않는다)", public_telegram_link(_lctx), ("", ""))
+    os.environ["TELEGRAM_PUBLIC_BOT_TOKEN"], os.environ["TELEGRAM_PUBLIC_CHAT_ID"] = "PUB:T", "-100999"
+    check("일반용 주소 — 공개 채널이면 봇이 알려 준 t.me/<채널이름>", public_telegram_link(_lctx), ("https://t.me/pfm_public", "channel"))
+    check("일반용 주소 — 일반용 봇 토큰으로 조회한다(부서용 토큰 아님)", "botPUB:T/getChat" in _lctx.http.urls[0], True)
+    _TG_LINK_CACHE.clear()
+    _lctx2 = Context(cfg=_lcfg, storage=_et, http=_LinkHttp({"invite_link": "https://t.me/+PUBINVITE"}))
+    check("일반용 주소 — 비공개 채널이면 초대 링크", public_telegram_link(_lctx2), ("https://t.me/+PUBINVITE", "channel"))
+    os.environ["TELEGRAM_PUBLIC_CHANNEL_URL"] = "https://t.me/+FROMENV"
+    check("일반용 주소 — TELEGRAM_PUBLIC_CHANNEL_URL 이 있으면 조회 없이 그 값", public_telegram_link(_lctx), ("https://t.me/+FROMENV", "channel"))
+    for _k, _v in _lk_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+    _TG_LINK_CACHE.clear()
     check("일반용 — 토큰·채널 번호가 없으면 꺼짐", public_enabled(), False)
     os.environ["TELEGRAM_PUBLIC_BOT_TOKEN"] = "PUB:TOKEN"
     check("일반용 — 토큰만 있으면 아직 꺼짐", public_enabled(), False)

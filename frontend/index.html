@@ -291,6 +291,27 @@
         <div id="kwCollectGroups"><p class="score-eg">불러오는 중…</p></div>
       </section>
 
+      <section class="master-section">
+        <h3><span class="ms-step">9</span> 텔레그램 연동</h3>
+        <small class="ms-lead">텔레그램 채널은 두 개입니다. <b>부서용</b>은 승인자만 보는 채널이라 <b>이 마스터 화면에서만</b> 바로가기를
+          보여 줍니다. <b>일반용</b>은 모든 직원이 볼 수 있는 채널이고, 화면 맨 위 <b>✈ Telegram 채널</b> 버튼이 이쪽으로 연결됩니다.</small>
+        <div class="tg-links">
+          <div class="tg-link-row">
+            <div><b>부서용</b> <span class="tg-tag tg-dept">승인자 전용</span>
+              <small id="tgDeptNote">전체 기사 알림(중요도 임계값 기준) · 부정 기사 포함</small></div>
+            <span class="tg-state" id="tgDeptState">확인 중…</span>
+            <a class="url-add-btn tg-open" id="tgDeptLink" href="#" target="_blank" rel="noopener noreferrer" hidden>채널 열기 ↗</a>
+          </div>
+          <div class="tg-link-row">
+            <div><b>일반용</b> <span class="tg-tag tg-pub">모든 직원</span>
+              <small id="tgPubNote">포스코퓨처엠 긍정·중립 기사만 · 같은 사건은 1건 · 시간당 최대 5건</small></div>
+            <span class="tg-state" id="tgPubState">확인 중…</span>
+            <a class="url-add-btn tg-open" id="tgPubLink" href="#" target="_blank" rel="noopener noreferrer" hidden>채널 열기 ↗</a>
+          </div>
+        </div>
+        <small>※ 주소가 안 보이면 서버 설정(<code>TELEGRAM_CHANNEL_URL</code>·<code>TELEGRAM_PUBLIC_CHANNEL_URL</code>)에 채널 초대 링크를 넣고 다시 배포하세요.</small>
+      </section>
+
       <p class="url-add-msg" id="masterMsg" hidden></p>
     </div>
   </div>

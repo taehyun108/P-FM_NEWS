@@ -856,7 +856,24 @@ function applyNightSettings(d) {
   renderNightMin(nm);
 }
 
+/* 마스터 '텔레그램 연동' — 부서용·일반용 채널 상태와 바로가기 */
+async function loadMasterTelegram() {
+  const fill = (key, info) => {
+    const st = $(`tg${key}State`), a = $(`tg${key}Link`);
+    if (!info) { st.textContent = '불러오지 못함'; a.hidden = true; return; }
+    st.textContent = info.enabled ? '연결됨' : '설정 안 됨';
+    st.className = `tg-state ${info.enabled ? 'ok' : 'off'}`;
+    if (info.url) { a.href = info.url; a.hidden = false; } else { a.hidden = true; }
+  };
+  try {
+    const d = await (await masterFetch('/api/master/telegram')).json();
+    fill('Dept', d.dept);
+    fill('Pub', d.public);
+  } catch { fill('Dept', null); fill('Pub', null); }
+}
+
 async function loadMasterSettings() {
+  loadMasterTelegram();
   try {
     const d = await (await masterFetch('/api/master/settings')).json();
     $('telegramEnabled').checked = !!d.telegram_enabled;
