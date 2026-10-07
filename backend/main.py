@@ -13267,7 +13267,11 @@ def cmd_selftest() -> int:
     _PUBLIC_SENT_AT[:] = [time.monotonic()]            # 방금 1건 보냈다 → 한도 1건 소진
     check("일반용 — 시간당 상한에 닿으면 이번엔 보내지 않는다", (send_public_notifications(_pctx), len(_tg.sent)), (0, 0))
     _PUBLIC_SENT_AT.clear()
-    check("일반용 — 상한이 풀리면(1시간 지나면) 다시 보낸다", (send_public_notifications(_pctx), len(_tg.sent)), (1, 1))
+    _r_cap = (send_public_notifications(_pctx), len(_tg.sent))
+    if _r_cap != (1, 1):   # 가끔 실패 — 원인 추적용(큐·플러드 상태)
+        print("DEBUG-CAP", _r_cap, _flood_remaining(), now_local(),
+              _et._rows("select n.status, n.channel, n.retry_count, n.error, a.title from notifications n join articles a on a.id=n.article_id where n.channel='telegram_public'"))
+    check("일반용 — 상한이 풀리면(1시간 지나면) 다시 보낸다", _r_cap, (1, 1))
     globals()["PUBLIC_MAX_PER_HOUR"] = _old_cap
     globals()["now_local"] = _orig_now_local
     globals()["RATE_LIMIT_SLEEP"] = _orig_sleep
