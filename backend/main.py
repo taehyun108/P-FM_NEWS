@@ -7878,14 +7878,26 @@ def public_telegram_link(ctx: Context) -> tuple[str, str]:
     return (url, "channel") if url else ("", "")
 
 
-def is_public_candidate(row: dict) -> bool:
-    """일반용에 올릴 기사인가 — 포스코퓨처엠 논조가 긍정·중립이고, 포스코퓨처엠 언급 근거(발췌 또는 제목)가 있다."""
-    if row.get("pfm_tone") not in PUBLIC_TONES:
+# 일반용(모든 직원) 채널은 '포스코퓨처엠이 주제인 기사'만 — 시세표·순위표에 이름만 스친 기사는 뺀다 (사용자 지정 2026-10-07)
+#   · 제목에 포스코퓨처엠(띄어 쓴 표기·영문 포함)이 있어야 한다.
+#   · 시세·순위·주가 기사(브랜드평판·시황·특징주·목표주가 등)는 제목에 있으면 뺀다 — 투자 권유처럼 보이거나 회사 소식이 아니다.
+PUBLIC_TITLE_EXCLUDE = (
+    "브랜드평판", "빅데이터 분석", "코스피", "코스닥", "시황", "마감", "종가", "특징주", "목표주가", "투자의견",
+    "리포트", "주가", "상한가", "하한가", "공매도", "순매수", "순매도", "급등", "급락",
+)
+
+
+def public_title_ok(title: str) -> bool:
+    """일반용 채널에 올릴 제목인가 — 제목에 포스코퓨처엠이 있고, 시세·순위·주가 기사 표시가 없다."""
+    t = (title or "").lower()
+    if not any(a in t for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"]):
         return False
-    if (row.get("pfm_excerpt") or "").strip():
-        return True
-    title = (row.get("title") or "").lower()
-    return any(a in title for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"])
+    return not any(x.lower() in t for x in PUBLIC_TITLE_EXCLUDE)
+
+
+def is_public_candidate(row: dict) -> bool:
+    """일반용에 올릴 기사인가 — 포스코퓨처엠 논조가 긍정·중립이고, 제목이 포스코퓨처엠 기사(시세·순위 기사 제외)다."""
+    return row.get("pfm_tone") in PUBLIC_TONES and public_title_ok(row.get("title") or "")
 
 
 # 같은 사건을 여러 언론사가 다룬 기사(예: 삼성SDI 6조 LFP 계약 20건)가 일반 채널에 줄줄이 올라가면 직원들에게 스팸이다.
@@ -8021,8 +8033,9 @@ def _send_public_notifications(ctx: Context, limit: int) -> int:
             break
         # 발송 직전 재확인 — 보관 처리됐거나 논조가 바뀐 기사는 보내지 않는다.
         detail = ctx.storage.article_detail(row["article_id"]) or {}
-        if detail.get("status") != "active" or detail.get("pfm_tone") not in PUBLIC_TONES:
-            ctx.storage.mark_notification(row["id"], "skipped", "일반용 조건 불충족(논조·상태)")
+        if (detail.get("status") != "active" or detail.get("pfm_tone") not in PUBLIC_TONES
+                or not public_title_ok(detail.get("title") or "")):
+            ctx.storage.mark_notification(row["id"], "skipped", "일반용 조건 불충족(논조·상태·제목)")
             continue
         _rate_gate()
         ok, err = _telegram_send(ctx, url, clamp_message(format_public_message(row)),
@@ -13162,12 +13175,20 @@ def cmd_selftest() -> int:
     check("일반용 — 토큰만 있으면 아직 꺼짐", public_enabled(), False)
     os.environ["TELEGRAM_PUBLIC_CHAT_ID"] = "-100999"
     check("일반용 — 둘 다 있으면 켜짐", public_enabled(), True)
-    check("일반용 대상 — 긍정·중립 + 언급 근거 있음만",
-          [is_public_candidate({"pfm_tone": t, "pfm_excerpt": "포스코퓨처엠은 증설한다.", "title": "x"}) for t in ("긍정", "중립", "부정", "", None)],
+    check("일반용 대상 — 긍정·중립 + 제목에 포스코퓨처엠이 있는 기사만",
+          [is_public_candidate({"pfm_tone": t, "title": "포스코퓨처엠, 양극재 증설"}) for t in ("긍정", "중립", "부정", "", None)],
           [True, True, False, False, False])
-    check("일반용 대상 — 언급 근거(발췌·제목) 둘 다 없으면 제외",
-          (is_public_candidate({"pfm_tone": "긍정", "pfm_excerpt": "", "title": "코스피 마감"}),
-           is_public_candidate({"pfm_tone": "중립", "pfm_excerpt": "", "title": "포스코퓨처엠 신공장"})), (False, True))
+    _pt = {"긍정": "포스코퓨처엠, 삼성SDI에 LFP 6조 공급", "띄어쓴": "포스코 퓨처엠 광양 공장 증설", "영문": "POSCO Future M to expand plant"}
+    check("일반용 제목 — 포스코퓨처엠(띄어쓴 표기·영문 포함)이 제목에 있으면 통과", [public_title_ok(t) for t in _pt.values()], [True, True, True])
+    _bad = ["CBC뉴스 | 화학 상장기업 브랜드평판 2026년 10월 빅데이터 분석결과…1위 에코프로·2위 LG화학",
+            "에코프로, 화학 상장기업 브랜드평판 1위…LG화학·포스코퓨처엠 順",
+            "코스피 하락 출발 뒤 6880선… 포스코퓨처엠 약세", "[특징주] 포스코퓨처엠, 삼성SDI 계약에 급등",
+            "포스코퓨처엠 목표주가 상향…증권사 리포트", "美 중간선거 앞두고 친환경주 꿈틀…신재생·이차전지 정책 기대",
+            "SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득"]
+    check("일반용 제목 — 시세·순위·주가 기사와 제목에 포스코퓨처엠이 없는 기사는 제외",
+          [public_title_ok(t) for t in _bad], [False] * len(_bad))
+    check("일반용 대상 — 논조가 중립이어도 시세·순위 기사면 제외",
+          is_public_candidate({"pfm_tone": "중립", "title": "에코프로, 화학 상장기업 브랜드평판 1위…LG화학·포스코퓨처엠 順"}), False)
     _pm = format_public_message({"title": "포스코퓨처엠 <신공장>", "summary_text": "요약문", "press_name": "머니투데이",
                                  "author": "홍길동", "importance_score": 90, "pfm_excerpt": "포스코퓨처엠은 증설한다.",
                                  "url_canonical": "https://x.test/a", "group_companies": '["포스코퓨처엠"]'})
@@ -13185,6 +13206,8 @@ def cmd_selftest() -> int:
                    iso(_pn2 - timedelta(hours=_hrs)), iso(_pn2), "rss", 10, '["포스코퓨처엠"]', "[]", "연합뉴스",
                    iso(_pn2), "active", 1, _pex, _ptone))
     _PUBLIC_SEEN.clear()
+    globals()["_FLOOD_UNTIL"] = 0.0      # 앞선 테스트(429)가 건 플러드 보류가 남아 있으면 발송이 막혀 결과가 흔들린다
+    _SEND_TIMES.clear()
     _tg = _FakeTG()
     _pctx = Context(cfg=_ectx.cfg, storage=_et, http=_tg)
     _orig_now_local, _orig_sleep = now_local, RATE_LIMIT_SLEEP
