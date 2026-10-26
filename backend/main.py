@@ -3289,7 +3289,24 @@ def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[R
     return items
 
 
-POSCO_MENTION_RE = re.compile(r"포스코|posco", re.IGNORECASE)
+# 건물·시설 이름으로 쓰인 '포스코'(포항 포스텍 '포스코국제관' 등)는 회사 언급이 아니다 — 세지 않는다 (사용자 지정 2026-10-26).
+_POSCO_FACILITY_RE = re.compile(r"포스코\s*(?:국제관|기념관|체육관|도서관|강당)", re.IGNORECASE)
+
+
+def strip_posco_facilities(text: str) -> str:
+    """'포스코국제관' 같은 시설 이름을 지워, 회사 언급 판정에서 빠지게 한다."""
+    return _POSCO_FACILITY_RE.sub(" ", text or "")
+
+
+class _PoscoMentionRE:
+    """포스코·POSCO 언급 판정 — re.Pattern.search 와 같게 쓰되, 시설 이름 속 '포스코'는 건너뛴다."""
+    _re = re.compile(r"포스코|posco", re.IGNORECASE)
+
+    def search(self, text: str, *args):
+        return self._re.search(strip_posco_facilities(text), *args)
+
+
+POSCO_MENTION_RE = _PoscoMentionRE()
 
 
 def _kw_hit(text: str, keywords: Sequence[str]) -> bool:
@@ -4952,7 +4969,7 @@ def detect_group_companies(text: str) -> list[str]:
 
     '포스코퓨처엠'이 잡히면 상위 개념인 '포스코'는 붙이지 않는다. 칩 중복의 원인이 된다.
     """
-    lowered = (text or "").lower()
+    lowered = strip_posco_facilities(text or "").lower()
     found: list[str] = []
     for canonical, aliases in _GROUP_ALIASES_LOWER.items():
         if canonical == "포스코":
@@ -13357,6 +13374,13 @@ def cmd_selftest() -> int:
     check("fixexcerpt — 보관 본문으로 발췌·논조를 채운다",
           ("포스코퓨처엠은 광양 양극재 공장 증설을" in _e3["pfm_excerpt"], _e3["pfm_tone"]), (True, "긍정"))
 
+    check("포스코 언급 — 시설 이름(포스코국제관·포스코 체육관)만 있으면 언급으로 세지 않는다",
+          [bool(POSCO_MENTION_RE.search(t)) for t in ("교내 포스코국제관에서 워크숍을 열었다", "포스코 체육관 개방",
+                                                      "포스코, 포항시로부터 받은 은혜", "POSCO 국제관 아님 POSCO 발표")],
+          [False, False, True, True])
+    check("그룹사 판정 — 포스코국제관은 '포스코' 태그를 만들지 않고 실제 회사 언급은 유지",
+          (detect_group_companies("포스텍 포스코국제관 워크숍"), detect_group_companies("포스코국제관 워크숍, 포스코 지원"),
+           detect_group_companies("포스코퓨처엠 양극재")), ([], ["포스코"], ["포스코퓨처엠"]))
     # presscheck — 도메인 꼬리가 남은 언론사명·기자명 누락 매체 점검(읽기 전용)
     _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
               "source_type,importance_score,group_companies,categories,press_name,author,analyzed_at,status,"
