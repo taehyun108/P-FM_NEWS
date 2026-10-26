@@ -1434,7 +1434,7 @@ function hideSwotTip() { $('swotTip').hidden = true; }
 const scoreDetailCache = new Map();   // 기사 id → 서버 응답. 같은 카드를 다시 올려도 재요청하지 않는다.
 let sentiTipToken = 0;                // 마우스를 빨리 옮길 때 늦게 온 옛 응답이 덮어쓰지 않게 한다.
 
-const SENTI_CRITERIA = '감성은 주가 호재·악재가 아니라 포스코 그룹의 대외협력 대응 필요성 기준으로 AI가 판단합니다.';
+const SENTI_CRITERIA = '긍정·중립·부정은 주가가 아니라 포스코퓨처엠 사업에 도움이 되는 소식인지(긍정)·불리한 소식인지(부정)를 기준으로 AI가 판단합니다.';
 
 function attachSentiTip(chip, item) {
   chip.tabIndex = 0;

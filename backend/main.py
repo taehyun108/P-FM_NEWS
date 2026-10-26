@@ -5306,12 +5306,17 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 목록에 없는 회사명을 만들어내지 않는다
 
 [감성]
-- sentiment: "긍정" | "중립" | "부정" 중 하나
-- 주가 호재/악재가 아니라 포스코 그룹의 대외협력 대응 필요성 기준으로 판단한다
-- sentiment_reason: 그렇게 판단한 근거를 본문 속 표현 기준으로 한 줄(60자 이내)
+- sentiment: "긍정" | "중립" | "부정" 중 하나 — 반드시 **포스코퓨처엠(양극재·음극재 등 이차전지소재 사업)의 관점**에서 판단한다
+  · 긍정: 포스코퓨처엠의 사업에 도움이 되는 소식(수주·증설·수요 확대·원가 개선·우호적 정책·평판 상승 등)
+  · 부정: 포스코퓨처엠의 사업에 불리한 소식(비용 증가·규제·수출 제약·실적 악화·사고·비판 등)
+  · 중립: 단순 사실 전달이거나 포스코퓨처엠 사업에 미치는 영향이 불분명·미미함
+- 기사 속 다른 회사(경쟁사·고객사·모회사)가 잘되거나 못되는 것을 그대로 따라 판정하지 않는다.
+  그 일이 포스코퓨처엠에 어떤 영향을 주는지로 판단한다(예: 경쟁사 수주 확대 = 포스코퓨처엠에는 부정일 수 있음)
+- 주가 호재/악재가 아니라 포스코퓨처엠 사업에 미치는 영향 기준이다
+- sentiment_reason: 포스코퓨처엠에 어떤 영향이라 그렇게 판단했는지 본문 속 표현 기준으로 한 줄(60자 이내)
 
 [SWOT]
-- swot: 이 기사의 사안이 포스코 그룹(철강·이차전지소재·인프라 전반)에 주는
+- swot: 이 기사의 사안이 **포스코퓨처엠**(양극재·음극재 등 이차전지소재 사업)에 주는
   영향을 S/W/O/T 로 평가한다. 각 항목 score(0~100 정수)와 text(1~2줄 근거)
 - 기사 본문에서 실제로 읽어낼 수 있는 함의를 적고, 최소한 한 항목은 채운다.
   신사업·수요 확대·우호적 협력 = O / 경쟁 심화·규제·공급과잉·자원 리스크 = T /
@@ -5366,8 +5371,8 @@ SENTI_REASON_PROMPT = """[기사 제목] {title}
 [기사 내용]
 {text}
 
-이 기사는 포스코 그룹의 대외협력 대응 필요성 기준으로 '{sentiment}'(긍정=우호적 보도, 부정=대응이 필요한 비판·리스크,
-중립=단순 사실 전달)으로 분류돼 있다. 그렇게 분류된 근거를 기사 속 표현을 인용해 한 줄(70자 이내)로 쓰라.
+이 기사는 포스코퓨처엠(이차전지소재 사업)의 관점에서 '{sentiment}'(긍정=사업에 도움이 되는 소식, 부정=사업에 불리한 소식·리스크,
+중립=단순 사실 전달이거나 영향이 불분명)으로 분류돼 있다. 그렇게 분류된 근거를 기사 속 표현을 인용해 한 줄(70자 이내)로 쓰라.
 - 판정을 바꾸지 말고, 기사에 없는 내용을 지어내지 않는다.
 형식: {{"reason":"..."}}"""
 
@@ -7291,6 +7296,11 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         tone, reason = ctx.llm.pfm_tone(excerpt)
         if tone:
             patch.update(pfm_tone=tone, pfm_tone_reason=reason)
+            # 카드 칩(긍정·중립·부정)과 언론사 탭·일반용 텔레그램의 논조가 어긋나지 않도록,
+            # 포스코퓨처엠 언급 부분을 직접 본 판정이 있으면 그 값을 카드 감성으로 쓴다 (사용자 지정 2026-10-26).
+            patch["sentiment"] = tone
+            if reason:
+                analysis.sentiment_reason = reason
     ctx.storage.update_article(article_id, patch)
     ctx.storage.save_summary({
         "id": new_id(),
@@ -13128,7 +13138,7 @@ def cmd_selftest() -> int:
 
         def analyze(self, title: str, press: str, body: str) -> Analysis:
             return Analysis(summary_sentences=["포스코퓨처엠이 양극재 공장을 증설한다."], perspective="",
-                            keywords=["양극재"], group_companies=["포스코퓨처엠"], sentiment="긍정",
+                            keywords=["양극재"], group_companies=["포스코퓨처엠"], sentiment=_EnLLM.senti,
                             sentiment_reason="증설 보도", ok=True)
 
         def translate_to_korean(self, title: str, excerpt: str) -> tuple[str, str]:
@@ -13136,6 +13146,8 @@ def cmd_selftest() -> int:
                 return "", ""
             return ("포스코퓨처엠, 광양 양극재 공장 증설" if title else "",
                     "포스코퓨처엠은 광양 양극재 공장을 증설한다." if excerpt else "")
+
+        senti = "긍정"   # 분석(analyze)이 돌려주는 감성 — 포스코퓨처엠 언급 판정과 다르게 만들어 시험한다
 
         def pfm_tone(self, excerpt: str) -> tuple[str, str]:
             return ("긍정", "x") if excerpt else ("", "")
@@ -13168,8 +13180,26 @@ def cmd_selftest() -> int:
     check("영어 기사 — 제목·발췌가 한글로 저장된다", (_e1["title"], _e1["pfm_excerpt"]),
           ("포스코퓨처엠, 광양 양극재 공장 증설", "포스코퓨처엠은 광양 양극재 공장을 증설한다."))
     check("영어 기사 — 영어 원제는 카드에 따로 실린다(감성 근거도 유지)",
-          (_c1["title_original"], _c1["sentiment_reason"]), ("POSCO Future M to expand cathode plant", "증설 보도"))
+          (_c1["title_original"], _c1["sentiment_reason"]), ("POSCO Future M to expand cathode plant", "x"))
     check("영어 기사 — 논조는 번역된 발췌로 판정", _e1["pfm_tone"], "긍정")
+    # 카드 감성은 포스코퓨처엠 관점 — 분석 감성이 중립·부정이어도 언급 부분 판정(긍정)이 있으면 그 값을 따른다
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("ez", "u/ez", "u/ez", "u/ez", "POSCO Future M cathode deal", iso(_pn), iso(_pn), "rss", 10, "[]", "[]",
+               "Yonhap", None, "active", 1))
+    _EnLLM.senti = "부정"
+    analyze_and_save(_ectx, "ez", {"id": "ez", "title": "POSCO Future M cathode deal", "press_id": None,
+                                   "press_name": "Yonhap", "importance_score": 10, "group_companies": []},
+                     _en_body, "fulltext")
+    _EnLLM.senti = "긍정"
+    _e3 = _et.article_detail("ez")
+    check("카드 감성 — 포스코퓨처엠 언급 판정이 있으면 분석 감성(부정)보다 우선한다",
+          (_e3["sentiment"], _e3["pfm_tone"], build_card(_e3)["sentiment_reason"]), ("긍정", "긍정", "x"))
+    check("분석 지시문 — 감성·SWOT 은 포스코퓨처엠 관점, 옛 '그룹 대외협력' 기준은 없다",
+          ("포스코퓨처엠(양극재·음극재" in ANALYSIS_PROMPT, "대외협력 대응 필요성" in ANALYSIS_PROMPT,
+           "포스코퓨처엠(이차전지소재 사업)의 관점" in SENTI_REASON_PROMPT, "대외협력 대응 필요성" in SENTI_REASON_PROMPT),
+          (True, False, True, False))
     _EnLLM.fail = True
     analyze_and_save(_ectx, "e2", {"id": "e2", "title": "POSCO Future M to expand plant too", "press_id": None,
                                    "press_name": "Yonhap", "importance_score": 10, "group_companies": []},
@@ -13202,7 +13232,7 @@ def cmd_selftest() -> int:
     cmd_sentireason(_ectx, 10)
     check("sentireason — 근거가 빈 기사를 채운다", sentiment_reason_of(_et.article_detail("e2")), "공장 증설을 호의적으로 보도")
     check("retranslate — 번역한 기사의 감성 근거는 지워지지 않는다(e1 재실행 대상 아님)",
-          sentiment_reason_of(_et.article_detail("e1")), "증설 보도")
+          sentiment_reason_of(_et.article_detail("e1")), "x")
     cmd_retranslate(_ectx, 10)
     check("retranslate — 이미 번역된 기사는 다시 하지 않는다", _et.article_detail("e1")["title"], "포스코퓨처엠, 광양 양극재 공장 증설")
 
