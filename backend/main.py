@@ -11259,6 +11259,49 @@ def cmd_fixauthors(ctx: Context) -> None:
     log.info("기자명 복구: %d건 정리 · %d건 재추출 · %d건 제거", fixed, recovered, cleared)
 
 
+# 이름 어딘가에 도메인 꼬리('.com'·'.co.kr' 등)가 붙은 언론사명 — 점검용
+_DOMAINISH_NAME_RE = re.compile(r"(?i)[a-z0-9-]+\.(?:co\.kr|or\.kr|com|net|org|kr|io|tv|news|me)\b")
+
+
+def cmd_presscheck(ctx: Context, min_articles: int = 3) -> dict:
+    """언론사명·기자명 점검 — 읽기 전용(아무것도 쓰지 않는다).
+
+    ① 이름에 '.com'·'.co.kr' 같은 도메인 꼬리가 남은 언론사(기사 수·예시 주소)
+    ② 기자명이 비어 있는 기사가 많은 언론사(매체별 비율·예시 주소) — 사이트 구조상 원래 기자명이
+       없는 매체인지, 추출이 놓친 건지 구분할 단서로 쓴다.
+    """
+    domainish: dict[str, dict] = {}
+    for r in ctx.storage.article_press_rows():
+        nm = (r.get("press_name") or "").strip()
+        if nm and _DOMAINISH_NAME_RE.search(nm):
+            ent = domainish.setdefault(nm, {"n": 0, "url": r.get("url_canonical") or r.get("url_original") or ""})
+            ent["n"] += 1
+    outlets = [(row.get("name") or "", row.get("domain") or "") for row in ctx.storage.all_press()
+               if _DOMAINISH_NAME_RE.search(row.get("name") or "")]
+    log.info("[언론사명 점검] 도메인 꼬리가 남은 이름 %d종 (기사 기준) · 언론사 표 %d곳", len(domainish), len(outlets))
+    for nm, ent in sorted(domainish.items(), key=lambda x: -x[1]["n"])[:40]:
+        log.info("  · %s — 기사 %d건 · 예: %s · 매핑표(SEED_PRESS) %s", nm, ent["n"], ent["url"][:90],
+                 "있음" if press_domain_of(ent["url"]) in SEED_PRESS else "없음")
+    by_press: dict[str, dict] = {}
+    for r in ctx.storage.list_articles(5000, 0, None, ""):
+        if r.get("status") not in (None, "active"):
+            continue
+        nm = press_display_name((r.get("press_name") or "").strip(), r.get("url_canonical") or r.get("url_original") or "")
+        ent = by_press.setdefault(nm or "(이름 없음)", {"n": 0, "miss": 0, "url": ""})
+        ent["n"] += 1
+        if not author_display(r.get("author") or ""):
+            ent["miss"] += 1
+            ent["url"] = ent["url"] or (r.get("url_canonical") or r.get("url_original") or "")
+    total = sum(e["n"] for e in by_press.values())
+    miss = sum(e["miss"] for e in by_press.values())
+    log.info("[기자명 점검] 최근 기사 %d건 중 기자명 없음 %d건 (%.0f%%)", total, miss, 100.0 * miss / max(total, 1))
+    bad = [(nm, e) for nm, e in by_press.items() if e["n"] >= min_articles and e["miss"]]
+    for nm, e in sorted(bad, key=lambda x: -x[1]["miss"])[:25]:
+        log.info("  · %s — %d건 중 %d건 없음 (%.0f%%) · 예: %s", nm, e["n"], e["miss"],
+                 100.0 * e["miss"] / e["n"], e["url"][:90])
+    return {"domainish": domainish, "outlets": outlets, "authors": by_press}
+
+
 def cmd_fixcategories(ctx: Context) -> None:
     """카테고리를 제목+요약 기준으로 재태깅한다 (일회성).
 
@@ -13262,6 +13305,17 @@ def cmd_selftest() -> int:
     _e3 = _et.article_detail("e3")
     check("fixexcerpt — 보관 본문으로 발췌·논조를 채운다",
           ("포스코퓨처엠은 광양 양극재 공장 증설을" in _e3["pfm_excerpt"], _e3["pfm_tone"]), (True, "긍정"))
+
+    # presscheck — 도메인 꼬리가 남은 언론사명·기자명 누락 매체 점검(읽기 전용)
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,author,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("pc1", "u/pc1", "https://zz.example.com/a", "https://zz.example.com/a", "t", iso(_pn), iso(_pn),
+               "rss", 10, "[]", "[]", "아무개뉴스.co.kr", "", iso(_pn), "active", 1))
+    _pcr = cmd_presscheck(_ectx, 1)
+    check("presscheck — 도메인 꼬리 남은 이름과 기자명 없는 기사를 찾아낸다(쓰지 않음)",
+          ("아무개뉴스.co.kr" in _pcr["domainish"], _pcr["authors"]["아무개뉴스.co.kr"]["miss"],
+           _et.article_detail("pc1")["press_name"]), (True, 1, "아무개뉴스.co.kr"))
 
     # 일반용 텔레그램 — 긍정·중립만, 부서용 큐와 분리 (2026-10-06)
     class _FakeTGResp:
@@ -15659,6 +15713,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
+  presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
@@ -15715,6 +15770,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixpress(ctx, dry="--dry" in argv[2:])
     elif command == "fixauthors":
         cmd_fixauthors(ctx)
+    elif command == "presscheck":
+        cmd_presscheck(ctx)
     elif command == "fixgroups":
         cmd_fixgroups(ctx)
     elif command == "regroup":
