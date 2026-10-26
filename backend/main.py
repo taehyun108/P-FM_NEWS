@@ -7968,7 +7968,13 @@ def public_telegram_link(ctx: Context) -> tuple[str, str]:
 PUBLIC_TITLE_EXCLUDE = (
     "브랜드평판", "빅데이터 분석", "코스피", "코스닥", "시황", "마감", "종가", "특징주", "목표주가", "투자의견",
     "리포트", "주가", "상한가", "하한가", "공매도", "순매수", "순매도", "급등", "급락",
+    "정오", "장중", "거래량",
 )
+# '하락·상승'은 실적·증설 기사에도 쓰이므로 단독으로는 빼지 않는다 — 제목에 %나 시각 표현이 함께 있으면 시세 기사로 본다 (사용자 승인 2026-10-26)
+#   · 단, 매출·영업이익·실적 같은 말이 같이 있으면 실적 기사이므로 살린다.
+_PUBLIC_MOVE_RE = re.compile(r"(하락|상승)")
+_PUBLIC_MOVE_CTX_RE = re.compile(r"\d+(?:\.\d+)?\s*%|오전|오후|\d+\s*시\b")
+_PUBLIC_EARNINGS_KW = ("매출", "영업이익", "실적", "순이익", "영업익")
 
 
 def public_title_ok(title: str) -> bool:
@@ -7976,7 +7982,13 @@ def public_title_ok(title: str) -> bool:
     t = (title or "").lower()
     if not any(a in t for a in _GROUP_ALIASES_LOWER["포스코퓨처엠"]):
         return False
-    return not any(x.lower() in t for x in PUBLIC_TITLE_EXCLUDE)
+    if any(x.lower() in t for x in PUBLIC_TITLE_EXCLUDE):
+        return False
+    # 'N% 하락' 같은 등락 표시 — 실적 기사는 예외
+    if (_PUBLIC_MOVE_RE.search(t) and _PUBLIC_MOVE_CTX_RE.search(t)
+            and not any(k in t for k in _PUBLIC_EARNINGS_KW)):
+        return False
+    return True
 
 
 def is_public_candidate(row: dict) -> bool:
@@ -13286,9 +13298,13 @@ def cmd_selftest() -> int:
             "에코프로, 화학 상장기업 브랜드평판 1위…LG화학·포스코퓨처엠 順",
             "코스피 하락 출발 뒤 6880선… 포스코퓨처엠 약세", "[특징주] 포스코퓨처엠, 삼성SDI 계약에 급등",
             "포스코퓨처엠 목표주가 상향…증권사 리포트", "美 중간선거 앞두고 친환경주 꿈틀…신재생·이차전지 정책 기대",
-            "SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득"]
+            "SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득",
+            "잡포스트 | 포스코퓨처엠 1.87% 하락…LFP 수주와 가동률 개선이 관건", "포스코퓨처엠, 26일 정오 0.87% 하락",
+            "포스코퓨처엠 장중 상승 전환", "포스코퓨처엠 거래량 급증"]
     check("일반용 제목 — 시세·순위·주가 기사와 제목에 포스코퓨처엠이 없는 기사는 제외",
           [public_title_ok(t) for t in _bad], [False] * len(_bad))
+    _ok = ["포스코퓨처엠, 3분기 영업이익 20% 상승…양극재 판매 늘어", "포스코퓨처엠 매출 하락 우려 해소, 증설 속도", "포스코퓨처엠, 가동률 상승 기대"]
+    check("일반용 제목 — 실적·증설 기사는 '상승·하락'이 있어도 통과", [public_title_ok(t) for t in _ok], [True] * len(_ok))
     check("일반용 대상 — 논조가 중립이어도 시세·순위 기사면 제외",
           is_public_candidate({"pfm_tone": "중립", "title": "에코프로, 화학 상장기업 브랜드평판 1위…LG화학·포스코퓨처엠 順"}), False)
     _pm = format_public_message({"title": "포스코퓨처엠 <신공장>", "summary_text": "요약문", "press_name": "머니투데이",
