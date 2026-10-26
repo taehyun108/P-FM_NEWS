@@ -2514,6 +2514,10 @@ SEED_FEEDS: list[tuple[str, str, str, bool]] = [
 
 # 도메인 → (언론사명, tier). tier 1=주요지, 2=업계·경제지, 3=기타 (PRD F2.3)
 SEED_PRESS: dict[str, tuple[str, int]] = {
+    # 사용자가 정식 이름을 알려 준 매체 (2026-10-26)
+    "kbench.com": ("Korea benchmark", 3), "futurechosen.com": ("더나은경제", 3),
+    "economictimes.com": ("economictimes", 3), "busanmbc.co.kr": ("부산MBC", 3),
+    "koreabiomed.com": ("Korea Biomedical Review", 3),
     "chosun.com": ("조선일보", 1), "donga.com": ("동아일보", 1), "joongang.co.kr": ("중앙일보", 1),
     "hani.co.kr": ("한겨레", 1), "khan.co.kr": ("경향신문", 1), "yna.co.kr": ("연합뉴스", 1),
     "news1.kr": ("뉴스1", 1), "newsis.com": ("뉴시스", 1), "kbs.co.kr": ("KBS", 1),
@@ -11302,6 +11306,53 @@ def cmd_presscheck(ctx: Context, min_articles: int = 3) -> dict:
     return {"domainish": domainish, "outlets": outlets, "authors": by_press}
 
 
+def cmd_why(ctx: Context, term: str) -> list[dict]:
+    """제목에 term 이 들어간 기사가 '왜 수집됐는지'를 보여 준다 — 읽기 전용(아무것도 쓰지 않는다).
+
+    수집 관문(그룹사·포스코 언급·배터리·통상·정부 소식·인사·무조건 키워드)을 제목·요약·보관 본문에 다시 대 보고,
+    포스코 언급은 앞뒤 문장을 함께 보여 준다. 보관 본문(30일)이 없으면 제목·요약만으로 판정한다.
+    """
+    term = (term or "").strip()
+    out: list[dict] = []
+    if not term:
+        log.warning("사용법: why <제목에 들어간 말>  예) why 포스텍")
+        return out
+    rows = [r for r in ctx.storage.list_articles(5000, 0, None, "") if term.lower() in (r.get("title") or "").lower()]
+    log.info("[수집 이유 점검] 제목에 '%s' 가 든 기사 %d건 (최대 8건 표시)", term, len(rows))
+    for r in rows[:8]:
+        title = r.get("title") or ""
+        body = ctx.storage.body_of(r["id"]) or ""
+        summary = r.get("summary_text") or ""
+        probe = f"{title}\n{summary}\n{body}"
+        reasons: list[str] = []
+        stored = jload(r.get("group_companies"), [])
+        if stored:
+            reasons.append("저장된 그룹사 태그: " + "·".join(stored))
+        m = POSCO_MENTION_RE.search(probe)
+        if m:
+            where = "제목" if POSCO_MENTION_RE.search(title) else ("요약" if POSCO_MENTION_RE.search(summary) else "본문")
+            ctx_txt = re.sub(r"\s+", " ", probe[max(0, m.start() - 40): m.end() + 40])
+            reasons.append(f"'{m.group(0)}' 언급({where}): …{ctx_txt}…")
+        if battery_company_hit(probe):
+            reasons.append("배터리 회사명 언급")
+        if is_battery_scope(title, summary):
+            reasons.append("배터리·이차전지 주제")
+        if is_trade_topic(title, summary) or _kw_hit_any(title, TRADE_MEASURE_KW):
+            reasons.append("통상 주제")
+        if is_gov_industry_news(title, summary):
+            reasons.append("부처·기관 산업 소식")
+        if people_news_kind(r.get("url_original") or "", title):
+            reasons.append("인사·부고 소식")
+        if not reasons:
+            reasons.append("현재 규칙으로는 걸리는 관문이 없음(수집 당시 규칙·키워드이거나 본문 미보관) — 수집 경로: "
+                           + str(r.get("source_type") or "?"))
+        log.info("  · %s | %s | %s", (r.get("press_name") or "")[:12], title[:60], r.get("source_type") or "")
+        for t in reasons:
+            log.info("      → %s", t)
+        out.append({"id": r["id"], "title": title, "reasons": reasons})
+    return out
+
+
 def cmd_fixcategories(ctx: Context) -> None:
     """카테고리를 제목+요약 기준으로 재태깅한다 (일회성).
 
@@ -13316,6 +13367,23 @@ def cmd_selftest() -> int:
     check("presscheck — 도메인 꼬리 남은 이름과 기자명 없는 기사를 찾아낸다(쓰지 않음)",
           ("아무개뉴스.co.kr" in _pcr["domainish"], _pcr["authors"]["아무개뉴스.co.kr"]["miss"],
            _et.article_detail("pc1")["press_name"]), (True, 1, "아무개뉴스.co.kr"))
+
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("pt1", "u/pt1", "u/pt1", "u/pt1", "포스텍 연구팀 신소재 개발", iso(_pn), iso(_pn), "naver", 10, "[]", "[]",
+               "테스트", iso(_pn), "active", 1))
+    _et.save_body("pt1", "포스텍 연구팀은 이번 연구에서 포스코홀딩스의 지원을 받았다고 밝혔다. " * 2, "fulltext")
+    _why = cmd_why(_ectx, "포스텍")
+    check("why — 제목에 말이 든 기사를 찾아 포스코 언급 관문을 보여 준다(쓰지 않음)",
+          (len(_why), any("포스코" in t and "본문" in t for t in _why[0]["reasons"]) if _why else None), (1, True))
+    check("매핑표 — 사용자가 알려 준 매체 5곳",
+          [SEED_PRESS[d][0] for d in ("kbench.com", "futurechosen.com", "economictimes.com", "busanmbc.co.kr", "koreabiomed.com")],
+          ["Korea benchmark", "더나은경제", "economictimes", "부산MBC", "Korea Biomedical Review"])
+    check("언론사명 — 도메인으로 저장된 이름을 정식 이름으로 보여 준다",
+          (press_display_name("busanmbc.co.kr", "https://www.busanmbc.co.kr/n/1"),
+           press_display_name("koreabiomed.com", "https://www.koreabiomed.com/news/1")),
+          ("부산MBC", "Korea Biomedical Review"))
 
     # 일반용 텔레그램 — 긍정·중립만, 부서용 큐와 분리 (2026-10-06)
     class _FakeTGResp:
@@ -15713,6 +15781,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
+  why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
@@ -15772,6 +15841,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixauthors(ctx)
     elif command == "presscheck":
         cmd_presscheck(ctx)
+    elif command == "why":
+        cmd_why(ctx, " ".join(argv[2:]))
     elif command == "fixgroups":
         cmd_fixgroups(ctx)
     elif command == "regroup":
