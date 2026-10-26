@@ -3288,12 +3288,58 @@ def _kw_hit_any(text: str, keywords: Sequence[str]) -> bool:
     return any(k in text for k in keywords)
 
 
+# '무조건 받을 키워드'는 단어 하나뿐 아니라 'A+B' 처럼 + 로 이으면 **모두** 있을 때만 맞는다(예: '포스코+노조').
+# 한 규칙의 각 부분은 같은 글(제목 + 판정된 그룹사)에서 찾는다. 단일 키워드는 예전과 똑같이 동작한다.
+def kw_rule_parts(rule: str) -> list[str]:
+    return [p.strip() for p in re.split(r"\s*\+\s*", rule or "") if p.strip()]
+
+
+def kw_rule_hit(text: str, rule: str) -> bool:
+    """규칙 하나가 글에 맞는가 — 'A+B' 는 A 와 B 가 둘 다 있어야 한다. 빈 규칙은 맞지 않는다."""
+    parts = kw_rule_parts(rule)
+    return bool(parts) and all(p in text for p in parts)
+
+
+def kw_rules_hit_any(text: str, rules: Sequence[str]) -> bool:
+    """규칙 중 하나라도 맞으면 True. 규칙이 비어 있으면 False(조건이 반드시 있어야 하는 경우)."""
+    return any(kw_rule_hit(text, r) for r in rules if r)
+
+
+def kw_rules_first_hit(text: str, rules: Sequence[str]) -> str | None:
+    """처음 맞은 규칙을 입력한 모양 그대로 돌려준다(발송 이유 표시용). 없으면 None."""
+    for r in rules:
+        if r and kw_rule_hit(text, r):
+            return r
+    return None
+
+
 def _kw_first_hit(text: str, keywords: Sequence[str]) -> str | None:
     """본문에 처음 걸린 키워드를 돌려준다. 없으면 None. (발송 이유 표시용)"""
     for k in keywords:
         if k and k in text:
             return k
     return None
+
+
+# 정부 부처·기관 소식 — 제목에 부처·기관 이름이 있고, 제목·요약에 포스코 사업과 닿는 산업어가 함께 있으면
+# 포스코 미언급이어도 수집한다(사용자 지정 2026-10-26: 이차전지·배터리·전기차 등 관련 부처 소식 누락 방지).
+GOV_AGENCY_KW = [
+    "산업통상부", "산업통상자원부", "산업부", "기후에너지환경부", "기후부", "환경부", "과기정통부", "과학기술정보통신부",
+    "재정경제부", "재경부", "기획재정부", "기재부", "기획예산처", "국토교통부", "국토부", "고용노동부", "노동부",
+    "중소벤처기업부", "중기부", "공정위", "공정거래위원회", "관세청", "금융위원회", "금융위", "산업은행",
+    "국무조정실", "국회", "정부", "당국", "범부처", "산업부 장관", "한국무역협회", "KOTRA", "코트라",
+]
+GOV_INDUSTRY_KW = [
+    "이차전지", "2차전지", "배터리", "전기차", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트", "흑연", "전해액", "분리막",
+    "ESS", "에너지저장", "핵심광물", "희토류", "소부장", "소재부품", "공급망", "철강", "제철", "수소환원", "탄소중립",
+    "탄소국경", "CBAM", "배출권", "전기요금", "산업단지", "특화단지", "국가첨단전략산업", "반도체", "친환경차", "충전",
+]
+
+
+def is_gov_industry_news(title: str, extra: str = "") -> bool:
+    """제목에 정부 부처·기관 이름이 있고, 제목·요약에 포스코 사업과 닿는 산업어가 함께 있는가."""
+    t = title or ""
+    return _kw_hit_any(t, GOV_AGENCY_KW) and _kw_hit_any(f"{t}\n{extra}", GOV_INDUSTRY_KW)
 
 
 def is_trade_topic(title: str, extra: str = "") -> bool:
@@ -4159,6 +4205,8 @@ def _naver_item_relevant(title: str, category: str, keyword: str = "",
     if category == "그룹사":
         return False
     if keyword and keyword in t:
+        return True
+    if is_gov_industry_news(t, snippet):       # 부처·기관 이름 + 산업어 — 포스코 미언급이어도 수집
         return True
     if category == "정책":
         return _kw_hit_any(t, POLICY_RELEVANCE_KW)
@@ -6017,6 +6065,7 @@ def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
         or battery_company_hit(probe)                 # 회사명은 리드에 있어도 인정
         or _kw_hit_any(probe, TRADE_MEASURE_KW)       # 조치명도 마찬가지
         or is_battery_scope(title, "")
+        or is_gov_industry_news(title, snippet or "")
         or is_trade_topic(title, "")
         or people_news_kind("", title)
     )
@@ -6130,6 +6179,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
         probe = f"{art['title']}\n{body}"
         if not (rule_groups or POSCO_MENTION_RE.search(probe)
                 or is_battery_scope(art["title"], body[:1500])
+                or is_gov_industry_news(art["title"], body[:1500])
                 or is_trade_topic(art["title"], body[:1500])
                 or bool(KOREA_KR_NEWS_RE.search(canonical or ""))):
             storage.update_article(aid, {"status": "archived"})
@@ -6867,6 +6917,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # "산업장관, EU 산업가속화법 우려 전달" 처럼 조치명만 제목에 있고 철강·배터리는
         # 본문에서 설명되는 기사가 통째로 버려지던 문제를 막는다.
         is_trade = is_trade_topic(item.title, f"{item.snippet or ''}\n{body[:1500]}")
+        is_gov = is_gov_industry_news(item.title, f"{item.snippet or ''}\n{body[:1500]}")
         if is_policy:
             # 정책브리핑 기사: 포스코 미언급이어도 포스코 산업에 닿는 주제면 수집.
             if not matches_keywords(relevance_probe, POLICY_RELEVANCE_KW):
@@ -6877,6 +6928,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             pass  # 통상 신호 + 산업 키워드가 확인됨 — 포스코 미언급 허용
         elif is_battery_scope(item.title, f"{item.snippet or ''}\n{body[:1500]}"):
             pass  # 배터리 생태계(소재·셀·전기차·ESS·원료) — 포스코 미언급 허용 (사용자 지정)
+        elif is_gov:
+            pass  # 정부 부처·기관 소식 + 포스코 사업과 닿는 산업어 — 포스코 미언급 허용 (사용자 지정 2026-10-26)
         elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
             # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
@@ -6884,7 +6937,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             continue
         # 카테고리는 제목+스니펫으로만 잡고, 분석 후 요약으로 다시 계산한다.
         categories = detect_categories(item.title, item.snippet or "")
-        if is_policy and "정부/정책" not in categories:
+        if (is_policy or is_gov) and "정부/정책" not in categories:
             categories = ["정부/정책"] + categories
         if is_trade and "글로벌 통상환경" not in categories:
             categories = ["글로벌 통상환경"] + categories
@@ -6950,7 +7003,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         priority_probe = f"{item.title}\n{' '.join(rule_groups)}"
         excluded = _kw_hit_any(item.title, exclude_kws)   # 제목에 제외 키워드 → 무조건 알림 안 함
         is_priority = (not excluded) and (
-            _kw_hit_any(priority_probe, always_kws)
+            kw_rules_hit_any(priority_probe, always_kws)
             or (hard_score > 0 and score >= hard_score))
         # 특수 주제 발송 조건: 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수, 비면 발송 안 함).
         # 제목에 그 주제의 제외 키워드가 있으면 뺀다.
@@ -7688,7 +7741,7 @@ def _notify_reason(row: dict, always_kws: Sequence[str] = (),
     prefix = "URL 등록 · " if manual else ""
     score = int(row.get("importance_score") or 0)
     probe = f"{row.get('title') or ''}\n{' '.join(jload(row.get('group_companies'), []))}"
-    kw = _kw_first_hit(probe, [k for k in always_kws if k])
+    kw = kw_rules_first_hit(probe, [k for k in always_kws if k])
     if kw:
         return f"{prefix}무조건 받을 키워드 '{kw}'"
     if int(row.get("priority") or 0) == 2:
@@ -7764,7 +7817,7 @@ def queue_manual_notify(ctx: Context, article_id: str) -> bool:
         log.info("수동 등록 기사 제목에 '제외' 키워드 → 웹에만 노출: %s",
                  (detail.get("title") or "")[:40])
         return False
-    is_priority = _kw_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
+    is_priority = kw_rules_hit_any(probe, always_kws) or (hard_score > 0 and score >= hard_score)
     # 임계값도 위에서 읽어 둔 state 로 판정한다(effective_threshold 를 부르면 run_state 를 또 조회한다).
     try:
         threshold = int(state["notify_threshold"]) if state.get("notify_threshold") is not None \
@@ -11731,8 +11784,9 @@ def cmd_fixofftopic(ctx: Context) -> None:
         cats = set(jload(r.get("categories"), []))
         if (is_policy_brief(r) or is_trade_article(r) or (cats & _KEEP_CATS)
                 or jload(r.get("group_companies"), [])
-                or is_battery_scope(r.get("title") or "", r.get("summary_text") or "")):
-            continue  # 정책·통상·배터리·인사·부고·그룹사 확정 기사는 유지 (사용자 지정)
+                or is_battery_scope(r.get("title") or "", r.get("summary_text") or "")
+                or is_gov_industry_news(r.get("title") or "", r.get("summary_text") or "")):
+            continue  # 정책·통상·배터리·부처 소식·인사·부고·그룹사 확정 기사는 유지 (사용자 지정)
         text = "\n".join([
             r.get("title") or "", r.get("summary_text") or "",
             " ".join(jload(r.get("keywords"), [])),
@@ -14622,6 +14676,36 @@ def cmd_selftest() -> int:
     check("항상발송 키워드 비면 우선 아님 (_kw_hit_any)",
           _kw_hit_any("포스코퓨처엠 양극재 증설", []), False)
 
+    # 무조건 받을 키워드 — 'A+B' 조합(모두 있어야 발송), 단일 키워드는 예전과 같다 (2026-10-26)
+    _rules = ["포스코+노조", "포스코+파업", "포스코퓨처엠"]
+    check("A+B 조합 — 둘 다 있으면 맞는다", kw_rule_hit("포스코노조 위원장 3연임 성공", "포스코+노조"), True)
+    check("A+B 조합 — 하나만 있으면 안 맞는다", (kw_rule_hit("포스코 3분기 실적", "포스코+노조"), kw_rule_hit("현대차 노조 파업", "포스코+노조")), (False, False))
+    check("A+B 조합 — 판정 그룹사 줄까지 합친 글에서 찾는다(제목에 '포스코' 없이 그룹사가 포스코)",
+          kw_rules_hit_any("노조 위원장 3연임 성공\n포스코", _rules), True)
+    check("A+B 조합 — 공백·여러 +·빈 조각은 무시한다", (kw_rule_parts(" 포스코 + 노조 "), kw_rule_parts("포스코++노조+"), kw_rule_parts("+")),
+          (["포스코", "노조"], ["포스코", "노조"], []))
+    check("A+B 조합 — 빈 규칙·빈 목록은 안 맞는다", (kw_rule_hit("포스코 노조", ""), kw_rules_hit_any("포스코 노조", []), kw_rules_hit_any("포스코 노조", [""])), (False, False, False))
+    check("단일 키워드 규칙은 예전처럼 동작", (kw_rules_hit_any("포스코퓨처엠 양극재", ["포스코퓨처엠"]), kw_rules_hit_any("포스코 양극재", ["포스코퓨처엠"])), (True, False))
+    check("발송 이유 표시 — 맞은 규칙을 입력한 모양 그대로", kw_rules_first_hit("포스코 노조 파업", _rules), "포스코+노조")
+    check("발송 이유 문구에 조합 규칙이 그대로 나온다",
+          "포스코+노조" in _notify_reason({"title": "포스코 노조 위원장 3연임", "group_companies": "[]", "importance_score": 5}, _rules, 50, 0), True)
+    # 정부 부처·기관 소식 — 포스코 미언급이어도 산업어와 함께면 수집 (2026-10-26)
+    _gv = [("산업통상부, 이차전지 소재 공급망 안정화 방안 발표", "", True),
+           ("기후에너지환경부, 철강 탄소중립 로드맵 공개", "", True),
+           ("정부, 핵심광물 비축 확대…희토류 공급망 점검", "", True),
+           ("고용노동부, 청년 일자리 지원 확대", "", False),
+           ("국토교통부, 아파트 분양가 상한제 개편", "", False),
+           ("산업부, 신규 지원사업 공고", "ESS 안전 기준 포함", True),
+           ("배터리 공장 화재, 소방당국 합동감식", "", True),
+           ("서울 날씨 맑음", "", False)]
+    check("부처 소식 판정 — 부처·기관 이름 + 산업어가 함께 있으면 수집",
+          [is_gov_industry_news(t, e) for t, e, _ in _gv], [x for *_, x in _gv])
+    check("부처 소식 — 네이버 느슨한 필터도 통과(산업 분류)",
+          (_naver_item_relevant("산업통상부, 이차전지 소재 공급망 안정화 방안 발표", "산업", "배터리"),
+           _naver_item_relevant("국토교통부, 아파트 분양가 상한제 개편", "산업", "배터리")), (True, False))
+    check("부처 소식 — 메타 저장 단계 관련성 판정도 통과",
+          (_title_snippet_relevant("기후에너지환경부, 철강 탄소중립 로드맵 공개", "")[0],
+           _title_snippet_relevant("국토교통부, 아파트 분양가 상한제 개편", "")[0]), (True, False))
     # 제외 키워드 — 제목에 있으면 임계값·항상발송 키워드보다 우선해서 알림 차단
     def _notify_decision(title, score, threshold, always, exclude):
         excluded = _kw_hit_any(title, [k for k in exclude if k])

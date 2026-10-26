@@ -120,8 +120,11 @@
         <p class="kw-label" style="margin-top:14px">무조건 받을 키워드</p>
         <small>제목 또는 판정된 계열사에 이 단어가 있으면 <b>임계값과 무관하게</b> 발송합니다.
           예: <b>포스코퓨처엠</b>, <b>수소환원제철</b>, <b>장인화</b></small>
+        <small><b>두 단어가 함께 있을 때만</b> 받으려면 <b>+</b>로 이으세요. 예: <b>포스코+노조</b> → 제목(또는 판정된 계열사)에
+          '포스코'와 '노조'가 <b>모두</b> 있을 때만 발송합니다. 한 칸에 하나씩 따로 등록하면 각각 따로 판정합니다
+          (예: <b>포스코+파업</b>, <b>포스코+임단협</b>).</small>
         <div class="kw-input">
-          <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 입력 후 Enter 또는 추가">
+          <input type="text" id="kwNew" class="url-add-input" placeholder="키워드 또는 A+B 입력 후 Enter 또는 추가">
           <button type="button" class="url-add-btn" id="kwAdd">추가</button>
         </div>
         <div class="kw-list" id="kwList"></div>
