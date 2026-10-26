@@ -2239,7 +2239,8 @@ def _ea_telegram_send(ctx: Any, text: str) -> tuple[bool, str | None]:
             return True, None
         return False, str(data.get("description") or resp.status_code)
     except Exception as exc:
-        return False, str(exc)
+        # 연결 오류 문구에는 요청 주소(=봇 토큰)가 들어 있다 — 화면·로그로 새지 않게 가린다.
+        return False, re.sub(r"(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}", "***", str(exc))
 
 
 # 화면 상단 카테고리(=탭). key 는 프런트·필터 API 가 공유한다.

@@ -166,8 +166,17 @@
       var original = btn.textContent;
       btn.disabled = true;
       btn.textContent = '전송 중…';
-      fetch(endpoint, { method: 'POST' })
-        .then(function (r) { return r.json().catch(function () { return {}; }); })
+      // 부서용 채널로 나가는 전송이라 마스터 로그인이 필요하다(app.js 의 마스터 인증을 그대로 쓴다)
+      var tok = (typeof masterAuth === 'function') ? masterAuth() : null;
+      fetch(endpoint, { method: 'POST', headers: { 'X-Master-Token': tok || '' } })
+        .then(function (r) {
+          if (r.status === 401) {
+            if (typeof clearMasterAuth === 'function') { clearMasterAuth(); }
+            if (typeof showMasterLogin === 'function') { showMasterLogin(); }
+            return { ok: false, error: '마스터 로그인 필요' };
+          }
+          return r.json().catch(function () { return {}; });
+        })
         .then(function (d) {
           btn.textContent = d.ok ? '✓ 전송됨' : (d.error || '전송 실패');
         })

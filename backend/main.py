@@ -74,6 +74,35 @@ logging.basicConfig(
 )
 log = logging.getLogger("pfm")
 
+# ── 비밀 값 가리기 (보안 점검 2026-10-26) ────────────────────────────────────
+# requests 오류 문구에는 요청 주소가 통째로 들어간다 — 텔레그램은 주소에 봇 토큰이 있어서
+# ('/bot123456:AA…/sendMessage') 연결 오류가 나면 토큰이 로그·발송 로그(DB)·화면 오류 칸으로 새어 나갈 수 있었다.
+_SECRET_RES = (
+    re.compile(r"(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}"),            # 텔레그램 봇 토큰
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),                         # OpenAI 계열 키
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),   # JWT(Supabase 키 등)
+)
+
+
+def redact_secrets(text: Any) -> str:
+    """문자열 속 토큰·API 키처럼 보이는 값을 '***' 로 바꾼다. None 은 빈 문자열."""
+    out = "" if text is None else str(text)
+    for rx in _SECRET_RES:
+        out = rx.sub("***", out)
+    return out
+
+
+class _RedactFilter(logging.Filter):
+    """모든 로그 줄에서 토큰·키를 가린다."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = redact_secrets(record.getMessage())
+            record.args = ()
+        except Exception:
+            pass
+        return True
+
+
 # 라이브러리 잡음 억제 — readability 는 "ruthless removal did not work.",
 # httpx 는 요청마다 'HTTP Request: ...' 를 INFO 로 찍는다. 레벨 조정만으로는
 # 라이브러리가 다시 켜는 경우가 있어, 루트 핸들러에 필터를 직접 건다.
@@ -97,6 +126,8 @@ def _hush_libraries() -> None:
     for handler in root.handlers:
         if not any(isinstance(f, _NoiseFilter) for f in handler.filters):
             handler.addFilter(_NoiseFilter())
+        if not any(isinstance(f, _RedactFilter) for f in handler.filters):
+            handler.addFilter(_RedactFilter())
 
 
 _hush_libraries()
@@ -8338,7 +8369,7 @@ def _telegram_send(ctx: Context, url: str, text: str,
         if resp.status_code == 200 and data.get("ok"):
             ok = True
         else:
-            err = str(data.get("description") or resp.status_code)
+            err = redact_secrets(data.get("description") or resp.status_code)
             if resp.status_code == 429:
                 # 텔레그램이 준 대기 시간만큼 봇 전체 발송을 보류한다.
                 retry_after = 0
@@ -8353,7 +8384,7 @@ def _telegram_send(ctx: Context, url: str, text: str,
                 log.warning("텔레그램 429 — %d초 발송 보류 (retry after)", retry_after)
                 err = f"Too Many Requests: retry after {retry_after}"
     except Exception as exc:
-        err = str(exc)
+        err = redact_secrets(exc)        # 연결 오류 문구에는 주소(=봇 토큰)가 들어 있다
     # 로그 기록은 발송 성패에 영향을 주면 안 된다 — 어떤 예외도 삼킨다.
     try:
         ctx.storage.log_telegram({"chat_id": target, "kind": kind, "article_id": article_id,
@@ -10023,6 +10054,17 @@ def create_app(ctx: Context):
                 return JSONResponse({"ok": False, "error": "로그인이 필요합니다."}, status_code=401)
         return await call_next(request)
 
+    # 부서용 채널로 글을 내보내는 API 는 마스터 전용이다(보안 점검 2026-10-26: 대외협력 카드의 '텔레그램 전송'
+    # API 가 로그인 없이 열려 있어, 웹에 들어온 누구나 부서용 채널에 글을 보낼 수 있었다).
+    _MASTER_ONLY_POST_RE = re.compile(r"^/api/ea/items/[^/]+/telegram$")
+
+    @app.middleware("http")
+    async def _master_only_posts(request, call_next):
+        if request.method == "POST" and _MASTER_ONLY_POST_RE.match(request.url.path):
+            if not _valid_master_token(request.headers.get("x-master-token", "")):
+                return JSONResponse({"ok": False, "error": "마스터 인증이 필요합니다."}, status_code=401)
+        return await call_next(request)
+
     @app.middleware("http")
     async def _no_cache_frontend(request, call_next):
         """프런트 정적 파일(HTML·JS·CSS)은 캐시하지 않는다.
@@ -10204,15 +10246,18 @@ def create_app(ctx: Context):
                 "importance_score": 0, "swot": None, "published_at": None, "thumbnail_url": ""}
 
     @app.get("/api/stats/notify-failed")
-    def api_stats_notify_failed(limit: int = 50):
-        """대시보드 '발송 실패' 카드를 눌렀을 때 — 실패한 기사 포토카드 + 실패 원인."""
+    def api_stats_notify_failed(limit: int = 50, x_master_token: str = fastapi.Header(default="")):
+        """대시보드 '발송 실패' 카드를 눌렀을 때 — 실패한 기사 포토카드 + 실패 원인. **마스터 전용**
+        (부서용 알림 내용·대화방 번호·오류 문구가 들어 있어 일반 사용자에게 보이면 안 된다)."""
+        if (err := _master_guard(x_master_token)):
+            return err
         rows = ctx.storage.failed_notifications(max(1, min(limit, 200)))
         items = []
         for r in rows:
             card = _detail_card(r.get("article_id"), r.get("title") or "(기사 정보 없음)",
                                 r.get("url_canonical") or r.get("url_original") or "")
             card["fail"] = {
-                "error": r.get("error") or "(원인이 기록되지 않았습니다)",
+                "error": redact_secrets(r.get("error")) or "(원인이 기록되지 않았습니다)",
                 "retry_count": r.get("retry_count"),
                 "created_at": r.get("created_at"),
                 "channel": r.get("channel"),
@@ -10240,15 +10285,18 @@ def create_app(ctx: Context):
         return JSONResponse({"items": items})
 
     @app.get("/api/stats/telegram-log")
-    def api_stats_telegram_log(limit: int = 100):
-        """대시보드 '발송 로그' 카드 — 봇으로 실제 나간 메시지 전문(알림·봇응답·테스트)."""
+    def api_stats_telegram_log(limit: int = 100, x_master_token: str = fastapi.Header(default="")):
+        """대시보드 '발송 로그' 카드 — 봇으로 실제 나간 메시지 전문(알림·봇응답·테스트). **마스터 전용**
+        (부서용 대화방 번호와, 일반 채널에 올리지 않는 부정 기사까지 전문이 들어 있다)."""
+        if (err := _master_guard(x_master_token)):
+            return err
         rows = ctx.storage.recent_telegram_logs(max(1, min(limit, 300)))
         return JSONResponse({"items": [{
             "created_at": r.get("created_at"),
             "chat_id": r.get("chat_id"),
             "kind": r.get("kind") or "기타",
             "ok": bool(r.get("ok")),
-            "error": r.get("error"),
+            "error": redact_secrets(r.get("error")) or None,
             "text": r.get("text") or "",
             "article_id": r.get("article_id"),
             "url": r.get("url_canonical") or r.get("url_original"),
@@ -14706,6 +14754,45 @@ def cmd_selftest() -> int:
     check("부처 소식 — 메타 저장 단계 관련성 판정도 통과",
           (_title_snippet_relevant("기후에너지환경부, 철강 탄소중립 로드맵 공개", "")[0],
            _title_snippet_relevant("국토교통부, 아파트 분양가 상한제 개편", "")[0]), (True, False))
+    # 보안 점검 (2026-10-26) — 오류 문구의 토큰 가리기, 부서용 알림 로그는 마스터만
+    _tok = "8123456789:AAH-xyzABC_def1234567890abcdefghijkl"
+    check("비밀 가리기 — 텔레그램 봇 토큰이 든 연결 오류 문구",
+          (_tok in redact_secrets(f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded with url: /bot{_tok}/sendMessage"),
+           "api.telegram.org" in redact_secrets(f"host=api.telegram.org url: /bot{_tok}/sendMessage")), (False, True))
+    check("비밀 가리기 — OpenAI 키·JWT·None·평범한 문구",
+          (redact_secrets("key=sk-abcdefghijklmnopqrstuvwxyz1234"), redact_secrets("t=eyJhbGciOiJIUzI1.eyJyb2xlIjoic2Vy.c2lnbmF0dXJlMTIz"),
+           redact_secrets(None), redact_secrets("chat not found")), ("key=***", "t=***", "", "chat not found"))
+    _lr = logging.LogRecord("pfm", logging.WARNING, __file__, 1, "실패: %s", (f"/bot{_tok}/getMe",), None)
+    _RedactFilter().filter(_lr)
+    check("비밀 가리기 — 로그 줄에서도 토큰이 사라진다", (_tok in _lr.getMessage(), "실패:" in _lr.getMessage()), (False, True))
+    try:
+        from fastapi.testclient import TestClient as _TC2
+    except Exception:
+        _TC2 = None
+    if _TC2 is not None:
+        _et.log_telegram({"chat_id": "-1009999", "kind": "부서용 테스트", "article_id": None,
+                          "text": "부정 기사 전문", "ok": False,
+                          "error": f"Max retries exceeded with url: /bot{_tok}/sendMessage"})
+        _sapp = create_app(_ectx)
+        _scl = _TC2(_sapp)
+        check("부서용 발송 로그 — 로그인 없이는 열 수 없다(401)",
+              (_scl.get("/api/stats/telegram-log").status_code, _scl.get("/api/stats/notify-failed").status_code), (401, 401))
+        _MASTER_TOKENS["test-master-token"] = now_utc() + timedelta(hours=1)
+        _lg = _scl.get("/api/stats/telegram-log", headers={"X-Master-Token": "test-master-token"})
+        check("부서용 발송 로그 — 마스터 토큰이면 열리고, 오류 문구의 토큰은 가려져 나온다",
+              (_lg.status_code, _tok in _lg.text, "부정 기사 전문" in _lg.text), (200, False, True))
+        check("발송 실패 목록 — 마스터 토큰이면 열린다",
+              _scl.get("/api/stats/notify-failed", headers={"X-Master-Token": "test-master-token"}).status_code, 200)
+        _MASTER_TOKENS.pop("test-master-token", None)
+        check("대외협력 '텔레그램 전송' — 로그인 없이는 보낼 수 없다(401)",
+              _scl.post("/api/ea/items/anything/telegram").status_code, 401)
+        _MASTER_TOKENS["test-master-token"] = now_utc() + timedelta(hours=1)
+        check("대외협력 '텔레그램 전송' — 마스터 토큰이면 인증은 통과한다(401 아님)",
+              _scl.post("/api/ea/items/anything/telegram", headers={"X-Master-Token": "test-master-token"}).status_code != 401, True)
+        _MASTER_TOKENS.pop("test-master-token", None)
+        check("일반 통계 숫자는 로그인 없이 그대로 볼 수 있다(개수만)", _scl.get("/api/stats").status_code, 200)
+        check("헤더 텔레그램 주소 API 는 부서용 주소를 내지 않는다",
+              "t.me/+DEPT" not in _scl.get("/api/telegram-link").text, True)
     # 제외 키워드 — 제목에 있으면 임계값·항상발송 키워드보다 우선해서 알림 차단
     def _notify_decision(title, score, threshold, always, exclude):
         excluded = _kw_hit_any(title, [k for k in exclude if k])

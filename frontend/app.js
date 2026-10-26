@@ -226,6 +226,7 @@ const STAT_DETAIL = {
   notify: {
     title: '발송 실패',
     api: '/api/stats/notify-failed',
+    master: true,      // 부서용 알림 내용이 들어 있어 마스터 로그인 후에만 열린다
     desc: '텔레그램으로 보내지 못한 기사입니다. 카드 위 붉은 칸이 텔레그램이 돌려준 실제 원인입니다.',
     cards: true,
     render: (it) => {
@@ -263,6 +264,7 @@ const STAT_DETAIL = {
   tglog: {
     title: '텔레그램 발송 로그',
     api: '/api/stats/telegram-log',
+    master: true,      // 부서용 알림 로그 — 마스터 로그인 후에만 열린다
     desc: '봇으로 실제 나간 메시지입니다. "발송 이유"가 이 기사를 왜 보냈는지 — '
         + '항상발송 키워드 매칭인지, 중요도 임계값 초과인지 — 알려줍니다. 최근 100건.',
     render: (it) => {
@@ -301,14 +303,16 @@ async function openStatDetail(kind) {
   list.replaceChildren(el('div', 'detail-empty', '불러오는 중…'));
   $('detailModal').hidden = false;
   try {
-    const data = await getJSON(spec.api);
+    const data = spec.master ? await (await masterFetch(spec.api)).json() : await getJSON(spec.api);
     const items = data.items || [];
     list.replaceChildren(
       ...(items.length ? items.map(spec.render)
                        : [el('div', 'detail-empty', '해당하는 항목이 없습니다.')]));
   } catch (err) {
     list.replaceChildren(
-      el('div', 'detail-empty', '목록을 불러오지 못했습니다: ' + err.message));
+      el('div', 'detail-empty', err.message === 'unauthorized'
+        ? '부서용 알림 내용이라 마스터 로그인이 필요합니다. 로그인 후 다시 눌러 주세요.'
+        : '목록을 불러오지 못했습니다: ' + err.message));
   }
 }
 
