@@ -6457,6 +6457,35 @@ def clean_site_name(name: str, domain: str = "") -> str:
     return name
 
 
+def aggregator_press_name(html: str, domain: str) -> str:
+    """네이버·다음 뉴스 페이지에서 '원래 언론사' 이름을 읽는다. 래퍼 도메인이 아니거나 못 찾으면 ''.
+
+    네이버 뉴스는 og:site_name 이 없고 twitter:site 가 '네이버 뉴스' 라서 그대로 두면 모든 기사의 언론사가
+    '네이버 뉴스' 가 된다. 실제 출처는 <meta property="og:article:author" content="연합뉴스 | 네이버"> 에 들어 있다.
+    """
+    if domain not in NEWS_AGGREGATORS:
+        return ""
+    for pat in (r'<meta[^>]+property=["\']og:article:author["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:article:author["\']'):
+        m = re.search(pat, html or "", re.I)
+        if m:
+            raw = re.sub(r"\s+", " ", html_mod.unescape(m.group(1))).strip()
+            parts = [x.strip() for x in re.split(r"\s*[|]\s*", raw) if x.strip()]
+            name = parts[0] if parts else ""
+            if name and _has_hangul(name) and name not in ("네이버", "네이버 뉴스", "다음", "Daum", "다음 뉴스"):
+                return name
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _seed_press_by_name() -> dict:
+    """매핑표의 언론사명 → (도메인, 등급). 같은 이름이 여러 도메인이면 먼저 나온 것."""
+    out: dict[str, tuple[str, int]] = {}
+    for dom, (nm, tier) in SEED_PRESS.items():
+        out.setdefault(nm, (dom, tier))
+    return out
+
+
 def site_name_from_html(html: str, domain: str = "") -> str:
     """HTML 의 og:site_name / <meta name=publisher> 에서 매체명을 뽑는다.
 
@@ -6467,6 +6496,9 @@ def site_name_from_html(html: str, domain: str = "") -> str:
     구분이 안 된다. <title> 기반 추정은 홈페이지에서만 신뢰할 수 있다
     (_homepage_site_name — 홈페이지 title은 '기사 제목'이 될 수 없다).
     """
+    real = aggregator_press_name(html, domain)
+    if real:
+        return real
     for pat in (r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']+)["\']',
                 r'<meta[^>]+name=["\'](?:twitter:site|publisher|source)["\'][^>]+content=["\']([^"\']+)["\']'):
         m = re.search(pat, html or "", re.I)
@@ -6603,6 +6635,13 @@ def resolve_press(storage: Storage, url: str, hint: str, html: str = "",
     domain = press_domain_of(url)
     if not domain:
         return (hint if hint and not _looks_like_domain(hint) else ""), None, 3
+
+    # 네이버·다음 뉴스 래퍼 페이지는 도메인이 아니라 '페이지에 적힌 원래 언론사'가 이 기사의 언론사다.
+    real = aggregator_press_name(html, domain)
+    if real:
+        dom2, tier2 = _seed_press_by_name().get(real, ("", 3))
+        row2 = press_row_cached(storage, dom2) if dom2 else None
+        return real, (row2 or {}).get("id"), int((row2 or {}).get("tier") or tier2 or 3)
 
     row = press_row_cached(storage, domain)
     seed = SEED_PRESS.get(domain)
@@ -11507,6 +11546,51 @@ def cmd_find(ctx: Context, term: str) -> list[dict]:
     return rows
 
 
+_AGG_PRESS_NAMES = frozenset({"네이버 뉴스", "네이버뉴스", "네이버", "다음 뉴스", "다음", "Daum", "daum", "Naver"})
+
+
+def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=None) -> dict:
+    """언론사가 '네이버 뉴스'·'다음' 같은 래퍼 이름으로 저장된 기사에서 원래 언론사 이름을 되찾는다.
+
+    네이버·다음 뉴스 주소로 직접 등록한 기사가 대상이다. 원문 페이지를 다시 받아 실제 출처를 읽는다.
+    dry 면 대상 수만 보여 주고 쓰지 않는다. limit 건까지 처리(기본 100).
+    """
+    fetch = fetch or prefetch_articles
+    rows = []
+    for r in ctx.storage.article_press_rows():
+        url = r.get("url_canonical") or r.get("url_original") or r.get("url_source") or ""
+        if (r.get("press_name") or "").strip() in _AGG_PRESS_NAMES or press_domain_of(url) in NEWS_AGGREGATORS:
+            rows.append((r, url))
+    todo = rows[:max(0, limit)]
+    log.info("[래퍼 언론사명 정리] 대상 %d건 중 %d건 처리%s", len(rows), len(todo), " (미리보기)" if dry else "")
+    result = {"targets": len(todo), "fixed": 0, "unchanged": 0, "nopage": 0}
+    if dry:
+        return result
+    pages = fetch(ctx.http, [u for _, u in todo if u])
+    names: Counter = Counter()
+    for r, url in todo:
+        _, html = pages.get(url, ("", ""))
+        if not html:
+            result["nopage"] += 1
+            continue
+        real = aggregator_press_name(html, press_domain_of(url))
+        if not real:
+            result["unchanged"] += 1
+            continue
+        dom2, tier2 = _seed_press_by_name().get(real, ("", 3))
+        row2 = ctx.storage.press_by_domain(dom2) if dom2 else None
+        patch: dict[str, Any] = {"press_name": real}
+        if row2:
+            patch["press_id"] = row2["id"]
+        ctx.storage.update_article(r["id"], patch)
+        result["fixed"] += 1
+        names[real] += 1
+    log.info("래퍼 언론사명 정리: %d건 교정 · %d건 원문에서 못 찾음 · %d건 원문 못 받음 — %s",
+             result["fixed"], result["unchanged"], result["nopage"],
+             ", ".join(f"{n} {c}" for n, c in names.most_common(8)) or "-")
+    return result
+
+
 def cmd_fixcategories(ctx: Context) -> None:
     """카테고리를 제목+요약 기준으로 재태깅한다 (일회성).
 
@@ -13569,6 +13653,27 @@ def cmd_selftest() -> int:
               "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               ("fd1", "u/fd1", "u/fd1", "u/fd1", "전기차 시험기사 보관됨", iso(_pn), iso(_pn), "manual", 10, "[]", "[]",
                "시험", None, "archived", 0))
+    # 네이버 뉴스 래퍼 — 원래 언론사 이름을 페이지에서 읽는다
+    _nv_html = ('<meta property="og:article:author" content="연합뉴스 | 네이버"><meta name="twitter:site" content="네이버 뉴스">'
+                '<meta name="twitter:creator" content="연합뉴스"><p>본문</p>')
+    _et.upsert_press("yna.co.kr", "연합뉴스", 1, "approved")
+    _nr = resolve_press(_et, "https://n.news.naver.com/mnews/article/001/0015000000", "", _nv_html, None)
+    check("네이버 뉴스 — 언론사는 '네이버 뉴스'가 아니라 페이지에 적힌 원래 언론사(연합뉴스)",
+          (site_name_from_html(_nv_html, "naver.com"), _nr[0], _nr[1] is not None, _nr[2]),
+          ("연합뉴스", "연합뉴스", True, 1))
+    check("네이버 뉴스 아닌 일반 사이트는 이 규칙을 타지 않는다",
+          (aggregator_press_name(_nv_html, "mt.co.kr"), aggregator_press_name('<meta property="og:article:author" content="네이버">', "naver.com")),
+          ("", ""))
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("ag1", "u/ag1", "https://n.news.naver.com/mnews/article/001/1", "https://n.news.naver.com/mnews/article/001/1",
+               "네이버 래퍼 시험", iso(_pn), iso(_pn), "manual", 10, "[]", "[]", "네이버 뉴스", iso(_pn), "active", 1))
+    _agf = lambda h, urls: {u: ("", _nv_html) for u in urls}
+    _ag0 = cmd_fixaggpress(_ectx, 10, dry=True, fetch=_agf)
+    check("fixaggpress --dry — 대상만 세고 쓰지 않는다", (_ag0["targets"] >= 1, _et.article_detail("ag1")["press_name"]), (True, "네이버 뉴스"))
+    _ag1 = cmd_fixaggpress(_ectx, 10, fetch=_agf)
+    check("fixaggpress — 원래 언론사명으로 바꾼다", (_ag1["fixed"] >= 1, _et.article_detail("ag1")["press_name"]), (True, "연합뉴스"))
     _fd = cmd_find(_ectx, "전기차 시험기사")
     check("find — 상태와 상관없이 찾고 보관·중복·분석 대기 이유를 알려 준다(쓰지 않음)",
           (len(_fd), _fd[0]["status"], _et.article_detail("fd1")["status"]), (1, "archived", "archived"))
@@ -15994,6 +16099,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
+  fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
@@ -16059,6 +16165,9 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fillauthors":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fillauthors(ctx, int(_nums[0]) if _nums else 150, dry="--dry" in argv[2:])
+    elif command == "fixaggpress":
+        _nums = [a for a in argv[2:] if a.isdigit()]
+        cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
     elif command == "why":
