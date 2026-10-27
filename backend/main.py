@@ -11283,7 +11283,7 @@ def cmd_fixauthors(ctx: Context) -> None:
     log.info("기자명 복구: %d건 정리 · %d건 재추출 · %d건 제거", fixed, recovered, cleared)
 
 
-def cmd_fillauthors(ctx: Context, limit: int = 150, dry: bool = False, fetch=None) -> dict:
+def cmd_fillauthors(ctx: Context, limit: int = 150, dry: bool = False, fetch=None, probe: bool = True) -> dict:
     """기자명이 비어 있는 기사에서 원문을 다시 받아 기자명을 채운다 (fixauthors 는 '있는 값'만 고친다).
 
     최근 기사부터 limit 건. 원문에 기자명이 정말 없는 매체(예: kbench)는 그대로 비워 둔다.
@@ -11304,11 +11304,15 @@ def cmd_fillauthors(ctx: Context, limit: int = 150, dry: bool = False, fetch=Non
     urls = [r.get("url_original") or r.get("url_canonical") or "" for r in todo]
     pages = fetch(ctx.http, [u for u in urls if u])
     miss_by_press: Counter = Counter()
+    none_samples: dict[str, tuple[str, str]] = {}   # 매체별 '기자명 못 찾음' 예시 — 원인 점검용
+    nopage_samples: dict[str, str] = {}             # 매체별 '원문 못 받음' 예시
     for r, u in zip(todo, urls):
         _, html = pages.get(u, ("", ""))
         press = (r.get("press_name") or "").strip()
+        label = press_display_name(press, u) or "(이름 없음)"
         if not html:
             result["nopage"] += 1
+            nopage_samples.setdefault(label, u)
             continue
         name = extract_author(html, extract_body(html), press)
         if name:
@@ -11316,10 +11320,25 @@ def cmd_fillauthors(ctx: Context, limit: int = 150, dry: bool = False, fetch=Non
             result["filled"] += 1
         else:
             result["none"] += 1
-            miss_by_press[press_display_name(press, u) or "(이름 없음)"] += 1
+            miss_by_press[label] += 1
+            # 본문에 '기자'가 나오는 자리를 함께 남겨, 추출 규칙이 놓친 것인지(서명이 있는데 못 읽음) 판단한다.
+            m = re.search(r"기자", html)
+            hint = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html[max(0, m.start() - 40): m.end() + 40])) if m else "'기자' 글자 없음"
+            none_samples.setdefault(label, (u, hint.strip()[:80]))
     log.info("기자명 채우기: %d건 채움 · %d건 원문에 기자명 없음 · %d건 원문 못 받음", result["filled"], result["none"], result["nopage"])
     if miss_by_press:
         log.info("  원문에 기자명을 못 찾은 매체: %s", ", ".join(f"{n} {c}" for n, c in miss_by_press.most_common(10)))
+        for label, (u, hint) in list(none_samples.items())[:8]:
+            log.info("    · [%s] %s | HTML 속 '기자' 주변: %s", label[:10], u[:80], hint)
+    if probe and nopage_samples:
+        # 원문을 못 받은 매체는 한 건씩 직접 받아 보고 접속 오류(차단·시간초과)를 알린다.
+        for label, u in list(nopage_samples.items())[:6]:
+            try:
+                resp = ctx.http.get(u, allow_redirects=True, timeout=15)
+                state = f"HTTP {resp.status_code}, {len(resp.content or b'')}바이트, 최종 주소 {resp.url[:60]}"
+            except Exception as exc:
+                state = f"접속 예외: {type(exc).__name__} {str(exc)[:60]}"
+            log.info("    · 원문 못 받음 [%s] %s | %s", label[:10], u[:70], state)
     return result
 
 
@@ -13443,7 +13462,14 @@ def cmd_selftest() -> int:
     _et._exec("update articles set url_original='https://zz.example.com/a' where id='pc1'")
     _far = cmd_fillauthors(_ectx, 5, dry=True, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls})
     check("fillauthors --dry — 대상만 세고 쓰지 않는다", (_far["targets"] >= 1, _far["filled"], _et.article_detail("pc1")["author"] or ""), (True, 0, ""))
-    _far = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls})
+    _far = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls}, probe=False)
+    _et._exec("update articles set author='' where id='pc1'")
+    _far2 = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {u: ("", "<html><p>기자명 없는 글</p></html>") for u in urls}, probe=False)
+    check("fillauthors — 기자명 없는 원문·못 받은 원문은 건수만 세고 그대로 둔다",
+          (_far2["filled"], _far2["none"] >= 1, _et.article_detail("pc1")["author"] or ""), (0, True, ""))
+    _far3 = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {}, probe=False)
+    check("fillauthors — 원문을 못 받으면 nopage 로 센다", (_far3["filled"], _far3["nopage"] >= 1), (0, True))
+    _far = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls}, probe=False)
     check("fillauthors — 원문에서 기자명을 찾아 채운다", (_far["filled"] >= 1, _et.article_detail("pc1")["author"]), (True, "김나연"))
 
     _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
