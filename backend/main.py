@@ -2515,9 +2515,10 @@ SEED_FEEDS: list[tuple[str, str, str, bool]] = [
 # 도메인 → (언론사명, tier). tier 1=주요지, 2=업계·경제지, 3=기타 (PRD F2.3)
 SEED_PRESS: dict[str, tuple[str, int]] = {
     # 사용자가 정식 이름을 알려 준 매체 (2026-10-26)
-    "kbench.com": ("Korea benchmark", 3), "futurechosen.com": ("더나은경제", 3),
-    "economictimes.com": ("economictimes", 3), "busanmbc.co.kr": ("부산MBC", 3),
-    "koreabiomed.com": ("Korea Biomedical Review", 3),
+    "kbench.com": ("Korea benchmark", 3), "futurechosun.com": ("더나은경제", 3),
+    "economictimes.com": ("economictimes", 3), "econotimes.com": ("economictimes", 3),
+    "busanmbc.co.kr": ("부산MBC", 3), "koreabiomed.com": ("Korea Biomedical Review", 3),
+    "ifs.or.kr": ("IFS POST", 3), "robotzine.co.kr": ("로봇기술", 3), "stnsports.co.kr": ("STN뉴스", 3),
     "chosun.com": ("조선일보", 1), "donga.com": ("동아일보", 1), "joongang.co.kr": ("중앙일보", 1),
     "hani.co.kr": ("한겨레", 1), "khan.co.kr": ("경향신문", 1), "yna.co.kr": ("연합뉴스", 1),
     "news1.kr": ("뉴스1", 1), "newsis.com": ("뉴시스", 1), "kbs.co.kr": ("KBS", 1),
@@ -4625,7 +4626,9 @@ AUTHOR_PATTERNS = [
     # 없는 경우) 이 수식어 자체가 캡처되는데, _valid_author 의 NON_AUTHOR_WORDS 가
     # 그런 수식어를 걸러낸다.
     re.compile(r'([가-힣]{2,4})\s*(?:칼럼|시민|객원|명예|인턴|수습|선임|특약)?기자'),
-    re.compile(r'<meta[^>]+(?:name|property)=["\'](?:author|article:author|dable:author)["\'][^>]+content=["\']([^"\']{2,30})["\']', re.I),
+    # 메타 태그는 사이트마다 속성 순서가 달라(name→content / content→name) 두 순서를 모두 본다. (group 1 또는 2)
+    re.compile(r'<meta[^>]+(?:name|property)=["\'](?:author|article:author|dable:author)["\'][^>]*?content=["\']([^"\']{2,30})["\']'
+               r'|<meta[^>]+content=["\']([^"\']{2,30})["\'][^>]*?(?:name|property)=["\'](?:author|article:author|dable:author)["\']', re.I),
 ]
 
 # 기자명 자리에 매체명이 잡히는 것을 막는다 (예: '중앙이코노미뉴스')
@@ -4777,7 +4780,7 @@ def extract_author(html: str, body: str, press_name: str = "") -> str:
     # 3) meta[name=author] (매체명을 넣는 사이트가 많아 최후 순위, 단일 매치)
     for source in (html, body):
         if source and (m := AUTHOR_PATTERNS[2].search(source)):
-            if name := _valid_author(m.group(1), press_key):
+            if name := _valid_author(m.group(1) or m.group(2) or "", press_key):
                 return name
 
     return ""
@@ -11280,6 +11283,46 @@ def cmd_fixauthors(ctx: Context) -> None:
     log.info("기자명 복구: %d건 정리 · %d건 재추출 · %d건 제거", fixed, recovered, cleared)
 
 
+def cmd_fillauthors(ctx: Context, limit: int = 150, dry: bool = False, fetch=None) -> dict:
+    """기자명이 비어 있는 기사에서 원문을 다시 받아 기자명을 채운다 (fixauthors 는 '있는 값'만 고친다).
+
+    최근 기사부터 limit 건. 원문에 기자명이 정말 없는 매체(예: kbench)는 그대로 비워 둔다.
+    dry 면 대상 수·매체별 건수만 보여 주고 아무것도 쓰지 않는다.
+    """
+    fetch = fetch or prefetch_articles
+    rows = [r for r in ctx.storage.list_articles(5000, 0, None, "")
+            if r.get("status") in (None, "active") and not author_display(r.get("author") or "")]
+    todo = rows[:max(0, limit)]
+    by_press = Counter(press_display_name((r.get("press_name") or "").strip(),
+                                          r.get("url_canonical") or r.get("url_original") or "") or "(이름 없음)" for r in todo)
+    log.info("[기자명 채우기] 기자명 없는 기사 %d건 중 %d건 대상 — 매체별: %s", len(rows), len(todo),
+             ", ".join(f"{n} {c}" for n, c in by_press.most_common(8)) or "없음")
+    result = {"targets": len(todo), "filled": 0, "none": 0, "nopage": 0}
+    if dry:
+        log.info("[미리보기] 실제로 채우려면 --dry 없이 다시 실행하세요.")
+        return result
+    urls = [r.get("url_original") or r.get("url_canonical") or "" for r in todo]
+    pages = fetch(ctx.http, [u for u in urls if u])
+    miss_by_press: Counter = Counter()
+    for r, u in zip(todo, urls):
+        _, html = pages.get(u, ("", ""))
+        press = (r.get("press_name") or "").strip()
+        if not html:
+            result["nopage"] += 1
+            continue
+        name = extract_author(html, extract_body(html), press)
+        if name:
+            ctx.storage.update_article(r["id"], {"author": name})
+            result["filled"] += 1
+        else:
+            result["none"] += 1
+            miss_by_press[press_display_name(press, u) or "(이름 없음)"] += 1
+    log.info("기자명 채우기: %d건 채움 · %d건 원문에 기자명 없음 · %d건 원문 못 받음", result["filled"], result["none"], result["nopage"])
+    if miss_by_press:
+        log.info("  원문에 기자명을 못 찾은 매체: %s", ", ".join(f"{n} {c}" for n, c in miss_by_press.most_common(10)))
+    return result
+
+
 # 이름 어딘가에 도메인 꼬리('.com'·'.co.kr' 등)가 붙은 언론사명 — 점검용
 _DOMAINISH_NAME_RE = re.compile(r"(?i)[a-z0-9-]+\.(?:co\.kr|or\.kr|com|net|org|kr|io|tv|news|me)\b")
 
@@ -13391,6 +13434,17 @@ def cmd_selftest() -> int:
     check("presscheck — 도메인 꼬리 남은 이름과 기자명 없는 기사를 찾아낸다(쓰지 않음)",
           ("아무개뉴스.co.kr" in _pcr["domainish"], _pcr["authors"]["아무개뉴스.co.kr"]["miss"],
            _et.article_detail("pc1")["press_name"]), (True, 1, "아무개뉴스.co.kr"))
+    # 메타 태그 속성 순서가 달라도 기자명을 읽는다(세계일보·아시아투데이 형식)
+    check("기자명 — 메타 태그 속성 순서(name→content / content→name) 둘 다 읽는다",
+          [extract_author('<meta property="dable:author" content="이한솔">', ""),
+           extract_author('<meta content="이종민" property="article:author">', ""),
+           extract_author('<meta name="author" content="이데일리">', "", "이데일리")], ["이한솔", "이종민", ""])
+    _fa = {"pc1": ('', '<html><meta content="김나연" property="dable:author"><p>본문 ' + "가" * 80 + '</p></html>')}
+    _et._exec("update articles set url_original='https://zz.example.com/a' where id='pc1'")
+    _far = cmd_fillauthors(_ectx, 5, dry=True, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls})
+    check("fillauthors --dry — 대상만 세고 쓰지 않는다", (_far["targets"] >= 1, _far["filled"], _et.article_detail("pc1")["author"] or ""), (True, 0, ""))
+    _far = cmd_fillauthors(_ectx, 5, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls})
+    check("fillauthors — 원문에서 기자명을 찾아 채운다", (_far["filled"] >= 1, _et.article_detail("pc1")["author"]), (True, "김나연"))
 
     _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
               "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
@@ -13401,9 +13455,11 @@ def cmd_selftest() -> int:
     _why = cmd_why(_ectx, "포스텍")
     check("why — 제목에 말이 든 기사를 찾아 포스코 언급 관문을 보여 준다(쓰지 않음)",
           (len(_why), any("포스코" in t and "본문" in t for t in _why[0]["reasons"]) if _why else None), (1, True))
-    check("매핑표 — 사용자가 알려 준 매체 5곳",
-          [SEED_PRESS[d][0] for d in ("kbench.com", "futurechosen.com", "economictimes.com", "busanmbc.co.kr", "koreabiomed.com")],
-          ["Korea benchmark", "더나은경제", "economictimes", "부산MBC", "Korea Biomedical Review"])
+    check("매핑표 — 사용자가 알려 준 매체",
+          [SEED_PRESS[d][0] for d in ("kbench.com", "futurechosun.com", "economictimes.com", "econotimes.com", "busanmbc.co.kr",
+                                      "koreabiomed.com", "ifs.or.kr", "robotzine.co.kr", "stnsports.co.kr")],
+          ["Korea benchmark", "더나은경제", "economictimes", "economictimes", "부산MBC", "Korea Biomedical Review",
+           "IFS POST", "로봇기술", "STN뉴스"])
     check("언론사명 — 도메인으로 저장된 이름을 정식 이름으로 보여 준다",
           (press_display_name("busanmbc.co.kr", "https://www.busanmbc.co.kr/n/1"),
            press_display_name("koreabiomed.com", "https://www.koreabiomed.com/news/1")),
@@ -15806,6 +15862,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
+  fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
   presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
@@ -15865,6 +15922,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixauthors(ctx)
     elif command == "presscheck":
         cmd_presscheck(ctx)
+    elif command == "fillauthors":
+        _nums = [a for a in argv[2:] if a.isdigit()]
+        cmd_fillauthors(ctx, int(_nums[0]) if _nums else 150, dry="--dry" in argv[2:])
     elif command == "why":
         cmd_why(ctx, " ".join(argv[2:]))
     elif command == "fixgroups":
