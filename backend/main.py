@@ -786,6 +786,10 @@ class Storage(ABC):
         """보관 중인 본문(최근 30일)에 term 이 들어 있는 기사 id. 대소문자 무시."""
 
     @abstractmethod
+    def find_articles_any_status(self, term: str, limit: int = 15) -> list[dict]:
+        """제목에 term 이 든 기사를 상태(active·draft·archived)·대표 여부와 상관없이 최근 수집 순으로 찾는다 (점검용)."""
+
+    @abstractmethod
     def article_press_rows(self) -> list[dict]:
         """모든 기사의 id·press_id·press_name·URL 만 가볍게 읽는다 (언론사명 정비용)."""
 
@@ -1556,6 +1560,10 @@ class SqliteStorage(Storage):
                           (f"%{term}%", limit))
         return {r["article_id"] for r in rows}
 
+    def find_articles_any_status(self, term: str, limit: int = 15) -> list[dict]:
+        return self._rows("select id, title, status, is_representative, source_type, analyzed_at, collected_at, published_at, press_name, group_companies, categories, importance_score, dedup_group_id, url_canonical from articles where title like ? order by collected_at desc limit ?",
+                          (f"%{term}%", limit))
+
     def article_press_rows(self) -> list[dict]:
         return self._rows("select id, press_id, press_name, url_canonical, url_original,"
                           " url_source from articles")
@@ -2304,6 +2312,10 @@ class SupabaseStorage(Storage):
             return set()
         return {r["article_id"] for r in self._page(lambda: (
             self._t("article_bodies").select("article_id").ilike("body", f"%{term}%")), cap=limit)}
+
+    def find_articles_any_status(self, term: str, limit: int = 15) -> list[dict]:
+        return (self._t("articles").select("id,title,status,is_representative,source_type,analyzed_at,collected_at,published_at,press_name,group_companies,categories,importance_score,dedup_group_id,url_canonical")
+                .ilike("title", f"%{term}%").order("collected_at", desc=True).limit(limit).execute().data or [])
 
     def article_press_rows(self) -> list[dict]:
         return self._page(lambda: self._t("articles").select(
@@ -11461,6 +11473,40 @@ def cmd_why(ctx: Context, term: str) -> list[dict]:
     return out
 
 
+def cmd_find(ctx: Context, term: str) -> list[dict]:
+    """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
+
+    목록(화면)은 활성·대표·분석 완료 기사만 보여 주므로, 직접 등록했는데 안 보이면 이 명령으로 상태를 본다.
+    """
+    term = (term or "").strip()
+    if not term:
+        log.warning("사용법: find <제목에 들어간 말>  예) find 전기차")
+        return []
+    rows = ctx.storage.find_articles_any_status(term, 15)
+    log.info("[기사 상태 점검] 제목에 '%s' 가 든 기사 %d건 (최근 수집 순, 최대 15건)", term, len(rows))
+    for r in rows:
+        why: list[str] = []
+        if r.get("status") == "draft":
+            why.append("미리보기만 만들고 '등록'을 누르지 않은 임시 저장(draft) — 목록에 안 뜸")
+        elif r.get("status") == "archived":
+            why.append("보관(archived) — 포스코·배터리·정부 소식 등 수집 관문에 안 맞아 무관으로 정리되었거나 직접 정리됨")
+        elif r.get("status") != "active":
+            why.append(f"상태 '{r.get('status')}'")
+        if not r.get("is_representative"):
+            why.append("같은 사건의 다른 기사에 흡수된 중복 기사 — 대표 기사 하나만 목록에 뜸(대표 id: " + str(r.get("dedup_group_id") or "?")[:8] + ")")
+        if not r.get("analyzed_at"):
+            why.append("AI 분석이 끝나지 않음(대기·실패) — 분석 완료 전에는 목록에 안 뜸")
+        if not why:
+            why.append("정상 — 활성·대표·분석 완료 (필터·기간·논조 칩 때문에 가려진 것일 수 있음)")
+        log.info("  · [%s] %s | %s · 수집 %s · 발행 %s", (r.get("press_name") or "")[:10], (r.get("title") or "")[:50],
+                 r.get("source_type") or "?", str(r.get("collected_at") or "")[:16], str(r.get("published_at") or "")[:16])
+        log.info("      그룹사 %s · 카테고리 %s · 중요도 %s", "·".join(jload(r.get("group_companies"), [])) or "-",
+                 "·".join(jload(r.get("categories"), [])) or "-", r.get("importance_score"))
+        for w in why:
+            log.info("      → %s", w)
+    return rows
+
+
 def cmd_fixcategories(ctx: Context) -> None:
     """카테고리를 제목+요약 기준으로 재태깅한다 (일회성).
 
@@ -13518,6 +13564,14 @@ def cmd_selftest() -> int:
               ("pt1", "u/pt1", "u/pt1", "u/pt1", "포스텍 연구팀 신소재 개발", iso(_pn), iso(_pn), "naver", 10, "[]", "[]",
                "테스트", iso(_pn), "active", 1))
     _et.save_body("pt1", "포스텍 연구팀은 이번 연구에서 포스코홀딩스의 지원을 받았다고 밝혔다. " * 2, "fulltext")
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("fd1", "u/fd1", "u/fd1", "u/fd1", "전기차 시험기사 보관됨", iso(_pn), iso(_pn), "manual", 10, "[]", "[]",
+               "시험", None, "archived", 0))
+    _fd = cmd_find(_ectx, "전기차 시험기사")
+    check("find — 상태와 상관없이 찾고 보관·중복·분석 대기 이유를 알려 준다(쓰지 않음)",
+          (len(_fd), _fd[0]["status"], _et.article_detail("fd1")["status"]), (1, "archived", "archived"))
     _why = cmd_why(_ectx, "포스텍")
     check("why — 제목에 말이 든 기사를 찾아 포스코 언급 관문을 보여 준다(쓰지 않음)",
           (len(_why), any("포스코" in t and "본문" in t for t in _why[0]["reasons"]) if _why else None), (1, True))
@@ -15940,6 +15994,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixpress [--dry]  언론사명 정리 (도메인으로 저장된 매체명을 정식 이름으로 교체,
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
+  find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
   presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
@@ -16004,6 +16059,8 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fillauthors":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fillauthors(ctx, int(_nums[0]) if _nums else 150, dry="--dry" in argv[2:])
+    elif command == "find":
+        cmd_find(ctx, " ".join(argv[2:]))
     elif command == "why":
         cmd_why(ctx, " ".join(argv[2:]))
     elif command == "fixgroups":
