@@ -10213,7 +10213,7 @@ def create_app(ctx: Context):
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20,
                      sort: str = "recent", s_title: str = "", s_body: str = "",
-                     s_press: str = "", s_author: str = ""):
+                     s_press: str = "", s_author: str = "", senti: str = ""):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
@@ -10227,6 +10227,10 @@ def create_app(ctx: Context):
                                 {normalize_chip(x) for x in _split_multi(group)},
                                 {normalize_chip(x) for x in _split_multi(cat)},
                                 {normalize_chip(x) for x in _split_multi(press)})
+        # 논조(긍정·중립·부정) 필터 — 카드 칩과 같은 기준(감성이 비어 있으면 카드에 '중립'으로 보인다). 같은 줄 안은 OR.
+        wanted_senti = {x for x in _split_multi(senti) if x in ("긍정", "중립", "부정")}
+        if wanted_senti:
+            matched = [t for t in matched if (t["row"].get("sentiment") or "중립") in wanted_senti]
         # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
         # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
         # 순서에 기대다가 신규 기사가 마지막 페이지로 밀리는 장애가 있었다).
@@ -15101,6 +15105,18 @@ def cmd_selftest() -> int:
         check("대외협력 '텔레그램 전송' — 마스터 토큰이면 인증은 통과한다(401 아님)",
               _scl.post("/api/ea/items/anything/telegram", headers={"X-Master-Token": "test-master-token"}).status_code != 401, True)
         _MASTER_TOKENS.pop("test-master-token", None)
+        # 논조 필터 — 긍정·중립·부정 칩이 카드 칩과 같은 기준으로 거른다
+        for _sid, _sv in (("sv1", "긍정"), ("sv2", "중립"), ("sv3", "부정"), ("sv4", None)):
+            _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                      "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                      "is_representative,sentiment) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (_sid, "u/" + _sid, "u/" + _sid, "u/" + _sid, "논조필터시험 " + _sid, iso(_pn), iso(_pn), "rss", 10,
+                       '["포스코퓨처엠"]', "[]", "시험", iso(_pn), "active", 1, _sv))
+        _sentis = lambda q: sorted(i["title"][-3:] for i in _scl.get("/api/articles?size=100&q=논조필터시험" + q).json()["items"])
+        check("논조 필터 — 긍정·부정·중립(감성 없음은 카드처럼 중립) 각각, 중복 선택은 OR",
+              (_sentis(""), _sentis("&senti=긍정"), _sentis("&senti=부정"), _sentis("&senti=중립"),
+               _sentis("&senti=긍정,부정"), _sentis("&senti=엉뚱한값")),
+              (["sv1", "sv2", "sv3", "sv4"], ["sv1"], ["sv3"], ["sv2", "sv4"], ["sv1", "sv3"], ["sv1", "sv2", "sv3", "sv4"]))
         check("일반 통계 숫자는 로그인 없이 그대로 볼 수 있다(개수만)", _scl.get("/api/stats").status_code, 200)
         check("헤더 텔레그램 주소 API 는 부서용 주소를 내지 않는다",
               "t.me/+DEPT" not in _scl.get("/api/telegram-link").text, True)

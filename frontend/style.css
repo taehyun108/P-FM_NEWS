@@ -233,6 +233,13 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   background: var(--navy); border-color: var(--navy); color: #fff; font-weight: 600;
 }
 .chip:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
+/* 논조 필터 칩 — 카드의 긍정(파랑)·중립(회색)·부정(빨강) 칩과 같은 색. 눌렸을 때는 그 색으로 채운다. */
+.chip.chip-pos { border-color: var(--pos); color: var(--pos); }
+.chip.chip-neu { border-color: var(--ink-mid); color: var(--ink-mid); }
+.chip.chip-neg { border-color: var(--neg); color: var(--neg); }
+.chip.chip-pos[aria-pressed="true"] { background: var(--pos); border-color: var(--pos); color: #fff; }
+.chip.chip-neu[aria-pressed="true"] { background: var(--ink-mid); border-color: var(--ink-mid); color: #fff; }
+.chip.chip-neg[aria-pressed="true"] { background: var(--neg); border-color: var(--neg); color: #fff; }
 /* '+N개 더' · '접기' — 값 칩이 아니라 조작 버튼이므로 톤을 낮춘다. */
 .chip-more {
   border-style: dashed; border-color: var(--line);

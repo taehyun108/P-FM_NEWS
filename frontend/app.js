@@ -16,6 +16,7 @@ const state = {
   group: new Set(),
   cat: new Set(),
   press: new Set(),
+  senti: new Set(),   // 논조 필터 — '긍정'·'중립'·'부정' (카드 칩과 같은 기준)
   period: 'all',
   sort: 'recent',   // 'recent'(발행일 최신순, 기본) | 'score'(직접 등록·중요도순)
   q: '',
@@ -114,6 +115,7 @@ function readStateFromURL() {
   load('group', state.group);
   load('cat', state.cat);
   load('press', state.press);
+  load('senti', state.senti);
   state.period = p.get('period') || 'all';
   state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
   state.q = p.get('q') || '';
@@ -126,6 +128,7 @@ function writeStateToURL() {
   if (state.group.size) p.set('group', [...state.group].join(','));
   if (state.cat.size) p.set('cat', [...state.cat].join(','));
   if (state.press.size) p.set('press', [...state.press].join(','));
+  if (state.senti.size) p.set('senti', [...state.senti].join(','));
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
@@ -324,6 +327,10 @@ function closeStatDetail() { $('detailModal').hidden = true; }
 const PRESS_CHIP_LIMIT = 24;
 let pressChipsExpanded = false;
 
+// 논조 필터 칩 — 카드의 긍정·중립·부정 칩과 같은 기준(포스코퓨처엠 관점). 값이 고정이라 서버에서 받지 않는다.
+const SENTI_OPTIONS = ['긍정', '중립', '부정'];
+const SENTI_CHIP_CLASS = { 긍정: 'chip-pos', 중립: 'chip-neu', 부정: 'chip-neg' };
+
 function renderChipGroup(container, values, selected, onToggle, single = false) {
   container.replaceChildren(...values.map((v) => {
     const key = typeof v === 'string' ? v : v.key;
@@ -361,6 +368,7 @@ function renderFilterChips(data) {
   }, true);
 
   const multi = [
+    ['sentiChips', SENTI_OPTIONS, state.senti, 0],
     ['groupChips', data.groups, state.group, 0],
     ['catChips', data.categories, state.cat, 0],
     // 언론사는 370곳이 넘는다. 전부 펼치면 필터만으로 화면을 채워 기사 카드가
@@ -385,6 +393,10 @@ function renderFilterChips(data) {
       $(id).append(more);
     } else {
       renderChipGroup($(id), values, set, onToggle);
+      if (id === 'sentiChips') {
+        // 긍정(파랑)·중립(회색)·부정(빨강) — 카드 칩 색과 맞춘다.
+        [...$(id).children].forEach((b) => b.classList.add(SENTI_CHIP_CLASS[b.textContent] || 'chip-neu'));
+      }
       if (cap && values.length > cap) {
         const less = el('button', 'chip chip-more', '접기');
         less.type = 'button';
@@ -403,6 +415,7 @@ function syncChipStates() {
       btn.setAttribute('aria-pressed', String(on));
     }
   };
+  sync('sentiChips', state.senti);
   sync('groupChips', state.group);
   sync('catChips', state.cat);
   sync('pressChips', state.press);
@@ -1970,6 +1983,7 @@ function buildQuery() {
   if (state.group.size) p.set('group', [...state.group].join(','));
   if (state.cat.size) p.set('cat', [...state.cat].join(','));
   if (state.press.size) p.set('press', [...state.press].join(','));
+  if (state.senti.size) p.set('senti', [...state.senti].join(','));
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.q) p.set('q', state.q);
@@ -2075,7 +2089,7 @@ function renderPagination(page, total) {
 /* ── 필터 접기/펼치기 ──────────────────────────────────────────── */
 
 function activeFilterCount() {
-  return state.group.size + state.cat.size + state.press.size
+  return state.group.size + state.cat.size + state.press.size + state.senti.size
     + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0) + advActive().length;
 }
 
@@ -2097,6 +2111,7 @@ function updateActiveFilterCount() {
     box.append(document.createTextNode(val));
   };
   seg('기간', PERIOD_LABEL[state.period] || '전체');
+  if (state.senti.size) seg('논조', [...state.senti].join(', '));
   seg('그룹사', state.group.size ? [...state.group].join(', ') : '전체');
   seg('카테고리', state.cat.size ? [...state.cat].join(', ') : '전체');
   seg('언론사', state.press.size ? [...state.press].join(', ') : '전체');
@@ -2291,7 +2306,7 @@ function init() {
     if (pressView) togglePressView();       // 언론사 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 전체 목록으로
-    state.group.clear(); state.cat.clear(); state.press.clear();
+    state.group.clear(); state.cat.clear(); state.press.clear(); state.senti.clear();
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
     ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = ''; $(id).value = ''; });
