@@ -3496,6 +3496,41 @@ BATTERY_SCOPE_KW = [
 BATTERY_TITLE_KW = ["전기차", "전기 자동차", "전기자동차", "배터리", "이차전지", "2차전지", "전기차충전", "EV "]
 
 
+# ── 잡음 기사 제외 (사용자 지정 2026-10-28) ─────────────────────────────────────────
+# 포스코 계열이 제목·리드에 없는 기사 중 '주식·시세' 기사와 '수상·시상' 기사는 배터리·포스코 업무와 무관해 번잡만 만든다.
+# (포스코 계열 기사는 이 규칙을 타지 않는다 — 포스코퓨처엠 수상 소식 등은 계속 받는다.)
+NOISE_STOCK_KW = (
+    "주가", "특징주", "목표주가", "투자의견", "코스피", "코스닥", "상한가", "하한가", "공매도", "순매수", "순매도",
+    "증시", "종가", "관련주", "수혜주", "테마주", "시가총액", "시총", "신고가", "신저가", "밸류업", "브랜드평판", "빅데이터 분석",
+)
+# '시황'은 리튬·니켈 같은 원자재 시황이면 사업과 직결되므로 원자재 낱말이 함께 있으면 살린다.
+_NOISE_RAW_MATERIAL_RE = re.compile(r"리튬|니켈|코발트|흑연|망간|철광석|원자재|광물|전구체|탄산|수산화")
+# 수상(受賞)·시상·훈장. '일본 수상'(총리)·'수상 태양광'(물 위)은 제외하려고 '○○상 수상'·'수상자·수상작' 꼴만 본다.
+_NOISE_AWARD_RE = re.compile(
+    r"(?:[가-힣A-Za-z0-9]상|어워드|award)['\"’”]?\s*(?:을|를)?\s*(?:\S{0,8}\s*)?수상"
+    r"|수상(?:자|작|식|소감|내역|\s*영예)|어워드|시상|수여식|표창|감사패|포상|훈장|수훈",
+    re.IGNORECASE)
+
+
+def noise_title_reason(title: str) -> str:
+    """'주식·시세' 또는 '수상·시상' 기사 제목이면 그 이유, 아니면 ''. (포스코 계열 여부는 호출부가 따진다)"""
+    t = title or ""
+    if "시황" in t and not _NOISE_RAW_MATERIAL_RE.search(t):
+        return "주식·시세"
+    if any(k in t for k in NOISE_STOCK_KW):
+        return "주식·시세"
+    if _NOISE_AWARD_RE.search(t):
+        return "수상·시상"
+    return ""
+
+
+def is_noise_news(title: str, rule_groups: Sequence[str] = ()) -> str:
+    """수집 제외 대상 잡음인가 — 이유 문자열(빈 문자열이면 아님). 제목·리드에 포스코 계열이 있으면 항상 아님."""
+    if rule_groups or POSCO_MENTION_RE.search(title or ""):
+        return ""
+    return noise_title_reason(title)
+
+
 def is_battery_scope(title: str, extra: str = "") -> bool:
     """포스코퓨처엠 전·후방(소재·셀·전기차·ESS·원료) 기사인가.
 
@@ -4276,6 +4311,8 @@ def _naver_item_relevant(title: str, category: str, keyword: str = "",
     # ── 고정밀 신호: 제목이 아니라 리드에 있어도 인정 ──────────────────
     if POSCO_MENTION_RE.search(lead) or detect_group_companies(lead):
         return True
+    if noise_title_reason(t):      # 주식·시세·수상 기사는 포스코 계열이 없으면 제외
+        return False
     if category != "그룹사" and (battery_company_hit(lead)
                                  or _kw_hit_any(lead, TRADE_MEASURE_KW)):
         return True
@@ -6156,6 +6193,8 @@ def _title_snippet_relevant(title: str, snippet: str) -> tuple[bool, list[str]]:
     여기서 조금 놓쳐도 복구된다."""
     probe = f"{title}\n{snippet or ''}"
     groups = normalize_group_list(detect_group_companies(probe))
+    if not groups and not POSCO_MENTION_RE.search(probe) and noise_title_reason(title):
+        return False, groups       # 주식·시세·수상 기사 — 포스코 계열이 없으면 제외
     keep = bool(
         groups
         or POSCO_MENTION_RE.search(probe)
@@ -6274,6 +6313,9 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
 
         rule_groups = detect_group_companies(f"{art['title']}\n{group_lead_text(body)}")
         probe = f"{art['title']}\n{body}"
+        if is_noise_news(art["title"], rule_groups):
+            storage.update_article(aid, {"status": "archived"})
+            continue
         if not (posco_relevant(art["title"], "", body, rule_groups)
                 or is_battery_scope(art["title"], body[:1500])
                 or is_gov_industry_news(art["title"], body[:1500])
@@ -7047,6 +7089,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 기사 주체를 가로채는 것을 막는다. (GROUP_LEAD_CHARS 주석 참고)
         rule_groups = detect_group_companies(f"{item.title}\n{group_lead_text(body)}")
         relevance_probe = f"{item.title}\n{item.snippet or ''}\n{body}"
+        if not is_policy and (noise_why := is_noise_news(item.title, rule_groups)):
+            # 포스코 계열이 없는 주식·시세·수상 기사 — 배터리·포스코 업무와 무관해 저장하지 않는다.
+            log.debug("잡음 기사 제외(%s): %s", noise_why, item.title[:40])
+            storage.upsert_ledger(item.url_source, "off_topic")
+            ctx.seen_cache.add(item.url_source)
+            continue
         # 글로벌 통상환경 기사: 제목에 통상 조치명 + 포스코 관련 산업어가 함께 있으면
         # 포스코 미언급이어도 수집한다. (사용자 지정)
         # 조치명은 여전히 **제목**에서만 인정하되(is_trade_topic 내부), 산업어는 본문까지 본다 —
@@ -10264,7 +10312,7 @@ def create_app(ctx: Context):
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20,
                      sort: str = "recent", s_title: str = "", s_body: str = "",
-                     s_press: str = "", s_author: str = "", senti: str = ""):
+                     s_press: str = "", s_author: str = "", senti: str = "", min_score: int = 0):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
@@ -10282,6 +10330,9 @@ def create_app(ctx: Context):
         wanted_senti = {x for x in _split_multi(senti) if x in ("긍정", "중립", "부정")}
         if wanted_senti:
             matched = [t for t in matched if (t["row"].get("sentiment") or "중립") in wanted_senti]
+        # 중요도 필터 — 점수가 min_score 이상인 기사만(번잡한 기사를 숨기고 볼 때). 수집은 그대로다.
+        if min_score and min_score > 0:
+            matched = [t for t in matched if int(t["row"].get("importance_score") or 0) >= min_score]
         # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
         # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
         # 순서에 기대다가 신규 기사가 마지막 페이지로 밀리는 장애가 있었다).
@@ -11589,6 +11640,34 @@ def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=Non
              result["fixed"], result["unchanged"], result["nopage"],
              ", ".join(f"{n} {c}" for n, c in names.most_common(8)) or "-")
     return result
+
+
+def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
+    """이미 쌓인 '주식·시세'·'수상·시상' 잡음 기사를 보관(archived) 처리한다. 기본은 미리보기(--run 을 줘야 실제 처리).
+
+    제외: 직접 등록(manual) 기사, 정책브리핑, 포스코 계열이 제목·그룹사 태그에 있는 기사. 보관은 되돌릴 수 있다.
+    """
+    rows = ctx.storage.list_articles(5000, 0, None, "")
+    hits: list[tuple[dict, str]] = []
+    for r in rows:
+        if r.get("source_type") == "manual" or is_policy_brief(r):
+            continue
+        groups = jload(r.get("group_companies"), [])
+        why = is_noise_news(r.get("title") or "", groups)
+        if why:
+            hits.append((r, why))
+    by_why = Counter(w for _, w in hits)
+    log.info("[잡음 기사 정리] 최근 %d건 중 대상 %d건 — %s%s", len(rows), len(hits),
+             ", ".join(f"{k} {v}" for k, v in by_why.items()) or "없음", " (미리보기)" if dry else "")
+    for r, w in hits[:12]:
+        log.info("  · [%s] %s | %s", w, (r.get("title") or "")[:50], (r.get("press_name") or "")[:8])
+    done = 0
+    if not dry:
+        for r, _ in hits:
+            ctx.storage.update_article(r["id"], {"status": "archived"})
+            done += 1
+        log.info("잡음 기사 정리: %d건 보관 처리", done)
+    return {"targets": len(hits), "archived": done, "by_why": dict(by_why)}
 
 
 def cmd_fixcategories(ctx: Context) -> None:
@@ -13653,6 +13732,35 @@ def cmd_selftest() -> int:
               "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               ("fd1", "u/fd1", "u/fd1", "u/fd1", "전기차 시험기사 보관됨", iso(_pn), iso(_pn), "manual", 10, "[]", "[]",
                "시험", None, "archived", 0))
+    # 잡음 기사 제외 — 포스코 계열이 없는 주식·시세·수상 기사 (사용자 지정 2026-10-28)
+    _noise = [("SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득", True), ("에코프로, 혁신상 수상…배터리 기술력 인정", True),
+              ("전자·IT의 날…케이에스엠 김윤호 대표 은탑산업훈장(종합)", True), ("삼성SDI, 올해의 배터리 대상 시상식서 대통령 표창", True),
+              ("美 증시 훈풍에 코스피·코스닥 4%대 급등", True), ("[특징주] 에코프로 신고가", True), ("2차전지 관련주 약세 확산", True),
+              ("배터리 3사 목표주가 하향", True), ("2차전지 시황 마감", True),
+              ("日 수상, 배터리 관세 인하 방침 밝혀", False), ("수상 태양광 ESS 실증 착수", False), ("리튬 시황 반등…탄산리튬 가격 상승", False),
+              ("LG에너지솔루션, 북미 공급계약 체결", False), ("니켈 가격 급락에 전구체 업계 긴장", False), ("EU 배터리 규정 시행 앞두고 업계 대응", False)]
+    check("잡음 판정 — 주식·시세·수상 제목은 걸리고 총리 수상·수상 태양광·원자재 시황·산업 동향은 안 걸린다",
+          [bool(is_noise_news(t)) for t, _ in _noise], [x for _, x in _noise])
+    check("잡음 판정 — 제목·리드에 포스코 계열이 있으면 수상·주가 기사도 받는다",
+          (bool(is_noise_news("포스코퓨처엠, 혁신상 수상")), bool(is_noise_news("시황 마감", ["포스코홀딩스"])),
+           bool(is_noise_news("포스코 임직원 표창")), bool(is_noise_news("포스코퓨처엠 목표주가 상향"))), (False, False, False, False))
+    check("수집 관문 — 주식·수상 기사는 본문 가져오기 전 단계에서도 걸러진다",
+          (_title_snippet_relevant("SK온, 포드 'Q1 어워드' 수상", "")[0], _title_snippet_relevant("美 증시 훈풍 2차전지 유리", "")[0],
+           _title_snippet_relevant("LG에너지솔루션 북미 공급계약", "")[0], _title_snippet_relevant("포스코퓨처엠 어워드 수상", "")[0],
+           _naver_item_relevant("SK온 어워드 수상", "산업", "배터리"), _naver_item_relevant("2차전지 관련주 급등", "산업", "배터리")),
+          (False, False, True, True, False, False))
+    for _nid, _nt, _ngs, _nsrc in (("nz1", "에코프로 신고가 경신 2차전지 관련주", "[]", "naver"), ("nz2", "포스코퓨처엠 신고가", '["포스코퓨처엠"]', "naver"),
+                                  ("nz3", "수상 기념 배터리 이벤트 시험", "[]", "manual")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_nid, "u/" + _nid, "u/" + _nid, "u/" + _nid, _nt, iso(_pn), iso(_pn), _nsrc, 10, _ngs, "[]", "시험", iso(_pn), "active", 1))
+    _fn0 = cmd_fixnoise(_ectx, dry=True)
+    check("fixnoise 미리보기 — 대상만 세고 쓰지 않는다", (_fn0["targets"] >= 1, _et.article_detail("nz1")["status"]), (True, "active"))
+    _fn1 = cmd_fixnoise(_ectx, dry=False)
+    check("fixnoise — 잡음만 보관 처리, 포스코 계열·직접 등록 기사는 그대로",
+          (_et.article_detail("nz1")["status"], _et.article_detail("nz2")["status"], _et.article_detail("nz3")["status"]),
+          ("archived", "active", "active"))
     # 네이버 뉴스 래퍼 — 원래 언론사 이름을 페이지에서 읽는다
     _nv_html = ('<meta property="og:article:author" content="연합뉴스 | 네이버"><meta name="twitter:site" content="네이버 뉴스">'
                 '<meta name="twitter:creator" content="연합뉴스"><p>본문</p>')
@@ -15271,11 +15379,22 @@ def cmd_selftest() -> int:
                       "is_representative,sentiment) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (_sid, "u/" + _sid, "u/" + _sid, "u/" + _sid, "논조필터시험 " + _sid, iso(_pn), iso(_pn), "rss", 10,
                        '["포스코퓨처엠"]', "[]", "시험", iso(_pn), "active", 1, _sv))
+        # 중요도 필터 — min_score 이상만
+        for _sid, _sc in (("sc1", 20), ("sc2", 55), ("sc3", 80)):
+            _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                      "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                      "is_representative,sentiment) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (_sid, "u/" + _sid, "u/" + _sid, "u/" + _sid, "중요도필터시험 " + _sid, iso(_pn), iso(_pn), "rss", _sc,
+                       '["포스코퓨처엠"]', "[]", "시험", iso(_pn), "active", 1, "중립"))
         _sentis = lambda q: sorted(i["title"][-3:] for i in _scl.get("/api/articles?size=100&q=논조필터시험" + q).json()["items"])
         check("논조 필터 — 긍정·부정·중립(감성 없음은 카드처럼 중립) 각각, 중복 선택은 OR",
               (_sentis(""), _sentis("&senti=긍정"), _sentis("&senti=부정"), _sentis("&senti=중립"),
                _sentis("&senti=긍정,부정"), _sentis("&senti=엉뚱한값")),
               (["sv1", "sv2", "sv3", "sv4"], ["sv1"], ["sv3"], ["sv2", "sv4"], ["sv1", "sv3"], ["sv1", "sv2", "sv3", "sv4"]))
+        _scs = lambda q: sorted(i["title"][-3:] for i in _scl.get("/api/articles?size=100&q=중요도필터시험" + q).json()["items"])
+        check("중요도 필터 — min_score 이상만, 0·없음은 전체",
+              (_scs(""), _scs("&min_score=50"), _scs("&min_score=70"), _scs("&min_score=90"), _scs("&min_score=0")),
+              (["sc1", "sc2", "sc3"], ["sc2", "sc3"], ["sc3"], [], ["sc1", "sc2", "sc3"]))
         check("일반 통계 숫자는 로그인 없이 그대로 볼 수 있다(개수만)", _scl.get("/api/stats").status_code, 200)
         check("헤더 텔레그램 주소 API 는 부서용 주소를 내지 않는다",
               "t.me/+DEPT" not in _scl.get("/api/telegram-link").text, True)
@@ -16100,6 +16219,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
+  fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
@@ -16168,6 +16288,8 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixaggpress":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
+    elif command == "fixnoise":
+        cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
     elif command == "why":

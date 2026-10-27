@@ -16,6 +16,7 @@ const state = {
   group: new Set(),
   cat: new Set(),
   press: new Set(),
+  minScore: '0',      // 중요도 필터 — '0'(전체)·'50'·'70'·'90'
   senti: new Set(),   // 논조 필터 — '긍정'·'중립'·'부정' (카드 칩과 같은 기준)
   period: 'all',
   sort: 'recent',   // 'recent'(발행일 최신순, 기본) | 'score'(직접 등록·중요도순)
@@ -40,6 +41,14 @@ const advActive = () => ADV_FIELDS.filter(([k]) => state.adv[k]);
 const SORT_OPTIONS = [
   { key: 'recent', label: '최신순' },
   { key: 'score', label: '중요도순' },
+];
+
+/* 중요도 필터 — 백엔드 /api/articles?min_score= 값(점수 이상만). 번잡한 기사를 숨기고 볼 때 쓴다(수집은 그대로). */
+const SCORE_OPTIONS = [
+  { key: '0', label: '전체' },
+  { key: '50', label: '50점 이상' },
+  { key: '70', label: '70점 이상' },
+  { key: '90', label: '90점 이상' },
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -118,6 +127,7 @@ function readStateFromURL() {
   load('senti', state.senti);
   state.period = p.get('period') || 'all';
   state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
+  state.minScore = SCORE_OPTIONS.some((o) => o.key === p.get('min_score')) ? p.get('min_score') : '0';
   state.q = p.get('q') || '';
   ADV_FIELDS.forEach(([k]) => { state.adv[k] = p.get(k) || ''; });
   state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
@@ -131,6 +141,7 @@ function writeStateToURL() {
   if (state.senti.size) p.set('senti', [...state.senti].join(','));
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
+  if (state.minScore !== '0') p.set('min_score', state.minScore);
   if (state.q) p.set('q', state.q);
   advActive().forEach(([k]) => p.set(k, state.adv[k]));
   if (state.page > 1) p.set('page', String(state.page));
@@ -367,6 +378,12 @@ function renderFilterChips(data) {
     refresh(true);
   }, true);
 
+  renderChipGroup($('scoreChips'), SCORE_OPTIONS, state.minScore, (key) => {
+    // 중요도는 '몇 점 이상' 하나만 — 단일 선택.
+    state.minScore = key;
+    refresh(true);
+  }, true);
+
   const multi = [
     ['sentiChips', SENTI_OPTIONS, state.senti, 0],
     ['groupChips', data.groups, state.group, 0],
@@ -423,6 +440,9 @@ function syncChipStates() {
   const periodKeys = ['today', '7d', '30d', 'all'];
   [...$('periodChips').children].forEach((btn, i) => {
     btn.setAttribute('aria-pressed', String(periodKeys[i] === state.period));
+  });
+  [...$('scoreChips').children].forEach((btn, i) => {
+    btn.setAttribute('aria-pressed', String((SCORE_OPTIONS[i] || {}).key === state.minScore));
   });
   // 정렬 칩도 인덱스로 맞춘다 (key ≠ label).
   [...$('sortChips').children].forEach((btn, i) => {
@@ -1986,6 +2006,7 @@ function buildQuery() {
   if (state.senti.size) p.set('senti', [...state.senti].join(','));
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
+  if (state.minScore !== '0') p.set('min_score', state.minScore);
   if (state.q) p.set('q', state.q);
   advActive().forEach(([k]) => p.set(k, state.adv[k]));
   p.set('page', String(state.page));
@@ -2090,6 +2111,7 @@ function renderPagination(page, total) {
 
 function activeFilterCount() {
   return state.group.size + state.cat.size + state.press.size + state.senti.size
+    + (state.minScore !== '0' ? 1 : 0)
     + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0) + advActive().length;
 }
 
@@ -2112,6 +2134,7 @@ function updateActiveFilterCount() {
   };
   seg('기간', PERIOD_LABEL[state.period] || '전체');
   if (state.senti.size) seg('논조', [...state.senti].join(', '));
+  if (state.minScore !== '0') seg('중요도', `${state.minScore}점 이상`);
   seg('그룹사', state.group.size ? [...state.group].join(', ') : '전체');
   seg('카테고리', state.cat.size ? [...state.cat].join(', ') : '전체');
   seg('언론사', state.press.size ? [...state.press].join(', ') : '전체');
@@ -2306,7 +2329,7 @@ function init() {
     if (pressView) togglePressView();       // 언론사 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 전체 목록으로
-    state.group.clear(); state.cat.clear(); state.press.clear(); state.senti.clear();
+    state.group.clear(); state.cat.clear(); state.press.clear(); state.senti.clear(); state.minScore = '0';
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
     ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = ''; $(id).value = ''; });
