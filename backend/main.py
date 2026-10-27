@@ -2673,7 +2673,7 @@ NEWS_AGGREGATORS = frozenset({"daum.net", "naver.com"})
 GROUP_COMPANIES: dict[str, list[str]] = {
     "포스코홀딩스": ["포스코홀딩스", "POSCO홀딩스", "posco holdings"],
     "포스코퓨처엠": ["포스코퓨처엠", "POSCO퓨처엠", "posco future m", "포스코케미칼"],
-    "포스코DX": ["포스코DX", "포스코 DX", "posco dx", "포스코ICT"],
+    "포스코DX": ["포스코DX", "포스코 DX", "posco dx", "포스코ICT", "포스코디엑스"],
     "포스코인터내셔널": ["포스코인터내셔널", "posco international", "포스코대우"],
     "포스코이앤씨": ["포스코이앤씨", "posco e&c", "포스코건설"],
     # ── 그 밖 계열사 ──────────────────────────────────────────────────
@@ -3308,6 +3308,18 @@ class _PoscoMentionRE:
 
 
 POSCO_MENTION_RE = _PoscoMentionRE()
+_POSCO_WORD_RE = re.compile(r"포스코|posco", re.IGNORECASE)
+
+
+def posco_relevant(title: str, snippet: str, body: str, rule_groups: Sequence[str]) -> bool:
+    """포스코 언급이 '스치는 한 줄'이 아닌가 — 다른 관문(배터리·정부·통상·정책)에 안 걸리는 기사에만 쓴다.
+
+    관련 있음: 제목·리드에 계열사가 있거나(rule_groups), 제목·스니펫에 포스코가 있거나, 본문에 2번 이상 나온다.
+    본문에 딱 1번(예: 우리금융 기사 속 '포스코그룹은 지분을 매각했다') 나오는 기사는 관련 없음으로 본다. (사용자 지정 2026-10-27, B-1)
+    """
+    if rule_groups or POSCO_MENTION_RE.search(f"{title}\n{snippet or ''}"):
+        return True
+    return len(_POSCO_WORD_RE.findall(strip_posco_facilities(body or ""))) >= 2
 
 
 def _kw_hit(text: str, keywords: Sequence[str]) -> bool:
@@ -6250,7 +6262,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
 
         rule_groups = detect_group_companies(f"{art['title']}\n{group_lead_text(body)}")
         probe = f"{art['title']}\n{body}"
-        if not (rule_groups or POSCO_MENTION_RE.search(probe)
+        if not (posco_relevant(art["title"], "", body, rule_groups)
                 or is_battery_scope(art["title"], body[:1500])
                 or is_gov_industry_news(art["title"], body[:1500])
                 or is_trade_topic(art["title"], body[:1500])
@@ -7003,8 +7015,8 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             pass  # 배터리 생태계(소재·셀·전기차·ESS·원료) — 포스코 미언급 허용 (사용자 지정)
         elif is_gov:
             pass  # 정부 부처·기관 소식 + 포스코 사업과 닿는 산업어 — 포스코 미언급 허용 (사용자 지정 2026-10-26)
-        elif not rule_groups and not POSCO_MENTION_RE.search(relevance_probe):
-            # 일반 기사: 포스코·계열사가 어디에도 없으면 무관 기사 — 저장하지 않는다.
+        elif not posco_relevant(item.title, item.snippet or "", body, rule_groups):
+            # 일반 기사: 포스코·계열사가 어디에도 없거나 본문에 딱 한 줄 스칠 뿐이면 무관 기사 — 저장하지 않는다.
             storage.upsert_ledger(item.url_source, "off_topic")
             ctx.seen_cache.add(item.url_source)
             continue
@@ -13453,6 +13465,14 @@ def cmd_selftest() -> int:
           [bool(POSCO_MENTION_RE.search(t)) for t in ("교내 포스코국제관에서 워크숍을 열었다", "포스코 체육관 개방",
                                                       "포스코, 포항시로부터 받은 은혜", "POSCO 국제관 아님 POSCO 발표")],
           [False, False, True, True])
+    check("포스코 관련성(B-1) — 제목·리드·스니펫에 있거나 본문에 2번 이상이면 관련, 본문 한 줄 스침이면 무관",
+          [posco_relevant("우리금융, 신탁계약 통해 자사주 취득", "", "…" * 50 + "한편 포스코그룹은 지분을 매각했다." + "…" * 50, []),
+           posco_relevant("우리금융 자사주 취득", "", "포스코가 지분을 팔았다. " + "…" * 20 + " 포스코는 6765억을 확보했다.", []),
+           posco_relevant("포스코 소식", "", "", []), posco_relevant("자사주 취득", "포스코그룹 지분 매각", "", []),
+           posco_relevant("자사주 취득", "", "본문", ["포스코홀딩스"]), posco_relevant("교내 포스코국제관 워크숍", "", "포스코국제관에서 열렸다", [])],
+          [False, True, True, True, True, False])
+    check("그룹사 판정 — 포스코디엑스(한글 표기)는 포스코DX 로 잡는다",
+          detect_group_companies("포스코디엑스, AI로 로드킬 막는다"), ["포스코DX"])
     check("그룹사 판정 — 포스코국제관은 '포스코' 태그를 만들지 않고 실제 회사 언급은 유지",
           (detect_group_companies("포스텍 포스코국제관 워크숍"), detect_group_companies("포스코국제관 워크숍, 포스코 지원"),
            detect_group_companies("포스코퓨처엠 양극재")), ([], ["포스코"], ["포스코퓨처엠"]))
