@@ -4629,6 +4629,8 @@ AUTHOR_PATTERNS = [
     # 메타 태그는 사이트마다 속성 순서가 달라(name→content / content→name) 두 순서를 모두 본다. (group 1 또는 2)
     re.compile(r'<meta[^>]+(?:name|property)=["\'](?:author|article:author|dable:author)["\'][^>]*?content=["\']([^"\']{2,30})["\']'
                r'|<meta[^>]+content=["\']([^"\']{2,30})["\'][^>]*?(?:name|property)=["\'](?:author|article:author|dable:author)["\']', re.I),
+    # '이재영 editor'·'홍길동 reporter' 처럼 영문 직함을 쓰는 매체(임팩트온) — 이름 뒤에 직함이 붙은 경우만 본다
+    re.compile(r'([가-힣]{2,4})\s*(?:editor|reporter|에디터)\b', re.I),
 ]
 
 # 기자명 자리에 매체명이 잡히는 것을 막는다 (예: '중앙이코노미뉴스')
@@ -4774,6 +4776,16 @@ def extract_author(html: str, body: str, press_name: str = "") -> str:
             continue
         names = [n for n in (_valid_author(g, press_key)
                              for g in AUTHOR_PATTERNS[1].findall(source)) if n]
+        if names:
+            return Counter(names).most_common(1)[0][0]
+
+    # 2-2) '이름 editor' 서명 — '기자' 서명이 없는 매체용. 최빈값을 택한다.
+    for source in (body, html):
+        if not source:
+            continue
+        # '오늘의 editor' 같은 일반 낱말(조사로 끝나는 말)은 이름이 아니므로 뺀다.
+        names = [n for n in (_valid_author(g, press_key) for g in AUTHOR_PATTERNS[3].findall(source)
+                             if not g.endswith(("의", "은", "는", "을", "를", "에", "와", "과"))) if n]
         if names:
             return Counter(names).most_common(1)[0][0]
 
@@ -13458,6 +13470,9 @@ def cmd_selftest() -> int:
           [extract_author('<meta property="dable:author" content="이한솔">', ""),
            extract_author('<meta content="이종민" property="article:author">', ""),
            extract_author('<meta name="author" content="이데일리">', "", "이데일리")], ["이한솔", "이종민", ""])
+    check("기자명 — '이름 editor' 서명을 읽고, 직함만 있으면 비운다",
+          [extract_author("", "<p>이재영 editor 입력 2026.10.27</p>"), extract_author("", "<p>Editor's Pick 입력</p>"),
+           extract_author("", "<p>오늘의 editor</p>")], ["이재영", "", ""])
     _fa = {"pc1": ('', '<html><meta content="김나연" property="dable:author"><p>본문 ' + "가" * 80 + '</p></html>')}
     _et._exec("update articles set url_original='https://zz.example.com/a' where id='pc1'")
     _far = cmd_fillauthors(_ectx, 5, dry=True, fetch=lambda h, urls: {u: _fa["pc1"] for u in urls})
