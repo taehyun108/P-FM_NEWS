@@ -234,7 +234,9 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
 }
 .chip:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
 /* 중요도 직접 입력 — '[  ] 점 이상 [  ] 점 이하' + 현재 기사 점수 범위 안내(한 줄 전체) */
-.score-range { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; width: 100%; }
+/* 칩 줄과 입력칸 줄을 세로로 쌓는 상자 — PC 에서 칩이 옆으로 밀려 글자가 세로로 깨지지 않게 */
+.score-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.score-range { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
 .score-input { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-mid); white-space: nowrap; }
 .score-input input {
   width: 76px; min-width: 76px; padding: 5px 8px; border: 1px solid var(--navy-line); border-radius: 8px;

@@ -3614,8 +3614,11 @@ _NOTICE_TAIL_RE = re.compile(
     # 기사 끝의 부속 문구(2026-10-28 국토교통부 인사: 뉴스1 '* 인사 게재 문의…·관련 키워드', 한국경제 '/연합뉴스 좋아요 0 …')
     r"|\*\s*인사\s*게재|관련\s*키워드|\s/\s*(?:연합뉴스|뉴스1|뉴시스|한경닷컴)\b|좋아요\s*\d|[ⓒ©]|\bERR_[A-Z_]+"
     # 조선일보 하단 메뉴('English(영문) 日本語 인사 100자평 …')·차단 안내('www.…com is blocked')
-    r"|English\s*\(영문\)|100자평|많이\s*본\s*뉴스|\swww\.[a-z0-9.-]+|blocked\s+by\s+an\s+extension).*$", re.S)
+    r"|English\s*\(영문\)|100자평|많이\s*본\s*뉴스|\swww\.[a-z0-9.-]+|blocked\s+by\s+an\s+extension|\s[.#][A-Za-z_][\w.#:> -]{0,60}\{|@media\b).*$", re.S)
 # 명단 한가운데 끼는 광고 문구('뉴스1 광고')와 단독 줄 '광고' — 사람 이름 줄에 붙지 않게 먼저 지운다
+# 본문 속에 딸려 온 스타일시트 조각('.view_dn_box{display:block;…}'·'@media screen and (…){…}'·'#AD1673.ad-template{…}') — 마지막 사람 이름에 붙지 않게 지운다
+#  (2026-10-28 비즈워크·물류신문 인사 카드). 규칙 블록이 닫히지 않은 채 남은 조각은 꼬리표 규칙이 자른다.
+_NOTICE_CSS_RE = re.compile(r"@media[^{}]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}|[.#][A-Za-z_][^{}\n]{0,100}\{[^{}]*\}")
 _NOTICE_AD_RE = re.compile(r"(?:뉴스1|뉴시스|연합뉴스)\s*광고|(?m:^\s*(?:광고|AD)\s*$)")
 # 줄글 기사 맨 앞의 '(서울=연합뉴스) 홍길동 기자 =' — 꼬리표 규칙이 본문 전체를 지우지 않게 먼저 뗀다
 _NOTICE_DATELINE_RE = re.compile(r"^\s*\(\S+=\s*연합뉴스\)\s*(?:[가-힣]{2,4}\s*기자\s*=)?\s*")
@@ -3950,7 +3953,8 @@ def _marked_block_candidate(html: str) -> str:
 
 def _clean_notice_text(body: str) -> str:
     """공백을 정리하고 머리(구독 안내)·꼬리(저작권 문구)를 떼어낸 인사·부고 공지 본문."""
-    text = re.sub(r"\s+", " ", _NOTICE_AD_RE.sub(" ", (body or "")).strip())
+    raw = _NOTICE_CSS_RE.sub(" ", _NOTICE_CSS_RE.sub(" ", body or ""))     # 중첩(@media 안 규칙)까지 두 번에 걸쳐 지운다
+    text = re.sub(r"\s+", " ", _NOTICE_AD_RE.sub(" ", raw).strip())
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
     # 줄글 기사는 맨 앞에 '(서울=연합뉴스) 홍길동 기자 =' 가 붙는다 — 꼬리표 규칙이 이걸 보고 본문 전체를
     # 지우지 않도록 머리의 것은 먼저 떼어 낸다.
@@ -13882,6 +13886,18 @@ def cmd_selftest() -> int:
           format_people_notice("[서울=뉴시스]\n◇국장급 승진\n▲국토정보정책관 이대섭 ▲지방시대기획단(국토공간혁신국장) 한정희\n www.newsis.com is blocked This page has been blocked by an extension",
                                "personnel", "[인사]국토교통부").splitlines(),
           ["ㆍ이대섭 · 국토정보정책관 (국장급 승진)", "ㆍ한정희 · 지방시대기획단(국토공간혁신국장) (국장급 승진)"])
+    _n4 = ("◇ 사무관 전보\n▲ 건축공간관 이승학 ▲ 용산공원조성추진기획단 공원정책과 박예슬 "
+           ".view_dn_box{display:block; text-align:center; margin-bottom:10px;border:1px solid #ebebeb;padding:10px; color:#e74c3c;} "
+           "@media screen and (max-width: 39.9375em) { .view_dn_box{line-height:1.5; background-color: #fff;} }")
+    check("인사 요약(비즈워크 형식) — 본문에 딸려 온 CSS 조각이 마지막 사람에 안 붙는다",
+          format_people_notice(_n4, "personnel", "[인사] 국토교통부").splitlines(),
+          ["ㆍ이승학 · 건축공간관 (사무관 전보)", "ㆍ박예슬 · 용산공원조성추진기획단 공원정책과 (사무관 전보)"])
+    _n5 = ("◇ 국장급 전보 ▲ 대변인 정구천 ▲ 관세평가분류원장 오현진 ▲ 인천공항세관 여행자통관1국장 강병로 "
+           "#AD167384589735.ad-template { margin:auto; position:relative; display:block; clear:both; z-index:1; } "
+           "#AD167384589735.ad-template .col { text-align:center; } #AD167384589735.ad-template .ad-view { position:relative; }")
+    check("인사 요약(물류신문 형식) — 광고 스타일 규칙(#AD….ad-template{…})이 사람 줄에 안 붙는다",
+          format_people_notice(_n5, "personnel", "[인사] 관세청").splitlines(),
+          ["ㆍ정구천 · 대변인 (국장급 전보)", "ㆍ오현진 · 관세평가분류원장 (국장급 전보)", "ㆍ강병로 · 인천공항세관 여행자통관1국장 (국장급 전보)"])
     # 인사 — 여러 기관을 한 기사에 모은 공지(금융위·국토부·과기부…): 기관 소제목이 앞 사람 이름에 붙던 문제 (2026-10-28)
     _ph = ('<html><head><meta property="og:description" content="금융위원회◇ 부이사관 승진△ 자본시장조사총괄과장 정종식◇ 서기관 승진△ 금융위원회 김종식"></head><body>'
            '<ul class="innorame-slot"><li class="item">인천 송도 이 아파트</li></ul>'
