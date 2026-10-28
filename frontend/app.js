@@ -51,6 +51,13 @@ const SCORE_OPTIONS = [
   { key: '90', label: '90점 이상' },
 ];
 
+// 중요도 직접 입력 값 정리 — 0~100 정수 문자열로 맞춘다. 비었거나 숫자가 아니거나 0 이하면 '0'(전체).
+function normalizeScore(raw) {
+  const n = Math.floor(Number(String(raw ?? '').trim()));
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  return String(Math.min(n, 100));
+}
+
 const $ = (id) => document.getElementById(id);
 const EXCERPT_FOLD_CHARS = 200;  // 포스코퓨처엠 언급 발췌가 이보다 길면 접어서 보여 준다
 const PFM_MENTION_RE = /(포스코\s*퓨처엠|POSCO\s*(?:FUTURE\s*M|퓨처엠)|퓨처엠)/i;  // 발췌에서 강조할 언급
@@ -127,7 +134,7 @@ function readStateFromURL() {
   load('senti', state.senti);
   state.period = p.get('period') || 'all';
   state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
-  state.minScore = SCORE_OPTIONS.some((o) => o.key === p.get('min_score')) ? p.get('min_score') : '0';
+  state.minScore = normalizeScore(p.get('min_score'));
   state.q = p.get('q') || '';
   ADV_FIELDS.forEach(([k]) => { state.adv[k] = p.get(k) || ''; });
   state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
@@ -444,6 +451,9 @@ function syncChipStates() {
   [...$('scoreChips').children].forEach((btn, i) => {
     btn.setAttribute('aria-pressed', String((SCORE_OPTIONS[i] || {}).key === state.minScore));
   });
+  // 직접 입력칸도 현재 값으로 — 0(전체)이면 비워 둔다.
+  const si = $('scoreInput');
+  if (si && document.activeElement !== si) si.value = state.minScore === '0' ? '' : state.minScore;
   // 정렬 칩도 인덱스로 맞춘다 (key ≠ label).
   [...$('sortChips').children].forEach((btn, i) => {
     btn.setAttribute('aria-pressed', String((SORT_OPTIONS[i] || {}).key === state.sort));
@@ -2336,6 +2346,15 @@ function init() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
     refresh(true);
   };
+  // 중요도 직접 입력 — Enter 를 누르거나 칸을 벗어나면(change) 적용한다. 0~100 으로 맞추고, 비우면 전체.
+  $('scoreInput').addEventListener('change', () => {
+    const v = normalizeScore($('scoreInput').value);
+    $('scoreInput').value = v === '0' ? '' : v;
+    if (v === state.minScore) return;
+    state.minScore = v;
+    refresh(true);
+  });
+  $('scoreInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('scoreInput').blur(); } });
   $('clearAll').addEventListener('click', goHome);
   $('brandHome').addEventListener('click', (e) => { e.preventDefault(); goHome(); });
 

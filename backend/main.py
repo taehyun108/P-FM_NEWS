@@ -10331,7 +10331,8 @@ def create_app(ctx: Context):
         if wanted_senti:
             matched = [t for t in matched if (t["row"].get("sentiment") or "중립") in wanted_senti]
         # 중요도 필터 — 점수가 min_score 이상인 기사만(번잡한 기사를 숨기고 볼 때). 수집은 그대로다.
-        if min_score and min_score > 0:
+        min_score = int(clamp(min_score or 0, 0, 100))
+        if min_score > 0:
             matched = [t for t in matched if int(t["row"].get("importance_score") or 0) >= min_score]
         # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
         # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
@@ -15395,6 +15396,9 @@ def cmd_selftest() -> int:
         check("중요도 필터 — min_score 이상만, 0·없음은 전체",
               (_scs(""), _scs("&min_score=50"), _scs("&min_score=70"), _scs("&min_score=90"), _scs("&min_score=0")),
               (["sc1", "sc2", "sc3"], ["sc2", "sc3"], ["sc3"], [], ["sc1", "sc2", "sc3"]))
+        check("중요도 필터 — 직접 입력한 점수(60·21·음수·100 초과)도 그대로 적용, 100 초과는 100으로",
+              (_scs("&min_score=60"), _scs("&min_score=21"), _scs("&min_score=-5"), _scs("&min_score=500")),
+              (["sc3"], ["sc2", "sc3"], ["sc1", "sc2", "sc3"], []))
         check("일반 통계 숫자는 로그인 없이 그대로 볼 수 있다(개수만)", _scl.get("/api/stats").status_code, 200)
         check("헤더 텔레그램 주소 API 는 부서용 주소를 내지 않는다",
               "t.me/+DEPT" not in _scl.get("/api/telegram-link").text, True)

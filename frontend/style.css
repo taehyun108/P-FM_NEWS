@@ -233,6 +233,13 @@ button.stat .stat-label::after { content: " ›"; color: var(--ink-soft); font-w
   background: var(--navy); border-color: var(--navy); color: #fff; font-weight: 600;
 }
 .chip:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
+/* 중요도 직접 입력 — 칩 옆에 '직접 입력 [  ] 점 이상' */
+.score-input { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-mid); }
+.score-input input {
+  width: 64px; padding: 4px 8px; border: 1px solid var(--navy-line); border-radius: 8px;
+  font: inherit; color: var(--navy); background: #fff;
+}
+.score-input input:focus-visible { outline: 2px solid var(--navy); outline-offset: 1px; }
 /* 논조 필터 칩 — 카드의 긍정(파랑)·중립(회색)·부정(빨강) 칩과 같은 색. 눌렸을 때는 그 색으로 채운다. */
 .chip.chip-pos { border-color: var(--pos); color: var(--pos); }
 .chip.chip-neu { border-color: var(--ink-mid); color: var(--ink-mid); }
