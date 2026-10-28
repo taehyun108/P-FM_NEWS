@@ -3284,11 +3284,11 @@ def collect_google_rss(http: HttpClient, keyword_rows: Sequence[dict]) -> list[R
             out.append(RawItem(
                 url_source=normalize_url(link),
                 url_original=link,
-                title=html_mod.unescape(entry.get("title", "")).strip(),
+                title=clean_text(entry.get("title", "")),
                 published_at=published,
                 source_type="google_rss",
                 press_hint=src_title,
-                snippet=html_mod.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))).strip(),
+                snippet=clean_text(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))),
             ))
         return out
 
@@ -4561,8 +4561,8 @@ def collect_naver(http: HttpClient, cfg: Config, keyword_rows: Sequence[dict]) -
             link = entry.get("originallink") or entry.get("link", "")
             if not link:
                 continue
-            title = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("title", ""))).strip()
-            snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", entry.get("description", ""))).strip()
+            title = clean_text(re.sub(r"<[^>]+>", "", entry.get("title", "")))
+            snippet = clean_text(re.sub(r"<[^>]+>", "", entry.get("description", "")))
             if not _naver_item_relevant(title, category, keyword, snippet):
                 local_dropped += 1
                 continue
@@ -4619,11 +4619,11 @@ def collect_rss_feeds(http: HttpClient, feeds: Sequence[dict]) -> list[RawItem]:
             local_items.append(RawItem(
                 url_source=normalize_url(link),
                 url_original=link,
-                title=html_mod.unescape(entry.get("title", "")).strip(),
+                title=clean_text(entry.get("title", "")),
                 published_at=published,
                 source_type="rss",
                 press_hint=feed_row.get("name", ""),
-                snippet=html_mod.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))).strip(),
+                snippet=clean_text(re.sub(r"<[^>]+>", " ", entry.get("summary", ""))),
             ))
         return local_items
 
@@ -4823,6 +4823,56 @@ def decode_unicode_escapes(text: str) -> str:
     return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
 
 
+_INLINE_TAG_RE = re.compile(r"</?(?:b|strong|em|i|u|span|font|mark)\b[^>]*>|<br\s*/?>", re.I)
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_ENTITY_LEFT_RE = re.compile(r"&(?:#\d{1,6}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,8});")
+
+
+def unescape_all(text: str) -> str:
+    """HTML 엔티티를 더 이상 안 바뀔 때까지(최대 4번) 풀어 준다 — '&amp;hellip;' → '&hellip;' → '…'.
+
+    매체가 제목을 두 번 이스케이프해 두면 한 번만 푼 결과가 '&hellip;·&middot;·&lsquo;' 로 카드에 그대로 보인다
+    (2026-10-29 마이데일리 '[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 &hellip;투자 고갈&middot;적자 위험').
+    """
+    t = text or ""
+    for _ in range(4):
+        n = html_mod.unescape(t)
+        if n == t:
+            break
+        t = n
+    return t
+
+
+def clean_text(text: str, keep_newlines: bool = False) -> str:
+    """화면·메시지에 낼 글의 깨짐을 정리한다 — 엔티티·\\uXXXX·모지바케·인라인 태그·보이지 않는 글자·NBSP.
+
+    keep_newlines 면 줄바꿈은 살린다(인사 명단·발췌처럼 줄이 의미 있는 글). 값이 없으면 ''.
+    """
+    t = unescape_all(decode_unicode_escapes(fix_mojibake(text or "")))
+    t = _INLINE_TAG_RE.sub(" ", t)
+    t = _ZERO_WIDTH_RE.sub("", t).replace("\u00a0", " ")
+    if keep_newlines:
+        return "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in t.splitlines()).strip()
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def text_defects(text: str) -> list[str]:
+    """글에 남은 깨짐의 종류(점검용) — 엔티티·\\u 표기·모지바케·대체문자(�)·인라인 태그."""
+    t = text or ""
+    out = []
+    if _ENTITY_LEFT_RE.search(t):
+        out.append("엔티티")
+    if "\\u" in t:
+        out.append("\\u표기")
+    if re.search(r"[ÂÃìíîï][\x80-\xBF]", t):
+        out.append("모지바케")
+    if "\ufffd" in t:
+        out.append("대체문자")
+    if _INLINE_TAG_RE.search(t):
+        out.append("태그")
+    return out
+
+
 def clean_author(name: str) -> str:
     """기자명 표기를 다듬는다. '영남본부=장원규' → '장원규', '송영민 기자' → '송영민'."""
     name = (name or "").strip()
@@ -4996,7 +5046,7 @@ def extract_title(html: str) -> str:
     ):
         m = re.search(pattern, html or "", re.I)
         if m:
-            title = html_mod.unescape(m.group(1)).strip()
+            title = clean_text(m.group(1))
             # ' - 언론사' 같은 사이트명 꼬리 정리
             title = re.sub(r'\s*[|·\-–—]\s*[^|·\-–—]{1,25}$', '', title).strip()
             if len(title) >= 5:
@@ -6016,7 +6066,7 @@ def _parse_json_object(content: str) -> dict | None:
 
 
 def _build_analysis(data: dict, usage: dict) -> Analysis:
-    sentences = [str(s).strip() for s in (data.get("summary") or []) if str(s).strip()]
+    sentences = [clean_text(str(s)) for s in (data.get("summary") or []) if clean_text(str(s))]
     if not sentences or sentences == ["요약불가"]:
         return Analysis(ok=False, token_usage=usage)
 
@@ -6042,7 +6092,7 @@ def _build_analysis(data: dict, usage: dict) -> Analysis:
     return Analysis(
         summary_sentences=sentences[:5],
         perspective=str(data.get("perspective") or "").strip(),
-        keywords=[str(k).strip() for k in (data.get("keywords") or []) if str(k).strip()],
+        keywords=[clean_text(str(k)) for k in (data.get("keywords") or []) if clean_text(str(k))],
         group_companies=groups,
         sentiment=sentiment,
         sentiment_reason=re.sub(r"\s+", " ", str(data.get("sentiment_reason") or "")).strip()[:120],
@@ -7530,7 +7580,7 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     # 통상환경은 detect_categories 가 '제목에 조치명' 조건으로 이미 판정한다 — 강제 추가 안 함.
 
     # 포스코퓨처엠 언급 발췌 — 카드 표시 + 논조 판정 입력. 언급이 없으면 빈 값(영역 미표시).
-    excerpt = extract_pfm_excerpt(body)
+    excerpt = clean_text(extract_pfm_excerpt(body), keep_newlines=True)   # 본문에 남은 엔티티·깨짐을 풀어 저장
     # 영어 기사는 제목과 발췌를 한글로 번역해 저장한다(요약·키워드·SWOT 근거는 이미 한국어로 만든다).
     # 번역이 실패하면 원문을 그대로 둔다. 영어 원제는 카드에 작게 보이도록 따로 남긴다.
     orig_title = ""
@@ -8014,8 +8064,8 @@ def format_message(row: dict) -> str:
                                row.get("url_canonical") or row.get("url_original") or "")
     header = format_summary_header(press, row.get("author") or "")
 
-    lines = [f"{emoji} [{esc(tag)}] {esc(row.get('title') or '')}", ""]
-    summary = (row.get("summary_text") or "").strip()
+    lines = [f"{emoji} [{esc(tag)}] {esc(clean_text(row.get('title') or ''))}", ""]
+    summary = clean_text(row.get("summary_text") or "", keep_newlines=True)
     if summary:
         lines.append(f"{esc(header)} {esc(summary)}".strip())
     excerpt = excerpt_for_message(row.get("pfm_excerpt") or "")
@@ -8345,8 +8395,8 @@ def format_public_message(row: dict) -> str:
     press = press_display_name(row.get("press_name") or "",
                                row.get("url_canonical") or row.get("url_original") or "")
     header = format_summary_header(press, row.get("author") or "")
-    lines = [f"📰 [포스코퓨처엠] {esc(row.get('title') or '')}", ""]
-    summary = (row.get("summary_text") or "").strip()
+    lines = [f"📰 [포스코퓨처엠] {esc(clean_text(row.get('title') or ''))}", ""]
+    summary = clean_text(row.get("summary_text") or "", keep_newlines=True)
     if summary:
         lines.append(f"{esc(header)} {esc(summary)}".strip())
     excerpt = excerpt_for_message(row.get("pfm_excerpt") or "")
@@ -9954,23 +10004,30 @@ def build_card(row: dict) -> dict:
                 "t": {"score": t_sc, "text": row.get("t_text") or "해당 없음"},
             }
 
+    # 저장된 글에 엔티티·모지바케가 남아 있어도(예전 수집분) 화면에서는 바로 풀어 보여 준다. DB 는 `fixentities` 가 고친다.
+    if swot:
+        for _k in "swot":
+            swot[_k]["text"] = clean_text(swot[_k]["text"])
+    keywords = [clean_text(k) for k in keywords]
+    press = clean_text(press)
+    author_shown = clean_text(author_display(row.get("author") or ""))
     return {
         "id": row.get("id"),
-        "title": row.get("title") or "",
+        "title": clean_text(row.get("title") or ""),
         "url": row.get("url_canonical") or row.get("url_original") or "",
         "press_name": press,
-        "author": author_display(row.get("author") or ""),
-        "summary_header": format_summary_header(press, author_display(row.get("author") or "")),
-        "summary_text": row.get("summary_text") or "",
-        "pfm_excerpt": row.get("pfm_excerpt") or "",
+        "author": author_shown,
+        "summary_header": format_summary_header(press, author_shown),
+        "summary_text": clean_text(row.get("summary_text") or "", keep_newlines=True),
+        "pfm_excerpt": clean_text(row.get("pfm_excerpt") or "", keep_newlines=True),
         "pfm_tone": row.get("pfm_tone") or "",
         "summary_source": row.get("summary_source") or "",
         "published_at": row.get("published_at"),
         "thumbnail_url": row.get("thumbnail_url") or "",
         "importance_score": int(row.get("importance_score") or 0),
         "sentiment": row.get("sentiment") or "",
-        "sentiment_reason": sentiment_reason_of(row),
-        "title_original": title_original_of(row),
+        "sentiment_reason": clean_text(sentiment_reason_of(row)),
+        "title_original": clean_text(title_original_of(row)),
         "keywords": keywords,
         "group_companies": groups,
         "categories": categories,
@@ -11764,6 +11821,43 @@ def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=Non
              result["fixed"], result["unchanged"], result["nopage"],
              ", ".join(f"{n} {c}" for n, c in names.most_common(8)) or "-")
     return result
+
+
+def cmd_fixentities(ctx: Context, dry: bool = True) -> dict:
+    """저장된 기사의 제목·기자명·언론사명·언급 발췌에 남은 글자 깨짐(엔티티·\\u·모지바케·태그)을 점검·복구한다.
+
+    기본은 미리보기(--run 을 줘야 실제 수정). 요약은 별도 표라 건드리지 않는다 — 화면과 텔레그램에서는 자동으로 풀려 보인다.
+    """
+    rows = ctx.storage.list_articles(8000, 0, None, "")
+    fields = (("title", False), ("author", False), ("press_name", False), ("pfm_excerpt", True))
+    kinds: Counter = Counter()
+    fixed_rows = 0
+    samples: list[str] = []
+    for r in rows:
+        patch = {}
+        for f, keep_nl in fields:
+            old = r.get(f) or ""
+            if not old:
+                continue
+            bad = text_defects(old)
+            new = clean_text(old, keep_newlines=keep_nl)
+            if bad and new != old:
+                patch[f] = new
+                for k in bad:
+                    kinds[f"{f}:{k}"] += 1
+                if len(samples) < 6:
+                    samples.append(f"{f}: {old[:40]!r} → {new[:40]!r}")
+        if patch:
+            fixed_rows += 1
+            if not dry:
+                ctx.storage.update_article(r["id"], patch)
+    summ = sum(1 for r in rows if text_defects(r.get("summary_text") or ""))
+    log.info("[글자 깨짐 점검] 기사 %d건 중 고칠 기사 %d건%s — %s", len(rows), fixed_rows, " (미리보기)" if dry else " 수정함",
+             ", ".join(f"{k} {v}" for k, v in kinds.most_common()) or "없음")
+    for sm in samples:
+        log.info("  · %s", sm)
+    log.info("  요약에 깨짐이 남은 기사 %d건 — 화면·텔레그램에서는 자동으로 풀려 보입니다(저장값은 그대로)", summ)
+    return {"rows": len(rows), "fixed": fixed_rows, "kinds": dict(kinds), "summary_defects": summ}
 
 
 def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
@@ -13921,6 +14015,43 @@ def cmd_selftest() -> int:
     check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
           format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
           ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
+    # 글자 깨짐 — 엔티티 이중 이스케이프(마이데일리 사례)·모지바케·태그를 화면·수집·메시지에서 모두 푼다 (2026-10-29)
+    _brk = "[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 &hellip;투자 고갈&middot;적자 위험 &lsquo;경고&rsquo;"
+    check("글자 깨짐 — 이중 이스케이프 엔티티를 끝까지 푼다",
+          (clean_text(_brk), clean_text("A &amp;hellip; B &amp;amp;lt;전보&amp;amp;gt;"), clean_text("R&D 투자 &amp; 확대"), clean_text("a&nbsp;b\u200bc")),
+          ("[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 …투자 고갈·적자 위험 ‘경고’", "A … B <전보>", "R&D 투자 & 확대", "a bc"))
+    check("글자 깨짐 — 줄바꿈 유지 옵션·인라인 태그·모지바케·\\u 표기",
+          (clean_text("ㆍ김철수 · 상무\nㆍ박영희  ·  전무", keep_newlines=True), clean_text("<b>배터리</b> 뉴스"),
+           clean_text("ì¡ìë¯¼".encode("latin-1", "ignore").decode("latin-1")) != "", clean_text("\\ud55c\\uae00 제목".replace("\\ud55c", "\\ud55c"))),
+          ("ㆍ김철수 · 상무\nㆍ박영희 · 전무", "배터리 뉴스", True, clean_text("\\ud55c\\uae00 제목")))
+    check("대외협력 수집 — 제목 엔티티도 끝까지 푼다", __import__("ea_crawl")._unesc_all("산업부 &amp;hellip; 입법예고 &amp;lsquo;안&amp;rsquo;"), "산업부 … 입법예고 ‘안’")
+    check("분석 결과 — 요약·키워드의 엔티티도 풀려 저장된다",
+          (_build_analysis({"summary": ["포스코 &amp;hellip; 파업"], "keywords": ["적자 &middot; 위험"], "swot": {}}, {}).summary_sentences,
+           _build_analysis({"summary": ["포스코 &amp;hellip; 파업"], "keywords": ["적자 &middot; 위험"], "swot": {}}, {}).keywords),
+          (["포스코 … 파업"], ["적자 · 위험"]))
+    check("글자 깨짐 판정 — 남은 깨짐 종류를 알려 준다",
+          (text_defects("&hellip;x"), text_defects("정상 제목"), text_defects("<b>x</b>"), text_defects("a\ufffdb")),
+          (["엔티티"], [], ["태그"], ["대체문자"]))
+    _card = build_card({"id": "x", "title": _brk, "press_name": "마이데일리", "author": "심지원", "summary_text": "포스코 &amp;hellip; 파업",
+                        "pfm_excerpt": "발췌 &lsquo;경고&rsquo;", "keywords": '["적자 &middot; 위험"]', "group_companies": '["포스코홀딩스"]',
+                        "categories": "[]", "url_canonical": "https://x.test/a"})
+    check("카드 — 저장된 제목·요약·발췌·키워드의 엔티티가 화면에서는 풀려 나온다",
+          (_card["title"].startswith("[하투 청구서 ⑤] 포스코") and "&" not in _card["title"], _card["summary_text"], _card["pfm_excerpt"], _card["keywords"]),
+          (True, "포스코 … 파업", "발췌 ‘경고’", ["적자 · 위험"]))
+    check("텔레그램 메시지 — 제목·요약의 엔티티를 풀어서 보낸다",
+          ("&hellip;" in format_message({"title": _brk, "summary_text": "요약 &amp;hellip;", "importance_score": 70, "group_companies": '["포스코홀딩스"]'}),
+           "&hellip;" in format_public_message({"title": _brk, "summary_text": "요약 &amp;hellip;"})), (False, False))
+    for _eid2, _et2, _ea2 in (("en1", "엔티티 시험 &hellip;투자 &lsquo;경고&rsquo;", "홍길동 &amp; 김철수"), ("en2", "정상 제목", "")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,author,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_eid2, "u/" + _eid2, "u/" + _eid2, "u/" + _eid2, _et2, _ea2, iso(_pn), iso(_pn), "rss", 10, "[]", "[]", "시험", iso(_pn), "active", 1))
+    _fe0 = cmd_fixentities(_ectx, dry=True)
+    check("fixentities 미리보기 — 고칠 곳만 세고 쓰지 않는다", (_fe0["fixed"] >= 1, _et.article_detail("en1")["title"].startswith("엔티티 시험 &hellip;")), (True, True))
+    cmd_fixentities(_ectx, dry=False)
+    check("fixentities — 제목·기자명의 깨짐만 고치고 정상 기사는 그대로",
+          (_et.article_detail("en1")["title"], _et.article_detail("en1")["author"], _et.article_detail("en2")["title"]),
+          ("엔티티 시험 …투자 ‘경고’", "홍길동 & 김철수", "정상 제목"))
     # 잡음 기사 제외 — 포스코 계열이 없는 주식·시세·수상 기사 (사용자 지정 2026-10-28)
     _noise = [("SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득", True), ("에코프로, 혁신상 수상…배터리 기술력 인정", True),
               ("전자·IT의 날…케이에스엠 김윤호 대표 은탑산업훈장(종합)", True), ("삼성SDI, 올해의 배터리 대상 시상식서 대통령 표창", True),
@@ -16416,6 +16547,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
+  fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
@@ -16485,6 +16617,8 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixaggpress":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
+    elif command == "fixentities":
+        cmd_fixentities(ctx, dry="--run" not in argv[2:])
     elif command == "fixnoise":
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":

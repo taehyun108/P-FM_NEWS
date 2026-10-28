@@ -364,6 +364,17 @@ MINISTRY_NEWS_FEEDS: list[tuple[str, str]] = [
 import html as _html_mod
 
 
+def _unesc_all(text: str) -> str:
+    """HTML 엔티티를 더 안 바뀔 때까지(최대 4번) 푼다 — 이중 이스케이프된 제목('&amp;hellip;')이 화면에 그대로 나오지 않게."""
+    t = text or ""
+    for _ in range(4):
+        n = _html_mod.unescape(t)
+        if n == t:
+            break
+        t = n
+    return t
+
+
 def _rss_items(xml: str) -> list[dict]:
     """<item> 목록을 {title, link, pubDate, description(평문)} 로 뽑는다."""
     out: list[dict] = []
@@ -371,9 +382,9 @@ def _rss_items(xml: str) -> list[dict]:
         def _f(tag: str) -> str:
             m = re.search(rf"<{tag}>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</{tag}>", block, re.S)
             return (m.group(1).strip() if m else "")
-        desc = _html_mod.unescape(_f("description"))
+        desc = _unesc_all(_f("description"))
         desc = _clean(re.sub(r"<[^>]+>", " ", desc))
-        out.append({"title": _clean(_html_mod.unescape(_f("title"))),
+        out.append({"title": _clean(_unesc_all(_f("title"))),
                     "link": _f("link"), "pubDate": _f("pubDate"), "description": desc})
     return out
 
@@ -439,7 +450,7 @@ _kotra_keys_logged = [False]
 def _kotra_relevant(r: dict) -> bool:
     ind = r.get("indstCl") or ""
     info = (r.get("infoCl") or "").strip()
-    title = _html_mod.unescape(r.get("newsTitl") or "")
+    title = _unesc_all(r.get("newsTitl") or "")
     return (any(k in ind for k in _KOTRA_INDUST_KEEP)
             or info in _KOTRA_INFO_KEEP
             or any(k in title for k in _KOTRA_TITLE_KW))
@@ -500,7 +511,7 @@ def crawl_kotra_news(service_key: str, rows: int = 100, pages: int = 2) -> list[
     for r in records:
         if not _kotra_relevant(r):
             continue
-        title = _clean(_html_mod.unescape(r.get("newsTitl") or ""))
+        title = _clean(_unesc_all(r.get("newsTitl") or ""))
         rid = str(r.get("bbstxSn") or "").strip()
         link = (r.get("kotraNewsUrl") or "").strip() or (
             f"https://dream.kotra.or.kr/user/extra/kotranews/bbs/linkView/jsp/Page.do?dataIdx={rid}"
