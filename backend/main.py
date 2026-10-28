@@ -3656,6 +3656,11 @@ _COMMON_SURNAMES = frozenset("김이박최정강조윤장임한오서신권황�
 _PEOPLE_NAME_ONLY_RE = re.compile(r"^[가-힣]{2,4}(?:\([^()]*\))?$")
 
 
+# 이름 앞에 오는 직급·직책 낱말 — 두 사람이 한 항목에 붙어 있을 때('서기관 곽희종 김민정') 직책으로 인정한다
+_PEOPLE_RANK_TAIL_RE = re.compile(
+    r"(?:부이사관|이사관|서기관|사무관|서기|연구위원|연구원|연구관|주무관|담당관|감사관|정책관|심의관|위원|과장|계장|팀장|담당|특보)$")
+
+
 def _split_item_people(item: str) -> list[str]:
     """'김민수, 박인찬, 이경재' → 세 사람. '직책 이름, 직책 이름' 도 사람별로 나눈다.
 
@@ -3669,12 +3674,13 @@ def _split_item_people(item: str) -> list[str]:
         tail: list[str] = []
         for tk in reversed(toks):
             if len(tk) == 3 and tk[0] in _COMMON_SURNAMES and _PEOPLE_NAME_ONLY_RE.match(tk) \
-                    and tk not in _TITLE_SUFFIXES:
+                    and tk not in _TITLE_SUFFIXES and not _PEOPLE_RANK_TAIL_RE.search(tk):   # '서기관'(서 씨 오인) 제외
                 tail.insert(0, tk)
             else:
                 break
-        if len(tail) >= 3 and len(tail) < len(toks):
-            org = " ".join(toks[:len(toks) - len(tail)])
+        org = " ".join(toks[:len(toks) - len(tail)]) if tail else ""
+        # 이름 둘도 앞이 '서기관'·'연구위원' 같은 직급이면 두 사람이다('△ 서기관 곽희종 김민정' — 2026-10-28 국토교통부 인사).
+        if len(tail) < len(toks) and (len(tail) >= 3 or (len(tail) == 2 and _PEOPLE_RANK_TAIL_RE.search(org))):
             return [f"{org} {n}" for n in tail]
         return [item]
     def kind_of(x: str) -> str:
@@ -3816,6 +3822,8 @@ def format_people_notice(body: str, kind: str, title: str = "") -> str:
            명단 표시가 없는 줄글 기사는 원문 문장을 한 줄씩 그대로 옮기되, 제목과 관련 없는 본문
            (추출이 엉뚱한 칼럼을 잡은 경우)이면 빈 문자열을 돌려준다 — 호출부가 안내 문구를 쓴다.
     """
+    if kind != "obituary":
+        body = _mark_org_headings(body)      # 기관별 소제목('국토교통부')을 기관 머리말로 — 앞 사람 이름에 붙지 않게
     text = _clean_notice_text(body)
     if kind == "obituary":
         raw_blocks = [b.strip() for b in text.split("▲") if b.strip()]
@@ -3840,6 +3848,72 @@ def format_people_notice(body: str, kind: str, title: str = "") -> str:
 
 
 PEOPLE_LINES_MAX_CHARS = 60000
+
+
+def _mark_org_headings(text: str) -> str:
+    """여러 기관·회사 인사를 한 기사에 모은 공지의 기관 소제목 줄을 기관 머리말(◈)로 바꾼다.
+
+    '금융위원회 / ◇ 부이사관 승진 / △ … / 국토교통부 / ◇ 실장급 전보 / △ …' 처럼 소제목 줄이 따로 있으면,
+    예전엔 공백 정리 때 소제목이 앞 사람 줄에 붙어 '박보라 국토교통부'처럼 깨졌다(2026-10-28 국토교통부 인사).
+    소제목 줄(마커 없음·25자 이하·문장부호 없음) 바로 다음 줄이 ◇류 머리표이고, 소제목이 2개 이상이며 그중 하나는
+    앞줄이 △류 항목일 때만 적용한다 — 기관 하나짜리 일반 공지는 그대로 둔다. 소제목 아래 ◇ 구분은 하위(◎)로 내린다.
+    """
+    if not text or "\n" not in text:
+        return text
+    lines = [ln.strip() for ln in text.splitlines()]
+    idx = [i for i, ln in enumerate(lines) if ln]
+    heads: set[int] = set()
+    after_item = False
+    for pos, i in enumerate(idx[:-1]):
+        ln, nxt = lines[i], lines[idx[pos + 1]]
+        prev_is_item = pos > 0 and bool(re.match(r"[△▲▶▷]", lines[idx[pos - 1]]))
+        # 소제목 다음은 ◇류 구분이거나(금융위원회→◇ 부이사관 승진), 앞줄이 △ 항목이면 바로 △ 항목이어도 된다(외교부→△ 최순희)
+        if (not _PEOPLE_MARK_RE.match(ln) and len(ln) <= 25 and not re.search(r"[.。!?,]", ln)
+                and (re.match(r"[◇◈◆◎□■]", nxt) or (prev_is_item and re.match(r"[△▲]", nxt)))):
+            heads.add(i)
+            if prev_is_item:
+                after_item = True
+    if len(heads) < 2 or not after_item:
+        return text
+    out: list[str] = []
+    in_org = False
+    for i in idx:
+        ln = lines[i]
+        if i in heads:
+            out.append("◈" + ln)
+            in_org = True
+        elif in_org and ln[:1] in "◇◈":
+            out.append("◎" + ln[1:])
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _marked_block_candidate(html: str) -> str:
+    """HTML 의 <p>·<h*> 블록 중 ◇△ 명단 구간을 줄 단위 텍스트로 만든다(기관 소제목 <h3> 포함). 없으면 ''.
+
+    인사 공지는 문단마다 '◇ …'·'△ …' 가 따로 있어, og:description 은 160자쯤에서 잘리고 기관 이름이 앞 사람에 붙어 버린다.
+    블록 단위로 읽으면 전체 명단과 기관 소제목이 줄로 남는다. 명단 구간 밖의 광고·관련기사 <li>·긴 문장은 버린다.
+    """
+    if not html:
+        return ""
+    clean = re.sub(r"<!--.*?-->|<script.*?</script>|<style.*?</style>", " ", html, flags=re.S | re.I)
+    blocks = []
+    for tag, inner in re.findall(r"<(h[1-6]|p)\b[^>]*>(.*?)</\1\s*>", clean, flags=re.S | re.I):
+        if re.search(r"<a\b", inner, re.I):
+            continue        # 관련기사 링크 문단('▶ 기사 제목')은 명단이 아니다
+        txt = re.sub(r"\s+", " ", html_mod.unescape(re.sub(r"<[^>]+>", " ", inner))).strip()
+        if txt:
+            blocks.append((tag.lower(), txt))
+    marked = [i for i, (_, x) in enumerate(blocks) if _PEOPLE_MARK_RE.match(x)]
+    if len(marked) < 2:
+        return ""
+    lo, hi = marked[0], marked[-1]
+    if lo > 0 and blocks[lo - 1][0].startswith("h"):
+        lo -= 1
+    keep = [x for t, x in blocks[lo:hi + 1]
+            if _PEOPLE_MARK_RE.match(x) or t.startswith("h") or len(x) <= 25]
+    return "\n".join(keep)
 
 
 def _clean_notice_text(body: str) -> str:
@@ -5008,6 +5082,9 @@ def _notice_text(html: str, body: str, title: str = "") -> str:
       (예전엔 가장 긴 것을 골라, 사이드바의 긴 칼럼이 진짜 공지보다 먼저 뽑혔다.)
     """
     cands = [body or ""]
+    blk = _marked_block_candidate(html)
+    if blk:
+        cands.append(blk)
     for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
                 r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']'):
         m = re.search(pat, html or "", re.I)
@@ -11760,12 +11837,13 @@ def cmd_regroup(ctx: Context) -> None:
              changed, unchanged, unchecked)
 
 
-def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
+def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False, only_personnel: bool = False) -> None:
     """기존 인사·부고 기사를 사람별 구조 요약(LLM)으로 다시 만든다.
 
     규칙 기반 덤프로 저장된 카드를 원문에서 본문을 다시 받아 재정리한다.
     이미 구조화된(요약이 'ㆍ'로 시작) 카드는 건너뛴다 — `repeople all` 이면 전부 다시.
     limit 로 LLM 호출 수를 제한한다(비용 관리). `repeople 20` 처럼 쓴다.
+    only_personnel(`repeople all 인사 30`)이면 인사 기사만 — 부고(LLM 사용)는 건드리지 않는다(2026-10-28 국토교통부 인사 요약 재정리용).
     """
     global PEOPLE_CAREER_PER_HOUR
     PEOPLE_CAREER_PER_HOUR = max(PEOPLE_CAREER_PER_HOUR, 400)   # 일회성 재정리는 시간당 검색 상한을 넉넉히
@@ -11780,6 +11858,8 @@ def cmd_repeople(ctx: Context, limit: int = 60, force: bool = False) -> None:
         if done >= limit:
             break
         kind = people_news_kind(r.get("url_canonical") or "", r.get("title") or "") or "personnel"
+        if only_personnel and kind != "personnel":
+            continue
         target = r.get("url_canonical") or r.get("url_original") or r.get("url_source") or ""
         if not target:
             skipped += 1
@@ -13733,6 +13813,29 @@ def cmd_selftest() -> int:
               "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               ("fd1", "u/fd1", "u/fd1", "u/fd1", "전기차 시험기사 보관됨", iso(_pn), iso(_pn), "manual", 10, "[]", "[]",
                "시험", None, "archived", 0))
+    # 인사 — 여러 기관을 한 기사에 모은 공지(금융위·국토부·과기부…): 기관 소제목이 앞 사람 이름에 붙던 문제 (2026-10-28)
+    _ph = ('<html><head><meta property="og:description" content="금융위원회◇ 부이사관 승진△ 자본시장조사총괄과장 정종식◇ 서기관 승진△ 금융위원회 김종식"></head><body>'
+           '<ul class="innorame-slot"><li class="item">인천 송도 이 아파트</li></ul>'
+           '<h3>금융위원회</h3><div class="ad">광고</div><p>◇ 부이사관 승진</p><p>△ 자본시장조사총괄과장 정종식</p>'
+           '<p>◇ 서기관 승진</p><p>△ 공정시장과 박보라</p>'
+           '<h3>국토교통부</h3><p>◇ 4급 승진</p><p>△ 과학기술서기관 고상룡 김병진</p><p>△ 서기관 곽희종 김민정</p>'
+           '<h3>외교부</h3><p>△ 외교전략정보본부 국제안보국장 최순희</p>'
+           '<h3>금호타이어</h3><p>◇ 승진</p><p>△ 연구위원 정경문 장민영</p>'
+           '<p>· · · · · · · · · ·</p><p><b>관련기사</b></p><p><a href="/x">▶ 국민의힘, 임명 강행 촉구</a></p></body></html>')
+    _pt = "[인사] 금융위원회 / 국토교통부 / 외교부 등"
+    _pn_text = format_people_notice(_notice_text(_ph, "최신뉴스 사이드바 상주시 농업기술센터", _pt), "personnel", _pt)
+    check("인사 요약 — 기관 소제목이 기관 머리말이 되고 앞 사람 이름에 붙지 않는다(국토교통부 사례)",
+          _pn_text.splitlines(),
+          ["ㆍ정종식 · 자본시장조사총괄과장 (금융위원회 · 부이사관 승진)", "ㆍ박보라 · 공정시장과 (금융위원회 · 서기관 승진)",
+           "ㆍ고상룡 · 과학기술서기관 (국토교통부 · 4급 승진)", "ㆍ김병진 · 과학기술서기관 (국토교통부 · 4급 승진)",
+           "ㆍ곽희종 · 서기관 (국토교통부 · 4급 승진)", "ㆍ김민정 · 서기관 (국토교통부 · 4급 승진)",
+           "ㆍ최순희 · 외교전략정보본부 국제안보국장 (외교부)",
+           "ㆍ정경문 · 연구위원 (금호타이어 · 승진)", "ㆍ장민영 · 연구위원 (금호타이어 · 승진)"])
+    check("인사 요약 — 관련기사 링크·광고·사이드바는 명단에 안 들어온다",
+          ("관련기사" in _pn_text, "임명 강행" in _pn_text, "인천" in _pn_text, "농업기술센터" in _pn_text), (False, False, False, False))
+    check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
+          format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
+          ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
     # 잡음 기사 제외 — 포스코 계열이 없는 주식·시세·수상 기사 (사용자 지정 2026-10-28)
     _noise = [("SK온, 포드 'Q1 어워드' 수상…최고 등급 품질 인증 획득", True), ("에코프로, 혁신상 수상…배터리 기술력 인정", True),
               ("전자·IT의 날…케이에스엠 김윤호 대표 은탑산업훈장(종합)", True), ("삼성SDI, 올해의 배터리 대상 시상식서 대통령 표창", True),
@@ -16234,7 +16337,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
   reswot     SWOT 가 전부 0인 기사를 재분석 (일회성)
-  repeople [N|all]  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (구조화 안 된 것만, all 이면 전부)
+  repeople [N|all] [인사]  (뒤에 '인사'를 붙이면 인사 기사만 — 예: repeople all 인사 30)  인사·부고 기사를 사람별 구조 요약으로 다시 만듦 (구조화 안 된 것만, all 이면 전부)
   fixlinks   홈으로 잘못 연결된 카드 링크(url_canonical) 보정 (일회성)
   fixdates   미래로 저장된 발행시각 보정 (타임존 오파싱 복구 — 일회성)
   once [N]   파이프라인 1회 실행 (N 을 주면 LLM 호출을 N건으로 제한 — 검증용)
@@ -16314,7 +16417,8 @@ def main(argv: Sequence[str]) -> int:
         rest = argv[2:]
         force = "all" in rest
         nums = [int(a) for a in rest if a.isdigit()]
-        cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force)
+        cmd_repeople(ctx, nums[0] if nums else (200 if force else 60), force=force,
+                     only_personnel="인사" in rest)
     elif command == "reexcerpt":
         cmd_reexcerpt(ctx, dry="--dry" in argv[2:])
     elif command == "retranslate":
