@@ -10421,7 +10421,7 @@ def create_app(ctx: Context):
     def api_articles(group: str = "", cat: str = "", press: str = "",
                      period: str = "all", q: str = "", page: int = 1, size: int = 20,
                      sort: str = "recent", s_title: str = "", s_body: str = "",
-                     s_press: str = "", s_author: str = "", senti: str = "", min_score: int = 0):
+                     s_press: str = "", s_author: str = "", senti: str = "", min_score: int = 0, max_score: int = 0):
         page = max(1, page)
         size = int(clamp(size, 1, 100))
         tagged = _scan_tagged(period, q)
@@ -10441,8 +10441,13 @@ def create_app(ctx: Context):
             matched = [t for t in matched if (t["row"].get("sentiment") or "중립") in wanted_senti]
         # 중요도 필터 — 점수가 min_score 이상인 기사만(번잡한 기사를 숨기고 볼 때). 수집은 그대로다.
         min_score = int(clamp(min_score or 0, 0, 100))
+        max_score = int(clamp(max_score or 0, 0, 100))
+        if min_score > 0 and max_score > 0 and min_score > max_score:
+            min_score, max_score = max_score, min_score       # 이상 > 이하 로 들어오면 바꿔서 쓴다
         if min_score > 0:
             matched = [t for t in matched if int(t["row"].get("importance_score") or 0) >= min_score]
+        if max_score > 0:
+            matched = [t for t in matched if int(t["row"].get("importance_score") or 0) <= max_score]
         # 정렬 — 기본(recent)은 refresh_scan_store 가 발행일 최신순으로 정렬해 준
         # 순서를 그대로 쓴다(그 함수의 '정렬 불변식' 주석 참고. 예전엔 dict 삽입
         # 순서에 기대다가 신규 기사가 마지막 페이지로 밀리는 장애가 있었다).
@@ -10483,7 +10488,9 @@ def create_app(ctx: Context):
         groups: list[str] = []
         cats: list[str] = []
         presses: list[str] = []
+        scores: list[int] = []
         for t in _scan_tagged("all", ""):   # /api/articles 와 스캔·태그 캐시를 공유한다
+            scores.append(int(t["row"].get("importance_score") or 0))
             groups += t["g"]
             cats += t["c"]
             if t["p"]:
@@ -10496,6 +10503,9 @@ def create_app(ctx: Context):
             "presses": [p for p, _ in Counter(presses).most_common()],  # 기사 많은 순
             "periods": [{"key": "today", "label": "오늘"}, {"key": "7d", "label": "7일"},
                         {"key": "30d", "label": "30일"}, {"key": "all", "label": "전체"}],
+            # 중요도 필터 안내용 — 지금 기사들의 실제 최저·최고 점수
+            "score_min": min(scores) if scores else 0,
+            "score_max": max(scores) if scores else 0,
         }
         _filters_cache.update(at=now, data=data)
         return JSONResponse(data)
@@ -15558,6 +15568,11 @@ def cmd_selftest() -> int:
         check("중요도 필터 — min_score 이상만, 0·없음은 전체",
               (_scs(""), _scs("&min_score=50"), _scs("&min_score=70"), _scs("&min_score=90"), _scs("&min_score=0")),
               (["sc1", "sc2", "sc3"], ["sc2", "sc3"], ["sc3"], [], ["sc1", "sc2", "sc3"]))
+        check("중요도 필터 — '이하'(max_score)와 범위, 이상>이하로 거꾸로 넣어도 바꿔서 적용",
+              (_scs("&max_score=60"), _scs("&min_score=30&max_score=60"), _scs("&min_score=70&max_score=30"), _scs("&max_score=0")),
+              (["sc1", "sc2"], ["sc2"], ["sc2"], ["sc1", "sc2", "sc3"]))
+        _flt = _scl.get("/api/filters").json()
+        check("필터 안내 — 지금 기사의 최저·최고 점수를 알려 준다", (_flt["score_min"] <= 20, _flt["score_max"] >= 80), (True, True))
         check("중요도 필터 — 직접 입력한 점수(60·21·음수·100 초과)도 그대로 적용, 100 초과는 100으로",
               (_scs("&min_score=60"), _scs("&min_score=21"), _scs("&min_score=-5"), _scs("&min_score=500")),
               (["sc3"], ["sc2", "sc3"], ["sc1", "sc2", "sc3"], []))

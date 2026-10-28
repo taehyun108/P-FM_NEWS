@@ -529,9 +529,11 @@
       <div class="filter-row">
         <span class="filter-label">중요도 <em>단일 선택 · 번잡하면 높여 보세요</em></span>
         <div class="chips" id="scoreChips" data-single="true"></div>
-        <label class="score-input" for="scoreInput">직접 입력
-          <input type="number" id="scoreInput" min="0" max="100" step="1" inputmode="numeric" placeholder="예: 60" autocomplete="off">
-          점 이상</label>
+        <div class="score-range">
+          <label class="score-input" for="scoreMin"><input type="number" id="scoreMin" min="0" max="100" step="1" inputmode="numeric" autocomplete="off" aria-label="중요도 몇 점 이상"> 점 이상</label>
+          <label class="score-input" for="scoreMax"><input type="number" id="scoreMax" min="0" max="100" step="1" inputmode="numeric" autocomplete="off" aria-label="중요도 몇 점 이하"> 점 이하</label>
+          <p class="score-hint" id="scoreHint"></p>
+        </div>
       </div>
 
       <div class="filter-row">

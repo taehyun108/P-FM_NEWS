@@ -16,7 +16,8 @@ const state = {
   group: new Set(),
   cat: new Set(),
   press: new Set(),
-  minScore: '0',      // 중요도 필터 — '0'(전체)·'50'·'70'·'90'
+  minScore: '0',      // 중요도 '이상' — '0'(제한 없음)~'100'
+  maxScore: '0',      // 중요도 '이하' — '0'(제한 없음)~'100'
   senti: new Set(),   // 논조 필터 — '긍정'·'중립'·'부정' (카드 칩과 같은 기준)
   period: 'all',
   sort: 'recent',   // 'recent'(발행일 최신순, 기본) | 'score'(직접 등록·중요도순)
@@ -52,6 +53,15 @@ const SCORE_OPTIONS = [
 ];
 
 // 중요도 직접 입력 값 정리 — 0~100 정수 문자열로 맞춘다. 비었거나 숫자가 아니거나 0 이하면 '0'(전체).
+// 이상 값이 이하 값보다 크면(둘 다 입력된 경우) 서로 바꿔 항상 이상 ≤ 이하가 되게 한다.
+function fixScoreOrder() {
+  const lo = Number(state.minScore), hi = Number(state.maxScore);
+  if (lo > 0 && hi > 0 && lo > hi) { state.minScore = String(hi); state.maxScore = String(lo); }
+}
+
+// 현재 기사들의 실제 점수 범위(서버 /api/filters 의 score_min·score_max) — 입력칸 아래 안내문에 쓴다.
+let scoreRange = { min: null, max: null };
+
 function normalizeScore(raw) {
   const n = Math.floor(Number(String(raw ?? '').trim()));
   if (!Number.isFinite(n) || n <= 0) return '0';
@@ -135,6 +145,8 @@ function readStateFromURL() {
   state.period = p.get('period') || 'all';
   state.sort = p.get('sort') === 'score' ? 'score' : 'recent';
   state.minScore = normalizeScore(p.get('min_score'));
+  state.maxScore = normalizeScore(p.get('max_score'));
+  fixScoreOrder();
   state.q = p.get('q') || '';
   ADV_FIELDS.forEach(([k]) => { state.adv[k] = p.get(k) || ''; });
   state.page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
@@ -149,6 +161,7 @@ function writeStateToURL() {
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.minScore !== '0') p.set('min_score', state.minScore);
+  if (state.maxScore !== '0') p.set('max_score', state.maxScore);
   if (state.q) p.set('q', state.q);
   advActive().forEach(([k]) => p.set(k, state.adv[k]));
   if (state.page > 1) p.set('page', String(state.page));
@@ -369,6 +382,8 @@ async function loadFilters() {
     console.warn('필터 조회 실패', err);
     return;
   }
+  if (Number.isFinite(data.score_max)) scoreRange = { min: data.score_min, max: data.score_max };
+  updateScoreHint();
   renderFilterChips(data);
 }
 
@@ -431,6 +446,15 @@ function renderFilterChips(data) {
   }
 }
 
+// 입력칸 아래 안내 — 지금 기사 점수의 최저·최고 (모르면 0~100 안내)
+function updateScoreHint() {
+  const h = $('scoreHint');
+  if (!h) return;
+  h.textContent = scoreRange.max != null
+    ? `현재 기사 점수: 최저 ${scoreRange.min}점 ~ 최고 ${scoreRange.max}점 (입력 범위 0~100, 비우면 제한 없음)`
+    : '점수 범위 0~100 (비우면 제한 없음)';
+}
+
 function syncChipStates() {
   const sync = (id, selected, single = false) => {
     for (const btn of $(id).children) {
@@ -452,8 +476,11 @@ function syncChipStates() {
     btn.setAttribute('aria-pressed', String((SCORE_OPTIONS[i] || {}).key === state.minScore));
   });
   // 직접 입력칸도 현재 값으로 — 0(전체)이면 비워 둔다.
-  const si = $('scoreInput');
-  if (si && document.activeElement !== si) si.value = state.minScore === '0' ? '' : state.minScore;
+  for (const [id, val] of [['scoreMin', state.minScore], ['scoreMax', state.maxScore]]) {
+    const el2 = $(id);
+    if (el2 && document.activeElement !== el2) el2.value = val === '0' ? '' : val;
+  }
+  updateScoreHint();
   // 정렬 칩도 인덱스로 맞춘다 (key ≠ label).
   [...$('sortChips').children].forEach((btn, i) => {
     btn.setAttribute('aria-pressed', String((SORT_OPTIONS[i] || {}).key === state.sort));
@@ -2017,6 +2044,7 @@ function buildQuery() {
   if (state.period !== 'all') p.set('period', state.period);
   if (state.sort !== 'recent') p.set('sort', state.sort);
   if (state.minScore !== '0') p.set('min_score', state.minScore);
+  if (state.maxScore !== '0') p.set('max_score', state.maxScore);
   if (state.q) p.set('q', state.q);
   advActive().forEach(([k]) => p.set(k, state.adv[k]));
   p.set('page', String(state.page));
@@ -2121,7 +2149,7 @@ function renderPagination(page, total) {
 
 function activeFilterCount() {
   return state.group.size + state.cat.size + state.press.size + state.senti.size
-    + (state.minScore !== '0' ? 1 : 0)
+    + (state.minScore !== '0' ? 1 : 0) + (state.maxScore !== '0' ? 1 : 0)
     + (state.period !== 'all' ? 1 : 0) + (state.q ? 1 : 0) + advActive().length;
 }
 
@@ -2144,7 +2172,9 @@ function updateActiveFilterCount() {
   };
   seg('기간', PERIOD_LABEL[state.period] || '전체');
   if (state.senti.size) seg('논조', [...state.senti].join(', '));
-  if (state.minScore !== '0') seg('중요도', `${state.minScore}점 이상`);
+  if (state.minScore !== '0' || state.maxScore !== '0') {
+    seg('중요도', [state.minScore !== '0' ? `${state.minScore}점 이상` : '', state.maxScore !== '0' ? `${state.maxScore}점 이하` : ''].filter(Boolean).join(' · '));
+  }
   seg('그룹사', state.group.size ? [...state.group].join(', ') : '전체');
   seg('카테고리', state.cat.size ? [...state.cat].join(', ') : '전체');
   seg('언론사', state.press.size ? [...state.press].join(', ') : '전체');
@@ -2339,22 +2369,27 @@ function init() {
     if (pressView) togglePressView();       // 언론사 화면이면 전체 목록으로
     if (favView) toggleFavView();          // 즐겨찾기 화면이면 전체 목록으로
     if (window.pfmCloseEaView) window.pfmCloseEaView();   // 대외협력 화면이면 전체 목록으로
-    state.group.clear(); state.cat.clear(); state.press.clear(); state.senti.clear(); state.minScore = '0';
+    state.group.clear(); state.cat.clear(); state.press.clear(); state.senti.clear(); state.minScore = '0'; state.maxScore = '0';
     state.period = 'all'; state.q = '';
     $('searchInput').value = '';
     ADV_FIELDS.forEach(([k, id]) => { state.adv[k] = ''; $(id).value = ''; });
     window.scrollTo({ top: 0, behavior: 'smooth' });
     refresh(true);
   };
-  // 중요도 직접 입력 — Enter 를 누르거나 칸을 벗어나면(change) 적용한다. 0~100 으로 맞추고, 비우면 전체.
-  $('scoreInput').addEventListener('change', () => {
-    const v = normalizeScore($('scoreInput').value);
-    $('scoreInput').value = v === '0' ? '' : v;
-    if (v === state.minScore) return;
-    state.minScore = v;
+  // 중요도 '이상'·'이하' 직접 입력 — Enter 를 누르거나 칸을 벗어나면(change) 적용한다. 0~100 으로 맞추고, 비우면 제한 없음.
+  //  이상 값이 이하 값보다 크면 서로 바꿔 준다.
+  const applyScoreInputs = () => {
+    state.minScore = normalizeScore($('scoreMin').value);
+    state.maxScore = normalizeScore($('scoreMax').value);
+    fixScoreOrder();
+    $('scoreMin').value = state.minScore === '0' ? '' : state.minScore;
+    $('scoreMax').value = state.maxScore === '0' ? '' : state.maxScore;
     refresh(true);
-  });
-  $('scoreInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('scoreInput').blur(); } });
+  };
+  for (const id of ['scoreMin', 'scoreMax']) {
+    $(id).addEventListener('change', applyScoreInputs);
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $(id).blur(); } });
+  }
   $('clearAll').addEventListener('click', goHome);
   $('brandHome').addEventListener('click', (e) => { e.preventDefault(); goHome(); });
 
