@@ -3610,7 +3610,13 @@ _NOTICE_HEAD_RE = re.compile(
     r"^.*?(?:구독\s*구독중\s*이전\s*다음|이미지\s*확대.*?자료사진\s*\])\s*")
 _NOTICE_TAIL_RE = re.compile(
     r"\s*(?:\(\S+=\s*연합뉴스\)|※\s*부고\s*요청|&lt;저작권자|<저작권자|제보는\s*카카오톡"
-    r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고).*$", re.S)
+    r"|무단\s*전재|\d{4}/\d{2}/\d{2}\s*\d{2}:\d{2}\s*송고"
+    # 기사 끝의 부속 문구(2026-10-28 국토교통부 인사: 뉴스1 '* 인사 게재 문의…·관련 키워드', 한국경제 '/연합뉴스 좋아요 0 …')
+    r"|\*\s*인사\s*게재|관련\s*키워드|\s/\s*(?:연합뉴스|뉴스1|뉴시스|한경닷컴)\b|좋아요\s*\d|[ⓒ©]|\bERR_[A-Z_]+"
+    # 조선일보 하단 메뉴('English(영문) 日本語 인사 100자평 …')·차단 안내('www.…com is blocked')
+    r"|English\s*\(영문\)|100자평|많이\s*본\s*뉴스|\swww\.[a-z0-9.-]+|blocked\s+by\s+an\s+extension).*$", re.S)
+# 명단 한가운데 끼는 광고 문구('뉴스1 광고')와 단독 줄 '광고' — 사람 이름 줄에 붙지 않게 먼저 지운다
+_NOTICE_AD_RE = re.compile(r"(?:뉴스1|뉴시스|연합뉴스)\s*광고|(?m:^\s*(?:광고|AD)\s*$)")
 # 줄글 기사 맨 앞의 '(서울=연합뉴스) 홍길동 기자 =' — 꼬리표 규칙이 본문 전체를 지우지 않게 먼저 뗀다
 _NOTICE_DATELINE_RE = re.compile(r"^\s*\(\S+=\s*연합뉴스\)\s*(?:[가-힣]{2,4}\s*기자\s*=)?\s*")
 
@@ -3723,9 +3729,16 @@ def _split_people_sections(text: str) -> list[tuple[str, str]]:
                 continue
             if item_mark in "▷▶":
                 l3 = ""
+            # 항목 끝에 붙은 '<전보>' 같은 유형 표시는 사람이 아니라 다음 구간의 유형이다(뉴스1: '… 한정희 <전보> ▷과장급 …').
+            tag_m = re.search(r"\s*<([^<>]{1,10})>\s*$", item)
+            if tag_m:
+                item = item[:tag_m.start()].strip(" ·,;")
             head = " · ".join(x for x in (l1, l2, l3) if x)
-            for one in _split_item_people(item):
+            for one in (_split_item_people(item) if item else []):
                 pairs.append((head, one))
+            if tag_m:
+                l2 = (l2.rsplit(" · ", 1)[0] + " · " + tag_m.group(1)) if " · " in l2 else tag_m.group(1)
+                l3 = ""
     return pairs
 
 
@@ -3825,6 +3838,8 @@ def format_people_notice(body: str, kind: str, title: str = "") -> str:
     if kind != "obituary":
         body = _mark_org_headings(body)      # 기관별 소제목('국토교통부')을 기관 머리말로 — 앞 사람 이름에 붙지 않게
     text = _clean_notice_text(body)
+    if kind != "obituary":
+        text = _mark_flat_org_headings(text)
     if kind == "obituary":
         raw_blocks = [b.strip() for b in text.split("▲") if b.strip()]
         if not raw_blocks:
@@ -3889,6 +3904,23 @@ def _mark_org_headings(text: str) -> str:
     return "\n".join(out)
 
 
+# 공백 없이 '▲국토교통부◇국장급 승진▷이름' 꼴 — ▲ 가 기관 소제목이고 ◇ 가 구분, ▷ 가 사람인 형식(조선일보)
+_FLAT_ORG_RE = re.compile(r"[▲△]([^\s▲△▷▶◇◈◆◎□■](?:[^▲△▷▶◇◈◆◎□■]{0,23}[^\s▲△▷▶◇◈◆◎□■])?)(?=◇)")
+
+
+def _mark_flat_org_headings(text: str) -> str:
+    """'▲국토교통부◇국장급 승진▷A▷B ▲MBC◇콘텐츠▷C' → 기관(◈) · 구분(◎) · 사람(▷). 해당 형식이 아니면 그대로.
+
+    예전엔 기관 이름이 사람 항목('ㆍ국토교통부')이 되고 뒤 기관의 사람이 앞 기관 줄에 합쳐졌다(2026-10-28 조선일보 인사).
+    공백 없이 붙어 있고 ▷ 로 사람을 적는 글에만 적용해 '▲ 김철수 ◇ 전보' 같은 일반 명단과 섞이지 않게 한다.
+    """
+    if not text or "▷" not in text or not _FLAT_ORG_RE.search(text):
+        return text
+    text = _FLAT_ORG_RE.sub(lambda m: "◈" + m.group(1) + "◇", text)
+    # 기관(◈) 아래의 ◇ 구분은 하위(◎)로 내린다
+    return re.sub(r"(?<=[^◈◇])◇|^◇", "◎", re.sub(r"(◈[^◈◇◎]*?)◇", r"\1◎", text))
+
+
 def _marked_block_candidate(html: str) -> str:
     """HTML 의 <p>·<h*> 블록 중 ◇△ 명단 구간을 줄 단위 텍스트로 만든다(기관 소제목 <h3> 포함). 없으면 ''.
 
@@ -3918,7 +3950,7 @@ def _marked_block_candidate(html: str) -> str:
 
 def _clean_notice_text(body: str) -> str:
     """공백을 정리하고 머리(구독 안내)·꼬리(저작권 문구)를 떼어낸 인사·부고 공지 본문."""
-    text = re.sub(r"\s+", " ", (body or "").strip())
+    text = re.sub(r"\s+", " ", _NOTICE_AD_RE.sub(" ", (body or "")).strip())
     text = _NOTICE_HEAD_RE.sub("", text, count=1)
     # 줄글 기사는 맨 앞에 '(서울=연합뉴스) 홍길동 기자 =' 가 붙는다 — 꼬리표 규칙이 이걸 보고 본문 전체를
     # 지우지 않도록 머리의 것은 먼저 떼어 낸다.
@@ -13813,6 +13845,33 @@ def cmd_selftest() -> int:
               "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               ("fd1", "u/fd1", "u/fd1", "u/fd1", "전기차 시험기사 보관됨", iso(_pn), iso(_pn), "manual", 10, "[]", "[]",
                "시험", None, "archived", 0))
+    # 인사 — 매체별 부속 문구·광고·유형 표시가 사람 줄에 붙던 문제 (2026-10-28 국토교통부 인사: 뉴스1·한국경제)
+    _n1 = ("◆국토교통부 <승진> ▷국장급 △국토정보정책관 이대섭 △지방시대기획단 국토교통혁신국장 한정희 <전보>\n\n뉴스1 광고\n\n"
+           "▷과장급 △규제개혁법무담당관 김영아 △건축안전과장 위은환 △공공택지조사개발과장 이랑 "
+           "* 인사 게재 문의는 카톡 뉴스1제보 , 이메일 opinion@news1.kr 관련 키워드 국토부 김동규 기자 뉴스1 광고 ERR_BLOCKED_BY_CLIENT")
+    check("인사 요약(뉴스1 형식) — 광고·부속 문구가 안 섞이고 '<전보>' 뒤 구간은 전보로 표시",
+          format_people_notice(_n1, "personnel", "[인사] 국토교통부").splitlines(),
+          ["ㆍ이대섭 · 국토정보정책관 (국토교통부 · 승진 · 국장급)", "ㆍ한정희 · 지방시대기획단 국토교통혁신국장 (국토교통부 · 승진 · 국장급)",
+           "ㆍ김영아 · 규제개혁법무담당관 (국토교통부 · 전보 · 과장급)", "ㆍ위은환 · 건축안전과장 (국토교통부 · 전보 · 과장급)",
+           "ㆍ이랑 · 공공택지조사개발과장 (국토교통부 · 전보 · 과장급)"])
+    _n2 = ("◇ 국장급 승진\n▲ 국토정보정책관 이대섭 ▲ 지방시대기획단 국토공간혁신국장 한정희\n◇ 과장급 전보\n"
+           "▲ 규제개혁법무담당관 김영아 ▲ 공공택지조사개발과장 이랑 /연합뉴스 좋아요 0 싫어요 0 후속기사 원해요 0 ⓒ 한경닷컴, 무단전재 금지")
+    check("인사 요약(한국경제 형식) — 마지막 사람 뒤 '/연합뉴스 좋아요…ⓒ' 가 이름에 붙지 않는다",
+          format_people_notice(_n2, "personnel", "[인사] 국토교통부").splitlines(),
+          ["ㆍ이대섭 · 국토정보정책관 (국장급 승진)", "ㆍ한정희 · 지방시대기획단 국토공간혁신국장 (국장급 승진)",
+           "ㆍ김영아 · 규제개혁법무담당관 (과장급 전보)", "ㆍ이랑 · 공공택지조사개발과장 (과장급 전보)"])
+    _n3 = ("조선일보 입력 2026.10.10. 00:32 ▲국토교통부◇국장급 승진▷국토정보정책관 이대섭▷지방시대기획단 국토공간혁신국장 한정희 "
+           "▲MBC◇콘텐츠사업본부▷미디어전략사업국장 홍준수▷마케팅국장 정홍대◇제작본부▷예능스튜디오 대표(국장) 박정규"
+           "▷보도기술팀장 송진우 English(영문) 日本語(일문) 인사 100자평 도움말 삭제기준 많이 본 뉴스 2030 여성들")
+    check("인사 요약(조선일보 형식) — 기관(▲)·구분(◇)·사람(▷)을 나누고 하단 메뉴는 버린다",
+          format_people_notice(_n3, "personnel", "[인사] 국토교통부 외").splitlines(),
+          ["ㆍ이대섭 · 국토정보정책관 (국토교통부 · 국장급 승진)", "ㆍ한정희 · 지방시대기획단 국토공간혁신국장 (국토교통부 · 국장급 승진)",
+           "ㆍ홍준수 · 미디어전략사업국장 (MBC · 콘텐츠사업본부)", "ㆍ정홍대 · 마케팅국장 (MBC · 콘텐츠사업본부)",
+           "ㆍ박정규 · 예능스튜디오 대표(국장) (MBC · 제작본부)", "ㆍ송진우 · 보도기술팀장 (MBC · 제작본부)"])
+    check("인사 요약(뉴시스 형식) — 하단 차단 안내문(www…·blocked)이 마지막 사람에 안 붙는다",
+          format_people_notice("[서울=뉴시스]\n◇국장급 승진\n▲국토정보정책관 이대섭 ▲지방시대기획단(국토공간혁신국장) 한정희\n www.newsis.com is blocked This page has been blocked by an extension",
+                               "personnel", "[인사]국토교통부").splitlines(),
+          ["ㆍ이대섭 · 국토정보정책관 (국장급 승진)", "ㆍ한정희 · 지방시대기획단(국토공간혁신국장) (국장급 승진)"])
     # 인사 — 여러 기관을 한 기사에 모은 공지(금융위·국토부·과기부…): 기관 소제목이 앞 사람 이름에 붙던 문제 (2026-10-28)
     _ph = ('<html><head><meta property="og:description" content="금융위원회◇ 부이사관 승진△ 자본시장조사총괄과장 정종식◇ 서기관 승진△ 금융위원회 김종식"></head><body>'
            '<ul class="innorame-slot"><li class="item">인천 송도 이 아파트</li></ul>'
