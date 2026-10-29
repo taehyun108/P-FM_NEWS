@@ -11946,6 +11946,34 @@ def _brief_error(exc: BaseException) -> str:
     return redact_secrets(f"{type(exc).__name__}: {text}")[:400]
 
 
+def cmd_pfmgap(ctx: Context, sample: int = 12) -> dict:
+    """'포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 포스코퓨처엠이 없는 기사를 세고 이유를 보여 준다 — 읽기 전용.
+
+    그룹사 칩은 제목 + 본문 앞 GROUP_LEAD_CHARS(700)자(+참여사 나열 문장)에서만 정하고, 발췌는 본문 전체에서 뽑는다.
+    그래서 퓨처엠이 본문 뒤쪽에서만 나오면 발췌 상자는 있는데 칩이 없다. 보관 본문이 있는 기사는 언급 횟수·첫 위치를 함께 보인다.
+    """
+    since = now_utc() - timedelta(days=60)
+    rows = _retry(lambda: ctx.storage.list_articles(4000, 0, since, ""))
+    gap = [r for r in rows if (r.get("pfm_excerpt") or "").strip()
+           and "포스코퓨처엠" not in jload(r.get("group_companies"), [])]
+    log.info("[퓨처엠 칩 누락 점검] 최근 60일 기사 %d건 중 '포스코퓨처엠 언급' 발췌는 있는데 칩이 없는 기사 %d건", len(rows), len(gap))
+    aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
+    stats = {"gap": len(gap), "total": len(rows), "once": 0, "multi": 0, "nobody": 0}
+    for r in gap[:sample]:
+        body = ctx.storage.body_of(r["id"]) or ""
+        low = body.lower()
+        positions = sorted(i for a in aliases for i in [m.start() for m in re.finditer(re.escape(a), low)])
+        if not body:
+            stats["nobody"] += 1
+            where = "보관 본문 없음(30일 지남)"
+        else:
+            stats["once" if len(positions) <= 1 else "multi"] += 1
+            where = f"본문 언급 {len(positions)}회 · 첫 위치 {positions[0] if positions else '-'}자째(칩은 앞 {GROUP_LEAD_CHARS}자만 봄)"
+        log.info("  · [%s] %s | 칩: %s | %s", (r.get("press_name") or "")[:8], (r.get("title") or "")[:40],
+                 "·".join(jload(r.get("group_companies"), [])) or "-", where)
+    return stats
+
+
 def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
     """퓨처엠 외 그룹사 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는(또는 옛 그룹사별 방식인) 기존 기사에 합친 발췌를 채운다 (2026-10-29 신기능 백필).
 
@@ -14193,6 +14221,20 @@ def cmd_selftest() -> int:
     check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
           format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
           ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
+    # 퓨처엠 칩 누락 점검 — 발췌는 본문 전체, 칩은 제목+앞 700자라 뒤쪽 언급은 칩이 없다 (2026-10-29)
+    _late = "이차전지 시장 동향을 정리한다. " * 60 + "한편 포스코퓨처엠은 양극재 증설을 발표했다. 투자 규모는 1조원이다. 업계가 주목한다."
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,pfm_excerpt,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("pg1", "u/pg1", "u/pg1", "u/pg1", "이차전지 업계 동향", iso(_pn), iso(_pn), "rss", 10, "[]", "[]", "시험",
+               "포스코퓨처엠은 양극재 증설을 발표했다.", iso(_pn), "active", 1))
+    _et.save_summary({"id": new_id(), "article_id": "pg1", "summary_text": "요약", "perspective_text": "", "summary_source": "fulltext",
+                      "model": "m", "token_usage": None, "created_at": iso(_pn)})
+    _et.save_body("pg1", _late, "fulltext")
+    _pg = cmd_pfmgap(_ectx)
+    check("퓨처엠 칩 누락 점검 — 발췌는 있고 칩이 없는 기사를 찾고, 본문이 있으면 언급 횟수를 센다(쓰지 않음)",
+          (_pg["gap"] >= 1, _pg["once"] >= 1, detect_group_companies(group_lead_text(_late)), "포스코퓨처엠" in extract_pfm_excerpt(_late)),
+          (True, True, [], True))
     # 일시 오류 재시도 · 오류 한 줄 요약 (2026-10-29 Supabase 500 HTML 이 그대로 쏟아진 사례)
     _calls = {"n": 0}
     def _flaky():
@@ -16808,6 +16850,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
+  pfmgap [N]  '포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 퓨처엠이 없는 기사 점검 (읽기 전용, N건 예시)
   fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
@@ -16879,6 +16922,9 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixaggpress":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
+    elif command == "pfmgap":
+        _nums = [a for a in argv[2:] if a.isdigit()]
+        cmd_pfmgap(ctx, int(_nums[0]) if _nums else 12)
     elif command == "fixgroupexcerpt":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixgroupexcerpt(ctx, int(_nums[0]) if _nums else 200, dry="--dry" in argv[2:])
