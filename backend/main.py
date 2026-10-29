@@ -11927,6 +11927,25 @@ def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=Non
     return result
 
 
+def _retry(fn, tries: int = 3, wait: float = 3.0):
+    """일시적인 DB·네트워크 오류(예: Supabase 500)는 몇 초 간격으로 다시 시도한다. 마지막 시도까지 실패하면 그 오류를 그대로 올린다."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == tries - 1:
+                raise
+            log.warning("일시 오류 — %d초 뒤 다시 시도(%d/%d): %s", int(wait * (attempt + 1)), attempt + 1, tries - 1, _brief_error(exc)[:160])
+            time.sleep(wait * (attempt + 1))
+
+
+def _brief_error(exc: BaseException) -> str:
+    """오류를 한 줄로 — HTML 오류 페이지(<html>…500 - Internal Server Error…)는 태그를 떼고 비밀값은 가린다."""
+    text = re.sub(r"<[^>]+>", " ", str(exc) or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return redact_secrets(f"{type(exc).__name__}: {text}")[:400]
+
+
 def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
     """퓨처엠 외 그룹사 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는(또는 옛 그룹사별 방식인) 기존 기사에 합친 발췌를 채운다 (2026-10-29 신기능 백필).
 
@@ -11935,7 +11954,8 @@ def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch
     """
     fetch = fetch or prefetch_articles
     todo = []
-    for r in ctx.storage.list_articles(8000, 0, None, ""):
+    # 보관 본문은 30일이라 최근 60일만 본다 — 8000건을 요약·SWOT 와 함께 받다가 DB 가 500 을 내던 문제(2026-10-29)를 피한다.
+    for r in _retry(lambda: ctx.storage.list_articles(4000, 0, now_utc() - timedelta(days=60), "")):
         cats = jload(r.get("categories"), [])
         groups = jload(r.get("group_companies"), [])
         if not [g for g in groups if g != "포스코퓨처엠"]:
@@ -11985,7 +12005,7 @@ def cmd_fixentities(ctx: Context, dry: bool = True) -> dict:
 
     기본은 미리보기(--run 을 줘야 실제 수정). 요약은 별도 표라 건드리지 않는다 — 화면과 텔레그램에서는 자동으로 풀려 보인다.
     """
-    rows = ctx.storage.list_articles(8000, 0, None, "")
+    rows = _retry(lambda: ctx.storage.list_articles(8000, 0, None, ""))
     fields = (("title", False), ("author", False), ("press_name", False), ("pfm_excerpt", True))
     kinds: Counter = Counter()
     fixed_rows = 0
@@ -12022,7 +12042,7 @@ def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
 
     제외: 직접 등록(manual) 기사, 정책브리핑, 포스코 계열이 제목·그룹사 태그에 있는 기사. 보관은 되돌릴 수 있다.
     """
-    rows = ctx.storage.list_articles(5000, 0, None, "")
+    rows = _retry(lambda: ctx.storage.list_articles(5000, 0, None, ""))
     hits: list[tuple[dict, str]] = []
     for r in rows:
         if r.get("source_type") == "manual" or is_policy_brief(r):
@@ -14173,6 +14193,22 @@ def cmd_selftest() -> int:
     check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
           format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
           ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
+    # 일시 오류 재시도 · 오류 한 줄 요약 (2026-10-29 Supabase 500 HTML 이 그대로 쏟아진 사례)
+    _calls = {"n": 0}
+    def _flaky():
+        _calls["n"] += 1
+        if _calls["n"] < 3:
+            raise RuntimeError("500")
+        return "ok"
+    _w = time.sleep
+    time.sleep = lambda x: None
+    try:
+        _rt = _retry(_flaky, tries=3, wait=1)
+    finally:
+        time.sleep = _w
+    _he = _brief_error(Exception('<!DOCTYPE html><html><head><title>500 - Internal Server Error</title></head><body><h1>500 - Internal Server Error</h1></body></html>'))
+    check("재시도 — 일시 오류는 두 번 실패해도 세 번째에 성공하고, HTML 오류 페이지는 한 줄로 줄어든다",
+          (_rt, _calls["n"], "<" in _he, "500 - Internal Server Error" in _he, len(_he) < 200), ("ok", 3, False, True, True))
     # 그룹사 언급 발췌 — 한 카드에 여러 계열사가 언급되면 상자 하나로 합쳐 같은 글이 되풀이되지 않게 (2026-10-29)
     _gb = ("[서울=뉴시스] 포스코그룹 임단협 결렬로 파업 위기가 커졌다.\n"
            "포스코홀딩스는 지난달 노조와 교섭을 시작했으나 합의에 이르지 못했다. 사측은 추가 비용이 1조원이라고 밝혔다.\n"
@@ -16965,5 +17001,19 @@ def main(argv: Sequence[str]) -> int:
     return 0
 
 
+def main_safe(argv: Sequence[str]) -> int:
+    """점검·정리 명령이 DB 오류(HTML 오류 페이지 통째)로 쏟아지지 않게 한 줄 오류로 알린다. 상시 실행(serve·worker)은 그대로 둔다."""
+    if len(argv) > 1 and argv[1] in ("serve", "worker", "all", "selftest"):
+        return main(argv)
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        log.error("명령 실패 — %s", _brief_error(exc))
+        log.error("잠시 뒤 같은 명령을 한 번 더 실행해 보세요. 계속 실패하면 이 줄을 알려 주세요.")
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main_safe(sys.argv))
