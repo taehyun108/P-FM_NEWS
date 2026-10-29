@@ -3357,12 +3357,21 @@ _POSCO_WORD_RE = re.compile(r"포스코|posco", re.IGNORECASE)
 def posco_relevant(title: str, snippet: str, body: str, rule_groups: Sequence[str]) -> bool:
     """포스코 언급이 '스치는 한 줄'이 아닌가 — 다른 관문(배터리·정부·통상·정책)에 안 걸리는 기사에만 쓴다.
 
-    관련 있음: 제목·리드에 계열사가 있거나(rule_groups), 제목·스니펫에 포스코가 있거나, 본문에 2번 이상 나온다.
-    본문에 딱 1번(예: 우리금융 기사 속 '포스코그룹은 지분을 매각했다') 나오는 기사는 관련 없음으로 본다. (사용자 지정 2026-10-27, B-1)
+    관련 있음: 제목·리드에 계열사가 있거나(rule_groups), 제목·스니펫에 포스코가 있거나, 본문에 3번 이상 나오거나,
+    2번이면서 그 문장이 공급·계약·협력·투자 같은 사업 동작을 말할 때. 1번(우리금융 기사 속 '포스코그룹은 지분을 매각했다')이나
+    사업 동작 없는 2번(분양 단지·참석자 목록)은 관련 없음으로 본다. (B-1 2026-10-27, 강화 2026-10-29)
     """
     if rule_groups or POSCO_MENTION_RE.search(f"{title}\n{snippet or ''}"):
         return True
-    return len(_POSCO_WORD_RE.findall(strip_posco_facilities(body or ""))) >= 2
+    clean = strip_posco_facilities(body or "")
+    n = len(_POSCO_WORD_RE.findall(clean))
+    if n >= 3:
+        return True
+    if n == 2:      # 두 번은 사업 동작 문장(공급·계약·협력·투자 …)일 때만 — 분양 단지·참석자 목록에 두 번 나온 것은 제외 (2026-10-29)
+        for sent in re.split(r"(?<=[.!?。])\s+|\n", clean):
+            if _POSCO_WORD_RE.search(sent) and any(k.lower() in sent.lower() for k in PFM_DEEP_ACTION_KW):
+                return True
+    return False
 
 
 def _kw_hit(text: str, keywords: Sequence[str]) -> bool:
@@ -3438,17 +3447,37 @@ GOV_AGENCY_KW = [
     "중소벤처기업부", "중기부", "공정위", "공정거래위원회", "관세청", "금융위원회", "금융위", "산업은행",
     "국무조정실", "국회", "정부", "범부처", "산업부 장관", "한국무역협회", "KOTRA", "코트라",
 ]
-GOV_INDUSTRY_KW = [
+# 포스코 사업과 직결된 산업어(핵심) — 본문 리드에만 있어도 인정한다.
+GOV_INDUSTRY_CORE = [
     "이차전지", "2차전지", "배터리", "전기차", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트", "흑연", "전해액", "분리막",
-    "ESS", "에너지저장", "핵심광물", "희토류", "소부장", "소재부품", "공급망", "철강", "제철", "수소환원", "탄소중립",
-    "탄소국경", "CBAM", "배출권", "전기요금", "산업단지", "특화단지", "국가첨단전략산업", "반도체", "친환경차", "충전",
+    "ESS", "에너지저장", "핵심광물", "희토류", "소부장", "소재부품", "공급망", "철강", "제철", "수소환원",
+    "탄소국경", "CBAM", "배출권", "국가첨단전략산업", "친환경차",
 ]
+# 넓은 산업어 — 반도체·충전·산업단지처럼 다른 주제 기사에도 흔해서 **제목에** 있을 때만 인정한다.
+#   (2026-10-29 수원일보 '국정감사 결산…국회의원 5인' 이 본문의 '반도체 벨트' 한 줄로 수집된 사례)
+GOV_INDUSTRY_BROAD = ["탄소중립", "전기요금", "산업단지", "특화단지", "반도체", "충전"]
+GOV_INDUSTRY_KW = GOV_INDUSTRY_CORE + GOV_INDUSTRY_BROAD
+# '정부'·'국회'처럼 어디에나 붙는 일반 기관어 — 제목에 핵심 산업어가 함께 있어야 한다.
+GOV_AGENCY_GENERIC = ("국회", "정부", "금융위원회", "금융위", "산업은행", "범부처")
+GOV_AGENCY_SPECIFIC = [k for k in GOV_AGENCY_KW if k not in GOV_AGENCY_GENERIC]
+# '국회의원'·'국회의사당'·'정부예산' 같은 낱말 속의 기관어는 기관 언급이 아니다
+_GOV_FALSE_AGENCY_RE = re.compile(r"국회(?:의원|의사당|의장|도서관)|정부(?:예산|청사)|지방정부|전\s*정부")
 
 
 def is_gov_industry_news(title: str, extra: str = "") -> bool:
-    """제목에 정부 부처·기관 이름이 있고, 제목·요약에 포스코 사업과 닿는 산업어가 함께 있는가."""
+    """정부 부처·기관 소식 중 포스코 사업과 닿는 기사인가 (사용자 지정 2026-10-26, 오탐 보강 2026-10-29).
+
+    · 구체적인 부처·기관(산업통상부·기후부·관세청 등)이 제목에 있으면 → 제목·리드에 핵심 산업어가 있거나, 제목에 넓은 산업어가 있을 때
+    · '정부'·'국회' 같은 일반 기관어만 있으면 → **제목에** 핵심 산업어가 있을 때만 (본문의 반도체 한 줄로 수원 국정감사 기사가 들어오던 문제)
+    """
     t = title or ""
-    return _kw_hit_any(t, GOV_AGENCY_KW) and _kw_hit_any(f"{t}\n{extra}", GOV_INDUSTRY_KW)
+    full = f"{t}\n{extra}"
+    if _kw_hit_any(t, GOV_AGENCY_SPECIFIC):
+        return _kw_hit_any(full, GOV_INDUSTRY_CORE) or _kw_hit_any(t, GOV_INDUSTRY_BROAD)
+    t_generic = _GOV_FALSE_AGENCY_RE.sub(" ", t)
+    if _kw_hit_any(t_generic, GOV_AGENCY_GENERIC):
+        return _kw_hit_any(t, GOV_INDUSTRY_CORE)
+    return False
 
 
 def is_trade_topic(title: str, extra: str = "") -> bool:
@@ -4682,6 +4711,13 @@ def decode_html(resp: Any) -> str:
     그대로 .text 를 쓰면 기자명·제목이 'ì¡ìë¯¼' 처럼 깨진다.
     """
     raw = resp.content or b""
+    # 0) 바이트가 엄격한 UTF-8 로 읽히면 그것이 정답이다. euc-kr 바이트는 UTF-8 로 거의 항상 읽히지 않기 때문이다.
+    #    meta·스크립트에 'charset=euc-kr' 같은 글자가 따로 있어도(본문은 UTF-8) cp949 로 읽어 기자명이
+    #    '誘뺣<�꽦' 처럼 깨지던 문제(2026-10-29 에너지경제)를 막는다.
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
     # 1) HTML meta 의 charset 을 우선한다.
     m = re.search(rb'charset=["\']?\s*([A-Za-z0-9_\-]+)', raw[:4096], re.I)
     if m:
@@ -4966,15 +5002,26 @@ def author_display(author: str) -> str:
     """카드 머리표에 쓸 기자명 — 소속·직함·이메일을 뗀 사람 이름만 '·' 로 잇는다.
     사람 이름이 하나도 안 남으면(부서·데스크·통신사뿐) 빈 문자열 → '[언론사]' 만 표기."""
     raw = (author or "").strip()
-    if not raw:
+    if not raw or is_garbled(raw):      # 깨진 기자명은 화면에 내지 않는다('[언론사]' 만 표기) — 저장값은 fixauthors 가 다시 뽑는다
         return ""
     names = split_authors(raw)
     return "·".join(names) if names else ""
 
 
+_CJK_IDEOGRAPH_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def is_garbled(text: str) -> bool:
+    """글이 깨졌는가 — 대체문자(�)가 있거나, 한글에 한자가 섞여 있다(UTF-8 을 cp949 로 잘못 읽으면 '민영' → '誘쇱쁺' 이 된다)."""
+    t = text or ""
+    return "\ufffd" in t or bool(_CJK_IDEOGRAPH_RE.search(t) and re.search(r"[가-힣]", t))
+
+
 def _valid_author(raw: str, press_key: str) -> str:
     """기자명 후보를 정제·검증한다. 부적합하면 빈 문자열."""
     raw_text = fix_mojibake(decode_unicode_escapes((raw or "").strip()))
+    if is_garbled(raw_text):
+        return ""
     if is_non_person_byline(raw_text):   # clean_author 가 '취재팀'의 '팀'을 떼기 전에 먼저 거른다
         return ""
     name = clean_author(raw_text)
@@ -11701,7 +11748,7 @@ def cmd_fixauthors(ctx: Context) -> None:
             continue
         restored = clean_author(fix_mojibake(decode_unicode_escapes(author)))
         press = (r.get("press_name") or "").strip()
-        bad = (re.match(r"(https?:|www\.)", restored, re.I) or _looks_like_domain(restored)
+        bad = (is_garbled(restored) or re.match(r"(https?:|www\.)", restored, re.I) or _looks_like_domain(restored)
                or (not restored.isascii() and not _has_hangul(restored))
                or not (2 <= len(restored) <= 20)
                or restored.endswith(MEDIA_NAME_SUFFIX)
@@ -12152,6 +12199,48 @@ def cmd_fixentities(ctx: Context, dry: bool = True) -> dict:
         log.info("  · %s", sm)
     log.info("  요약에 깨짐이 남은 기사 %d건 — 화면·텔레그램에서는 자동으로 풀려 보입니다(저장값은 그대로)", summ)
     return {"rows": len(rows), "fixed": fixed_rows, "kinds": dict(kinds), "summary_defects": summ}
+
+
+def cmd_fixrelevance(ctx: Context, dry: bool = True, limit: int = 3000) -> dict:
+    """이미 쌓인 기사 중 **지금 수집 기준으로는 안 들어올** 기사를 보관(archived) 처리한다 — 기본은 미리보기(--run 이면 실행).
+
+    수원 국정감사·분양 목록·한국씨티은행처럼 포스코·배터리와 무관한데 예전(느슨한) 기준으로 들어온 기사를 정리한다.
+    보관 본문(30일)이 있는 기사만 다시 판정하고(없으면 건드리지 않음), 직접 등록·정책브리핑·인사·부고와
+    그룹사 칩이 이미 붙은 기사는 제외한다. 보관은 되돌릴 수 있다.
+    """
+    since = now_utc() - timedelta(days=45)
+    rows = _retry(lambda: ctx.storage.list_articles(max(limit, 100), 0, since, ""))
+    hits: list[tuple[dict, str]] = []
+    checked = nobody = 0
+    for r in rows:
+        cats = jload(r.get("categories"), [])
+        if (r.get("source_type") == "manual" or is_policy_brief(r) or PEOPLE_NEWS_CATEGORY in cats
+                or jload(r.get("group_companies"), [])):
+            continue
+        body = ctx.storage.body_of(r["id"]) or ""
+        if not body:
+            nobody += 1
+            continue
+        checked += 1
+        title, summ = r.get("title") or "", r.get("summary_text") or ""
+        extra = f"{summ}\n{body[:1500]}"
+        rule_groups = detect_group_companies(f"{title}\n{group_lead_text(body)}")
+        if (rule_groups or is_trade_topic(title, extra) or is_battery_scope(title, extra)
+                or is_gov_industry_news(title, extra) or posco_relevant(title, "", body, rule_groups)
+                or people_news_kind(r.get("url_canonical") or "", title)):
+            continue
+        hits.append((r, "현재 기준 밖(포스코·배터리·통상·정부 산업 소식 아님)"))
+    log.info("[관련성 재점검] 최근 45일 %d건 중 본문으로 다시 본 기사 %d건 · 본문 없어 건너뜀 %d건 — 현재 기준 밖 %d건%s",
+             len(rows), checked, nobody, len(hits), " (미리보기)" if dry else "")
+    for r, why in hits[:15]:
+        log.info("  · [%s] %s | %s", (r.get("press_name") or "")[:8], (r.get("title") or "")[:46], ", ".join(jload(r.get("categories"), [])) or "-")
+    done = 0
+    if not dry:
+        for r, _ in hits:
+            ctx.storage.update_article(r["id"], {"status": "archived"})
+            done += 1
+        log.info("관련성 재점검: %d건 보관 처리", done)
+    return {"checked": checked, "targets": len(hits), "archived": done, "nobody": nobody}
 
 
 def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
@@ -14194,12 +14283,46 @@ def cmd_selftest() -> int:
           [bool(POSCO_MENTION_RE.search(t)) for t in ("교내 포스코국제관에서 워크숍을 열었다", "포스코 체육관 개방",
                                                       "포스코, 포항시로부터 받은 은혜", "POSCO 국제관 아님 POSCO 발표")],
           [False, False, True, True])
-    check("포스코 관련성(B-1) — 제목·리드·스니펫에 있거나 본문에 2번 이상이면 관련, 본문 한 줄 스침이면 무관",
+    check("포스코 관련성 — 제목·리드·스니펫에 있거나 본문 3회 이상 또는 사업 동작 문장 2회면 관련, 스침(1회·동작 없는 2회)은 무관",
           [posco_relevant("우리금융, 신탁계약 통해 자사주 취득", "", "…" * 50 + "한편 포스코그룹은 지분을 매각했다." + "…" * 50, []),
-           posco_relevant("우리금융 자사주 취득", "", "포스코가 지분을 팔았다. " + "…" * 20 + " 포스코는 6765억을 확보했다.", []),
+           posco_relevant("우리금융 자사주 취득", "", "포스코가 지분을 팔았다. " + "…" * 20 + " 포스코는 6765억을 확보했다.", [])
+           or posco_relevant("분양 소식", "", "포스코이앤씨는 하남에서 더샵을 공급한다. 포스코이앤씨는 부산에서도 분양한다.", []),
            posco_relevant("포스코 소식", "", "", []), posco_relevant("자사주 취득", "포스코그룹 지분 매각", "", []),
            posco_relevant("자사주 취득", "", "본문", ["포스코홀딩스"]), posco_relevant("교내 포스코국제관 워크숍", "", "포스코국제관에서 열렸다", [])],
-          [False, True, True, True, True, False])
+          [False, False, True, True, True, False])
+    check("포스코 관련성 — 3회 이상, 또는 2회 중 한 문장이 공급·계약·협력 같은 사업 동작이면 관련",
+          [posco_relevant("제목", "", "포스코는 어제 발표했다. 포스코는 오늘도 말했다. 포스코는 내일 쉰다.", []),
+           posco_relevant("제목", "", "삼성SDI는 포스코와 공급 계약을 맺었다. 이후 포스코는 입장을 냈다.", []),
+           posco_relevant("제목", "", "포스코이앤씨는 하남에서 더샵 단지를 선보인다. 포스코이앤씨는 부산에서도 선보인다.", [])],
+          [True, True, False])
+    _gnew = [("[국정감사 결산] 수원 지역 국회의원 5인, 현안 대응 성과와 과제", "경기남부첨단반도체 클러스터 반도체 벨트 광역교통망", False),
+             ("충북도 내년 정부예산 확보 '사활'", "K-바이오스페이스 반도체 클러스터 지방재정", False),
+             ("정부, 美 금리 동결에 시장 변동성 점검…국고채 긴급바이백 검토", "반도체 철강 수출", False),
+             ("이원택, 국회서 예산정책협의회…2027년 국가예산 확보 총력전", "농생명 반도체", False),
+             ("한국씨티은행 노조, 금융위원회 앞에서 집회", "반도체 충전", False),
+             ("정부, 이차전지 공급망 지원 확대", "", True), ("국회, 배터리 안전 특별법 심사", "", True),
+             ("산업통상부, 신규 사업 공고", "리튬 공급망 점검 포함", True), ("산업통상부, 반도체 지원 확대", "", True),
+             ("산업통상부, 인사 발표", "반도체 얘기만 본문에", False)]
+    check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
+          [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
+    for _rid, _rt, _rb, _rg in (("fr1", "[국정감사 결산] 수원 지역 국회의원 5인, 현안 대응 성과", "수원 현안 반도체 벨트 이야기. " * 30, "[]"),
+                                 ("fr2", "삼성SDI, 양극재 증설 발표", "배터리 소재 증설 소식. " * 30, "[]"),
+                                 ("fr3", "강남 3구는 내리고 강북은 뛰고", "분양 단지 소개 문장이 길게 이어진다. " * 40 + "포스코이앤씨는 더샵을 선보인다. 포스코이앤씨는 부산에서도 선보인다.", "[]"),   # 앞 700자 밖에서만 나옴
+                                 ("fr4", "분양 소식 칩있음", "분양 이야기만 있다. " * 30, '["포스코이앤씨"]'),
+                                 ("fr5", "한국씨티은행, 새 점포 개설", "점포 개설 소식. " * 30, "[]")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_rid, "u/" + _rid, "u/" + _rid, "u/" + _rid, _rt, iso(_pn), iso(_pn), "rss", 10, _rg, "[]", "시험", iso(_pn), "active", 1))
+        _et.save_summary({"id": new_id(), "article_id": _rid, "summary_text": "요약", "perspective_text": "", "summary_source": "fulltext",
+                          "model": "m", "token_usage": None, "created_at": iso(_pn)})
+        _et.save_body(_rid, _rb, "fulltext")
+    _fr0 = cmd_fixrelevance(_ectx, dry=True)
+    check("fixrelevance 미리보기 — 현재 기준 밖 기사만 세고 쓰지 않는다", (_fr0["targets"] >= 3, _et.article_detail("fr1")["status"]), (True, "active"))
+    cmd_fixrelevance(_ectx, dry=False)
+    check("fixrelevance — 수원 국감·분양 목록(동작 없는 2회)·씨티은행은 보관, 배터리 소재·칩이 있는 기사는 그대로",
+          [_et.article_detail(x)["status"] for x in ("fr1", "fr2", "fr3", "fr4", "fr5")],
+          ["archived", "active", "archived", "active", "archived"])
     check("그룹사 판정 — 포스코디엑스(한글 표기)는 포스코DX 로 잡는다",
           detect_group_companies("포스코디엑스, AI로 로드킬 막는다"), ["포스코DX"])
     check("그룹사 판정 — 포스코국제관은 '포스코' 태그를 만들지 않고 실제 회사 언급은 유지",
@@ -14443,6 +14566,20 @@ def cmd_selftest() -> int:
     check("카드 — '확인함' 표시는 화면에 상자를 만들지 않는다", build_card({"id": "g9", "title": "t", "press_name": "p", "perspective_text":
           pack_perspective("", "", "", group_excerpts={GROUP_EXCERPT_NONE: "-"}), "group_companies": '["포스코홀딩스"]', "categories": "[]",
           "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})["group_excerpts"], [])
+    # 글자 깨짐(에너지경제 기자명 '誘뺣<�꽦') — UTF-8 본문을 cp949 로 읽던 문제와 화면 숨김 (2026-10-29)
+    class _R:
+        def __init__(self, raw, enc=None):
+            self.content, self.encoding = raw, enc
+    _ko = '<html><head><meta http-equiv="Content-Type" content="text/html; charset=euc-kr"></head><body>기자 민영민 입력</body></html>'
+    check("HTML 디코드 — 실제는 UTF-8 인데 meta 에 euc-kr 이라 적혀 있어도 한글이 안 깨진다 · 진짜 euc-kr 은 그대로 읽는다",
+          ("민영민" in decode_html(_R(_ko.encode("utf-8"))), "민영민" in decode_html(_R(_ko.encode("cp949"))),
+           "민영민" in decode_html(_R("<meta charset=utf-8>민영민".encode("utf-8"), "ISO-8859-1"))), (True, True, True))
+    check("깨진 글 판정 — 대체문자·한글+한자 혼합은 깨짐, 정상 이름·순한자·영문은 아님",
+          (is_garbled("誘뺣<�꽦 渽갯엳"), is_garbled("민영".encode("utf-8").decode("cp949", "replace")), is_garbled("홍길동"),
+           is_garbled("李在明"), is_garbled("Kim Minyoung")), (True, True, False, False, False))
+    check("기자명 — 깨진 후보는 버리고 정상 후보로 넘어간다 · 화면에서도 깨진 기자명은 숨긴다",
+          (extract_author('<meta name="author" content="誘뺣<�꽦">', "민영민 기자 입력"), author_display("誘뺣<�꽦 渽갯엳"), author_display("민영민 기자")),
+          ("민영민", "", "민영민"))
     # 글자 깨짐 — 엔티티 이중 이스케이프(마이데일리 사례)·모지바케·태그를 화면·수집·메시지에서 모두 푼다 (2026-10-29)
     _brk = "[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 &hellip;투자 고갈&middot;적자 위험 &lsquo;경고&rsquo;"
     check("글자 깨짐 — 이중 이스케이프 엔티티를 끝까지 푼다",
@@ -16979,6 +17116,7 @@ USAGE = """사용법: python backend/main.py <명령>
   pfmgap [N]  '포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 퓨처엠이 없는 기사 점검 (읽기 전용, N건 예시)
   fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
+  fixrelevance [--run]  지금 수집 기준으로는 안 들어올 기사(수원 국감·분양 목록 등)를 보관 처리 (기본 미리보기, 본문 있는 기사만)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
@@ -17059,6 +17197,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixgroupexcerpt(ctx, int(_nums[0]) if _nums else 200, dry="--dry" in argv[2:])
     elif command == "fixentities":
         cmd_fixentities(ctx, dry="--run" not in argv[2:])
+    elif command == "fixrelevance":
+        cmd_fixrelevance(ctx, dry="--run" not in argv[2:])
     elif command == "fixnoise":
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
