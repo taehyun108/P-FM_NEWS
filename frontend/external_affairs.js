@@ -561,9 +561,12 @@
     body.append(h);
 
     if (isNotice) {
-      var nb = [it.agency && ('소관: ' + it.agency),
-        it.law_name && ((isGrant ? '담당·전문기관: ' : '') + it.law_name), it.status].filter(Boolean);
-      body.append(el('p', 'ea-card-sub', nb.join(' · ')));
+      // 소관(부처)과 진행 상태(예고중·종료)는 따로 보인다 — 상태가 소관 글자에 섞이지 않게
+      var nb = [(isGrant ? '담당부서: ' : '소관부서: ') + (it.agency || '확인 불가'),
+        it.law_name && ((isGrant ? '담당·전문기관: ' : '대상 법령: ') + it.law_name)].filter(Boolean);
+      var nsub = el('p', 'ea-card-sub', nb.join(' · '));
+      if (it.status) { nsub.append(document.createTextNode(' '), el('span', 'ea-status-chip', it.status)); }
+      body.append(nsub);
     } else if (isTrade) {
       // 기자명이 없는 정부 발행물 — 출처를 산업통상부(월간 통상)로 적는다
       var src = el('p', 'ea-card-sub');
@@ -597,8 +600,9 @@
         who.append(document.createTextNode('발의 의원 정보를 가져오지 못했습니다 — 의안정보시스템 원문에서 확인하세요'));
       }
       body.append(who);
-      var sub = [it.agency && ('소관위: ' + it.agency), it.status].filter(Boolean).join(' · ');
-      if (sub) { body.append(el('p', 'ea-card-sub', sub)); }
+      var bsub = el('p', 'ea-card-sub', '소관위원회: ' + (it.agency && it.agency !== '국회' ? it.agency : '확인 불가(의안정보시스템 원문 확인)'));
+      if (it.status) { bsub.append(document.createTextNode(' '), el('span', 'ea-status-chip', it.status)); }
+      body.append(bsub);
     }
 
     var tags = el('div', 'ea-tags');
@@ -608,13 +612,22 @@
     });
     if (tags.childNodes.length) { body.append(tags); }
 
-    var sum = el('p', 'ea-summary', it.summary || '요약을 아직 만들지 못했습니다 — 원문에서 확인하세요');
+    // 주요 내용 — 항상 3줄 이내(줄마다 한 문장)
     var sumBox = el('div', 'ea-summary-box');
     sumBox.append(el('b', 'ea-summary-label', '주요 내용'));
-    sumBox.append(foldable(sum, 5));
+    var sumList = el('ul', 'ea-summary-lines');
+    var lines = (it.summary_lines && it.summary_lines.length) ? it.summary_lines
+      : [it.summary || '요약을 아직 만들지 못했습니다 — 원문에서 확인하세요'];
+    lines.slice(0, 3).forEach(function (ln) { sumList.append(el('li', null, ln)); });
+    sumBox.append(sumList);
     body.append(sumBox);
     if (it.priority_reason) {
       body.append(el('p', 'ea-prio-why', '분류 이유: ' + it.priority_reason));
+    }
+    if (it.implication) {
+      var imp = el('p', 'ea-implication');
+      imp.append(el('b', null, '퓨처엠 시사점: '), document.createTextNode(it.implication));
+      body.append(imp);
     }
 
     var acts = el('div', 'ea-actions');

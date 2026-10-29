@@ -93,7 +93,7 @@ def kotra_service_key() -> str:
     return _env("EA_KOTRA_SERVICE_KEY")
 
 
-EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 50, 0)   # noqa: E731
+EA_LLM_DAILY_LIMIT = lambda: _env_int("EA_LLM_DAILY_LIMIT", 100, 0)   # noqa: E731
 ASSEMBLY_AGE = lambda: _env_int("EA_ASSEMBLY_AGE", 22, 1)            # noqa: E731
 EA_PRESS_DAYS = lambda: _env_int("EA_PRESS_DAYS", 3, 1, 30)           # noqa: E731  정책브리핑 보도자료 조회 기간(일)
 EA_PRESS_PAGES = lambda: _env_int("EA_PRESS_PAGES", 5, 1, 20)        # noqa: E731  페이지당 약 20건
@@ -314,6 +314,13 @@ class EaDB:
 
     def delete_analysis(self, item_id: str) -> None:
         self.exec("delete from ea_analyses where policy_item_id=?", (item_id,))
+
+    def items_without_implication(self, limit: int) -> list[dict]:
+        """분석은 있으나 퓨처엠 시사점([시사점] 표식)이 없는 항목 — 3줄 요약·시사점으로 다시 분석할 대상(최신순)."""
+        return self.rows(
+            "select p.* from ea_policy_items p join ea_analyses a on a.policy_item_id = p.id"
+            " where coalesce(a.model,'') != 'rule' and coalesce(a.suggested_action,'') not like ?"
+            " order by coalesce(p.notice_start, substr(p.collected_at,1,10)) desc limit ?", ("%[시사점]%", limit))
 
     def analyses_today(self) -> int:
         return int((self.one(
@@ -633,6 +640,16 @@ class EaSupabaseDB:
 
     def delete_analysis(self, item_id: str) -> None:
         self._t("ea_analyses").delete().eq("policy_item_id", item_id).execute()
+
+    def items_without_implication(self, limit: int) -> list[dict]:
+        rows = self._t("ea_analyses").select("policy_item_id,suggested_action,model").execute().data
+        ids = {r["policy_item_id"] for r in rows
+               if (r.get("model") or "") != "rule" and "[시사점]" not in (r.get("suggested_action") or "")}
+        if not ids:
+            return []
+        items = [r for r in self._t("ea_policy_items").select("*").execute().data if r["id"] in ids]
+        items.sort(key=lambda r: r.get("notice_start") or (r.get("collected_at") or "")[:10], reverse=True)
+        return items[:limit]
 
     def analyses_today(self) -> int:
         midnight = iso(now_utc().replace(hour=0, minute=0, second=0, microsecond=0))
@@ -1717,6 +1734,91 @@ EA_IMPACT_LEVELS = ("high", "medium", "low", "none")
 _EA_CITE = re.compile(
     r'(?:안\s*)?제\s?\d+\s?조|제\s?\d+\s?항|제\s?\d+\s?호|["“][^"”]{10,}["”]')
 
+
+# ── 카드 '주요 내용' 3줄 · 퓨처엠 시사점 · 소관 정리 (사용자 지정 2026-10-29) ─────────────────
+# 시사점은 DB 컬럼을 새로 만들지 않고 suggested_action 끝에 [시사점] 표식으로 붙여 저장한다(DDL 불필요).
+IMPL_TAG = "\n[시사점] "
+_SENT_SPLIT = re.compile(r"(?<=[.!?。])\s+|\n+")
+# 소관 칸에 들어오면 안 되는 상태·진행 표현 (예: '예고중' 이 소관으로 보이던 문제)
+_STATUS_WORDS = {"예고중", "예고 중", "예고", "입법예고", "행정예고", "입법예고중", "종료", "마감", "진행중", "진행 중",
+                 "접수중", "접수 중", "계류", "계류중", "원안가결", "수정가결", "폐기", "철회", "대안반영폐기", "국회심의"}
+
+
+def clean_agency(value: str) -> str:
+    """소관 부처/위원회 이름만 남긴다 — 상태어(예고중·종료)·날짜·숫자뿐인 값은 비운다."""
+    v = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not v or v in _STATUS_WORDS or re.fullmatch(r"[\d\s.\-~/:()]+", v):
+        return ""
+    return v
+
+
+def three_lines(summary: Any) -> list[str]:
+    """요약(문자열 또는 배열)을 최대 3줄로 맞춘다. 3줄을 넘으면 뒤쪽을 마지막 줄에 합친다."""
+    if isinstance(summary, (list, tuple)):
+        parts = [str(x).strip() for x in summary]
+    else:
+        parts = _SENT_SPLIT.split(str(summary or "").strip())
+    parts = [re.sub(r"^[\-·•\d\.\)\s]+(?=\S)", "", p).strip() for p in parts if p and p.strip()]
+    if len(parts) > 3:
+        parts = parts[:2] + [" ".join(parts[2:])]
+    return parts
+
+
+def pack_action(action: str | None, implication: str | None) -> str | None:
+    """대응 제안 + 퓨처엠 시사점을 suggested_action 한 칸에 담는다."""
+    a = (action or "").strip()
+    i = re.sub(r"\s+", " ", str(implication or "")).strip()
+    if not i:
+        return a or None
+    return (a + IMPL_TAG + i) if a else ("[시사점] " + i)
+
+
+def unpack_action(raw: str | None) -> tuple[str, str]:
+    """pack_action 의 반대 — (대응 제안, 시사점)."""
+    t = str(raw or "")
+    if "[시사점] " in t:
+        head, _, tail = t.partition("[시사점] ")
+        return head.strip(), tail.strip()
+    return t.strip(), ""
+
+
+def rule_implication(v: dict) -> str:
+    """AI 시사점이 없는 예전 항목용 규칙 문장 — 영향도·사업 분야만으로 쓴다(새 사실을 만들지 않는다)."""
+    areas = ", ".join(v.get("affected_areas") or [])
+    lv = v.get("impact_level") or ""
+    if lv in ("high", "medium"):
+        return (f"포스코퓨처엠 사업({areas})에 영향을 줄 수 있어 세부 내용 점검이 필요함" if areas
+                else "포스코퓨처엠 사업에 영향을 줄 수 있어 세부 내용 점검이 필요함")
+    if lv == "low":
+        return "포스코퓨처엠 사업에 미치는 영향은 크지 않으나 추가 검토가 필요함"
+    if lv == "none":
+        return "포스코퓨처엠 사업에 직접 영향은 제한적"
+    return "분석 전이라 포스코퓨처엠 영향은 아직 판단하지 못함"
+
+
+def summary_lines(v: dict) -> list[str]:
+    """카드에 보일 '주요 내용' 3줄. 요약이 없거나 자리표시면 제목·소관·기간·영향 근거로 채운다(규칙)."""
+    raw = v.get("summary") or ""
+    lines = [] if (not raw.strip() or raw.startswith(PLACEHOLDER_SUMMARY)) else three_lines(raw)
+    if len(lines) < 3:
+        pad = []
+        if not lines:
+            pad.append(v.get("title") or "")
+        if v.get("law_name"):
+            pad.append(f"대상 법령: {v['law_name']}")
+        if v.get("notice_start") or v.get("notice_end"):
+            pad.append(f"기간: {v.get('notice_start') or '미정'} ~ {v.get('notice_end') or '미정'}")
+        elif v.get("published_at"):
+            pad.append(f"발표일: {v['published_at']}")
+        if v.get("status"):
+            pad.append(f"진행 상태: {v['status']}")
+        if v.get("impact_rationale"):
+            pad.append(str(v["impact_rationale"]))
+        for p in pad:
+            if p and p not in lines and len(lines) < 3:
+                lines.append(p)
+    return lines[:3]
+
 EA_SYSTEM = (
     "당신은 포스코 그룹 대외협력(대관) 담당자를 돕는 한국어 정책 분석 어시스턴트다. "
     "제공된 자료에 실제로 적힌 내용만 근거로 분석하고 JSON 으로만 답한다."
@@ -1725,9 +1827,9 @@ EA_SYSTEM = (
 EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSON 하나로만 답하라.
 
 [요약 — 이 개정안의 내용]
-- summary: 원문 발췌의 **개정이유(제안이유)와 주요내용**을 3~5문장으로 정리한다
-  · 첫 문장: 왜 개정하는가(개정이유)
-  · 이후: 무엇을 어떻게 바꾸는가(주요내용), 시행일·적용대상이 원문에 있으면 포함
+- summary: 원문 발췌의 **개정이유(제안이유)와 주요내용**을 **정확히 3줄(배열 3개 항목, 항목당 한 문장·80자 안팎)** 로 정리한다
+  · 1줄: 왜 개정하는가(개정이유)
+  · 2~3줄: 무엇을 어떻게 바꾸는가(주요내용), 시행일·적용대상이 원문에 있으면 포함
 - 포스코와의 관련 여부와 무관하게, 개정 내용 자체를 항상 요약한다
 - 원문에 없는 시행일·수치·대상을 만들어내지 않는다
 - 원문 발췌가 비어 있거나 상용문구뿐이면 "원문을 확보하지 못했습니다" 한 줄만 쓴다
@@ -1740,6 +1842,11 @@ EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSO
   impact_rationale="포스코 그룹 사업과 직접 연결되는 조항 없음" (summary 는 그대로 채운다)
 - 불분명하면 추정하지 말고 "low" + "추가 검토 필요"
 
+[포스코퓨처엠 시사점]
+- implication: 이 내용이 **포스코퓨처엠**(양극재·음극재·전구체·리튬 등 이차전지소재, 원료 조달, 수출입·통상)에
+  어떤 영향을 줄 수 있는지 1~2문장. 원문에 근거가 없으면 "포스코퓨처엠 사업에 직접 영향은 제한적" 이라고 쓴다.
+  · 단정하지 말고 "~할 수 있음", "~점검 필요" 처럼 쓴다. 원문에 없는 수치·일정을 만들지 않는다
+
 [관련 사업 영역]
 - affected_areas: 해당하는 것만 배열로. 없으면 빈 배열
   ["철강", "이차전지소재", "건설·인프라", "에너지", "환경·안전", "통상", "노무"]
@@ -1751,7 +1858,7 @@ EA_PROMPT = """아래 입법·행정예고 또는 의안 자료를 분석해 JSO
 
 [출력 형식 — 이 구조를 정확히 지킨다]
 {{"summary":["문장1","문장2","문장3"],"impact_level":"none",
-"impact_rationale":"...","affected_areas":[],"suggested_action":"..."}}
+"impact_rationale":"...","implication":"...","affected_areas":[],"suggested_action":"..."}}
 
 제목: {title}
 대상 법령: {law_name}
@@ -1767,7 +1874,7 @@ EA_NEWS_PROMPT = """아래 정부부처(또는 KOTRA) 발표 자료를 분석해
 법령 개정안이 아니라 정책·통상 동향 자료다. '개정이유'·'조문' 표현을 쓰지 마라.
 
 [요약 — 이 발표의 내용]
-- summary: 무엇을 발표·추진하는가를 3~4문장으로. 주체·시점·핵심 내용·후속 계획 순.
+- summary: 무엇을 발표·추진하는가를 **정확히 3줄(배열 3개 항목, 항목당 한 문장·80자 안팎)** 로. 1줄 주체·시점, 2줄 핵심 내용, 3줄 후속 계획·효과.
 - 원문에 없는 수치·일정·대상을 지어내지 않는다
 - 원문 발췌가 비어 있으면 "원문을 확보하지 못했습니다" 한 줄만 쓴다
 
@@ -1779,6 +1886,11 @@ EA_NEWS_PROMPT = """아래 정부부처(또는 KOTRA) 발표 자료를 분석해
   impact_rationale="포스코 그룹 사업과 직접 연결되는 내용 없음"
 - 불분명하면 "low" + "추가 검토 필요"
 
+[포스코퓨처엠 시사점]
+- implication: 이 내용이 **포스코퓨처엠**(양극재·음극재·전구체·리튬 등 이차전지소재, 원료 조달, 수출입·통상)에
+  어떤 영향을 줄 수 있는지 1~2문장. 원문에 근거가 없으면 "포스코퓨처엠 사업에 직접 영향은 제한적" 이라고 쓴다.
+  · 단정하지 말고 "~할 수 있음", "~점검 필요" 처럼 쓴다. 원문에 없는 수치·일정을 만들지 않는다
+
 [관련 사업 영역]
 - affected_areas: 해당하는 것만. ["철강","이차전지소재","건설·인프라","에너지","환경·안전","통상","노무"]
 
@@ -1787,7 +1899,7 @@ EA_NEWS_PROMPT = """아래 정부부처(또는 KOTRA) 발표 자료를 분석해
 
 [출력 형식]
 {{"summary":["문장1","문장2","문장3"],"impact_level":"none",
-"impact_rationale":"...","affected_areas":[],"suggested_action":"..."}}
+"impact_rationale":"...","implication":"...","affected_areas":[],"suggested_action":"..."}}
 
 제목: {title}
 발표 기관: {agency}
@@ -1956,10 +2068,8 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
         log.warning("대외협력 분석 JSON 파싱 실패: %s", (item.get("title") or "")[:30])
         return False
 
-    summary = parsed.get("summary")
-    if isinstance(summary, list):
-        summary = " ".join(str(s).strip() for s in summary if str(s).strip())
-    summary = str(summary or "").strip() or "원문을 확보하지 못했습니다 — 원문 링크로 확인하세요"
+    summary = "\n".join(three_lines(parsed.get("summary"))).strip()   # 3줄(줄바꿈 구분)
+    summary = summary or "원문을 확보하지 못했습니다 — 원문 링크로 확인하세요"
 
     level = str(parsed.get("impact_level") or "none").strip().lower()
     if level not in EA_IMPACT_LEVELS:
@@ -1984,7 +2094,7 @@ def analyze_item(ctx: Any, db: Any, item: dict, source_text: str = "") -> bool:
         "impact_level": level,
         "impact_rationale": rationale,
         "affected_areas": jdump(areas),
-        "suggested_action": str(parsed.get("suggested_action") or "").strip() or None,
+        "suggested_action": pack_action(str(parsed.get("suggested_action") or ""), parsed.get("implication")),
         "model": ctx.cfg.llm_model,
         "reviewed_by": None,
         "reviewed_at": None,
@@ -2053,6 +2163,35 @@ def reanalyze_placeholders(ctx: Any, db: Any, limit: int = 40, dry: bool = False
     return res
 
 
+def reanalyze_for_implication(ctx: Any, db: Any, limit: int = 40, dry: bool = False) -> dict:
+    """예전에 분석된 항목을 '3줄 요약 + 퓨처엠 시사점' 형식으로 다시 분석한다(일회성). 오늘 AI 상한 안에서만 한다."""
+    items = db.items_without_implication(500)
+    res = {"targets": len(items), "fixed": 0, "failed": 0, "no_body": 0}
+    if dry or not items:
+        return res
+    budget = min(limit, analysis_budget(ctx, db))
+    for it in items:
+        if res["fixed"] + res["failed"] >= budget:
+            break
+        body = fetch_body_for_item(it)
+        if not body.strip():
+            try:
+                body = _crawl().fetch_detail(it).get("body") or ""
+            except Exception:
+                body = ""
+        if len(body.strip()) < 40:
+            res["no_body"] += 1      # 본문을 못 구하면 기존 분석을 지키고 건너뛴다(화면은 규칙 3줄로 보강)
+            continue
+        db.delete_analysis(it["id"])
+        if analyze_item(ctx, db, it, body):
+            res["fixed"] += 1
+        else:
+            res["failed"] += 1       # 지운 상태로 남으면 다음 ea-collect 가 미분석으로 다시 시도한다
+    log.info("대외협력 3줄·시사점 재분석: 대상 %d · 성공 %d · 본문 못 구함 %d · 실패 %d",
+             res["targets"], res["fixed"], res["no_body"], res["failed"])
+    return res
+
+
 def analyze_backlog(ctx: Any, db: Any) -> int:
     """미분석 항목을 처리한다. KOTRA(trade_news)는 규칙 기반이라 상한 밖에서 전부,
     나머지는 전용 LLM 상한 안에서(마감 임박 우선)."""
@@ -2116,7 +2255,10 @@ def ea_priority(v: dict) -> tuple[str, str]:
     groups = v.get("group_companies") or []
     impact = v.get("impact_level") or ""
     kw = next((k for k in _EA_DIRECT_KW if k in title), "")
-    direct = ("포스코퓨처엠" in groups) or bool(kw) or impact == "high"
+    # 포스코퓨처엠과 실제로 관련된 것만 '직접'으로 본다 (사용자 지정 2026-10-29: 관련 없는 긴급 제외).
+    #   · AI 가 '해당없음(none)' 으로 본 항목은 제목에 '관세'·'공급망' 같은 말이 있어도 직접 관련이 아니다.
+    #   · 분석 전(impact 없음)이면 퓨처엠 분류 태그 또는 제목 핵심어만 인정한다.
+    direct = (impact != "none") and (("포스코퓨처엠" in groups) or bool(kw) or impact == "high")
     why_direct = ("포스코퓨처엠 관련 분야로 분류" if "포스코퓨처엠" in groups
                   else f"제목에 '{kw}'" if kw else "AI 영향도 '높음'")
     im = _EA_IMMINENT_RE.search(text)
@@ -2143,6 +2285,9 @@ def _item_view(row: dict) -> dict:
         view["thumbnail"] = (view.get("attachment_urls") or [""])[0]
         view["attachment_urls"] = []
     view["priority"], view["priority_reason"] = ea_priority(view)
+    view["summary_lines"] = summary_lines(view)          # 카드 '주요 내용' — 항상 3줄 이내
+    view["summary"] = "\n".join(view["summary_lines"])
+    view["implication"] = view.get("implication") or rule_implication(view)
     return view
 
 
@@ -2155,7 +2300,7 @@ def _item_view_base(row: dict) -> dict:
         "item_type": row.get("item_type") or "",
         "category": row.get("category") or "",
         "law_name": row.get("law_name") or "",
-        "agency": row.get("agency_name") or row.get("agency_raw") or "",
+        "agency": clean_agency(row.get("agency_name")) or clean_agency(row.get("agency_raw")),
         "notice_start": row.get("notice_start"),
         "notice_end": row.get("notice_end"),
         "d_day": d_day(row.get("notice_end")),
@@ -2166,8 +2311,10 @@ def _item_view_base(row: dict) -> dict:
         "summary": row.get("summary") or "",
         "impact_rationale": row.get("impact_rationale") or "",
         "affected_areas": jload(row.get("affected_areas"), []),
-        "suggested_action": row.get("suggested_action") or "",
+        "suggested_action": unpack_action(row.get("suggested_action"))[0],
+        "implication": unpack_action(row.get("suggested_action"))[1],
         "group_companies": jload(row.get("group_companies"), []),
+        "published_at": row.get("published_at") or "",
     }
 
 
@@ -2207,6 +2354,8 @@ def _ea_format_message(view: dict) -> str:
         lines.append(f"포스코 영향: {_EA_IMPACT_LABEL.get(view['impact_level'], view['impact_level'])}")
         if view.get("impact_rationale"):
             lines.append(f"근거: {view['impact_rationale']}")
+    if view.get("implication"):
+        lines.append(f"퓨처엠 시사점: {view['implication']}")
     if view.get("suggested_action"):
         lines.append(f"대응(초안): {view['suggested_action']}")
     if view.get("url"):

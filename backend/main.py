@@ -2914,6 +2914,9 @@ TRADE_MACRO_KW = [
     "품목관세", "품목별 관세", "자동차 관세", "철강 관세", "대미투자", "대미 투자", "한미 통상",
     "통상협상", "통상 협상", "무역합의", "무역 합의",
 ]
+# 자국 중심 공급망 이니셔티브형 기사 판정용 — 제목에 정책 이름, 리드에 대중국 견제·무역 조치 신호가 함께 있어야 한다
+TRADE_INITIATIVE_TITLE_KW = ["이니셔티브", "자국 중심", "자국중심"]
+TRADE_INITIATIVE_LEAD_KW = ["트럼프", "에너지부", "자국 중심", "중국산", "대중국", "관세", "반덤핑", "상계관세", "수출통제", "불공정 무역"]
 # 통상 기사가 '포스코 관련 산업'인지 판정.
 TRADE_INDUSTRY_KW = [
     "배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "리튬", "니켈", "코발트",
@@ -3456,6 +3459,9 @@ GOV_INDUSTRY_CORE = [
 # 넓은 산업어 — 반도체·충전·산업단지처럼 다른 주제 기사에도 흔해서 **제목에** 있을 때만 인정한다.
 #   (2026-10-29 수원일보 '국정감사 결산…국회의원 5인' 이 본문의 '반도체 벨트' 한 줄로 수집된 사례)
 GOV_INDUSTRY_BROAD = ["탄소중립", "전기요금", "산업단지", "특화단지", "반도체", "충전"]
+# 산업 전환형 단어 — 산업통상부·기후부 같은 **구체적 부처** 소식에서만 제목·리드 어디에 있어도 인정한다
+#   (B안, 사용자 지정 2026-10-29: '산업부, 원로 공학인 간담회'·'정부, 산업용 히트펌프…탈탄소 전환' 누락 방지).
+GOV_INDUSTRY_TRANSITION = ["탈탄소", "탄소중립", "산업 전환", "산업전환", "에너지 전환", "에너지전환", "저탄소", "온실가스", "녹색전환"]
 GOV_INDUSTRY_KW = GOV_INDUSTRY_CORE + GOV_INDUSTRY_BROAD
 # '정부'·'국회'처럼 어디에나 붙는 일반 기관어 — 제목에 핵심 산업어가 함께 있어야 한다.
 GOV_AGENCY_GENERIC = ("국회", "정부", "금융위원회", "금융위", "산업은행", "범부처")
@@ -3473,7 +3479,8 @@ def is_gov_industry_news(title: str, extra: str = "") -> bool:
     t = title or ""
     full = f"{t}\n{extra}"
     if _kw_hit_any(t, GOV_AGENCY_SPECIFIC):
-        return _kw_hit_any(full, GOV_INDUSTRY_CORE) or _kw_hit_any(t, GOV_INDUSTRY_BROAD)
+        return (_kw_hit_any(full, GOV_INDUSTRY_CORE) or _kw_hit_any(t, GOV_INDUSTRY_BROAD)
+                or _kw_hit_any(full, GOV_INDUSTRY_TRANSITION))
     t_generic = _GOV_FALSE_AGENCY_RE.sub(" ", t)
     if _kw_hit_any(t_generic, GOV_AGENCY_GENERIC):
         return _kw_hit_any(t, GOV_INDUSTRY_CORE)
@@ -3488,6 +3495,11 @@ def is_trade_topic(title: str, extra: str = "") -> bool:
     포스코 관련 산업(철강·배터리)이 제목·요약에 함께 있어야 한다.
     """
     if _kw_hit_any(title, TRADE_MACRO_KW):
+        return True
+    # 자국 중심 공급망 '이니셔티브'형 정책 기사 — 조치명은 제목에 없지만 본문 리드에 대중국 견제·관세가 명시된다
+    #   (미주중앙일보 '배터리 제조 이니셔티브 발표…조지아 한국기업들 촉각', 사용자 지적 2026-10-29)
+    if (_kw_hit_any(title, TRADE_INITIATIVE_TITLE_KW) and _kw_hit_any(title, TRADE_INDUSTRY_KW)
+            and _kw_hit_any(extra or "", TRADE_INITIATIVE_LEAD_KW)):
         return True
     return _kw_hit_any(title, TRADE_MEASURE_KW) and _kw_hit_any(f"{title}\n{extra}", TRADE_INDUSTRY_KW)
 
@@ -3612,7 +3624,7 @@ BATTERY_COMPANY_KW = [
     "에코프로", "에코프로비엠", "에코프로머티리얼즈", "엘앤에프", "코스모신소재",
     "대주전자재료", "나노신소재", "한솔케미칼", "금양", "성일하이텍", "새빗켐",
     "탑머티리얼", "SK아이이테크놀로지", "더블유씨피", "천보", "동화일렉트로라이트",
-    "엔켐", "솔루스첨단소재",
+    "엔켐", "솔루스첨단소재", "SK이노베이션",
     "BTR", "베이터루이", "샨샨", "룽바이", "CNGR", "중웨이", "화유코발트", "당성과기",
 ]
 
@@ -5648,6 +5660,9 @@ ANALYSIS_PROMPT = """아래 기사를 분석해 JSON 하나로만 답하라.
 - 원문 문장을 그대로 복사하지 않고 재서술한다
 - 언론사명과 기자명은 summary 에 넣지 않는다 (표시할 때 따로 붙인다)
 - 기사가 요약하기에 불충분하면 summary 를 ["요약불가"] 로만 채운다
+- 관세·반덤핑·보조금·수출통제·자국 중심 공급망 같은 **통상·무역 정책 내용이 본문에 있으면**
+  summary 에 그 정책을 반드시 한 문장 이상 넣는다 — 어느 나라/기관이, 어떤 조치(대상 품목·국가)를, 언제부터,
+  한국 기업에 어떤 영향이 있다고 보는지 기사에 적힌 만큼만 쓴다(기사 속 행사·인물 소개보다 정책 내용을 우선한다)
 
 [키워드]
 - keywords: 기사 핵심 키워드 최대 6개, 한국어 명사구
@@ -14322,7 +14337,18 @@ def cmd_selftest() -> int:
              ("한국씨티은행 노조, 금융위원회 앞에서 집회", "반도체 충전", False),
              ("정부, 이차전지 공급망 지원 확대", "", True), ("국회, 배터리 안전 특별법 심사", "", True),
              ("산업통상부, 신규 사업 공고", "리튬 공급망 점검 포함", True), ("산업통상부, 반도체 지원 확대", "", True),
-             ("산업통상부, 인사 발표", "반도체 얘기만 본문에", False)]
+             ("산업통상부, 인사 발표", "반도체 얘기만 본문에", False),
+             ("산업부, 원로 공학인 초청 간담회", "산업 전환과 탈탄소 대응 논의", True),   # B안: 구체적 부처 + 전환어
+             ("정부, 산업용 히트펌프 보급 확대", "탈탄소 전환 지원", False),            # 일반 기관어는 계속 엄격
+             ("기후부, 온실가스 감축 로드맵 발표", "", True),
+             ("산업부, 인사 발표", "국장급 전보 명단", False)]
+    check("통상 판정 — 미국 '배터리 제조 이니셔티브'(리드에 대중국 견제·관세)는 통상환경, 관련 없는 이니셔티브는 아니다",
+          [is_trade_topic("[현장] 중간선거 6일 앞두고 ‘배터리 제조 이니셔티브’ 발표… 조지아 한국기업들 촉각",
+                          "트럼프 행정부가 배터리 공급망을 자국 중심으로 구축하는 정책. 중국산 원료 견제"),
+           is_trade_topic("[K-이니셔티브] 중국 기업과 8GWh 배터리 공급 계약", "계약 체결 소식"),
+           is_trade_topic("청년 일자리 이니셔티브 발표", "트럼프 행정부 관세")],
+          [True, False, False])
+    check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
     for _rid, _rt, _rb, _rg in (("fr1", "[국정감사 결산] 수원 지역 국회의원 5인, 현안 대응 성과", "수원 현안 반도체 벨트 이야기. " * 30, "[]"),
@@ -16874,6 +16900,36 @@ def cmd_selftest() -> int:
         check("우선순위 — 이유 문장이 함께 나온다(기준이 보이게)",
               "배터리" in ea_mod.ea_priority(_pv(title="배터리 규제", summary="공포"))[1], True)
 
+        check("우선순위 — AI 가 해당없음(none)으로 본 항목은 제목에 관세·공급망이 있어도 긴급이 아니다 (관련 없는 긴급 제외)",
+              [ea_mod.ea_priority(_pv(title="농산물 관세 인하 시행", summary="내년 시행", impact_level="none"))[0],
+               ea_mod.ea_priority(_pv(title="농산물 관세 인하 시행", summary="내년 시행", impact_level="none",
+                                      group_companies=["포스코퓨처엠"]))[0],
+               ea_mod.ea_priority(_pv(title="리튬 관세 부과 시행", summary="", impact_level="medium"))[0]],
+              ["일반", "일반", "긴급"])
+        check("3줄 요약 — 문장 5개면 3줄로 합치고, 배열·줄바꿈도 3줄 이내로 맞춘다",
+              [len(ea_mod.three_lines("가나다한다. 라마바한다. 사아자한다. 차카타한다. 파하거한다.")),
+               ea_mod.three_lines(["1. 첫째다.", "- 둘째다.", "셋째다."]), ea_mod.three_lines("한 줄뿐이다.")],
+              [3, ["첫째다.", "둘째다.", "셋째다."], ["한 줄뿐이다."]])
+        check("시사점 보관 — 대응 제안과 한 칸에 담았다가 그대로 나눠 꺼낸다(DDL 불필요)",
+              [ea_mod.unpack_action(ea_mod.pack_action("검토한다", "양극재 조달에 영향")),
+               ea_mod.unpack_action(ea_mod.pack_action(None, "영향 제한적")), ea_mod.unpack_action("검토만")],
+              [("검토한다", "양극재 조달에 영향"), ("", "영향 제한적"), ("검토만", "")])
+        check("소관 정리 — 예고중·종료 같은 상태어·날짜는 소관이 아니다",
+              [ea_mod.clean_agency(x) for x in ("예고중", "종료", "2026-10-29", "산업통상부", " 산업통상자원 \n 위원회 ", None)],
+              ["", "", "", "산업통상부", "산업통상자원 위원회", ""])
+        _sv = ea_mod._item_view({"id": "s1", "title": "이차전지 지원 입법예고", "item_type": "legislation",
+                                 "agency_raw": "예고중", "status": "예고중", "law_name": "소재부품법", "notice_start": "2026-10-01",
+                                 "notice_end": "2026-11-10", "impact_level": "medium", "impact_rationale": "제3조 인용",
+                                 "summary": "", "suggested_action": "검토" + ea_mod.IMPL_TAG + "양극재 지원 확대 가능"})
+        check("카드 뷰 — 소관에서 상태어가 빠지고, 요약이 없어도 3줄이 채워지고, 시사점이 따로 나온다",
+              (_sv["agency"], len(_sv["summary_lines"]), _sv["implication"], _sv["suggested_action"]),
+              ("", 3, "양극재 지원 확대 가능", "검토"))
+        _sv2 = ea_mod._item_view({"id": "s2", "title": "배터리 안전 기준", "item_type": "legislation", "agency_raw": "산업통상부",
+                                  "impact_level": "none", "summary": "첫째 개정한다. 둘째 바꾼다. 셋째 시행한다. 넷째 알린다."})
+        check("카드 뷰 — 요약이 4문장이어도 3줄, 시사점이 없으면 규칙 문장(영향 제한적)",
+              (_sv2["summary_lines"], _sv2["implication"]),
+              (["첫째 개정한다.", "둘째 바꾼다.", "셋째 시행한다. 넷째 알린다."], "포스코퓨처엠 사업에 직접 영향은 제한적"))
+
         check("발의자 이름 분리 — '의원'·'외 N인' 꼬리 제거",
               ea_mod._split_names("김철수의원 외 12인, 이영희 의원, 박민수"), ["김철수", "이영희", "박민수"])
         _mem_html = ("<table><tr><th>이름</th><th>정당</th></tr>"
@@ -17171,7 +17227,7 @@ USAGE = """사용법: python backend/main.py <명령>
   kakao-auth   카카오 '나에게 보내기' 최초 토큰 발급 (브라우저 동의 → code 붙여넣기, 1회)
   kakao-test   카카오 '나에게 보내기' 시험 발송 1건
   ea-collect      대외협력(입법·행정예고·국회) 즉시 1회 수집·분석
-  ea-reanalyze [N] [--dry]  '원문을 확보하지 못했습니다'로 저장된 대외협력 요약을 본문을 다시 받아 재분석(기본 40건, AI 일일 상한 안에서)
+  ea-reanalyze [N] [--all] [--dry]  '원문을 확보하지 못했습니다'로 저장된 대외협력 요약을 본문을 다시 받아 재분석(기본 40건, AI 일일 상한 안에서). --all 이면 예전 분석 전체를 3줄 요약+퓨처엠 시사점으로 재분석
   migrate    SQLite → Supabase 전체 이관 (schema.sql 배포 + DB_BACKEND=supabase 후, 일회성)
   weekly [--dry]  주간 레포트 즉시 생성·발송 (--dry 면 생성·저장만, 이메일 없음)
   selftest   내장 검증 (DB · 네트워크 · API 키 불필요)
@@ -17327,7 +17383,11 @@ def main(argv: Sequence[str]) -> int:
         _nums = [int(a) for a in _rest if a.isdigit()]
         _edb = ea_mod.make_ea_db(ctx)
         _edb.ensure_ready()
-        ea_mod.reanalyze_placeholders(ctx, _edb, _nums[0] if _nums else 40, dry="--dry" in _rest)
+        if "--all" in _rest:    # 예전 분석을 '3줄 요약 + 퓨처엠 시사점' 형식으로 다시 분석
+            _r = ea_mod.reanalyze_for_implication(ctx, _edb, _nums[0] if _nums else 40, dry="--dry" in _rest)
+            print(f"3줄·시사점 재분석 — 대상 {_r['targets']}건 · 성공 {_r['fixed']} · 본문 못 구함 {_r['no_body']} · 실패 {_r['failed']}")
+        else:
+            ea_mod.reanalyze_placeholders(ctx, _edb, _nums[0] if _nums else 40, dry="--dry" in _rest)
     elif command == "migrate":
         cmd_migrate(ctx)
     elif command == "serve":
