@@ -6246,14 +6246,17 @@ def _group_aliases(groups: Sequence[str]) -> list[str]:
 
 
 def extract_group_excerpts(body: str, groups: Sequence[str]) -> dict[str, str]:
-    """카드에 붙은 그룹사 중 본문에 실제로 언급된 곳들을 **하나의 발췌로 합친다** — {"포스코퓨처엠, 포스코HY클린메탈": 발췌}.
+    """본문에 실제로 언급된 그룹사(카드 칩에 붙은 곳 + 본문에서 찾은 곳)를 **하나의 발췌로 합친다** — {"포스코퓨처엠, 포스코HY클린메탈": 발췌}.
 
     같은 문단에 여러 계열사가 나오면 계열사마다 같은 글을 되풀이해 보여 주게 된다(2026-10-29 사용자 지적).
     언급된 계열사를 이름 하나로 묶고, 그 이름들의 별칭으로 한 번만 발췌한다. 포스코퓨처엠 하나만 언급됐으면 빈 dict —
     그건 pfm_excerpt 상자가 맡는다. 영어 본문은 번역하지 않으므로 싣지 않는다.
     """
     low = (body or "").lower()
-    mentioned = [g for g in dict.fromkeys(groups)
+    # 카드 칩에 없어도 본문에 이름이 나온 계열사는 포함한다 — 칩은 제목+앞 700자만 보므로, 분양 단지 목록의 포스코이앤씨처럼
+    # 본문 뒤쪽에만 나온 회사의 언급이 카드에서 통째로 사라지던 문제(2026-10-29). 칩이 있는 회사를 앞세워 순서를 지킨다.
+    cands = list(dict.fromkeys([*groups, *detect_group_companies(body or "")]))
+    mentioned = [g for g in cands
                  if g != GROUP_EXCERPT_NONE and any(a in low for a in _GROUP_ALIASES_LOWER.get(g, []))][:GROUP_EXCERPT_MAX_NAMES]
     if not mentioned or mentioned == ["포스코퓨처엠"]:
         return {}
@@ -12055,10 +12058,11 @@ def cmd_pfmgap(ctx: Context, sample: int = 12) -> dict:
 
 
 def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
-    """퓨처엠 외 그룹사 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는(또는 옛 그룹사별 방식인) 기존 기사에 합친 발췌를 채운다 (2026-10-29 신기능 백필).
+    """'○○ 언급' 발췌가 아직 없는(또는 옛 그룹사별 방식인) 기존 기사에 합친 발췌를 채운다 (2026-10-29 신기능 백필).
 
+    그룹사 칩이 있든 없든 본문에 포스코 계열사 이름이 나오면 만든다(칩은 앞 700자만 봐서 뒤쪽 언급은 칩이 없다).
     보관 본문(30일)이 있으면 그것으로, 없으면 원문을 다시 받아 만든다. 인사·부고는 제외. 최근 기사부터 limit 건.
-    dry 면 대상 수만 보여 주고 쓰지 않는다. 원문에 언급이 없는 그룹사는 그대로 둔다.
+    dry 면 대상 수만 보여 주고 쓰지 않는다. 언급이 없는 기사는 '확인함' 표시만 남긴다.
     """
     fetch = fetch or prefetch_articles
     todo = []
@@ -12066,44 +12070,49 @@ def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch
     for r in _retry(lambda: ctx.storage.list_articles(4000, 0, now_utc() - timedelta(days=60), "")):
         cats = jload(r.get("categories"), [])
         groups = jload(r.get("group_companies"), [])
-        if not [g for g in groups if g != "포스코퓨처엠"]:
-            continue            # 포스코퓨처엠만 붙은 기사는 기존 '포스코퓨처엠 언급' 상자로 충분하다
         have = group_excerpts_of(r)
-        if PEOPLE_NEWS_CATEGORY in cats or not groups or (len(have) == 1):
-            continue            # 이미 합친 발췌(또는 '언급 없음' 표시) 하나가 있으면 끝난 기사. 여러 개(옛 그룹사별 방식)면 다시 합친다
-        todo.append((r, groups))
-    by_group = Counter(g for _, gs in todo for g in gs)
-    todo = todo[:max(0, limit)]
-    log.info("[그룹사 언급 채우기] 대상 %d건 — %s%s", len(todo), ", ".join(f"{g} {c}" for g, c in by_group.most_common(8)) or "없음",
-             " (미리보기)" if dry else "")
+        if PEOPLE_NEWS_CATEGORY in cats or len(have) == 1:
+            continue            # 이미 합친 발췌(또는 '확인함' 표시) 하나가 있으면 끝난 기사. 여러 개(옛 그룹사별 방식)면 다시 합친다
+        todo.append((r, groups))          # 칩이 없는 기사도 대상 — 본문 뒤쪽에만 회사명이 나온 경우가 있다
+    by_group = Counter(g for _, gs in todo for g in (gs or ["(칩 없음)"]))
+    log.info("[그룹사 언급 채우기] 대상 %d건(최근 60일) — %s%s", len(todo), ", ".join(f"{g} {c}" for g, c in by_group.most_common(8)) or "없음",
+             " (미리보기)" if dry else f" · 이번에 최대 {limit}건 처리")
     result = {"targets": len(todo), "filled": 0, "none": 0, "nopage": 0}
     if dry:
         return result
-    need_fetch = {}
-    bodies: dict[str, str] = {}
-    for r, _ in todo:
-        b = ctx.storage.body_of(r["id"]) or ""
-        if b:
-            bodies[r["id"]] = b
-        else:
-            need_fetch[r["id"]] = r.get("url_canonical") or r.get("url_original") or ""
-    if need_fetch:
-        pages = fetch(ctx.http, [u for u in need_fetch.values() if u])
-        for aid, u in need_fetch.items():
-            _, html = pages.get(u, ("", ""))
-            if html:
-                bodies[aid] = extract_body(html)
-    for r, groups in todo:
-        body = bodies.get(r["id"], "")
-        if not body:
-            result["nopage"] += 1
-            continue
-        gx = extract_group_excerpts(body, groups)
-        # 합친 발췌 하나로 갈아 끼운다(옛 그룹사별 줄은 지운다). 언급이 없으면 '확인함' 표시만 남겨 다음에 또 대상이 되지 않게 한다.
-        ctx.storage.set_perspective(r["id"], pack_perspective(
-            sentiment_reason_of(r), title_original_of(r), r.get("perspective_text") or "",
-            group_excerpts=gx or {GROUP_EXCERPT_NONE: "-"}))
-        result["filled" if gx else "none"] += 1
+    # 50건씩 나눠 처리한다. 원문을 못 받는 기사가 앞쪽을 막아 뒤 기사가 영영 안 처리되는 일이 없도록,
+    # '처리 끝낸 기사'(채움·언급 없음)가 limit 에 닿을 때까지 이어 가고(단, 시도는 limit×3건까지) 못 받은 기사는 다음에 다시 시도한다.
+    attempts = 0
+    for start in range(0, len(todo), 50):
+        batch = todo[start:start + 50]
+        bodies: dict[str, str] = {}
+        need_fetch: dict[str, str] = {}
+        for r, _ in batch:
+            b = ctx.storage.body_of(r["id"]) or ""
+            if b:
+                bodies[r["id"]] = b
+            else:
+                need_fetch[r["id"]] = r.get("url_canonical") or r.get("url_original") or ""
+        if need_fetch:
+            pages = fetch(ctx.http, [u for u in need_fetch.values() if u])
+            for aid, u in need_fetch.items():
+                _, html = pages.get(u, ("", ""))
+                if html:
+                    bodies[aid] = extract_body(html)
+        for r, groups in batch:
+            attempts += 1
+            body = bodies.get(r["id"], "")
+            if not body:
+                result["nopage"] += 1
+                continue
+            gx = extract_group_excerpts(body, groups)
+            # 합친 발췌 하나로 갈아 끼운다(옛 그룹사별 줄은 지운다). 언급이 없으면 '확인함' 표시만 남겨 다음에 또 대상이 되지 않게 한다.
+            ctx.storage.set_perspective(r["id"], pack_perspective(
+                sentiment_reason_of(r), title_original_of(r), r.get("perspective_text") or "",
+                group_excerpts=gx or {GROUP_EXCERPT_NONE: "-"}))
+            result["filled" if gx else "none"] += 1
+        if result["filled"] + result["none"] >= limit or attempts >= limit * 3:
+            break
     log.info("그룹사 언급 채우기: %d건 채움 · %d건 원문에 언급 없음 · %d건 원문 못 받음", result["filled"], result["none"], result["nopage"])
     return result
 
@@ -14402,7 +14411,7 @@ def cmd_selftest() -> int:
           group_excerpts_of({"perspective_text": pack_perspective("새 근거", "", "", group_excerpts=group_excerpts_of({"perspective_text": _pp}))}),
           {"포스코홀딩스, 포스코DX": "첫 줄\n둘째 줄"})
     for _gid, _ggs, _gbody, _gper in (("gq1", '["포스코홀딩스", "포스코DX"]', _gb, "[감성근거] 우려"),
-                                       ("gq2", '["포스코홀딩스"]', "아무 상관없는 본문입니다. 포스코 이야기가 없다.", ""),
+                                       ("gq2", '["포스코홀딩스"]', "아무 상관없는 본문입니다. 다른 회사 이야기만 나온다.", ""),
                                        ("gq3", '["포스코홀딩스", "포스코DX"]', _gb, _legacy),
                                        ("gq4", '["포스코퓨처엠"]', _gb, "")):
         _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
@@ -14413,15 +14422,24 @@ def cmd_selftest() -> int:
         _et.save_summary({"id": new_id(), "article_id": _gid, "summary_text": "요약", "perspective_text": _gper, "summary_source": "fulltext",
                           "model": "m", "token_usage": None, "created_at": iso(_pn)})
         _et.save_body(_gid, _gbody, "fulltext")
-    _gf0 = cmd_fixgroupexcerpt(_ectx, 10, dry=True)
-    check("fixgroupexcerpt --dry — 대상(gq1 신규·gq2 신규·gq3 옛 방식)만 세고 쓰지 않으며 퓨처엠만 붙은 gq4 는 대상이 아니다",
-          (_gf0["targets"], group_excerpts_of(_et.article_detail("gq1"))), (3, {}))
-    _gf1 = cmd_fixgroupexcerpt(_ectx, 10)
-    check("fixgroupexcerpt — 합친 발췌 하나로 채우고(옛 그룹사별은 갈아 끼움), 감성 근거는 지키고, 언급 없는 기사엔 '확인함' 표시",
-          (_gf1["filled"], _gf1["none"], list(group_excerpts_of(_et.article_detail("gq1"))), sentiment_reason_of(_et.article_detail("gq1")),
+    _nofetch = lambda h, urls: {}      # 시험은 인터넷 없이 — 보관 본문이 없는 기사는 '원문 못 받음' 으로 센다
+    _gf0 = cmd_fixgroupexcerpt(_ectx, 500, dry=True)
+    check("fixgroupexcerpt --dry — 대상(칩 있는 신규·옛 방식·칩 없는 기사)을 세고 쓰지 않는다",
+          (_gf0["targets"] >= 4, group_excerpts_of(_et.article_detail("gq1"))), (True, {}))
+    _gf1 = cmd_fixgroupexcerpt(_ectx, 500, fetch=_nofetch)
+    check("fixgroupexcerpt — 합친 발췌 하나로 채우고(옛 그룹사별은 갈아 끼움), 감성 근거는 지키고, 언급 없는 기사엔 '확인함' 표시, 칩 없는 기사도 본문 언급으로 채움",
+          (list(group_excerpts_of(_et.article_detail("gq1"))), sentiment_reason_of(_et.article_detail("gq1")),
            list(group_excerpts_of(_et.article_detail("gq3"))), list(group_excerpts_of(_et.article_detail("gq2"))),
-           cmd_fixgroupexcerpt(_ectx, 10, dry=True)["targets"]),
-          (2, 1, ["포스코홀딩스, 포스코DX"], "우려", ["포스코홀딩스, 포스코DX"], [GROUP_EXCERPT_NONE], 0))
+           list(group_excerpts_of(_et.article_detail("gq4"))), cmd_fixgroupexcerpt(_ectx, 500, dry=True)["targets"] <= _gf0["targets"] - 3),
+          (["포스코홀딩스, 포스코DX, 포스코퓨처엠, 포스코이앤씨"], "우려", ["포스코홀딩스, 포스코DX, 포스코퓨처엠, 포스코이앤씨"], [GROUP_EXCERPT_NONE],
+           ["포스코퓨처엠, 포스코홀딩스, 포스코DX, 포스코이앤씨"], True))
+    _apt = ("올해 마지막 대형 분양이 이어진다. 계룡건설과 동부건설이 서울 주요 지역에 신규 단지를 선보인다.\n"
+            "총 5만6533가구 가운데 수도권 물량이 많다. 청약 경쟁이 치열할 전망이다.\n"
+            "포스코이앤씨는 경기 하남에서 더샵 단지를 공급한다. 포스코이앤씨는 같은 달 부산에서도 분양에 나선다.\n"
+            "분양가는 3.3㎡당 4000만원 안팎이다.")
+    check("그룹사 언급 — 카드에 칩이 없어도(분양 단지 목록의 포스코이앤씨) 본문에 이름이 나오면 '포스코이앤씨 언급' 발췌가 만들어진다",
+          (extract_group_excerpts(_apt, []).keys().__iter__().__next__(), "더샵 단지를 공급한다" in next(iter(extract_group_excerpts(_apt, []).values()))),
+          ("포스코이앤씨", True))
     check("카드 — '확인함' 표시는 화면에 상자를 만들지 않는다", build_card({"id": "g9", "title": "t", "press_name": "p", "perspective_text":
           pack_perspective("", "", "", group_excerpts={GROUP_EXCERPT_NONE: "-"}), "group_companies": '["포스코홀딩스"]', "categories": "[]",
           "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})["group_excerpts"], [])
