@@ -2627,6 +2627,8 @@ def register_api(app: Any, ctx: Any) -> None:
                     "published_at": (r.get("published_at") or "")[:10],
                     "score": int(r.get("importance_score") or 0),
                     "summary": r.get("summary_text") or "",
+                    "summary_lines": three_lines(r.get("summary_text") or ""),     # 카드 '주요 내용' 3줄
+                    "group_companies": jload(r.get("group_companies"), []),
                     "source": "article",   # /api/articles/{id}/telegram 로 전송
                 })
         if ea_types:
@@ -2639,6 +2641,8 @@ def register_api(app: Any, ctx: Any) -> None:
                     "published_at": (r.get("notice_start") or r.get("collected_at") or "")[:10],
                     "score": _IMPACT_RANK.get(r.get("impact_level") or "", 0) * 25,
                     "summary": r.get("summary") or "",
+                    "summary_lines": three_lines(r.get("summary") or ""),
+                    "group_companies": jload(r.get("group_companies"), []),
                     "source": "ea",   # /api/ea/items/{id}/telegram 로 전송
                 })
         out.sort(key=lambda x: x["published_at"], reverse=True)

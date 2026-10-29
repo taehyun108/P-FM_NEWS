@@ -15,12 +15,16 @@
   var CATS = [
     { key: 'policy', label: '정책 동향', kind: 'items', types: 'policy_press',
       sort: 'priority', hasDeadline: false, layout: 'policy' },
+    { key: 'govnews', label: '정부·정책 기사', kind: 'news', endpoint: '/api/ea/policy-news?limit=120',
+      sort: 'recent', hasDeadline: false, layout: 'news' },     // 메인 수집 기사 중 정부/정책 분류
     { key: 'notice', label: '입법·행정예고', kind: 'items', types: 'legislation,admin_notice',
       sort: 'deadline', hasDeadline: true, layout: 'notice' },    // 의견제출 마감(D-day) 중심
     { key: 'bill',   label: '국회 의안', kind: 'items', types: 'bill',
       sort: 'priority', hasDeadline: false, layout: 'bill' },
     { key: 'trade',  label: '통상 환경', kind: 'items', types: 'trade_webzine',
       sort: 'priority', hasDeadline: false, layout: 'trade' },   // 산업통상부 월간 통상(tongsangnews.kr)
+    { key: 'tradenews', label: '통상 기사', kind: 'news', endpoint: '/api/ea/trade-news?limit=120',
+      sort: 'recent', hasDeadline: false, layout: 'news' },     // 메인 수집 기사 중 글로벌 통상환경 분류 (예: 미국 배터리 제조 이니셔티브)
     { key: 'grant',  label: '공모·수요조사', kind: 'items', types: 'grant_notice',
       sort: 'deadline', hasDeadline: true, layout: 'grant' },     // 산업부·기후부 사업공고 + IRIS
     { key: 'calendar', label: '일정', kind: 'calendar', layout: 'calendar' }   // 모든 마감일을 달력으로
@@ -643,6 +647,37 @@
     return card;
   }
 
+  /* ── 기사 카드 — 메인에서 수집한 정부/정책·통상 기사: 제목 / 언론사 / 주요 내용 3줄 ── */
+  function buildNewsCard(it) {
+    var card = el('article', 'ea-card ea-card--flat');
+    var body = el('div', 'ea-card-body');
+    var head = el('div', 'ea-card-head');
+    if (it.score) { head.append(el('span', 'ea-tag', '중요도 ' + it.score)); }
+    head.append(el('span', 'ea-card-date', fmtDate(it.published_at)));
+    body.append(head);
+    var h = el('h3', 'ea-card-title');
+    h.append(link(it.title, it.url));
+    body.append(h);
+    var who = [it.press, it.agency && it.agency !== it.press ? '소관: ' + it.agency : ''].filter(Boolean).join(' · ');
+    if (who) { body.append(el('p', 'ea-card-sub', who)); }
+    var tags = el('div', 'ea-tags');
+    (it.group_companies || []).forEach(function (g) { tags.append(el('span', 'ea-tag is-group', g)); });
+    if (tags.childNodes.length) { body.append(tags); }
+    var sumBox = el('div', 'ea-summary-box');
+    sumBox.append(el('b', 'ea-summary-label', '주요 내용'));
+    var ul = el('ul', 'ea-summary-lines');
+    var lines = (it.summary_lines && it.summary_lines.length) ? it.summary_lines : [it.summary || '요약이 없습니다 — 원문에서 확인하세요'];
+    lines.slice(0, 3).forEach(function (ln) { ul.append(el('li', null, ln)); });
+    sumBox.append(ul);
+    body.append(sumBox);
+    var acts = el('div', 'ea-actions');
+    acts.append(link('기사 원문', it.url));
+    acts.append(telegramButton((it.source === 'ea' ? '/api/ea/items/' : '/api/articles/') + it.id + '/telegram'));
+    body.append(acts);
+    card.append(body);
+    return card;
+  }
+
   /* ── 필터: 카테고리 칩 + 카테고리별 행 노출 ── */
   function renderCatChips() {
     renderChips($('eaCatChips'), CATS, eaState.cat, function (key) {
@@ -661,13 +696,13 @@
 
   function applyRowVisibility() {
     var c = currentCat();
-    var cal = c.layout === 'calendar';
+    var cal = c.layout === 'calendar' || c.layout === 'news';   // 기사 목록은 검색·세부 필터 없이 최신순
     $('eaSearch').closest('.filter-row').hidden = cal;
     $('eaAgencyRow').hidden = cal;
     $('eaPriorityRow').hidden = cal;
     $('eaGroupRow').hidden = cal;
     $('eaMiscRow').hidden = cal;
-    $('eaSort').hidden = false;
+    $('eaSort').hidden = c.layout === 'news';
     $('eaStatus').hidden = !(c.layout === 'bill' || c.layout === 'notice');   // 심사 단계·예고 상태
     $('eaDue').hidden = c.layout !== 'notice';                                  // 마감 D-7/14/30
     var lab = document.querySelector('#eaAgencyRow .filter-label');
@@ -687,7 +722,7 @@
 
   function loadFilters() {
     var c = currentCat();
-    if (c.layout === 'calendar') { return Promise.resolve(); }
+    if (c.layout === 'calendar' || c.layout === 'news') { return Promise.resolve(); }
     return getJSON('/api/ea/filters?category=' + encodeURIComponent(c.key)).then(function (d) {
       fillSelect($('eaSort'), d.sorts || [], eaState.sort || c.sort || 'deadline', null);
       fillSelect($('eaStatus'), (d.statuses || []).map(function (s) {
@@ -778,6 +813,22 @@
       return el('div', 'ea-skeleton');
     }));
     var done = function () { eaState.loading = false; };
+
+    if (c.layout === 'news') {          // 메인에서 수집한 정부/정책·통상 기사 — 최신순, 쪽 나누기는 화면에서
+      getJSON(c.endpoint).then(function (d) {
+        var all = d.items || [];
+        var pages = Math.max(1, Math.ceil(all.length / EA_PAGE_SIZE));
+        if (eaState.page > pages) { eaState.page = pages; }
+        $('eaCount').textContent = all.length.toLocaleString('ko-KR') + '건';
+        renderPager(all.length);
+        if (!all.length) { showState('', '최근 45일 안에 해당 분류의 기사가 없습니다.'); return; }
+        var from = (eaState.page - 1) * EA_PAGE_SIZE;
+        $('eaList').replaceChildren.apply($('eaList'), all.slice(from, from + EA_PAGE_SIZE).map(buildNewsCard));
+      }).catch(function () {
+        showState('is-error', '목록을 불러오지 못했습니다.');
+      }).finally(done);
+      return;
+    }
 
     var p = new URLSearchParams();
     p.set('item_type', c.types);
