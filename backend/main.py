@@ -5342,12 +5342,12 @@ def extract_pfm_excerpt(body: str) -> str:
     return extract_mention_excerpt(body, _GROUP_ALIASES_LOWER.get("포스코퓨처엠", []))
 
 
-def extract_mention_excerpt(body: str, aliases: Sequence[str]) -> str:
+def extract_mention_excerpt(body: str, aliases: Sequence[str], cover: Sequence[Sequence[str]] = ()) -> str:
     """본문에서 aliases(소문자 별칭) 중 하나가 나온 언급을 **원문 순서 그대로 이어지게** 발췌한다.
 
     ① 언급이 나온 문단 — 문단째(길면 언급 문장 앞뒤를 문장 단위로)
     ② 그 문단 바로 앞 문장(맥락)과 바로 뒤 문장(이어지는 내용) — 원문에서 붙어 있던 글만 가져온다
-    언급 문단은 최대 3개, 전체는 700자 이내. 문장은 중간에서 자르지 않고, 기사의 문장을 그대로 옮길 뿐
+    언급 문단은 최대 3개(cover 로 여러 회사를 주면 회사마다 첫 언급 문단을 먼저 담아 최대 5개), 전체는 700자 이내(그때는 1000자). 문장은 중간에서 자르지 않고, 기사의 문장을 그대로 옮길 뿐
     재서술하지 않는다.
 
     예전엔 '기사 주제(첫 문단)'를 따로 앞에 붙여 서로 안 이어지는 두 토막이 됐고, 카드의 접힌 줄 아래로 정작
@@ -5368,11 +5368,26 @@ def extract_mention_excerpt(body: str, aliases: Sequence[str]) -> str:
     if not hits:
         return ""
     hit_set = set(hits)
+    # 여러 회사를 한 상자에 담을 때(cover) — 한 회사의 언급이 많아도 다른 회사의 첫 언급 문단이 밀려나지 않게 회사마다 먼저 하나씩 뽑는다.
+    cap, max_chars = PFM_MENTION_PARAS, PFM_EXCERPT_MAX
+    chosen: list[int] = []
+    if len(cover) > 1:
+        cap, max_chars = min(5, max(PFM_MENTION_PARAS, len(cover))), 1000
+        for als in cover:
+            first = next((i for i in hits if any(a in paras[i].lower() for a in als)), None)
+            if first is not None and first not in chosen:
+                chosen.append(first)
+    for i in hits:
+        if len(chosen) >= cap:
+            break
+        if i not in chosen:
+            chosen.append(i)
+    chosen = sorted(chosen[:cap])
 
     segs: list[tuple[int, str]] = []
     used_idx: set[int] = set()
     used = 0
-    for idx in hits[:PFM_MENTION_PARAS]:
+    for idx in chosen:
         if idx in used_idx:
             continue
         window: list[tuple[int, str]] = []
@@ -5386,9 +5401,9 @@ def extract_mention_excerpt(body: str, aliases: Sequence[str]) -> str:
             ctx_after = _head_sentences(paras[next_i])
             if ctx_after:
                 window.append((next_i, ctx_after))
-        if used + sum(len(t) + 1 for _, t in window) > PFM_EXCERPT_MAX:
+        if used + sum(len(t) + 1 for _, t in window) > max_chars:
             window = [w for w in window if w[0] == idx]      # 넘치면 앞뒤 맥락부터 뺀다
-            if used + len(window[0][1]) + 1 > PFM_EXCERPT_MAX:
+            if used + len(window[0][1]) + 1 > max_chars:
                 break
         for i, t in window:
             segs.append((i, t))
@@ -6186,22 +6201,53 @@ def pack_perspective(reason: str = "", original_title: str = "", fallback: str =
     return "\n".join(lines) if lines else fallback
 
 
-GROUP_EXCERPT_MAX_GROUPS = 4
+GROUP_EXCERPT_NONE = "(없음)"        # 채우기 명령이 '확인했지만 언급 없음' 을 기록하는 표시(다시 대상이 되지 않게)
+GROUP_EXCERPT_MAX_NAMES = 6
+
+
+def _group_aliases(groups: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    for g in groups:
+        for a in _GROUP_ALIASES_LOWER.get(g, []):
+            if a not in out:
+                out.append(a)
+    return out
 
 
 def extract_group_excerpts(body: str, groups: Sequence[str]) -> dict[str, str]:
-    """카드에 붙은 그룹사(포스코퓨처엠 제외 — 그건 pfm_excerpt)별로 본문의 언급 발췌를 만든다. 언급이 안 잡히면 그 그룹사는 뺀다.
+    """카드에 붙은 그룹사 중 본문에 실제로 언급된 곳들을 **하나의 발췌로 합친다** — {"포스코퓨처엠, 포스코HY클린메탈": 발췌}.
 
-    영어 본문은 번역하지 않으므로 싣지 않는다. 한 카드에 최대 GROUP_EXCERPT_MAX_GROUPS 곳.
+    같은 문단에 여러 계열사가 나오면 계열사마다 같은 글을 되풀이해 보여 주게 된다(2026-10-29 사용자 지적).
+    언급된 계열사를 이름 하나로 묶고, 그 이름들의 별칭으로 한 번만 발췌한다. 포스코퓨처엠 하나만 언급됐으면 빈 dict —
+    그건 pfm_excerpt 상자가 맡는다. 영어 본문은 번역하지 않으므로 싣지 않는다.
     """
-    out: dict[str, str] = {}
-    for g in groups:
-        if g == "포스코퓨처엠" or len(out) >= GROUP_EXCERPT_MAX_GROUPS:
-            continue
-        ex = clean_text(extract_mention_excerpt(body, _GROUP_ALIASES_LOWER.get(g, [])), keep_newlines=True)
-        if ex and not looks_english(ex):
-            out[g] = ex
-    return out
+    low = (body or "").lower()
+    mentioned = [g for g in dict.fromkeys(groups)
+                 if g != GROUP_EXCERPT_NONE and any(a in low for a in _GROUP_ALIASES_LOWER.get(g, []))][:GROUP_EXCERPT_MAX_NAMES]
+    if not mentioned or mentioned == ["포스코퓨처엠"]:
+        return {}
+    ex = clean_text(extract_mention_excerpt(body, _group_aliases(mentioned),
+                                            cover=[_GROUP_ALIASES_LOWER.get(g, []) for g in mentioned]), keep_newlines=True)
+    if not ex or looks_english(ex):
+        return {}
+    return {", ".join(mentioned): ex}
+
+
+def merged_group_excerpt(row: dict) -> dict | None:
+    """카드에 보일 '언급' 상자 하나 — {"names": [...], "text": 발췌}. 저장된 값이 여러 개(옛 방식: 그룹사별)면 문단을 겹침 없이 합친다."""
+    have = {k: v for k, v in group_excerpts_of(row).items() if k != GROUP_EXCERPT_NONE and v.strip()}
+    if not have:
+        return None
+    names: list[str] = []
+    paras: list[str] = []
+    for k, v in have.items():
+        for n in (x.strip() for x in k.split(",")):
+            if n and n not in names:
+                names.append(n)
+        for para in (x.strip() for x in v.splitlines()):
+            if para and not any(para in q or q in para for q in paras):
+                paras.append(para)
+    return {"names": names, "text": "\n".join(paras)}
 
 
 def swot_total(swot: dict[str, dict[str, Any]]) -> int:
@@ -10028,6 +10074,15 @@ def card_tags(row: dict) -> tuple[list[str], list[str], str]:
     return groups, categories, press
 
 
+def _group_excerpt_card(row: dict, groups: Sequence[str]) -> list[dict]:
+    m = merged_group_excerpt(row)
+    if not m:
+        return []
+    names = sorted(m["names"], key=lambda n: (list(groups).index(n) if n in groups else 99))
+    return [{"group": ", ".join(names), "text": clean_text(m["text"], keep_newlines=True),
+             "aliases": _group_aliases(names)[:24], "includes_pfm": "포스코퓨처엠" in names}]
+
+
 def build_card(row: dict) -> dict:
     """카드 1건의 표시용 형태를 만든다. 칩 중복 제거를 여기서 한 번 더 한다. (PRD F6.2b)"""
     groups, categories, press = card_tags(row)
@@ -10073,11 +10128,8 @@ def build_card(row: dict) -> dict:
         "thumbnail_url": row.get("thumbnail_url") or "",
         "importance_score": int(row.get("importance_score") or 0),
         "sentiment": row.get("sentiment") or "",
-        # 포스코퓨처엠 외 그룹사(포스코홀딩스·포스코·포스코이앤씨·포스코DX …)의 본문 언급 발췌 — 카드 그룹사 칩 순서대로
-        "group_excerpts": [
-            {"group": g, "text": clean_text(t, keep_newlines=True), "aliases": list(_GROUP_ALIASES_LOWER.get(g, []))[:8]}
-            for g, t in sorted(group_excerpts_of(row).items(), key=lambda kv: (groups.index(kv[0]) if kv[0] in groups else 99))
-            if g != "포스코퓨처엠"],
+        # 본문에 언급된 계열사들을 한 상자로 — 이름은 '포스코퓨처엠, 포스코HY클린메탈 언급'. 포스코퓨처엠이 들어 있으면 별도 퓨처엠 상자는 숨긴다.
+        "group_excerpts": _group_excerpt_card(row, groups),
         "sentiment_reason": clean_text(sentiment_reason_of(row)),
         "title_original": clean_text(title_original_of(row)),
         "keywords": keywords,
@@ -11876,7 +11928,7 @@ def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=Non
 
 
 def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
-    """그룹사(포스코퓨처엠 제외) 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는 기존 기사에 발췌를 채운다 (2026-10-29 신기능 백필).
+    """퓨처엠 외 그룹사 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는(또는 옛 그룹사별 방식인) 기존 기사에 합친 발췌를 채운다 (2026-10-29 신기능 백필).
 
     보관 본문(30일)이 있으면 그것으로, 없으면 원문을 다시 받아 만든다. 인사·부고는 제외. 최근 기사부터 limit 건.
     dry 면 대상 수만 보여 주고 쓰지 않는다. 원문에 언급이 없는 그룹사는 그대로 둔다.
@@ -11885,10 +11937,12 @@ def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch
     todo = []
     for r in ctx.storage.list_articles(8000, 0, None, ""):
         cats = jload(r.get("categories"), [])
-        groups = [g for g in jload(r.get("group_companies"), []) if g != "포스코퓨처엠"]
+        groups = jload(r.get("group_companies"), [])
+        if not [g for g in groups if g != "포스코퓨처엠"]:
+            continue            # 포스코퓨처엠만 붙은 기사는 기존 '포스코퓨처엠 언급' 상자로 충분하다
         have = group_excerpts_of(r)
-        if PEOPLE_NEWS_CATEGORY in cats or not groups or all(g in have for g in groups[:GROUP_EXCERPT_MAX_GROUPS]):
-            continue
+        if PEOPLE_NEWS_CATEGORY in cats or not groups or (len(have) == 1):
+            continue            # 이미 합친 발췌(또는 '언급 없음' 표시) 하나가 있으면 끝난 기사. 여러 개(옛 그룹사별 방식)면 다시 합친다
         todo.append((r, groups))
     by_group = Counter(g for _, gs in todo for g in gs)
     todo = todo[:max(0, limit)]
@@ -11917,13 +11971,11 @@ def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch
             result["nopage"] += 1
             continue
         gx = extract_group_excerpts(body, groups)
-        if not gx:
-            result["none"] += 1
-            continue
-        merged = {**group_excerpts_of(r), **gx}
+        # 합친 발췌 하나로 갈아 끼운다(옛 그룹사별 줄은 지운다). 언급이 없으면 '확인함' 표시만 남겨 다음에 또 대상이 되지 않게 한다.
         ctx.storage.set_perspective(r["id"], pack_perspective(
-            sentiment_reason_of(r), title_original_of(r), r.get("perspective_text") or "", group_excerpts=merged))
-        result["filled"] += 1
+            sentiment_reason_of(r), title_original_of(r), r.get("perspective_text") or "",
+            group_excerpts=gx or {GROUP_EXCERPT_NONE: "-"}))
+        result["filled" if gx else "none"] += 1
     log.info("그룹사 언급 채우기: %d건 채움 · %d건 원문에 언급 없음 · %d건 원문 못 받음", result["filled"], result["none"], result["nopage"])
     return result
 
@@ -14121,43 +14173,73 @@ def cmd_selftest() -> int:
     check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
           format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
           ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
-    # 그룹사별 언급 발췌 — 포스코퓨처엠처럼 포스코홀딩스·포스코DX·포스코이앤씨·포스코 언급도 카드에 (2026-10-29)
+    # 그룹사 언급 발췌 — 한 카드에 여러 계열사가 언급되면 상자 하나로 합쳐 같은 글이 되풀이되지 않게 (2026-10-29)
     _gb = ("[서울=뉴시스] 포스코그룹 임단협 결렬로 파업 위기가 커졌다.\n"
            "포스코홀딩스는 지난달 노조와 교섭을 시작했으나 합의에 이르지 못했다. 사측은 추가 비용이 1조원이라고 밝혔다.\n"
            "한편 포스코DX는 스마트팩토리 수주를 늘렸다. 포스코이앤씨는 해외 플랜트 공사를 따냈다.\n"
            "포스코퓨처엠은 양극재 증설을 발표했다.")
-    _gx = extract_group_excerpts(_gb, ["포스코퓨처엠", "포스코홀딩스", "포스코DX", "포스코이앤씨", "포스코", "포스코인터내셔널", "배터리협회"])
-    check("그룹사 언급 — 퓨처엠 외 그룹사별로 언급 문단을 뽑고, 언급이 없는 그룹사는 뺀다",
-          (list(_gx), "교섭을 시작했으나" in _gx["포스코홀딩스"], "스마트팩토리" in _gx["포스코DX"], "해외 플랜트" in _gx["포스코이앤씨"],
-           "포스코퓨처엠" in _gx, "포스코인터내셔널" in _gx),
-          (["포스코홀딩스", "포스코DX", "포스코이앤씨", "포스코"], True, True, True, False, False))
-    _pp = pack_perspective("파업 우려", "", "", group_excerpts={"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"})
+    _gx = extract_group_excerpts(_gb, ["포스코퓨처엠", "포스코홀딩스", "포스코DX", "포스코이앤씨", "포스코인터내셔널", "배터리협회"])
+    _gk = next(iter(_gx), "")
+    check("그룹사 언급 — 언급된 계열사를 이름 하나로 묶어 발췌 하나만 만든다(언급 없는 계열사는 이름에서 빠진다)",
+          (len(_gx), _gk, _gx.get(_gk, "").count("포스코홀딩스는 지난달"), "스마트팩토리" in _gx.get(_gk, ""), "양극재 증설" in _gx.get(_gk, "")),
+          (1, "포스코퓨처엠, 포스코홀딩스, 포스코DX, 포스코이앤씨", 1, True, True))
+    _cv = ("포스코홀딩스는 이번 투자를 주도했다. 규모는 1조원이다.\n"
+           "포스코홀딩스는 추가로 3000억원을 더 투입할 계획이다. 이사회 의결을 거쳤다.\n"
+           "포스코홀딩스 관계자는 조속한 추진을 약속했다. 일정은 내년 초다.\n"
+           "포스코필바라리튬솔루션은 광양 공장에서 수산화리튬 생산을 시작했다. 연산은 4만 톤이다.\n"
+           "포스코에이치와이클린메탈은 폐배터리 재활용 설비를 증설했다. 투자액은 500억원이다.")
+    _cx = next(iter(extract_group_excerpts(_cv, ["포스코홀딩스", "포스코필바라리튬솔루션", "포스코에이치와이클린메탈"]).values()), "")
+    check("그룹사 언급 — 한 회사 언급이 많아도 다른 회사들의 첫 언급 문단이 밀려나지 않는다(회사마다 먼저 하나씩)",
+          ("수산화리튬" in _cx, "폐배터리" in _cx, "조속한 추진" in _cx), (True, True, False))
+    check("그룹사 언급 — 퓨처엠만 언급됐거나 언급이 없으면 만들지 않는다(퓨처엠은 기존 상자)",
+          (extract_group_excerpts("포스코퓨처엠은 양극재 증설을 발표했다. 투자 규모는 1조원이다.", ["포스코퓨처엠", "포스코홀딩스"]),
+           extract_group_excerpts("전혀 상관없는 기사 본문입니다. 아무 말도 없다.", ["포스코홀딩스"]),
+           list(extract_group_excerpts("포스코홀딩스가 투자를 발표했다. 규모는 크다고 했다.", ["포스코홀딩스", "포스코DX"]))),
+          ({}, {}, ["포스코홀딩스"]))
+    _pp = pack_perspective("파업 우려", "", "", group_excerpts={"포스코홀딩스, 포스코DX": "첫 줄\n둘째 줄"})
     check("그룹사 언급 저장 — perspective_text 한 칸에 줄 단위로 담고 줄바꿈까지 되살린다(감성 근거와 공존)",
           (group_excerpts_of({"perspective_text": _pp}), sentiment_reason_of({"perspective_text": _pp}), len(_pp.splitlines())),
-          ({"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"}, "파업 우려", 3))
-    _gc = build_card({"id": "gx", "title": "t", "press_name": "p", "perspective_text": _pp, "group_companies": '["포스코DX", "포스코홀딩스"]',
+          ({"포스코홀딩스, 포스코DX": "첫 줄\n둘째 줄"}, "파업 우려", 2))
+    _legacy = pack_perspective("", "", "", group_excerpts={"포스코홀딩스": "공통 문단입니다 파업\n홀딩스 문단", "포스코DX": "공통 문단입니다 파업\nDX 문단"})
+    _gc = build_card({"id": "gx", "title": "t", "press_name": "p", "perspective_text": _legacy, "group_companies": '["포스코DX", "포스코홀딩스"]',
                       "categories": "[]", "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})
-    check("카드 — group_excerpts 가 그룹사 칩 순서대로, 강조용 별칭과 함께 나온다",
-          ([x["group"] for x in _gc["group_excerpts"]], _gc["group_excerpts"][0]["text"], "포스코dx" in _gc["group_excerpts"][0]["aliases"]),
-          (["포스코DX", "포스코홀딩스"], "DX 발췌", True))
+    check("카드 — 옛 그룹사별 저장분도 상자 하나로 합쳐 겹치는 문단을 한 번만 보여 준다(칩 순서, 강조 별칭)",
+          (len(_gc["group_excerpts"]), _gc["group_excerpts"][0]["group"], _gc["group_excerpts"][0]["text"].splitlines(),
+           "포스코dx" in _gc["group_excerpts"][0]["aliases"], _gc["group_excerpts"][0]["includes_pfm"]),
+          (1, "포스코DX, 포스코홀딩스", ["공통 문단입니다 파업", "홀딩스 문단", "DX 문단"], True, False))
+    _gc2 = build_card({"id": "gx2", "title": "t", "press_name": "p", "group_companies": '["포스코퓨처엠", "포스코에이치와이클린메탈", "포스코필바라리튬솔루션"]',
+                       "perspective_text": pack_perspective("", "", "", group_excerpts={"포스코퓨처엠, 포스코에이치와이클린메탈, 포스코필바라리튬솔루션": "세 회사가 함께 나온 문단"}),
+                       "categories": "[]", "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})
+    check("카드 — 세 회사가 한 문단에 나오면 '포스코퓨처엠, 포스코에이치와이클린메탈, 포스코필바라리튬솔루션 언급' 상자 하나, 퓨처엠 상자는 숨긴다",
+          (len(_gc2["group_excerpts"]), _gc2["group_excerpts"][0]["group"], _gc2["group_excerpts"][0]["includes_pfm"]),
+          (1, "포스코퓨처엠, 포스코에이치와이클린메탈, 포스코필바라리튬솔루션", True))
     check("그룹사 언급 — 다른 곳이 perspective_text 를 다시 써도(감성 근거 보충) 발췌는 보존된다",
           group_excerpts_of({"perspective_text": pack_perspective("새 근거", "", "", group_excerpts=group_excerpts_of({"perspective_text": _pp}))}),
-          {"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"})
-    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
-              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
-              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-              ("gq1", "u/gq1", "u/gq1", "u/gq1", "포스코 파업 위기", iso(_pn), iso(_pn), "rss", 10, '["포스코홀딩스", "포스코DX"]', "[]",
-               "시험", iso(_pn), "active", 1))
-    _et.save_summary({"id": new_id(), "article_id": "gq1", "summary_text": "요약", "perspective_text": "[감성근거] 우려", "summary_source": "fulltext",
-                      "model": "m", "token_usage": None, "created_at": iso(_pn)})
-    _et.save_body("gq1", _gb, "fulltext")
+          {"포스코홀딩스, 포스코DX": "첫 줄\n둘째 줄"})
+    for _gid, _ggs, _gbody, _gper in (("gq1", '["포스코홀딩스", "포스코DX"]', _gb, "[감성근거] 우려"),
+                                       ("gq2", '["포스코홀딩스"]', "아무 상관없는 본문입니다. 포스코 이야기가 없다.", ""),
+                                       ("gq3", '["포스코홀딩스", "포스코DX"]', _gb, _legacy),
+                                       ("gq4", '["포스코퓨처엠"]', _gb, "")):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_gid, "u/" + _gid, "u/" + _gid, "u/" + _gid, "포스코 파업 위기 " + _gid, iso(_pn), iso(_pn), "rss", 10, _ggs, "[]",
+                   "시험", iso(_pn), "active", 1))
+        _et.save_summary({"id": new_id(), "article_id": _gid, "summary_text": "요약", "perspective_text": _gper, "summary_source": "fulltext",
+                          "model": "m", "token_usage": None, "created_at": iso(_pn)})
+        _et.save_body(_gid, _gbody, "fulltext")
     _gf0 = cmd_fixgroupexcerpt(_ectx, 10, dry=True)
-    check("fixgroupexcerpt --dry — 대상만 세고 쓰지 않는다", (_gf0["targets"] >= 1, group_excerpts_of(_et.article_detail("gq1"))), (True, {}))
+    check("fixgroupexcerpt --dry — 대상(gq1 신규·gq2 신규·gq3 옛 방식)만 세고 쓰지 않으며 퓨처엠만 붙은 gq4 는 대상이 아니다",
+          (_gf0["targets"], group_excerpts_of(_et.article_detail("gq1"))), (3, {}))
     _gf1 = cmd_fixgroupexcerpt(_ectx, 10)
-    _gd = _et.article_detail("gq1")
-    check("fixgroupexcerpt — 보관 본문으로 그룹사 언급을 채우고 감성 근거는 지키며, 다시 돌려도 대상이 아니다",
-          (_gf1["filled"] >= 1, sorted(group_excerpts_of(_gd)), sentiment_reason_of(_gd), cmd_fixgroupexcerpt(_ectx, 10, dry=True)["targets"] == 0),
-          (True, ["포스코DX", "포스코홀딩스"], "우려", True))
+    check("fixgroupexcerpt — 합친 발췌 하나로 채우고(옛 그룹사별은 갈아 끼움), 감성 근거는 지키고, 언급 없는 기사엔 '확인함' 표시",
+          (_gf1["filled"], _gf1["none"], list(group_excerpts_of(_et.article_detail("gq1"))), sentiment_reason_of(_et.article_detail("gq1")),
+           list(group_excerpts_of(_et.article_detail("gq3"))), list(group_excerpts_of(_et.article_detail("gq2"))),
+           cmd_fixgroupexcerpt(_ectx, 10, dry=True)["targets"]),
+          (2, 1, ["포스코홀딩스, 포스코DX"], "우려", ["포스코홀딩스, 포스코DX"], [GROUP_EXCERPT_NONE], 0))
+    check("카드 — '확인함' 표시는 화면에 상자를 만들지 않는다", build_card({"id": "g9", "title": "t", "press_name": "p", "perspective_text":
+          pack_perspective("", "", "", group_excerpts={GROUP_EXCERPT_NONE: "-"}), "group_companies": '["포스코홀딩스"]', "categories": "[]",
+          "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})["group_excerpts"], [])
     # 글자 깨짐 — 엔티티 이중 이스케이프(마이데일리 사례)·모지바케·태그를 화면·수집·메시지에서 모두 푼다 (2026-10-29)
     _brk = "[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 &hellip;투자 고갈&middot;적자 위험 &lsquo;경고&rsquo;"
     check("글자 깨짐 — 이중 이스케이프 엔티티를 끝까지 푼다",

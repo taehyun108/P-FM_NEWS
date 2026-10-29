@@ -668,7 +668,10 @@ function buildCard(item) {
     }
     card.append(box);
   };
-  if (item.pfm_excerpt) addExcerptBox('포스코퓨처엠 언급', item.pfm_excerpt, PFM_MENTION_RE.source);
+  /* 한 카드에 여러 계열사가 언급되면 상자 하나로 합쳐 온다(group_excerpts 1개, 이름은 '포스코퓨처엠, 포스코HY클린메탈 언급').
+     그 상자가 포스코퓨처엠을 포함하면(includes_pfm) 퓨처엠 전용 상자는 같은 글을 되풀이하므로 그리지 않는다. */
+  const mergedBox = (item.group_excerpts || []).find((g) => g && g.text);
+  if (item.pfm_excerpt && !(mergedBox && mergedBox.includes_pfm)) addExcerptBox('포스코퓨처엠 언급', item.pfm_excerpt, PFM_MENTION_RE.source);
   (item.group_excerpts || []).forEach((g) => {
     if (!g || !g.text) return;
     /* 강조 별칭 — 서버가 준 그룹사 별칭(정규식 특수문자는 이스케이프). 없으면 그룹사 이름 그대로 */
