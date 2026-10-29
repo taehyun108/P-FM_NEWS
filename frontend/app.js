@@ -621,22 +621,23 @@ function buildCard(item) {
     }
   }
 
-  /* 포스코퓨처엠 언급 발췌 — 본문 원문에서 언급 문장+앞뒤 문맥(약 4줄).
-     언급이 없는 기사는 이 영역을 아예 그리지 않는다(대체 문구 없음). */
-  if (item.pfm_excerpt) {
+  /* 언급 발췌 상자 — 본문 원문에서 언급 문장+앞뒤 문맥(약 4줄). 언급이 없는 기사는 상자를 아예 그리지 않는다(대체 문구 없음).
+     포스코퓨처엠은 pfm_excerpt, 그 밖 그룹사(포스코홀딩스·포스코DX·포스코이앤씨·포스코 등)는 group_excerpts 로 같은 모양을 쓴다. */
+  const addExcerptBox = (label, text, markSource) => {
     const box = el('div', 'card-excerpt');
-    box.append(el('strong', null, '포스코퓨처엠 언급'));
+    box.append(el('strong', null, label));
     const body = el('div', 'card-excerpt-text');
-    const paras = item.pfm_excerpt.split('\n').filter((t) => t.trim());
-    const hit = paras.map((t) => PFM_MENTION_RE.test(t));
+    const paras = text.split('\n').filter((t) => t.trim());
+    const hit = paras.map((t) => new RegExp(markSource, 'i').test(t));
     const first = Math.max(0, hit.indexOf(true));
-    /* 문단 하나를 그리되 포스코퓨처엠 언급은 <mark>로 강조한다 */
+    /* 문단 하나를 그리되 해당 그룹사 언급은 <mark>로 강조한다 */
     const paint = (t, idx) => {
       const d = el('div', 'excerpt-para');
       d.dataset.idx = idx;
       let last = 0; let m;
-      const re = new RegExp(PFM_MENTION_RE.source, 'gi');
+      const re = new RegExp(markSource, 'gi');
       while ((m = re.exec(t))) {
+        if (m[0] === '') { re.lastIndex += 1; continue; }
         if (m.index > last) d.append(document.createTextNode(t.slice(last, m.index)));
         d.append(el('mark', 'pfm-mark', m[0]));
         last = m.index + m[0].length;
@@ -647,7 +648,7 @@ function buildCard(item) {
     paras.forEach((t, i) => body.append(paint(t, i)));
     box.append(body);
     /* 길면 '언급이 든 문단'만 남기고 접는다 — 언급이 가려지는 일이 없도록 앞뒤 문단만 숨긴다 */
-    if (paras.length > 1 && item.pfm_excerpt.length > EXCERPT_FOLD_CHARS) {
+    if (paras.length > 1 && text.length > EXCERPT_FOLD_CHARS) {
       const apply = (folded) => {
         body.querySelectorAll('.excerpt-para').forEach((d) => {
           d.hidden = folded && Number(d.dataset.idx) !== first;
@@ -666,7 +667,14 @@ function buildCard(item) {
       box.append(more);
     }
     card.append(box);
-  }
+  };
+  if (item.pfm_excerpt) addExcerptBox('포스코퓨처엠 언급', item.pfm_excerpt, PFM_MENTION_RE.source);
+  (item.group_excerpts || []).forEach((g) => {
+    if (!g || !g.text) return;
+    /* 강조 별칭 — 서버가 준 그룹사 별칭(정규식 특수문자는 이스케이프). 없으면 그룹사 이름 그대로 */
+    const names = (g.aliases && g.aliases.length ? g.aliases : [g.group]).map((a) => a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    addExcerptBox(`${g.group} 언급`, g.text, names.join('|'));
+  });
 
   /* 기자 · 출처 */
   const meta = el('div', 'card-meta');

@@ -5338,7 +5338,12 @@ def _reflow_quote_widgets(text: str) -> str:
 
 
 def extract_pfm_excerpt(body: str) -> str:
-    """본문에서 포스코퓨처엠(옛 사명·영문·띄어쓴 표기 포함) 언급을 **원문 순서 그대로 이어지게** 발췌한다.
+    """본문에서 포스코퓨처엠(옛 사명·영문·띄어쓴 표기 포함) 언급을 **원문 순서 그대로 이어지게** 발췌한다. (아래 공통 함수의 포스코퓨처엠 판)"""
+    return extract_mention_excerpt(body, _GROUP_ALIASES_LOWER.get("포스코퓨처엠", []))
+
+
+def extract_mention_excerpt(body: str, aliases: Sequence[str]) -> str:
+    """본문에서 aliases(소문자 별칭) 중 하나가 나온 언급을 **원문 순서 그대로 이어지게** 발췌한다.
 
     ① 언급이 나온 문단 — 문단째(길면 언급 문장 앞뒤를 문장 단위로)
     ② 그 문단 바로 앞 문장(맥락)과 바로 뒤 문장(이어지는 내용) — 원문에서 붙어 있던 글만 가져온다
@@ -5356,7 +5361,8 @@ def extract_pfm_excerpt(body: str) -> str:
     if not text:
         return ""
     text = _reflow_quote_widgets(text)
-    aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
+    if not aliases:
+        return ""
     paras = [_strip_byline_prefix(p.strip(), aliases) for p in text.split("\n") if len(p.strip()) >= 15] or [text]
     hits = [i for i, p in enumerate(paras) if any(a in p.lower() for a in aliases)]
     if not hits:
@@ -6138,7 +6144,7 @@ def ensure_sentiment_reason(ctx: "Context", row: dict) -> str:
     reason = ctx.llm.sentiment_reason(row.get("title") or "", basis, senti)
     if reason and aid:
         ctx.storage.set_perspective(aid, pack_perspective(
-            reason, title_original_of(row), row.get("perspective_text") or ""))
+            reason, title_original_of(row), row.get("perspective_text") or "", group_excerpts=group_excerpts_of(row)))
     return reason
 
 
@@ -6147,15 +6153,55 @@ def title_original_of(row: dict) -> str:
     return _perspective_field(row, TITLE_ORIGINAL_TAG)
 
 
-def pack_perspective(reason: str = "", original_title: str = "", fallback: str = "") -> str:
-    """감성 근거·원제를 perspective_text 한 칸에 줄 단위로 담는다(컬럼 추가 없이)."""
+GROUP_EXCERPT_TAG = "[그룹언급] "     # '[그룹언급] 포스코홀딩스<TAB>발췌…' — 발췌 안의 줄바꿈은 '⏎' 로 바꿔 한 줄에 담는다
+_EXCERPT_NL = "⏎"
+
+
+def group_excerpts_of(row: dict) -> dict[str, str]:
+    """perspective_text 에 담긴 '그룹사별 언급 발췌'({그룹사: 발췌}). 없으면 빈 dict. 포스코퓨처엠은 pfm_excerpt 가 따로 있다."""
+    out: dict[str, str] = {}
+    for line in (row.get("perspective_text") or "").splitlines():
+        line = line.strip()
+        if line.startswith(GROUP_EXCERPT_TAG):
+            g, _, txt = line[len(GROUP_EXCERPT_TAG):].partition("\t")
+            g, txt = g.strip(), txt.strip()
+            if g and txt:
+                out[g] = txt.replace(_EXCERPT_NL, "\n")
+    return out
+
+
+def pack_perspective(reason: str = "", original_title: str = "", fallback: str = "",
+                     group_excerpts: dict[str, str] | None = None) -> str:
+    """감성 근거·원제·그룹사별 언급 발췌를 perspective_text 한 칸에 줄 단위로 담는다(컬럼 추가 없이)."""
     lines = []
     if reason:
         lines.append(f"{SENTIMENT_REASON_TAG}{reason}")
     if original_title:
         one_line = re.sub(r"\s+", " ", original_title).strip()   # 줄바꿈이 있으면 머리말 구조가 깨진다
         lines.append(TITLE_ORIGINAL_TAG + one_line)
+    for g, txt in (group_excerpts or {}).items():
+        one = re.sub(r"[ \t\r]*\n[ \t\r]*", _EXCERPT_NL, (txt or "").strip())
+        if g and one:
+            lines.append(f"{GROUP_EXCERPT_TAG}{g}\t{one}")
     return "\n".join(lines) if lines else fallback
+
+
+GROUP_EXCERPT_MAX_GROUPS = 4
+
+
+def extract_group_excerpts(body: str, groups: Sequence[str]) -> dict[str, str]:
+    """카드에 붙은 그룹사(포스코퓨처엠 제외 — 그건 pfm_excerpt)별로 본문의 언급 발췌를 만든다. 언급이 안 잡히면 그 그룹사는 뺀다.
+
+    영어 본문은 번역하지 않으므로 싣지 않는다. 한 카드에 최대 GROUP_EXCERPT_MAX_GROUPS 곳.
+    """
+    out: dict[str, str] = {}
+    for g in groups:
+        if g == "포스코퓨처엠" or len(out) >= GROUP_EXCERPT_MAX_GROUPS:
+            continue
+        ex = clean_text(extract_mention_excerpt(body, _GROUP_ALIASES_LOWER.get(g, [])), keep_newlines=True)
+        if ex and not looks_english(ex):
+            out[g] = ex
+    return out
 
 
 def swot_total(swot: dict[str, dict[str, Any]]) -> int:
@@ -7619,7 +7665,8 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
         "summary_text": analysis.summary_text,
         # '포스코 관점'은 생성을 중단해 이 칸이 비어 있다 — 감성 판단 근거를 표시 머리말과 함께 담는다
         # (컬럼 추가 없이 쓰려는 것. 읽을 때는 sentiment_reason_of 가 머리말로 구분한다).
-        "perspective_text": pack_perspective(analysis.sentiment_reason, orig_title, analysis.perspective),
+        "perspective_text": pack_perspective(analysis.sentiment_reason, orig_title, analysis.perspective,
+                                             group_excerpts=extract_group_excerpts(body, groups)),
         "summary_source": summary_source,
         "model": ctx.cfg.llm_model,
         "token_usage": analysis.token_usage,
@@ -10026,6 +10073,11 @@ def build_card(row: dict) -> dict:
         "thumbnail_url": row.get("thumbnail_url") or "",
         "importance_score": int(row.get("importance_score") or 0),
         "sentiment": row.get("sentiment") or "",
+        # 포스코퓨처엠 외 그룹사(포스코홀딩스·포스코·포스코이앤씨·포스코DX …)의 본문 언급 발췌 — 카드 그룹사 칩 순서대로
+        "group_excerpts": [
+            {"group": g, "text": clean_text(t, keep_newlines=True), "aliases": list(_GROUP_ALIASES_LOWER.get(g, []))[:8]}
+            for g, t in sorted(group_excerpts_of(row).items(), key=lambda kv: (groups.index(kv[0]) if kv[0] in groups else 99))
+            if g != "포스코퓨처엠"],
         "sentiment_reason": clean_text(sentiment_reason_of(row)),
         "title_original": clean_text(title_original_of(row)),
         "keywords": keywords,
@@ -11823,6 +11875,59 @@ def cmd_fixaggpress(ctx: Context, limit: int = 100, dry: bool = False, fetch=Non
     return result
 
 
+def cmd_fixgroupexcerpt(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
+    """그룹사(포스코퓨처엠 제외) 태그가 붙었지만 '○○ 언급' 발췌가 아직 없는 기존 기사에 발췌를 채운다 (2026-10-29 신기능 백필).
+
+    보관 본문(30일)이 있으면 그것으로, 없으면 원문을 다시 받아 만든다. 인사·부고는 제외. 최근 기사부터 limit 건.
+    dry 면 대상 수만 보여 주고 쓰지 않는다. 원문에 언급이 없는 그룹사는 그대로 둔다.
+    """
+    fetch = fetch or prefetch_articles
+    todo = []
+    for r in ctx.storage.list_articles(8000, 0, None, ""):
+        cats = jload(r.get("categories"), [])
+        groups = [g for g in jload(r.get("group_companies"), []) if g != "포스코퓨처엠"]
+        have = group_excerpts_of(r)
+        if PEOPLE_NEWS_CATEGORY in cats or not groups or all(g in have for g in groups[:GROUP_EXCERPT_MAX_GROUPS]):
+            continue
+        todo.append((r, groups))
+    by_group = Counter(g for _, gs in todo for g in gs)
+    todo = todo[:max(0, limit)]
+    log.info("[그룹사 언급 채우기] 대상 %d건 — %s%s", len(todo), ", ".join(f"{g} {c}" for g, c in by_group.most_common(8)) or "없음",
+             " (미리보기)" if dry else "")
+    result = {"targets": len(todo), "filled": 0, "none": 0, "nopage": 0}
+    if dry:
+        return result
+    need_fetch = {}
+    bodies: dict[str, str] = {}
+    for r, _ in todo:
+        b = ctx.storage.body_of(r["id"]) or ""
+        if b:
+            bodies[r["id"]] = b
+        else:
+            need_fetch[r["id"]] = r.get("url_canonical") or r.get("url_original") or ""
+    if need_fetch:
+        pages = fetch(ctx.http, [u for u in need_fetch.values() if u])
+        for aid, u in need_fetch.items():
+            _, html = pages.get(u, ("", ""))
+            if html:
+                bodies[aid] = extract_body(html)
+    for r, groups in todo:
+        body = bodies.get(r["id"], "")
+        if not body:
+            result["nopage"] += 1
+            continue
+        gx = extract_group_excerpts(body, groups)
+        if not gx:
+            result["none"] += 1
+            continue
+        merged = {**group_excerpts_of(r), **gx}
+        ctx.storage.set_perspective(r["id"], pack_perspective(
+            sentiment_reason_of(r), title_original_of(r), r.get("perspective_text") or "", group_excerpts=merged))
+        result["filled"] += 1
+    log.info("그룹사 언급 채우기: %d건 채움 · %d건 원문에 언급 없음 · %d건 원문 못 받음", result["filled"], result["none"], result["nopage"])
+    return result
+
+
 def cmd_fixentities(ctx: Context, dry: bool = True) -> dict:
     """저장된 기사의 제목·기자명·언론사명·언급 발췌에 남은 글자 깨짐(엔티티·\\u·모지바케·태그)을 점검·복구한다.
 
@@ -12087,7 +12192,8 @@ def cmd_retranslate(ctx: Context, limit: int = 50, dry: bool = False) -> None:
         ctx.storage.update_article(r["id"], patch)
         if t_ko:
             ctx.storage.set_perspective(r["id"], pack_perspective(
-                sentiment_reason_of(r), r.get("title") or "", r.get("perspective_text") or ""))
+                sentiment_reason_of(r), r.get("title") or "", r.get("perspective_text") or "",
+                group_excerpts=group_excerpts_of(r)))
         done += 1
         log.info("  ✓ %s", (t_ko or r.get("title") or "")[:50])
     log.info("영어 기사 번역 완료: 성공 %d · 실패 %d · 남은 대상 %d건", done, failed, max(0, len(todo) - limit))
@@ -14015,6 +14121,43 @@ def cmd_selftest() -> int:
     check("인사 요약 — 기관 하나짜리 일반 공지는 기관 머리말을 만들지 않고 그대로",
           format_people_notice("◇ 신규 임원 승진\n▲ 전무 홍길동 ▲ 상무 김철수", "personnel", "[인사] 어느회사").splitlines(),
           ["ㆍ홍길동 · 전무 (신규 임원 승진)", "ㆍ김철수 · 상무 (신규 임원 승진)"])
+    # 그룹사별 언급 발췌 — 포스코퓨처엠처럼 포스코홀딩스·포스코DX·포스코이앤씨·포스코 언급도 카드에 (2026-10-29)
+    _gb = ("[서울=뉴시스] 포스코그룹 임단협 결렬로 파업 위기가 커졌다.\n"
+           "포스코홀딩스는 지난달 노조와 교섭을 시작했으나 합의에 이르지 못했다. 사측은 추가 비용이 1조원이라고 밝혔다.\n"
+           "한편 포스코DX는 스마트팩토리 수주를 늘렸다. 포스코이앤씨는 해외 플랜트 공사를 따냈다.\n"
+           "포스코퓨처엠은 양극재 증설을 발표했다.")
+    _gx = extract_group_excerpts(_gb, ["포스코퓨처엠", "포스코홀딩스", "포스코DX", "포스코이앤씨", "포스코", "포스코인터내셔널", "배터리협회"])
+    check("그룹사 언급 — 퓨처엠 외 그룹사별로 언급 문단을 뽑고, 언급이 없는 그룹사는 뺀다",
+          (list(_gx), "교섭을 시작했으나" in _gx["포스코홀딩스"], "스마트팩토리" in _gx["포스코DX"], "해외 플랜트" in _gx["포스코이앤씨"],
+           "포스코퓨처엠" in _gx, "포스코인터내셔널" in _gx),
+          (["포스코홀딩스", "포스코DX", "포스코이앤씨", "포스코"], True, True, True, False, False))
+    _pp = pack_perspective("파업 우려", "", "", group_excerpts={"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"})
+    check("그룹사 언급 저장 — perspective_text 한 칸에 줄 단위로 담고 줄바꿈까지 되살린다(감성 근거와 공존)",
+          (group_excerpts_of({"perspective_text": _pp}), sentiment_reason_of({"perspective_text": _pp}), len(_pp.splitlines())),
+          ({"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"}, "파업 우려", 3))
+    _gc = build_card({"id": "gx", "title": "t", "press_name": "p", "perspective_text": _pp, "group_companies": '["포스코DX", "포스코홀딩스"]',
+                      "categories": "[]", "keywords": "[]", "url_canonical": "https://x.test/a", "summary_text": "요약"})
+    check("카드 — group_excerpts 가 그룹사 칩 순서대로, 강조용 별칭과 함께 나온다",
+          ([x["group"] for x in _gc["group_excerpts"]], _gc["group_excerpts"][0]["text"], "포스코dx" in _gc["group_excerpts"][0]["aliases"]),
+          (["포스코DX", "포스코홀딩스"], "DX 발췌", True))
+    check("그룹사 언급 — 다른 곳이 perspective_text 를 다시 써도(감성 근거 보충) 발췌는 보존된다",
+          group_excerpts_of({"perspective_text": pack_perspective("새 근거", "", "", group_excerpts=group_excerpts_of({"perspective_text": _pp}))}),
+          {"포스코홀딩스": "첫 줄\n둘째 줄", "포스코DX": "DX 발췌"})
+    _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+              "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
+              "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              ("gq1", "u/gq1", "u/gq1", "u/gq1", "포스코 파업 위기", iso(_pn), iso(_pn), "rss", 10, '["포스코홀딩스", "포스코DX"]', "[]",
+               "시험", iso(_pn), "active", 1))
+    _et.save_summary({"id": new_id(), "article_id": "gq1", "summary_text": "요약", "perspective_text": "[감성근거] 우려", "summary_source": "fulltext",
+                      "model": "m", "token_usage": None, "created_at": iso(_pn)})
+    _et.save_body("gq1", _gb, "fulltext")
+    _gf0 = cmd_fixgroupexcerpt(_ectx, 10, dry=True)
+    check("fixgroupexcerpt --dry — 대상만 세고 쓰지 않는다", (_gf0["targets"] >= 1, group_excerpts_of(_et.article_detail("gq1"))), (True, {}))
+    _gf1 = cmd_fixgroupexcerpt(_ectx, 10)
+    _gd = _et.article_detail("gq1")
+    check("fixgroupexcerpt — 보관 본문으로 그룹사 언급을 채우고 감성 근거는 지키며, 다시 돌려도 대상이 아니다",
+          (_gf1["filled"] >= 1, sorted(group_excerpts_of(_gd)), sentiment_reason_of(_gd), cmd_fixgroupexcerpt(_ectx, 10, dry=True)["targets"] == 0),
+          (True, ["포스코DX", "포스코홀딩스"], "우려", True))
     # 글자 깨짐 — 엔티티 이중 이스케이프(마이데일리 사례)·모지바케·태그를 화면·수집·메시지에서 모두 푼다 (2026-10-29)
     _brk = "[하투 청구서 ⑤] 포스코 창사 58년 만의 첫 파업 &hellip;투자 고갈&middot;적자 위험 &lsquo;경고&rsquo;"
     check("글자 깨짐 — 이중 이스케이프 엔티티를 끝까지 푼다",
@@ -16547,6 +16690,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
+  fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
@@ -16617,6 +16761,9 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixaggpress":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
+    elif command == "fixgroupexcerpt":
+        _nums = [a for a in argv[2:] if a.isdigit()]
+        cmd_fixgroupexcerpt(ctx, int(_nums[0]) if _nums else 200, dry="--dry" in argv[2:])
     elif command == "fixentities":
         cmd_fixentities(ctx, dry="--run" not in argv[2:])
     elif command == "fixnoise":
