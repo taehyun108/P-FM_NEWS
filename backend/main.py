@@ -12243,6 +12243,26 @@ def cmd_fixrelevance(ctx: Context, dry: bool = True, limit: int = 3000) -> dict:
     return {"checked": checked, "targets": len(hits), "archived": done, "nobody": nobody}
 
 
+def cmd_restore(ctx: Context, term: str, run: bool = False) -> list[dict]:
+    """보관(archived) 처리된 기사 중 제목에 term 이 든 것을 다시 활성으로 되돌린다 — 정리 명령(fixrelevance·fixnoise)을 되돌릴 때 쓴다.
+
+    기본은 미리보기(찾은 기사만 보여 줌). `--run` 을 붙여야 실제로 되돌린다. 직접 등록 기사의 draft(임시 저장)는 건드리지 않는다.
+    """
+    term = (term or "").strip()
+    if not term:
+        log.warning("사용법: restore <제목에 들어간 말> [--run]  예) restore 산업부")
+        return []
+    rows = [r for r in ctx.storage.find_articles_any_status(term, 30) if r.get("status") == "archived"]
+    log.info("[보관 기사 복구] 제목에 '%s' 가 든 보관 기사 %d건%s", term, len(rows), "" if run else " (미리보기)")
+    for r in rows[:15]:
+        log.info("  · [%s] %s", (r.get("press_name") or "")[:8], (r.get("title") or "")[:56])
+    if run:
+        for r in rows:
+            ctx.storage.update_article(r["id"], {"status": "active"})
+        log.info("보관 기사 복구: %d건을 다시 보이게 했습니다", len(rows))
+    return rows
+
+
 def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
     """이미 쌓인 '주식·시세'·'수상·시상' 잡음 기사를 보관(archived) 처리한다. 기본은 미리보기(--run 을 줘야 실제 처리).
 
@@ -14323,6 +14343,10 @@ def cmd_selftest() -> int:
     check("fixrelevance — 수원 국감·분양 목록(동작 없는 2회)·씨티은행은 보관, 배터리 소재·칩이 있는 기사는 그대로",
           [_et.article_detail(x)["status"] for x in ("fr1", "fr2", "fr3", "fr4", "fr5")],
           ["archived", "active", "archived", "active", "archived"])
+    check("restore — 미리보기는 쓰지 않고, --run 이면 보관 기사를 다시 활성으로(활성 기사는 대상 아님)",
+          (len(cmd_restore(_ectx, "수원 지역 국회의원")), _et.article_detail("fr1")["status"],
+           len(cmd_restore(_ectx, "수원 지역 국회의원", run=True)), _et.article_detail("fr1")["status"],
+           len(cmd_restore(_ectx, "삼성SDI, 양극재 증설"))), (1, "archived", 1, "active", 0))
     check("그룹사 판정 — 포스코디엑스(한글 표기)는 포스코DX 로 잡는다",
           detect_group_companies("포스코디엑스, AI로 로드킬 막는다"), ["포스코DX"])
     check("그룹사 판정 — 포스코국제관은 '포스코' 태그를 만들지 않고 실제 회사 언급은 유지",
@@ -17117,6 +17141,7 @@ USAGE = """사용법: python backend/main.py <명령>
   fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
   fixrelevance [--run]  지금 수집 기준으로는 안 들어올 기사(수원 국감·분양 목록 등)를 보관 처리 (기본 미리보기, 본문 있는 기사만)
+  restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
@@ -17199,6 +17224,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixentities(ctx, dry="--run" not in argv[2:])
     elif command == "fixrelevance":
         cmd_fixrelevance(ctx, dry="--run" not in argv[2:])
+    elif command == "restore":
+        cmd_restore(ctx, " ".join(a for a in argv[2:] if a != "--run"), run="--run" in argv[2:])
     elif command == "fixnoise":
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
