@@ -10732,6 +10732,7 @@ def create_app(ctx: Context):
 
     # 필터 칩 고정 순서 — 목록에 없는 값은 뒤에 원래 순서로 붙는다.
     GROUP_ORDER = ["포스코퓨처엠", "포스코홀딩스", "포스코", "포스코DX", "포스코이앤씨"]
+    EA_ONLY_FILTER_CATS = {POLICY_CATEGORY, TRADE_CATEGORY}
     CATEGORY_ORDER = ["양극재", "음극재", "배터리·이차전지", "산업", "시장/주가",
                       "정부/정책", "글로벌 통상환경", PEOPLE_NEWS_CATEGORY]
 
@@ -10760,7 +10761,8 @@ def create_app(ctx: Context):
             # 포스코 계열이 아닌 '배터리협회'는 기사가 아직 없어도 칩이 사라지지 않게 항상 맨 끝에 둔다.
             "groups": [g for g in _ordered(groups, GROUP_ORDER) if g not in NON_POSCO_GROUPS]
                       + sorted(NON_POSCO_GROUPS),
-            "categories": _ordered(cats, CATEGORY_ORDER),
+            # 정부/정책·글로벌 통상환경은 대외협력 탭에서 본다 — 메인 필터 칩에서는 뺀다(수집·태그·알림은 그대로, 사용자 지정 2026-10-29)
+            "categories": [c for c in _ordered(cats, CATEGORY_ORDER) if c not in EA_ONLY_FILTER_CATS],
             "presses": [p for p, _ in Counter(presses).most_common()],  # 기사 많은 순
             "periods": [{"key": "today", "label": "오늘"}, {"key": "7d", "label": "7일"},
                         {"key": "30d", "label": "30일"}, {"key": "all", "label": "전체"}],
@@ -16334,6 +16336,8 @@ def cmd_selftest() -> int:
               (_scs("&max_score=60"), _scs("&min_score=30&max_score=60"), _scs("&min_score=70&max_score=30"), _scs("&max_score=0")),
               (["sc1", "sc2"], ["sc2"], ["sc2"], ["sc1", "sc2", "sc3"]))
         _flt = _scl.get("/api/filters").json()
+        check("메인 필터 칩 — 정부/정책·글로벌 통상환경은 대외협력 탭으로 옮겨 칩에서 빠진다",
+              [c for c in _flt["categories"] if c in ("정부/정책", "글로벌 통상환경")], [])
         check("필터 안내 — 지금 기사의 최저·최고 점수를 알려 준다", (_flt["score_min"] <= 20, _flt["score_max"] >= 80), (True, True))
         check("중요도 필터 — 직접 입력한 점수(60·21·음수·100 초과)도 그대로 적용, 100 초과는 100으로",
               (_scs("&min_score=60"), _scs("&min_score=21"), _scs("&min_score=-5"), _scs("&min_score=500")),
