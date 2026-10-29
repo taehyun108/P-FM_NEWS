@@ -2849,6 +2849,37 @@ def group_lead_text(body: str) -> str:
     return lead + "\n" + "\n".join(extra) if extra else lead
 
 
+# 포스코퓨처엠이 본문 뒤쪽(앞 700자 밖)에서만 나와도 '의미 있게' 나온 기사는 퓨처엠 칩을 붙인다 (사용자 지정 2026-10-29, A안):
+#  · 본문에 2번 이상 나오거나
+#  · 딱 한 번이어도 그 문장이 공급·계약·협력·투자 같은 사업 동작을 말할 때(예: '…포스코퓨처엠과 양극재 공급망을 구축한다').
+# 시황·나열 기사에 한 줄 스친 언급(동작어 없는 한 번)은 예전처럼 칩을 붙이지 않는다.
+PFM_DEEP_ACTION_KW = ("공급망", "공급계약", "공급 계약", "공급 협약", "협약", "MOU", "합작", "제휴", "파트너", "협력", "수주", "납품",
+                      "인수", "증설", "투자", "구축", "체결", "계약", "공동")
+
+
+def pfm_deep_mention(body: str) -> str:
+    """제목·리드에는 없지만 본문에서 포스코퓨처엠이 의미 있게 언급됐는가 — 이유('본문 N회 언급'·'사업 문장'), 아니면 ''."""
+    low = (body or "").lower()
+    aliases = _GROUP_ALIASES_LOWER.get("포스코퓨처엠", [])
+    n = sum(low.count(a) for a in aliases)
+    if n >= 2:
+        return f"본문 {n}회 언급"
+    if n == 1:
+        for sent in re.split(r"(?<=[.!?。])\s+|\n", body or ""):
+            sl = sent.lower()
+            if any(a in sl for a in aliases) and any(k.lower() in sl for k in PFM_DEEP_ACTION_KW):
+                return "사업 문장(공급·협력 등)"
+    return ""
+
+
+def with_deep_pfm_tag(groups: Sequence[str], body: str) -> list[str]:
+    """그룹사 목록에 퓨처엠이 없고 본문 뒤쪽 언급이 의미 있으면 '포스코퓨처엠'을 더한다."""
+    out = list(groups)
+    if "포스코퓨처엠" not in out and pfm_deep_mention(body):
+        out.append("포스코퓨처엠")
+    return normalize_group_list(out)
+
+
 REGROUP_DAYS = 3   # `regroup` 명령이 되돌아볼 기간. 그보다 오래된 카드는 화면에서 밀려난다.
 
 TRADE_CATEGORY = "글로벌 통상환경"
@@ -7655,7 +7686,7 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     llm_verified = [g for g in analysis.group_companies if g in mentioned and g in in_source]
     # LLM 이 group_companies 에 안 넣었어도 키워드에 계열사명이 있으면 채택한다(원문에도 있어야 한다).
     kw_groups = [g for g in detect_group_companies(kw_text) if g != "포스코" and g in in_source]
-    groups = normalize_group_list(rule_groups + llm_verified + kw_groups)
+    groups = with_deep_pfm_tag(normalize_group_list(rule_groups + llm_verified + kw_groups), body)
     # 그룹사로 표기된 값은 키워드에서 제외한다 — 칩 중복의 근본 원인이다.
     keywords = dedupe_chips(analysis.keywords, exclude=groups)[:6]
     score_overrides, score_customs = get_score_rules(ctx.storage)
@@ -11946,6 +11977,55 @@ def _brief_error(exc: BaseException) -> str:
     return redact_secrets(f"{type(exc).__name__}: {text}")[:400]
 
 
+def cmd_fixpfmtag(ctx: Context, limit: int = 200, dry: bool = False, fetch=None) -> dict:
+    """'포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 퓨처엠이 없는 기존 기사에, 본문 뒤쪽 언급이 의미 있으면(A안) 칩을 더한다.
+
+    의미 있음 = 본문 2회 이상 언급 또는 한 번이어도 공급·협력·투자 같은 사업 문장. 보관 본문(30일)이 없으면 원문을 다시 받는다.
+    기존 태그는 지우지 않고 '추가'만 한다. dry 면 대상·이유만 보여 주고 쓰지 않는다.
+    """
+    fetch = fetch or prefetch_articles
+    since = now_utc() - timedelta(days=60)
+    rows = _retry(lambda: ctx.storage.list_articles(4000, 0, since, ""))
+    gap = [r for r in rows if (r.get("pfm_excerpt") or "").strip() and "포스코퓨처엠" not in jload(r.get("group_companies"), [])
+           and PEOPLE_NEWS_CATEGORY not in jload(r.get("categories"), [])]
+    todo = gap[:max(0, limit)]
+    log.info("[퓨처엠 칩 보강] 칩이 없는데 언급 발췌가 있는 기사 %d건 중 %d건 점검%s", len(gap), len(todo), " (미리보기)" if dry else "")
+    bodies: dict[str, str] = {}
+    need: dict[str, str] = {}
+    for r in todo:
+        b = ctx.storage.body_of(r["id"]) or ""
+        if b:
+            bodies[r["id"]] = b
+        else:
+            need[r["id"]] = r.get("url_canonical") or r.get("url_original") or ""
+    if need:
+        pages = fetch(ctx.http, [u for u in need.values() if u])
+        for aid, u in need.items():
+            _, html = pages.get(u, ("", ""))
+            if html:
+                bodies[aid] = extract_body(html)
+    result = {"targets": len(todo), "tagged": 0, "skipped": 0, "nobody": 0}
+    reasons: Counter = Counter()
+    for r in todo:
+        body = bodies.get(r["id"], "")
+        if not body:
+            result["nobody"] += 1
+            continue
+        why = pfm_deep_mention(body)
+        if not why:
+            result["skipped"] += 1
+            continue
+        reasons[why.split("(")[0].split(" ")[0] if why.startswith("본문") else why] += 1
+        result["tagged"] += 1
+        if result["tagged"] <= 8:
+            log.info("  · [%s] %s | %s", (r.get("press_name") or "")[:8], (r.get("title") or "")[:40], why)
+        if not dry:
+            new = with_deep_pfm_tag(jload(r.get("group_companies"), []), body)
+            ctx.storage.update_article(r["id"], {"group_companies": jdump(new)})
+    log.info("퓨처엠 칩 보강: %d건 %s · %d건 한 줄 스침이라 제외 · %d건 본문 없음", result["tagged"], "대상" if dry else "추가", result["skipped"], result["nobody"])
+    return result
+
+
 def cmd_pfmgap(ctx: Context, sample: int = 12) -> dict:
     """'포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 포스코퓨처엠이 없는 기사를 세고 이유를 보여 준다 — 읽기 전용.
 
@@ -12170,7 +12250,7 @@ def cmd_regroup(ctx: Context) -> None:
             r.get("title") or "", group_lead_text(body),
             r.get("summary_text") or "", " ".join(jload(r.get("keywords"), [])),
         ])
-        new = normalize_group_list(detect_group_companies(probe))
+        new = with_deep_pfm_tag(normalize_group_list(detect_group_companies(probe)), body)
         cur = normalize_group_list(jload(r.get("group_companies"), []))
         if not new or new == cur:
             unchanged += 1
@@ -14235,6 +14315,33 @@ def cmd_selftest() -> int:
     check("퓨처엠 칩 누락 점검 — 발췌는 있고 칩이 없는 기사를 찾고, 본문이 있으면 언급 횟수를 센다(쓰지 않음)",
           (_pg["gap"] >= 1, _pg["once"] >= 1, detect_group_companies(group_lead_text(_late)), "포스코퓨처엠" in extract_pfm_excerpt(_late)),
           (True, True, [], True))
+    # 퓨처엠 칩 보강(A안) — 본문 뒤쪽 언급이 의미 있을 때만 칩을 더한다 (2026-10-29)
+    _pad = "이차전지 시장 동향을 정리한다. " * 60
+    _cases = [("두 번 언급", _pad + "포스코퓨처엠은 증설을 발표했다. 한편 포스코퓨처엠 관계자는 신중하다고 말했다."),
+              ("한 번·공급망", _pad + "삼성SDI는 포스코퓨처엠과 양극재 공급망을 구축한다고 밝혔다."),
+              ("한 번·협약", _pad + "LG엔솔은 지난달 포스코 퓨처엠과 협약을 맺었다."),
+              ("한 번·시황 나열", _pad + "코스피 이차전지주로는 에코프로, 포스코퓨처엠 등이 약세였다."),
+              ("언급 없음", _pad + "에코프로가 증설을 발표했다.")]
+    check("퓨처엠 칩 보강 판정 — 2회 이상·사업 문장은 칩, 한 줄 스침·언급 없음은 아님",
+          [bool(pfm_deep_mention(b)) for _, b in _cases], [True, True, True, False, False])
+    check("퓨처엠 칩 보강 — 기존 칩은 지우지 않고 더하며 이미 있으면 그대로",
+          (with_deep_pfm_tag(["포스코홀딩스"], _cases[1][1]), with_deep_pfm_tag(["포스코퓨처엠"], _cases[3][1]), with_deep_pfm_tag([], _cases[3][1])),
+          (["포스코홀딩스", "포스코퓨처엠"], ["포스코퓨처엠"], []))
+    for _tid, _tb in (("pk1", _cases[1][1]), ("pk2", _cases[3][1])):
+        _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
+                  "source_type,importance_score,group_companies,categories,press_name,pfm_excerpt,analyzed_at,status,"
+                  "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (_tid, "u/" + _tid, "u/" + _tid, "u/" + _tid, "양극재 공급망 소식 " + _tid, iso(_pn), iso(_pn), "rss", 10, "[]", "[]", "시험",
+                   "포스코퓨처엠 발췌", iso(_pn), "active", 1))
+        _et.save_summary({"id": new_id(), "article_id": _tid, "summary_text": "요약", "perspective_text": "", "summary_source": "fulltext",
+                          "model": "m", "token_usage": None, "created_at": iso(_pn)})
+        _et.save_body(_tid, _tb, "fulltext")
+    _pt0 = cmd_fixpfmtag(_ectx, 20, dry=True)
+    check("fixpfmtag --dry — 대상만 세고 쓰지 않는다", (_pt0["tagged"] >= 1, jload(_et.article_detail("pk1")["group_companies"], [])), (True, []))
+    _pt1 = cmd_fixpfmtag(_ectx, 20)
+    check("fixpfmtag — 사업 문장 기사에는 퓨처엠 칩을 더하고 한 줄 스침 기사는 그대로 둔다",
+          (jload(_et.article_detail("pk1")["group_companies"], []), jload(_et.article_detail("pk2")["group_companies"], [])),
+          (["포스코퓨처엠"], []))
     # 일시 오류 재시도 · 오류 한 줄 요약 (2026-10-29 Supabase 500 HTML 이 그대로 쏟아진 사례)
     _calls = {"n": 0}
     def _flaky():
@@ -16850,6 +16957,7 @@ USAGE = """사용법: python backend/main.py <명령>
                     --dry 는 고칠 대상·매핑 없는 도메인만 보여주고 쓰지 않음)
   fixauthors 깨진 기자명 복구 (JSON-LD 유니코드 이스케이프 — 일회성)
   fixaggpress [N] [--dry]  '네이버 뉴스'·'다음'으로 저장된 기사의 원래 언론사명 되찾기 (기본 100건)
+  fixpfmtag [N] [--dry]  본문 뒤쪽에서 의미 있게 언급된 포스코퓨처엠 기사에 퓨처엠 칩 보강 (기본 200건, 추가만)
   pfmgap [N]  '포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 퓨처엠이 없는 기사 점검 (읽기 전용, N건 예시)
   fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
@@ -16922,6 +17030,9 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixaggpress":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_fixaggpress(ctx, int(_nums[0]) if _nums else 100, dry="--dry" in argv[2:])
+    elif command == "fixpfmtag":
+        _nums = [a for a in argv[2:] if a.isdigit()]
+        cmd_fixpfmtag(ctx, int(_nums[0]) if _nums else 200, dry="--dry" in argv[2:])
     elif command == "pfmgap":
         _nums = [a for a in argv[2:] if a.isdigit()]
         cmd_pfmgap(ctx, int(_nums[0]) if _nums else 12)
