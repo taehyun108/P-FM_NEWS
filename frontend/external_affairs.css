@@ -175,6 +175,11 @@
 .ea-implication { margin: 2px 0 6px; padding: 7px 10px; border-radius: 7px; font-size: 12.5px; line-height: 1.6;
   background: var(--navy-soft); color: var(--ink-mid); word-break: keep-all; }
 .ea-implication b { color: var(--navy); }
+.ea-impl-title { display: block; margin-bottom: 3px; }
+.ea-impl-lines { margin: 0; padding-left: 16px; }
+.ea-impl-lines li { margin-bottom: 3px; }
+.ea-list > .card { margin-bottom: 0; }
+.card > .ea-implication { margin: 8px 12px 12px; }
 .ea-prio-why { margin: 2px 0 4px; font-size: 11.5px; color: var(--ink-soft); }
 .ea-criteria { margin: 8px 0 12px; border: 1px solid var(--navy-line); border-radius: 10px; background: #fff; }
 .ea-criteria > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; font-weight: 600; color: var(--navy); }

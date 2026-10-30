@@ -303,6 +303,48 @@ _NOISE = re.compile(
     r"첨부파일이 없습니다|목록 보기|본문 보기)")
 
 
+LIKMS = "https://likms.assembly.go.kr"
+_BILL_ID_RE = re.compile(r"(?:lgsltPaId|billId)=([A-Za-z0-9_]+)")
+_REASON_LABEL_RE = re.compile(r"제안\s*이유\s*및\s*주요\s*내용")
+_REASON_STOP_RE = re.compile(r"\+\s*더보기|위원회\s*심사|소관위\s*심사정보|심사진행단계|참고사항|의견제출\s*방법")
+
+
+def parse_likms_bill(html: str) -> dict:
+    """의안정보시스템 상세 → {body: 제안이유 및 주요내용, proposer: 대표발의의원, committee: 소관위원회}.
+
+    제안이유는 서버가 준 본문 어디에 있든 '제안이유 및 주요내용' 라벨 뒤 가장 긴 덩어리를 쓴다
+    (같은 라벨이 제목·본문에 두 번 나온다).
+    """
+    soup = _soup(html)
+    text = soup.get_text("\n", strip=False)
+    body = ""
+    pos = [m.end() for m in _REASON_LABEL_RE.finditer(text)]
+    for i in pos:
+        seg = text[i:]
+        stop = _REASON_STOP_RE.search(seg)
+        seg = seg[: stop.start()] if stop else seg[:6000]
+        seg = _clean(re.sub(_REASON_LABEL_RE, " ", seg))
+        if len(seg) > len(body):
+            body = seg
+    flat = re.sub(r"\s+", " ", text)
+    pm = re.search(r"대표\s*발의\s*의원\s*([가-힣]{2,4})\s*의원", flat)
+    cm = re.search(r"소관\s*위원회\s*([가-힣·]{3,30}위원회)", flat)
+    return {"body": body[:8000], "proposer": pm.group(1) if pm else "", "committee": cm.group(1) if cm else ""}
+
+
+def fetch_likms_bill(url: str) -> dict:
+    """입법예고(pal)·의안 링크에서 의안 id 를 뽑아 의안정보시스템 상세를 읽는다. 실패하면 빈 dict."""
+    m = _BILL_ID_RE.search(url or "")
+    if not m:
+        return {}
+    try:
+        html = _get(f"{LIKMS}/bill/bi/billDetailPage.do", {"billId": m.group(1), "currMenuNo": "2600044"})
+    except Exception as exc:
+        log.debug("의안정보시스템 상세 실패 %s: %s", url, exc)
+        return {}
+    return parse_likms_bill(html)
+
+
 def fetch_detail(item: dict) -> dict:
     """G3·G4 — 예고 상세에서 개정이유·주요내용 텍스트와 정식 제명을 뽑는다.
 
@@ -323,10 +365,20 @@ def fetch_detail(item: dict) -> dict:
 
     if kind == "bill":
         # 국회 의안 — pal.assembly.go.kr : .desc 에 제안이유·주요내용
-        cand = [e for e in soup.find_all(class_=re.compile(r"desc|card-wrap|item"))
-                if "제안이유" in e.get_text()]
-        node = min(cand, key=lambda e: len(e.get_text()), default=None)
-        body = _clean(node.get_text(" ")) if node else ""
+        if "likms.assembly.go.kr" in url:        # 의안정보시스템 링크 — 전용 파서
+            lk0 = parse_likms_bill(html)
+            body = ("[제안이유 및 주요내용] " + lk0["body"]) if lk0.get("body") else ""
+            node = None
+        else:
+            cand = [e for e in soup.find_all(class_=re.compile(r"desc|card-wrap|item"))
+                    if "제안이유" in e.get_text()]
+            node = min(cand, key=lambda e: len(e.get_text()), default=None)
+            body = _clean(node.get_text(" ")) if node else ""
+        # 국회 입법예고 상세(pal)는 제안이유 칸이 비어 있고 내용은 의안정보시스템에만 있다 — 짧으면 거기서 받는다
+        if "likms.assembly.go.kr" not in url and len(re.sub(r"제안\s*이유\s*및\s*주요\s*내용", "", body).strip()) < 40:
+            lk = fetch_likms_bill(url)
+            if lk.get("body"):
+                body = "[제안이유 및 주요내용] " + lk["body"]
         full = soup.get_text(" ", strip=True)
         tm = _BILL_TITLE.search(full)
         if tm:

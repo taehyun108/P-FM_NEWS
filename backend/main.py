@@ -16892,12 +16892,15 @@ def cmd_selftest() -> int:
                     "group_companies": [], "impact_level": "", "d_day": None, "category": ""}
             base.update(kw)
             return base
-        check("우선순위 긴급 — 퓨처엠 직접(배터리) + 시행 단계",
-              ea_mod.ea_priority(_pv(title="이차전지 핵심광물 지원 확대", summary="내년 1월부터 시행한다"))[0], "긴급")
+        check("우선순위 — 긴급은 없다: 퓨처엠 직접 + 시행 단계도 '중요', 이유에 임박 단계가 적힌다",
+              (ea_mod.ea_priority(_pv(title="이차전지 핵심광물 지원 확대", summary="내년 1월부터 시행한다"))[0],
+               "시행" in ea_mod.ea_priority(_pv(title="이차전지 핵심광물 지원 확대", summary="내년 1월부터 시행한다"))[1],
+               ea_mod.EA_PRIORITIES), ("중요", True, ["중요", "관심", "일반"]))
         check("우선순위 중요 — 직접 영향이지만 임박 단계 없음",
               ea_mod.ea_priority(_pv(title="양극재 기술 로드맵 논의", summary="간담회를 열었다"))[0], "중요")
-        check("우선순위 긴급 — 마감 D-7 이내도 임박",
-              ea_mod.ea_priority(_pv(title="배터리 안전 기준 행정예고", d_day=5))[0], "긴급")
+        check("우선순위 중요 — 마감 D-7 이내도 이유에 마감이 적힌다",
+              (ea_mod.ea_priority(_pv(title="배터리 안전 기준 행정예고", d_day=5))[0],
+               "D-5" in ea_mod.ea_priority(_pv(title="배터리 안전 기준 행정예고", d_day=5))[1]), ("중요", True))
         check("우선순위 관심 — 다른 그룹사 사업만",
               ea_mod.ea_priority(_pv(title="건설산업 규제 개선", group_companies=["포스코이앤씨"]))[0], "관심")
         check("우선순위 일반 — 연결 없음", ea_mod.ea_priority(_pv(title="청소년 쉼터 운영 안내"))[0], "일반")
@@ -16908,8 +16911,9 @@ def cmd_selftest() -> int:
               [ea_mod.ea_priority(_pv(title="농산물 관세 인하 시행", summary="내년 시행", impact_level="none"))[0],
                ea_mod.ea_priority(_pv(title="농산물 관세 인하 시행", summary="내년 시행", impact_level="none",
                                       group_companies=["포스코퓨처엠"]))[0],
-               ea_mod.ea_priority(_pv(title="리튬 관세 부과 시행", summary="", impact_level="medium"))[0]],
-              ["일반", "일반", "긴급"])
+               ea_mod.ea_priority(_pv(title="리튬 관세 부과 시행", summary="", impact_level="medium"))[0],
+               ea_mod.ea_priority(_pv(title="농산물 관세 인하", summary="", impact_level="low"))[0]],
+              ["일반", "일반", "중요", "관심"])
         check("3줄 요약 — 문장 5개면 3줄로 합치고, 배열·줄바꿈도 3줄 이내로 맞춘다",
               [len(ea_mod.three_lines("가나다한다. 라마바한다. 사아자한다. 차카타한다. 파하거한다.")),
                ea_mod.three_lines(["1. 첫째다.", "- 둘째다.", "셋째다."]), ea_mod.three_lines("한 줄뿐이다.")],
@@ -16930,9 +16934,41 @@ def cmd_selftest() -> int:
               ("", 3, "양극재 지원 확대 가능", "검토"))
         _sv2 = ea_mod._item_view({"id": "s2", "title": "배터리 안전 기준", "item_type": "legislation", "agency_raw": "산업통상부",
                                   "impact_level": "none", "summary": "첫째 개정한다. 둘째 바꾼다. 셋째 시행한다. 넷째 알린다."})
-        check("카드 뷰 — 요약이 4문장이어도 3줄, 시사점이 없으면 규칙 문장(영향 제한적)",
+        check("카드 뷰 — 요약이 4문장이어도 3줄, 영향 없음(none)이면 시사점을 보이지 않는다",
               (_sv2["summary_lines"], _sv2["implication"]),
-              (["첫째 개정한다.", "둘째 바꾼다.", "셋째 시행한다. 넷째 알린다."], "포스코퓨처엠 사업에 직접 영향은 제한적"))
+              (["첫째 개정한다.", "둘째 바꾼다.", "셋째 시행한다. 넷째 알린다."], ""))
+        _impl = {"so_what": "위협 — 원료 조달비 상승", "impact_path": "리튬 관세→전구체 원가", "scale_timing": "원문에 수치 없음",
+                 "risks_opps": "위험: 가격 / 기회: 국내 조달", "actions": "①관세청 확인 ②구매팀 공유"}
+        _packed = ea_mod.pack_action("검토", _impl, True)
+        check("시사점 보관 — 5개 항목이 줄별로 담기고 그대로 나뉜다, 퓨처엠 무관이면 표식만 남고 화면엔 안 나온다",
+              (ea_mod.unpack_action(_packed)[1].split("\n")[0], len(ea_mod.unpack_action(_packed)[1].split("\n")),
+               ea_mod.unpack_action(ea_mod.pack_action("검토", {}, False)), ea_mod.pack_action("검토", {}, False).endswith("-")),
+              ("핵심 시사점: 위협 — 원료 조달비 상승", 5, ("검토", ""), True))
+        check("발의 의원 — 법률안명 끝 괄호에서 대표발의자·총원을 읽는다('등 12인'·'대표발의'·일반 괄호는 제외)",
+              [ea_mod.proposers_from_title(t) for t in ("지방세법 일부개정법률안 (강명구의원 등 12인)",
+                                                       "지방세법 일부개정법률안 (부승찬의원 대표발의)",
+                                                       "전기사업법 일부개정법률안(김철수 의원 외 9인)",
+                                                       "소재부품법 일부개정(안)", "철강법 (일부개정)")],
+              [([{"name": "강명구", "party": "", "role": "대표"}], 12), ([{"name": "부승찬", "party": "", "role": "대표"}], 1),
+               ([{"name": "김철수", "party": "", "role": "대표"}], 9), ([], 0), ([], 0)])
+        _bv = ea_mod._item_view({"id": "b9", "title": "지방세법 일부개정법률안 (강명구의원 등 12인)", "item_type": "bill",
+                                 "agency_raw": "행정안전위원회", "status": "예고중", "summary": "원문을 확보하지 못했습니다 — 원문 링크로 확인하세요",
+                                 "impact_level": "none"})
+        check("의안 카드 — 발의자를 못 가져와도 제목의 의원이 나오고 총원이 12명, 소관위는 위원회, 자리표시 요약은 제목을 되풀이하지 않는다",
+              (_bv["proposers"][0]["name"], _bv["proposer_total"], _bv["agency"], len(_bv["summary_lines"]),
+               any("지방세법" in x for x in _bv["summary_lines"])), ("강명구", 12, "행정안전위원회", 2, False))
+        check("요약이 제목을 되풀이하는지 판별 — 제목과 거의 같으면 True, 실제 제안이유면 False",
+              [ea_mod.summary_echoes_title("지방세법 일부개정법률안은 지방세법을 개정한다.", "지방세법 일부개정법률안 (강명구의원 등 12인)"),
+               ea_mod.summary_echoes_title("지방소비세 지역 안분 일몰기한이 2026년 말 도래하여 2033년까지 7년 연장한다.", "지방세법 일부개정법률안 (강명구의원 등 12인)")],
+              [True, False])
+        _lk = _eac.parse_likms_bill("<html><body><h3>[2222154] 지방세법 일부개정법률안(강명구의원 등 12인)</h3>"
+                                    "<div><strong>대표발의의원</strong> 강명구의원 <strong>소관위원회</strong> 행정안전위원회</div>"
+                                    "<h4>제안이유 및 주요내용</h4><pre>제안이유 및 주요내용\n 현행법은 부가가치세의 일부를 지방소비세로 배분한다. "
+                                    "이에 일몰기한을 2033년 12월 31일까지 7년 연장하려는 것임.</pre><a>+더보기</a><h3>위원회 심사</h3>"
+                                    "<p>소관위 심사정보 행정안전위원회</p></body></html>")
+        check("의안정보시스템 상세 — 제안이유 본문·대표발의·소관위를 읽는다",
+              ("일몰기한을 2033년" in _lk["body"], "위원회 심사" in _lk["body"], _lk["proposer"], _lk["committee"]),
+              (True, False, "강명구", "행정안전위원회"))
 
         check("발의자 이름 분리 — '의원'·'외 N인' 꼬리 제거",
               ea_mod._split_names("김철수의원 외 12인, 이영희 의원, 박민수"), ["김철수", "이영희", "박민수"])
@@ -17169,7 +17205,7 @@ def cmd_selftest() -> int:
         _v = ea_mod._item_view({"id": "i1", "title": "이차전지 지원", "item_type": "policy_press",
                                 "proposers": '[{"name":"김철수","party":"무소속","role":"대표"}]',
                                 "summary": "시행한다", "group_companies": '["포스코퓨처엠"]'})
-        check("항목 뷰 — 우선순위·발의자 포함", (_v["priority"], _v["proposers"][0]["name"]), ("긴급", "김철수"))
+        check("항목 뷰 — 우선순위·발의자 포함", (_v["priority"], _v["proposers"][0]["name"]), ("중요", "김철수"))
 
     if failures:
         print(f"실패 {len(failures)}건:\n" + "\n".join(failures))

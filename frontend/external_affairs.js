@@ -15,7 +15,7 @@
   var CATS = [
     { key: 'policy', label: '정책 동향', kind: 'items', types: 'policy_press',
       sort: 'priority', hasDeadline: false, layout: 'policy' },
-    { key: 'govnews', label: '정부·정책 기사', kind: 'news', endpoint: '/api/ea/policy-news?limit=120',
+    { key: 'govnews', label: '정부·정책 기사', kind: 'news', cat: '정부/정책',
       sort: 'recent', hasDeadline: false, layout: 'news' },     // 메인 수집 기사 중 정부/정책 분류
     { key: 'notice', label: '입법·행정예고', kind: 'items', types: 'legislation,admin_notice',
       sort: 'deadline', hasDeadline: true, layout: 'notice' },    // 의견제출 마감(D-day) 중심
@@ -23,15 +23,15 @@
       sort: 'priority', hasDeadline: false, layout: 'bill' },
     { key: 'trade',  label: '통상 환경', kind: 'items', types: 'trade_webzine',
       sort: 'priority', hasDeadline: false, layout: 'trade' },   // 산업통상부 월간 통상(tongsangnews.kr)
-    { key: 'tradenews', label: '통상 기사', kind: 'news', endpoint: '/api/ea/trade-news?limit=120',
+    { key: 'tradenews', label: '통상 기사', kind: 'news', cat: '글로벌 통상환경',
       sort: 'recent', hasDeadline: false, layout: 'news' },     // 메인 수집 기사 중 글로벌 통상환경 분류 (예: 미국 배터리 제조 이니셔티브)
     { key: 'grant',  label: '공모·수요조사', kind: 'items', types: 'grant_notice',
       sort: 'deadline', hasDeadline: true, layout: 'grant' },     // 산업부·기후부 사업공고 + IRIS
     { key: 'calendar', label: '일정', kind: 'calendar', layout: 'calendar' }   // 모든 마감일을 달력으로
   ];
   // 우선순위 4단계 — 기준은 화면의 '기준 보기'와 같은 말이다(백엔드 ea_priority 규칙).
-  var PRIORITIES = ['긴급', '중요', '관심', '일반'];
-  var PRIORITY_CLASS = { '긴급': 'is-urgent', '중요': 'is-important', '관심': 'is-interest', '일반': 'is-normal' };
+  var PRIORITIES = ['중요', '관심', '일반'];
+  var PRIORITY_CLASS = { '중요': 'is-important', '관심': 'is-interest', '일반': 'is-normal' };
 
   var eaState = {
     open: false, loaded: false, cat: 'policy',
@@ -319,12 +319,9 @@
   /* ── 우선순위 배지 — 마우스를 올리거나(PC) 눌러서(모바일) '포스코퓨처엠에 미치는 영향'을 쉬운 말로 보여 준다 ── */
   // 등급별 쉬운 설명 (백엔드 ea_priority 규칙과 같은 기준)
   var PRIO_ELI5 = {
-    '긴급': { head: '긴급 — 지금 바로 챙겨야 해요',
-      easy: '우리 회사(포스코퓨처엠)가 하는 일과 직접 관련된 소식인데, 곧 시행되거나 결정되거나 마감이 다가오는 단계예요. ' +
-            '비유하면 “우리 집 앞 도로 공사가 내일부터 시작돼요”라는 공지와 같아요. 미리 준비하지 않으면 바로 영향을 받을 수 있어요.' },
     '중요': { head: '중요 — 꼭 알아 두세요',
-      easy: '우리 회사가 하는 일(배터리 소재·핵심광물·무역 등)과 직접 관련된 소식이에요. 다만 아직 “논의 중”이거나 “계획 단계”라 당장 시행되지는 않아요. ' +
-            '비유하면 “우리 동네에 도로를 새로 낼 계획이 있대요”라는 소문이에요. 지금 급하진 않지만 어떻게 흘러가는지 지켜봐야 해요.' },
+      easy: '우리 회사가 하는 일(배터리 소재·핵심광물·무역 등)과 직접 관련된 소식이에요. 시행·마감이 가까우면 그 이유가 아래에 같이 적혀 있어요. ' +
+            '비유하면 “우리 동네 도로 공사 소식”이에요. 어떻게 흘러가는지 꼭 지켜봐야 해요.' },
     '관심': { head: '관심 — 가볍게 지켜봐요',
       easy: '포스코퓨처엠이 직접 영향을 받는 소식은 아니고, 포스코 그룹의 다른 회사(철강·건설·에너지·무역 등)와 관련된 소식이에요. ' +
             '비유하면 “옆집에 공사가 있대요”처럼, 우리 집엔 당장 상관없지만 소문은 알아 두면 좋은 정도예요.' },
@@ -431,7 +428,7 @@
       ul.append(el('li', null, '“' + m[1] + '” 단계예요. ' + (stage || '곧 영향이 생기는 단계예요.')));
     }
     if (why.indexOf('시행·의결 등 임박 단계는 아직') >= 0) {
-      ul.append(el('li', null, '아직 시행·결정 직전 단계는 아니에요. 그래서 “긴급”이 아니라 “중요”예요.'));
+      ul.append(el('li', null, '아직 시행·결정 직전 단계는 아니에요.'));
     }
     if (it.priority === '관심') {
       var og = (it.group_companies || []).filter(function (g) { return g !== '포스코퓨처엠'; });
@@ -588,7 +585,8 @@
       if (ps.length) {
         var rep = ps[0];
         who.append(el('b', null, '발의: '));
-        who.append(document.createTextNode(party(rep) + (ps.length > 1 ? ' 외 ' + (ps.length - 1) + '인' : '')));
+        var tot = Math.max(it.proposer_total || 0, ps.length);
+        who.append(document.createTextNode(party(rep) + (tot > 1 ? ' 외 ' + (tot - 1) + '인' : '')));
         if (ps.length > 1) {
           var all = el('p', 'ea-proposer-all is-folded', ps.map(party).join(', '));
           var tog = el('button', 'ea-fold-btn', '발의 의원 ' + ps.length + '명 전원 보기 ▾');
@@ -628,11 +626,7 @@
     if (it.priority_reason) {
       body.append(el('p', 'ea-prio-why', '분류 이유: ' + it.priority_reason));
     }
-    if (it.implication) {
-      var imp = el('p', 'ea-implication');
-      imp.append(el('b', null, '퓨처엠 시사점: '), document.createTextNode(it.implication));
-      body.append(imp);
-    }
+    if (it.implication) { body.append(buildImplication(it.implication.split('\n'))); }
 
     var acts = el('div', 'ea-actions');
     acts.append(link(isBill ? '의안정보시스템 원문' : isTrade ? '월간 통상 원문' : isGrant ? '공고 원문' : isNotice ? '원문' : '정책브리핑 원문', it.url));
@@ -647,7 +641,45 @@
     return card;
   }
 
-  /* ── 기사 카드 — 메인에서 수집한 정부/정책·통상 기사: 제목 / 언론사 / 주요 내용 3줄 ── */
+  /* 퓨처엠 시사점 상자 — '라벨: 내용' 줄마다 한 줄씩(핵심 시사점은 맨 위에 굵게) */
+  function buildImplication(lines) {
+    var box = el('div', 'ea-implication');
+    box.append(el('b', 'ea-impl-title', '퓨처엠 시사점'));
+    var ul = el('ul', 'ea-impl-lines');
+    lines.filter(function (l) { return l && l.trim(); }).forEach(function (ln) {
+      var i = ln.indexOf(': ');
+      var li = el('li');
+      if (i > 0 && i < 12) { li.append(el('b', null, ln.slice(0, i) + ' '), document.createTextNode(ln.slice(i + 2))); }
+      else { li.textContent = ln; }
+      ul.append(li);
+    });
+    box.append(ul);
+    return box;
+  }
+
+  /* 기사형 카테고리(정부·정책 / 통상) — 메인 화면의 포토카드를 그대로 쓰고, 퓨처엠과 관련 있을 때만 시사점을 덧붙인다 */
+  function newsImplication(item) {
+    var sw = item.swot, lines = [];
+    var names = { s: '강점', w: '약점', o: '기회', t: '위협' };
+    if (sw) {
+      Object.keys(names).map(function (k) { return { k: k, v: sw[k] || {} }; })
+        .filter(function (x) { return (x.v.score || 0) >= 31 && x.v.text && x.v.text !== '해당 없음'; })
+        .sort(function (a, b) { return (b.v.score || 0) - (a.v.score || 0); }).slice(0, 3)
+        .forEach(function (x) { lines.push(names[x.k] + '(' + x.v.score + '점): ' + x.v.text); });
+    }
+    if (!lines.length) { return null; }                       // 퓨처엠과 관련 없는 기사는 시사점을 달지 않는다
+    if (item.sentiment_reason) { lines.unshift('핵심 시사점: ' + (item.sentiment ? '[' + item.sentiment + '] ' : '') + item.sentiment_reason); }
+    return buildImplication(lines);
+  }
+
+  function buildNewsPhotoCard(item) {
+    var card = (typeof buildCard === 'function' && typeof window.buildCard === 'function') ? window.buildCard(item) : buildNewsCard(item);
+    var imp = newsImplication(item);
+    if (imp) { card.append(imp); }
+    return card;
+  }
+
+  /* ── (예비) 간단 기사 카드 — 메인 카드 함수를 못 찾을 때만 ── */
   function buildNewsCard(it) {
     var card = el('article', 'ea-card ea-card--flat');
     var body = el('div', 'ea-card-body');
@@ -814,16 +846,18 @@
     }));
     var done = function () { eaState.loading = false; };
 
-    if (c.layout === 'news') {          // 메인에서 수집한 정부/정책·통상 기사 — 최신순, 쪽 나누기는 화면에서
-      getJSON(c.endpoint).then(function (d) {
-        var all = d.items || [];
-        var pages = Math.max(1, Math.ceil(all.length / EA_PAGE_SIZE));
-        if (eaState.page > pages) { eaState.page = pages; }
-        $('eaCount').textContent = all.length.toLocaleString('ko-KR') + '건';
-        renderPager(all.length);
-        if (!all.length) { showState('', '최근 45일 안에 해당 분류의 기사가 없습니다.'); return; }
-        var from = (eaState.page - 1) * EA_PAGE_SIZE;
-        $('eaList').replaceChildren.apply($('eaList'), all.slice(from, from + EA_PAGE_SIZE).map(buildNewsCard));
+    if (c.layout === 'news') {          // 메인에서 수집한 정부/정책·통상 기사 — 기존 포토카드, 최신순
+      var np = new URLSearchParams();
+      np.set('cat', c.cat); np.set('period', 'all'); np.set('sort', 'recent');
+      np.set('page', String(eaState.page)); np.set('size', String(EA_PAGE_SIZE));
+      getJSON('/api/articles?' + np.toString()).then(function (d) {
+        var total = d.total || 0;
+        var pages = Math.max(1, Math.ceil(total / EA_PAGE_SIZE));
+        if (eaState.page > pages) { eaState.page = pages; eaState.loading = false; load(); return; }
+        $('eaCount').textContent = total.toLocaleString('ko-KR') + '건';
+        renderPager(total);
+        if (!total) { showState('', '해당 분류의 기사가 아직 없습니다.'); return; }
+        $('eaList').replaceChildren.apply($('eaList'), (d.items || []).map(buildNewsPhotoCard));
       }).catch(function () {
         showState('is-error', '목록을 불러오지 못했습니다.');
       }).finally(done);
