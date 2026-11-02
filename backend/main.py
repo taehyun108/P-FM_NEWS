@@ -10302,6 +10302,23 @@ def tag_row(row: dict) -> dict:
     return {"row": row, "g": g, "c": c, "p": pname, "gk": gk, "ck": ck, "pk": pk}
 
 
+# 메인(일반) 목록에서 숨기고 대외협력 탭에서만 보여 줄 기사 (사용자 지정 2026-11-02):
+#   정부/정책·글로벌 통상환경 분류인데 포스코 그룹사 태그도, 배터리 생태계(배터리·양극재·음극재) 분류도 없는 기사.
+#   직접 등록한 기사는 항상 보인다.
+EA_ONLY_CATS = frozenset({"정부/정책", "글로벌 통상환경"})
+BATTERY_ECO_CATS = frozenset({"배터리·이차전지", "양극재", "음극재"})
+
+
+def is_ea_only_article(t: dict) -> bool:
+    cats = set(t.get("c") or [])
+    if not (cats & EA_ONLY_CATS):
+        return False
+    if (t["row"].get("source_type") or "") == "manual":
+        return False
+    groups = [g for g in (t.get("g") or []) if g not in NON_POSCO_GROUPS]
+    return not groups and not (cats & BATTERY_ECO_CATS)
+
+
 def filter_tagged(tagged: list[dict], g_keys: set[str], c_keys: set[str],
                   p_keys: set[str]) -> list[dict]:
     """같은 그룹 안은 OR, 다른 그룹 사이는 AND. (PRD F6.1a)
@@ -10697,6 +10714,9 @@ def create_app(ctx: Context):
                                 {normalize_chip(x) for x in _split_multi(cat)},
                                 {normalize_chip(x) for x in _split_multi(press)})
         # 논조(긍정·중립·부정) 필터 — 카드 칩과 같은 기준(감성이 비어 있으면 카드에 '중립'으로 보인다). 같은 줄 안은 OR.
+        # 대외협력 탭 전용 기사 숨김 — 그 탭이 정부/정책·통상환경을 직접 고른 요청이면 숨기지 않는다
+        if not ({normalize_chip(x) for x in _split_multi(cat)} & {normalize_chip(x) for x in EA_ONLY_CATS}):
+            matched = [t for t in matched if not is_ea_only_article(t)]
         wanted_senti = {x for x in _split_multi(senti) if x in ("긍정", "중립", "부정")}
         if wanted_senti:
             matched = [t for t in matched if (t["row"].get("sentiment") or "중립") in wanted_senti]
@@ -14350,6 +14370,16 @@ def cmd_selftest() -> int:
            is_trade_topic("[K-이니셔티브] 중국 기업과 8GWh 배터리 공급 계약", "계약 체결 소식"),
            is_trade_topic("청년 일자리 이니셔티브 발표", "트럼프 행정부 관세")],
           [True, False, False])
+    check("메인 목록 숨김 — 정부/정책·통상환경만 달린 기사는 대외협력 탭 전용, 포스코 그룹사·배터리 생태계·직접 등록은 메인에도 보인다",
+          [is_ea_only_article(t) for t in (
+              {"c": ["글로벌 통상환경"], "g": [], "row": {}},                              # 농심 관세 — 숨김
+              {"c": ["글로벌 통상환경", "산업"], "g": [], "row": {}},                      # 숨김
+              {"c": ["정부/정책"], "g": ["포스코퓨처엠"], "row": {}},                      # 포스코 그룹 — 보임
+              {"c": ["글로벌 통상환경", "배터리·이차전지"], "g": [], "row": {}},          # 배터리 — 보임
+              {"c": ["글로벌 통상환경"], "g": ["배터리협회"], "row": {}},                  # 협회만 — 숨김
+              {"c": ["글로벌 통상환경"], "g": [], "row": {"source_type": "manual"}},       # 직접 등록 — 보임
+              {"c": ["산업"], "g": [], "row": {}})],                                       # 해당 분류 없음 — 보임
+          [True, True, False, False, True, False, False])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
