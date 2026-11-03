@@ -5540,6 +5540,9 @@ def normalize_group_list(groups: Iterable[str]) -> list[str]:
     return cleaned
 
 
+_TARIFF_TITLE_RE = re.compile(r"관세(?!청|사|법인|평가|직|국)")
+
+
 def detect_categories(title: str, summary: str = "") -> list[str]:
     """카테고리 태깅. (PRD F3.1)
 
@@ -5554,6 +5557,10 @@ def detect_categories(title: str, summary: str = "") -> list[str]:
     for cat in TITLE_ANCHORED_CATEGORIES:
         if cat in found and not _kw_hit_any(title_l, _CATEGORY_RULES_LOWER[cat]):
             found.remove(cat)
+    # 제목에 '관세'가 있으면 통상환경 (사용자 지정 2026-11-03: 관세·대미투자 기사가 메인에 섞여 나옴).
+    #   '관세청'·'관세사' 같은 기관·직업명은 제외한다. '대미투자'는 TRADE_MEASURE_KW 에 이미 있다.
+    if TRADE_CATEGORY not in found and _TARIFF_TITLE_RE.search(title or ""):
+        found.append(TRADE_CATEGORY)
     # '그룹사'는 별도의 그룹사 필터가 담당하므로 카테고리에는 넣지 않는다.
     return dedupe_chips(found)
 
@@ -14387,6 +14394,12 @@ def cmd_selftest() -> int:
               ("국민성장펀드, 첫 투자처로 이차전지 기업 선정", ""), ("정책금융 지원 확대, 소재 기업 대상", ""),
               ("포스코퓨처엠 3분기 실적 개선", "국민성장펀드 투자 검토 언급"))],
           [True, True, False])
+    check("통상환경 분류 — 제목에 관세·대미투자가 있으면 통상환경, 관세청·관세사·본문에만 스친 관세는 아니다",
+          [TRADE_CATEGORY in detect_categories(t, e) for t, e in (
+              ("농심, 美 정부 상대 '트럼프 관세' 환급 소송 제기", ""), ("관세 부담에 수출기업 한숨", ""),
+              ("한국, 대미투자 3500억달러 집행 속도", ""), ("관세청, 밀수 단속 강화", ""),
+              ("관세사 시험 접수 시작", ""), ("포스코 3분기 실적 개선", "관세 영향 언급"))],
+          [True, True, True, False, False, False])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
