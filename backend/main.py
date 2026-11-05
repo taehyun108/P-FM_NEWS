@@ -5559,6 +5559,19 @@ _TARIFF_TITLE_RE = re.compile(
     r"|공급망\s?(?:실사|협정|안정화\s?협약)|핵심\s?광물\s?(?:협정|협력|무기화)|탈\s?중국|디커플링|FEOC|해외\s?우려\s?기관")
 
 
+def gate_categories(title: str, extra: str = "") -> list[str]:
+    """수집 관문(통상·정부 소식)이 통과시킨 기사에 붙여야 할 분류 — 수집 때는 붙였는데 분석·재태깅이 지우던 문제를 막는다.
+
+    제목에 조치명은 없어도 본문 리드로 관문을 통과한 기사(예: 정부 부처 소식)가 대상이다.
+    """
+    out: list[str] = []
+    if is_gov_industry_news(title, extra):
+        out.append(POLICY_CATEGORY)
+    if is_trade_topic(title, extra):
+        out.append(TRADE_CATEGORY)
+    return out
+
+
 def detect_categories(title: str, summary: str = "") -> list[str]:
     """카테고리 태깅. (PRD F3.1)
 
@@ -7790,7 +7803,11 @@ def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summar
     categories = detect_categories(row["title"], f"{analysis.summary_text}\n{' '.join(keywords)}")
     if is_policy_brief(row) and "정부/정책" not in categories:
         categories = ["정부/정책"] + categories
-    # 통상환경은 detect_categories 가 '제목에 조치명' 조건으로 이미 판정한다 — 강제 추가 안 함.
+    # 수집 관문(정부 소식·통상)이 본문 리드로 통과시킨 기사의 분류를 다시 붙인다 — 안 그러면 분석 단계에서 태그가 사라져
+    # 대외협력 탭에서 빠지고 메인에서도 숨겨진다(사용자 지적 2026-11-06).
+    for _gc in gate_categories(row["title"], f"{analysis.summary_text}\n{body[:1500]}"):
+        if _gc not in categories:
+            categories = [_gc] + categories
 
     # 포스코퓨처엠 언급 발췌 — 카드 표시 + 논조 판정 입력. 언급이 없으면 빈 값(영역 미표시).
     excerpt = clean_text(extract_pfm_excerpt(body), keep_newlines=True)   # 본문에 남은 엔티티·깨짐을 풀어 저장
@@ -12374,6 +12391,16 @@ def cmd_fixcategories(ctx: Context) -> None:
         new = detect_categories(r.get("title") or "", probe)
         if is_policy_brief(r) and "정부/정책" not in new:
             new = ["정부/정책"] + new
+        # 수집 관문이 본문 리드로 붙였던 정부/정책·통상환경 분류를 다시 판정해 붙이고(보관 본문이 있으면 본문까지),
+        # 본문이 없는 옛 기사는 이미 붙어 있던 두 분류를 지우지 않는다.
+        body = ctx.storage.body_of(r["id"]) or ""
+        for _gc in gate_categories(r.get("title") or "", f"{r.get('summary_text') or ''}\n{body[:1500]}"):
+            if _gc not in new:
+                new = [_gc] + new
+        if not body:
+            for _keep in (POLICY_CATEGORY, TRADE_CATEGORY):
+                if _keep in cur and _keep not in new:
+                    new = [_keep] + new
         if new != cur:
             ctx.storage.update_article(r["id"], {"categories": jdump(new)})
             fixed += 1
@@ -14418,6 +14445,11 @@ def cmd_selftest() -> int:
               ("중국, 흑연·희토류 수출통제 확대", ""), ("미국, 對중 반도체 수출 통제 강화", ""),
               ("日 수출규제 3년, 소재 국산화 성과", ""), ("수출 호조에 흑자 확대", ""))],
           [True, True, True, False, False, False, True, True, True, False])
+    check("관문 분류 — 정부 소식·통상 관문을 본문 리드로 통과한 기사는 분석·재태깅 뒤에도 정부/정책·통상환경 분류를 잃지 않는다",
+          [sorted(gate_categories("산업통상부, 원로 공학인 초청 간담회", "산업 전환과 탈탄소 대응 논의")),
+           sorted(gate_categories("산업장관, EU 산업가속화법 우려 전달", "철강 배터리 업계 영향")),
+           gate_categories("주말 날씨 맑음", "")],
+          [["정부/정책"], ["글로벌 통상환경"], []])
     check("통상환경 분류(확장) — 통상 압박·무역장벽·FTA·WTO·보호무역·301조·FEOC 등은 통상환경, 일반 문장·영문 단어 속 FTA는 아니다",
           [TRADE_CATEGORY in detect_categories(t, "") for t in (
               "미국 통상 압박 강화에 업계 긴장", "무역전쟁 재점화 우려", "비관세장벽 해소 위한 한미 협의", "한-EU FTA 개정 논의",
