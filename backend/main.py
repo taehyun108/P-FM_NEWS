@@ -5540,7 +5540,8 @@ def normalize_group_list(groups: Iterable[str]) -> list[str]:
     return cleaned
 
 
-_TARIFF_TITLE_RE = re.compile(r"관세(?!청|사|법인|평가|직|국)")
+# 제목에 이 말이 있으면 통상환경 — 관세 외에 수출통제·수출규제·수입규제·반덤핑도 포함(사용자 지적 2026-11-05: 수출통제 기사 누락).
+_TARIFF_TITLE_RE = re.compile(r"관세(?!청|사|법인|평가|직|국)|수출\s?(?:통제|제한|규제|금지)|수입\s?(?:규제|제한|금지)|반덤핑|상계관세")
 
 
 def detect_categories(title: str, summary: str = "") -> list[str]:
@@ -14398,8 +14399,10 @@ def cmd_selftest() -> int:
           [TRADE_CATEGORY in detect_categories(t, e) for t, e in (
               ("농심, 美 정부 상대 '트럼프 관세' 환급 소송 제기", ""), ("관세 부담에 수출기업 한숨", ""),
               ("한국, 대미투자 3500억달러 집행 속도", ""), ("관세청, 밀수 단속 강화", ""),
-              ("관세사 시험 접수 시작", ""), ("포스코 3분기 실적 개선", "관세 영향 언급"))],
-          [True, True, True, False, False, False])
+              ("관세사 시험 접수 시작", ""), ("포스코 3분기 실적 개선", "관세 영향 언급"),
+              ("중국, 흑연·희토류 수출통제 확대", ""), ("미국, 對중 반도체 수출 통제 강화", ""),
+              ("日 수출규제 3년, 소재 국산화 성과", ""), ("수출 호조에 흑자 확대", ""))],
+          [True, True, True, False, False, False, True, True, True, False])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])

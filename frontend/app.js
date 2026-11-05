@@ -15,6 +15,7 @@ const PAGE_SIZE = 9;             // 포토카드 페이지당 개수 (3열 × 3�
 const state = {
   group: new Set(),
   cat: new Set(),
+  forceCat: '',       // 대외협력 탭의 기사 카테고리(정부·정책/통상)를 열면 그 분류로 고정 — 나머지 필터는 메인과 같다
   press: new Set(),
   minScore: '0',      // 중요도 '이상' — '0'(제한 없음)~'100'
   maxScore: '0',      // 중요도 '이하' — '0'(제한 없음)~'100'
@@ -715,6 +716,7 @@ function buildCard(item) {
   keywords.forEach((k) => chips.append(el('span', 'tag tag-key', k)));
   card.append(chips);
 
+  if (state.forceCat && window.pfmEaCardExtra) window.pfmEaCardExtra(card, item);   // 대외협력 기사 카테고리: 퓨처엠 시사점 덧붙임
   return card;
 }
 
@@ -2049,7 +2051,8 @@ async function sendWeeklyMail() {
 function buildQuery() {
   const p = new URLSearchParams();
   if (state.group.size) p.set('group', [...state.group].join(','));
-  if (state.cat.size) p.set('cat', [...state.cat].join(','));
+  if (state.forceCat) p.set('cat', state.forceCat);
+  else if (state.cat.size) p.set('cat', [...state.cat].join(','));
   if (state.press.size) p.set('press', [...state.press].join(','));
   if (state.senti.size) p.set('senti', [...state.senti].join(','));
   if (state.period !== 'all') p.set('period', state.period);
@@ -2414,6 +2417,31 @@ function init() {
     if (pressView) togglePressView();
   };
   window.pfmRefreshList = () => refresh(true);
+  /* 대외협력 탭의 '정부·정책 기사'·'통상 기사' — 메인과 같은 필터·카드·쪽 나누기를 그대로 쓰되 분류만 고정한다 */
+  window.pfmEaNews = {
+    enter(cat) {
+      state.forceCat = cat;
+      const row = $('catChips').closest('.filter-row');
+      if (row) row.hidden = true;                       // 분류는 고정이라 카테고리 칩 줄은 숨긴다
+      $('mainFilters').hidden = false;
+      $('grid').hidden = false;
+      const more = document.querySelector('.more-wrap');
+      if (more) more.hidden = false;
+      refresh(true);
+    },
+    leave() {
+      if (!state.forceCat) return;
+      state.forceCat = '';
+      const row = $('catChips').closest('.filter-row');
+      if (row) row.hidden = false;
+      if (window.pfmEaIsOpen && window.pfmEaIsOpen()) {   // 대외협력의 다른 카테고리로 옮겨 가면 메인 목록은 다시 숨긴다
+        $('mainFilters').hidden = true;
+        $('grid').hidden = true;
+        const more = document.querySelector('.more-wrap');
+        if (more) more.hidden = true;
+      }
+    },
+  };
   $('weeklyGenBtn').addEventListener('click', generateWeekly);
   $('weeklyMailBtn').addEventListener('click', sendWeeklyMail);
   initMaster();

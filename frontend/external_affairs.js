@@ -679,6 +679,19 @@
     return card;
   }
 
+  /* 기사형 카테고리(정부·정책 기사/통상 기사) — 메인 필터·포토카드를 그대로 쓰고 대외협력 전용 목록은 숨긴다 */
+  function syncNewsMode() {
+    var news = eaState.open && currentCat().layout === 'news';
+    ['eaList', 'eaPager'].forEach(function (id) { if ($(id)) { $(id).hidden = news; } });
+    var crit = document.querySelector('.ea-criteria'); if (crit) { crit.hidden = news; }
+    var disc = document.querySelector('.ea-disclaimer'); if (disc) { disc.hidden = news; }
+    if (window.pfmEaNews) { if (news) { window.pfmEaNews.enter(currentCat().cat); } else { window.pfmEaNews.leave(); } }
+  }
+  window.pfmEaCardExtra = function (card, item) {
+    var imp = newsImplication(item);
+    if (imp) { card.append(imp); }
+  };
+
   /* ── (예비) 간단 기사 카드 — 메인 카드 함수를 못 찾을 때만 ── */
   function buildNewsCard(it) {
     var card = el('article', 'ea-card ea-card--flat');
@@ -721,6 +734,7 @@
       eaState.sort = currentCat().sort || 'priority';
       renderCatChips();
       applyRowVisibility();
+      syncNewsMode();
       loadFilters().then(load);
       loadStats();
     }, true);
@@ -841,28 +855,11 @@
 
     var c = currentCat();
     if (c.layout === 'calendar') { eaState.loading = false; loadCalendar(); return; }
+    if (c.layout === 'news') { eaState.loading = false; syncNewsMode(); return; }
     $('eaList').replaceChildren.apply($('eaList'), [0, 1, 2].map(function () {
       return el('div', 'ea-skeleton');
     }));
     var done = function () { eaState.loading = false; };
-
-    if (c.layout === 'news') {          // 메인에서 수집한 정부/정책·통상 기사 — 기존 포토카드, 최신순
-      var np = new URLSearchParams();
-      np.set('cat', c.cat); np.set('period', 'all'); np.set('sort', 'recent');
-      np.set('page', String(eaState.page)); np.set('size', String(EA_PAGE_SIZE));
-      getJSON('/api/articles?' + np.toString()).then(function (d) {
-        var total = d.total || 0;
-        var pages = Math.max(1, Math.ceil(total / EA_PAGE_SIZE));
-        if (eaState.page > pages) { eaState.page = pages; eaState.loading = false; load(); return; }
-        $('eaCount').textContent = total.toLocaleString('ko-KR') + '건';
-        renderPager(total);
-        if (!total) { showState('', '해당 분류의 기사가 아직 없습니다.'); return; }
-        $('eaList').replaceChildren.apply($('eaList'), (d.items || []).map(buildNewsPhotoCard));
-      }).catch(function () {
-        showState('is-error', '목록을 불러오지 못했습니다.');
-      }).finally(done);
-      return;
-    }
 
     var p = new URLSearchParams();
     p.set('item_type', c.types);
@@ -929,6 +926,12 @@
       applyRowVisibility();
       loadFilters().then(load);
       loadStats();
+      syncNewsMode();
+    } else {
+      if (window.pfmEaNews) { window.pfmEaNews.leave(); }
+      ['eaList', 'eaPager'].forEach(function (id) { if ($(id) && id === 'eaList') { $(id).hidden = false; } });
+      var crit = document.querySelector('.ea-criteria'); if (crit) { crit.hidden = false; }
+      var disc = document.querySelector('.ea-disclaimer'); if (disc) { disc.hidden = false; }
     }
   }
 
