@@ -6762,6 +6762,25 @@ def _defer_overflow(ctx: Context, overflow: list[tuple[RawItem, bool]],
     return saved
 
 
+# 본문을 계속 못 받는 deferred 기사가 '가장 오래된 순' 큐 맨 앞을 영구히 막아 뒤 기사들이 24시간씩 못 나가던 문제
+# (2026-11-06 서버 점검: 가장 오래된 16건 중 15건이 본문 못 받음 → 매 회차 같은 16건만 재시도). 프로세스 메모리에 실패 횟수를
+# 기억해, 연속 실패한 기사는 잠시 건너뛰고 뒤 기사를 먼저 처리한다(재시작하면 초기화 — 안전한 방향).
+_DRAIN_FAILS: dict[str, tuple[int, float]] = {}
+DRAIN_FAIL_COOLDOWN_BASE_SEC = 600      # 실패 1회당 10분씩 쉬었다 다시, 최대 1시간
+
+
+def _drain_cooling(aid: str) -> bool:
+    n, last = _DRAIN_FAILS.get(aid, (0, 0.0))
+    return n >= 2 and (time.monotonic() - last) < min(3600, DRAIN_FAIL_COOLDOWN_BASE_SEC * n)
+
+
+def _drain_note_fail(aid: str) -> None:
+    n, _ = _DRAIN_FAILS.get(aid, (0, 0.0))
+    if len(_DRAIN_FAILS) > 5000:
+        _DRAIN_FAILS.clear()
+    _DRAIN_FAILS[aid] = (n + 1, time.monotonic())
+
+
 def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
                     people_llm: int = 0) -> int:
     """메타만 저장된(deferred) 기사를 본문 확보 → 관련성 재검 → 분석한다.
@@ -6775,7 +6794,19 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
     done = 0
     # 중복 판정을 통과한 항목만 모아 뒀다가 LLM 분석만 병렬로 보낸다(아래 참고).
     to_analyze: list[tuple[str, dict, str]] = []
-    pending = storage.deferred_articles(limit)
+    # 후보를 넉넉히 읽어(limit*4), 연속 실패해 쉬는 기사를 건너뛰고 앞에서 limit 건만 처리한다.
+    # 쉬는 기사가 24시간을 넘겼으면 여기서 바로 보관한다(맨 앞을 막지 않게).
+    cands = storage.deferred_articles(max(limit * 4, limit))
+    pending: list[dict] = []
+    for a in cands:
+        if _drain_cooling(a["id"]):
+            coll = parse_dt(a.get("collected_at"))
+            if coll and (now_utc() - coll) > timedelta(hours=DEFER_MAX_AGE_HOURS):
+                storage.update_article(a["id"], {"status": "archived"})
+                _DRAIN_FAILS.pop(a["id"], None)
+            continue
+        if len(pending) < limit:
+            pending.append(a)
     # 본문 확보는 신규 수집과 동일하게 병렬로 받는다. 순차로 받으면 느린 언론사 한 곳이
     # 회차 전체를 붙잡아 사이클 시간이 수십 초씩 늘어난다.
     targets = {a["id"]: (a.get("url_original") or a.get("url_canonical") or a.get("url_source"))
@@ -6790,7 +6821,11 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             collected = parse_dt(art.get("collected_at"))
             if collected and (now_utc() - collected) > timedelta(hours=DEFER_MAX_AGE_HOURS):
                 storage.update_article(aid, {"status": "archived"})
+                _DRAIN_FAILS.pop(aid, None)
+            else:
+                _drain_note_fail(aid)      # 연속 실패는 잠시 건너뛴다
             continue   # 다음 회차 재시도
+        _DRAIN_FAILS.pop(aid, None)
 
         # 인사·부고면 사람별 구조로 정리한다 (예산 남으면 LLM, 아니면 규칙 기반)
         pk = people_news_kind(canonical or art["url_source"], art["title"])
@@ -12366,6 +12401,12 @@ def cmd_drainnow(ctx: Context, limit: int = 16, run: bool = False) -> dict:
             tag = "본문 못 받음(%d자)" % len(body) + (" · 24시간 넘어 보관 대상" if age_h > DEFER_MAX_AGE_HOURS else " · 다음 회차 재시도")
             res["no_body"] += 1
             res["stale"] += 1 if age_h > DEFER_MAX_AGE_HOURS else 0
+            # 왜 못 받았는지 — 접속 오류·HTTP 상태·짧은 응답을 직접 확인
+            try:
+                _r = http.get(target, allow_redirects=True, timeout=8)
+                tag += " · 원인: HTTP %s(%s) 응답 %d자" % (_r.status_code, (urlsplit(_r.url).hostname or "")[:22], len(getattr(_r, "text", "") or ""))
+            except Exception as exc:
+                tag += " · 원인: 접속 오류 %s(%s)" % (type(exc).__name__, (urlsplit(target or "").hostname or "")[:22])
         else:
             groups = detect_group_companies(f"{title}\n{group_lead_text(body)}")
             rel = (posco_relevant(title, "", body, groups) or is_battery_scope(title, body[:1500])
@@ -16448,6 +16489,26 @@ def cmd_selftest() -> int:
     check("실제로 분석 완료된 건 정확히 2건(중복 제외, 병렬 실행에도 안전)",
           len(_analyzed_ids), 2)
 
+    # 앞줄 막힘 방지 — 오래된 본문-없음 기사 6건이 맨 앞에 있어도 연속 실패하면 쉬고, 뒤의 정상 기사가 결국 분석된다
+    _DRAIN_FAILS.clear()
+    _pages["http://x.test/hl-good"] = ("<html><body><article><p>" + ("포스코퓨처엠 앞줄 막힘 시험용 서로 다른 본문입니다. " * 12)
+                                       + "</p></article></body></html>")
+    _hl_rows = [(f"hl-f{i}", f"http://x.test/hl-fail{i}", f"포스코퓨처엠 실패기사{i}", iso(now_utc() - timedelta(hours=10 - i))) for i in range(6)]
+    _hl_rows.append(("hl-good", "http://x.test/hl-good", "포스코퓨처엠 정상기사Z", iso(now_utc())))
+    for did, durl, dtitle, dpub in _hl_rows:
+        _tmp._exec(
+            "insert into articles (id, url_source, url_canonical, url_original, title, published_at,"
+            " collected_at, source_type, importance_score, group_companies, categories, press_name,"
+            " analyzed_at, status, is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (did, durl, durl, durl, dtitle, dpub, _now_iso, "search", 50, "[]", "[]", "", None, "active", 1))
+    _hctx = Context(cfg=_pcfg, storage=_tmp, http=_FakeHttpDrain(_pages))
+    _hctx._llm = _StubAnalyzeLLM()
+    for _cycle in range(8):
+        _drain_deferred(_hctx, 3, [])
+    check("드레인 앞줄 막힘 방지 — 본문 못 받는 오래된 기사가 앞에 있어도 8회차 안에 뒤의 정상 기사가 분석된다",
+          _tmp._one("select analyzed_at from articles where id='hl-good'")["analyzed_at"] is not None, True)
+    _DRAIN_FAILS.clear()
+
     print("\n[7-3] 네이버 키워드 교대 조회 — 일일 무료 한도 대응 (2026-09-15)")
     # 활성 키워드 118개를 매 회차 전부 조회하면 하루 33,984회로 무료 한도(25,000)를
     # 1.4배 초과해, 매일 중간부터 429 로 네이버 수집이 통째로 막혔다.
@@ -16795,6 +16856,15 @@ def cmd_selftest() -> int:
         HttpClient.get = _old_get3
     check("피드 점검(feedtest) — 피드 2건 중 키워드 통과 1건, 새 후보 1건", (_fts[0]["items"], _fts[0]["passed"], _fts[0]["new"]), (2, 1, 1))
     _dn = cmd_drainnow(SimpleNamespace(storage=_tmp, http=HttpClient()), 5)
+    _DRAIN_FAILS.clear()
+    _cool = []
+    for _ in range(3):
+        _cool.append(_drain_cooling("x1"))
+        _drain_note_fail("x1")
+    _cool.append(_drain_cooling("x1"))
+    _DRAIN_FAILS.clear()
+    check("드레인 실패 기억 — 1·2번째 실패까지는 계속 시도하고, 연속 2회 실패부터는 쉬었다 다시 시도한다",
+          _cool, [False, False, True, True])
     check("드레인 점검(drainnow) — 하나씩 점검해 합계가 대기 건수와 같다(미리보기는 아무것도 저장하지 않는다)",
           _dn["ok"] + _dn["irrelevant"] + _dn["no_body"] == _dn["pending"], True)
     _qs = cmd_queuestat(SimpleNamespace(storage=_tmp, cfg=SimpleNamespace(llm_daily_limit=1500, llm_per_run=6)))
