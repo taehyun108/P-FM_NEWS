@@ -12064,6 +12064,76 @@ def cmd_why(ctx: Context, term: str) -> list[dict]:
     return out
 
 
+def cmd_trace(ctx: Context, url: str) -> dict:
+    """기사 URL 한 건이 왜 수집되지 않았는지 끝까지 추적한다 — 읽기 전용(아무것도 저장하지 않는다).
+
+    ① 이미 저장됐나·수집 원장(제외 기록)에 있나 → ② 원문을 받아 제목·본문 확보 → ③ 수집 관문 판정
+    → ④ 구글 뉴스 RSS 가 그 기사를 실제로 돌려주는지(그룹사 키워드·제목 검색). 어디서 끊기는지 한 번에 알려 준다.
+    """
+    url = (url or "").strip()
+    res: dict = {"url": url, "stored": False, "ledger": "", "fetched": False, "gates": [], "rss": []}
+    if not url.lower().startswith(("http://", "https://")):
+        log.warning("사용법: trace <기사 주소 전체>  예) trace https://www.example.com/news/1")
+        return res
+    norm = normalize_url(url)
+    log.info("[수집 추적] %s", norm)
+    # ① 저장·원장
+    try:
+        row = ctx.storage.find_by_canonical(norm)
+        if row:
+            res["stored"] = True
+            log.info("  ① 이미 저장됨 — 상태 %s · 대표 %s · 제목 %s", row.get("status"), row.get("is_representative"), (row.get("title") or "")[:40])
+        seen = ctx.storage.seen_url_sources([norm])
+        if norm in seen and not row:
+            res["ledger"] = "원장/별칭에 있음"
+            log.info("  ① 수집 원장(제외 기록)이나 별칭에 있음 → 이미 한 번 본 주소라 다시 안 받음. 제외 사유는 원장에 사유만 남고 기사는 없음")
+        elif not row:
+            log.info("  ① 저장도 원장 기록도 없음 → 수집기가 이 주소를 한 번도 후보로 못 본 것(검색 결과에 안 나왔거나 아직 순서가 안 옴)")
+    except Exception as exc:
+        log.warning("  ① 저장 조회 실패: %s", _brief_error(exc))
+    # ② 원문
+    http = HttpClient()
+    final, html = resolve_canonical(http, url)
+    title = extract_title(html) if html else ""
+    body = extract_body(html) if html else ""
+    pub = extract_published(html) if html else None
+    if not html:
+        log.info("  ② 원문을 받지 못함(접속 실패·차단) → 수집기도 같은 이유로 못 받았을 수 있음")
+        return res
+    res["fetched"] = True
+    log.info("  ② 원문 확보 — 제목: %s | 본문 %d자 | 발행 %s", title[:50], len(body), pub.isoformat()[:16] if pub else "읽지 못함(발행시각 없으면 수집 제외 사유)")
+    # ③ 관문
+    groups = normalize_group_list(detect_group_companies(f"{title}\n{group_lead_text(body)}"))
+    gates = [
+        ("그룹사 칩", ", ".join(groups) or "없음"),
+        ("포스코 관련성", "통과" if posco_relevant(title, "", body, groups) else "탈락"),
+        ("잡음 규칙", is_noise_news(title, groups) or "해당 없음"),
+        ("배터리 범위", "통과" if is_battery_scope(title, body[:1500]) else "탈락"),
+        ("통상", "통과" if is_trade_topic(title, body[:1500]) else "탈락"),
+        ("정부 소식", "통과" if is_gov_industry_news(title, body[:1500]) else "탈락"),
+    ]
+    res["gates"] = gates
+    for g, v in gates:
+        log.info("  ③ %s: %s", g, v)
+    # ④ 구글 뉴스 RSS 가 이 기사를 돌려주는지
+    feedparser = _import("feedparser", "feedparser")
+    host = (urlsplit(final or url).hostname or "").lower().replace("www.", "")
+    queries = [f"{g}" for g in (groups or ["포스코퓨처엠"])[:2]] + [title[:40]]
+    for q in dict.fromkeys(queries):
+        try:
+            r = http.get(GOOGLE_NEWS_RSS.format(q=urlencode({"q": q})[2:]))
+            ents = feedparser.parse(r.content).entries
+        except Exception as exc:
+            log.info("  ④ 구글 RSS '%s' 조회 실패: %s", q[:20], _brief_error(exc))
+            continue
+        found = [e for e in ents if title[:12] and title[:12] in clean_text(e.get("title", ""))
+                 or host in str((e.get("source", {}) or {}).get("href", ""))]
+        res["rss"].append((q, len(ents), len(found)))
+        log.info("  ④ 구글 RSS '%s' → 결과 %d건 중 이 기사 %s", q[:24], len(ents), "있음" if found else "없음")
+    log.info("[수집 추적] 끝 — ①에서 기록이 없고 ④가 '없음'이면 검색 결과에 안 나온 것, ④가 '있음'인데 ①이 비면 수집 순서·접속 문제입니다.")
+    return res
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16397,6 +16467,23 @@ def cmd_selftest() -> int:
         cmd_postdeploy(SimpleNamespace(storage=_tmp), run=False)     # 각 단계가 실패해도 끝까지 가야 한다(대외협력 DB 없는 임시 환경)
     except Exception:
         _pd_ok = False
+    # trace — 네트워크를 가짜로 바꿔 끝까지 도는지 확인
+    _g = globals()
+    _old_rc, _old_get = _g["resolve_canonical"], HttpClient.get
+    _html = ("<html><head><title>포스코퓨처엠 깜짝 실적은 보상금 착시</title></head><body><article>"
+             + "포스코퓨처엠은 3분기 영업이익 821억원을 기록했다. 양극재 판매는 부진했다. " * 6 + "</article></body></html>")
+    _rss = ('<?xml version="1.0"?><rss><channel><item><title>포스코퓨처엠 깜짝 실적은 보상금 착시 - 리드경제</title>'
+            '<link>https://news.google.com/rss/articles/CBMi</link><source url="https://www.leadeconomy.co.kr">리드경제</source></item></channel></rss>')
+    try:
+        _g["resolve_canonical"] = lambda http, u: ("https://www.leadeconomy.co.kr/news/articleView.html?idxno=1", _html)
+        HttpClient.get = lambda self, u, **k: SimpleNamespace(content=_rss.encode("utf-8"), status_code=200,
+                                                              raise_for_status=lambda: None)
+        _tr = cmd_trace(SimpleNamespace(storage=_tmp), "https://www.leadeconomy.co.kr/news/articleView.html?idxno=1")
+    finally:
+        _g["resolve_canonical"], HttpClient.get = _old_rc, _old_get
+    check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
+          (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
+          (True, "포스코퓨처엠", "통과", True))
     check("배포 후 정리(postdeploy) — 한 단계가 실패해도 중단 없이 끝까지 실행된다", _pd_ok, True)
     check("인사·부고 기사는 태그 유지",
           jload(_tmp._one("select categories from articles where id='art-people'")["categories"], []),
@@ -17460,6 +17547,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  trace <기사주소>  그 기사가 왜 수집되지 않았는지 끝까지 추적(저장·원장·원문·관문·구글 RSS, 읽기 전용)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
   presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
@@ -17547,6 +17635,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "trace":
+        cmd_trace(ctx, " ".join(argv[2:]))
     elif command == "why":
         cmd_why(ctx, " ".join(argv[2:]))
     elif command == "fixgroups":
