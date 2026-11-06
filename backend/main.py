@@ -3628,6 +3628,12 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
     probe = f"{title}\n{extra}"
     if _kw_hit_any(probe, _BATTERY_TOPIC_KW) or _kw_hit_any(title or "", BATTERY_TITLE_KW):
         return True
+    # 약한 주제어·ESS: 제목에 있거나 제목·리드에 2번 이상일 때만 (한 줄 스친 기사는 제외)
+    if _kw_hit_any(title or "", _BATTERY_WEAK_TOPIC_KW) or _BATTERY_ESS_RE.search(title or ""):
+        return True
+    weak_hits = sum(probe.count(k) for k in _BATTERY_WEAK_TOPIC_KW) + len(_BATTERY_ESS_RE.findall(probe))
+    if weak_hits >= 2:
+        return True
     names = {k for k in _BATTERY_NAME_KW if _battery_name_in(probe, k)}
     if not names:
         return False
@@ -3665,7 +3671,14 @@ _BATTERY_NAME_KW = frozenset(BATTERY_COMPANY_KW) | frozenset({
     "테슬라", "Tesla", "리비안", "루시드", "에코프로", "엘앤에프", "코스모신소재", "대주전자재료", "나노신소재", "한솔케미칼",
     "샨산", "롱바이", "스미토모금속광산", "니치아", "에코프로비엠", "에코프로머티리얼즈", "성일하이텍", "새빗켐", "탑머티리얼",
     "SK아이이테크놀로지", "더블유씨피", "동화일렉트로라이트", "엔켐", "솔루스첨단소재", "LG화학 양극재", "LG화학 첨단소재"})
-_BATTERY_TOPIC_KW = [k for k in BATTERY_SCOPE_KW if k not in _BATTERY_NAME_KW]
+# 약한 주제어 — 다른 업종 기사에도 한 줄 스치기 쉬운 말. 제목에 있거나 제목·리드에 2번 이상 나올 때만 인정한다.
+_BATTERY_WEAK_TOPIC_KW = ("전기차 판매", "전기차 수요", "전기차 보조금", "전기차 캐즘", "전기차 시장", "EV 수요",
+                          "에너지저장장치", "에너지저장시스템", "전력저장", "계통 안정화",
+                          "리튬 가격", "니켈 가격", "코발트 가격", "흑연 공급", "배터리 시장", "배터리 수요")
+# ESS·BESS 는 영문 단어 속 글자(BUSINESS·PROGRESS)에 걸리지 않게 단어 경계로 본다 — 약한 주제어와 같이 취급
+_BATTERY_ESS_RE = re.compile(r"(?<![A-Za-z])B?ESS(?![A-Za-z])")
+_BATTERY_TOPIC_KW = [k for k in BATTERY_SCOPE_KW
+                     if k not in _BATTERY_NAME_KW and k not in _BATTERY_WEAK_TOPIC_KW and k not in ("ESS", "BESS")]
 # 회사명이 있어도 이 낱말이 제목·리드에 함께 있어야 '배터리 기사'로 본다 — 'LG에너지솔루션·LG화학 등 채용 연계' 같은 스침 방지
 _BATTERY_CONTEXT_KW = ("배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "전기차", "전고체", "리튬", "니켈", "코발트",
                        "흑연", "ESS", "에너지저장", "셀 ", "충전")
@@ -12413,6 +12426,33 @@ def cmd_fixnoise(ctx: Context, dry: bool = True) -> dict:
     return {"targets": len(hits), "archived": done, "by_why": dict(by_why)}
 
 
+def cmd_postdeploy(ctx: Context, run: bool = False, ea_limit: int = 40) -> None:
+    """배포 직후 정리 작업을 한 번에 실행한다 (사용자 지정 2026-11-06: 한 번에 배포·정리).
+
+    ① 카테고리 재태깅(정부/정책·통상환경 복원 포함) → ② 관련성 재점검(기본 미리보기, --run 이면 보관 처리)
+    → ③ 대외협력 3줄 요약·시사점 재분석(하루 AI 상한 안에서). 각 단계는 서로 독립이라 하나가 실패해도 다음으로 간다.
+    """
+    steps: list[tuple[str, Any]] = [
+        ("카테고리 재태깅", lambda: cmd_fixcategories(ctx)),
+        ("관련성 재점검" + ("" if run else "(미리보기)"), lambda: cmd_fixrelevance(ctx, dry=not run)),
+    ]
+    if ea_mod is not None:
+        def _ea() -> None:
+            _edb = ea_mod.make_ea_db(ctx)
+            _edb.ensure_ready()
+            r = ea_mod.reanalyze_for_implication(ctx, _edb, ea_limit)
+            log.info("대외협력 재분석 — 대상 %d건 · 성공 %d · 본문 못 구함 %d · 실패 %d",
+                     r["targets"], r["fixed"], r["no_body"], r["failed"])
+        steps.append(("대외협력 3줄·시사점 재분석", _ea))
+    for i, (name, fn) in enumerate(steps, 1):
+        log.info("[배포 후 정리 %d/%d] %s 시작", i, len(steps), name)
+        try:
+            fn()
+        except Exception as exc:
+            log.error("[배포 후 정리 %d/%d] %s 실패: %s", i, len(steps), name, _brief_error(exc) if "_brief_error" in globals() else exc)
+    log.info("[배포 후 정리] 끝%s", "" if run else " — 관련성 재점검은 미리보기였습니다. 목록이 맞으면 postdeploy --run 으로 보관 처리하세요.")
+
+
 def cmd_fixcategories(ctx: Context) -> None:
     """카테고리를 제목+요약 기준으로 재태깅한다 (일회성).
 
@@ -14515,6 +14555,15 @@ def cmd_selftest() -> int:
            is_battery_scope("현지 인재 확보 나선 기업들", "LG에너지솔루션이 배터리 인력 채용을 늘린다"),
            is_battery_scope("테슬라 3분기 인도량 사상 최대")],
           [False, True, True, True, True])
+    check("배터리 범위(약한 낱말) — BUSINESS·PROGRESS 속 ESS, 전기차 판매·리튬 가격 한 줄 언급은 아니고, 제목이거나 2번 이상이면 맞다",
+          [is_battery_scope("삼성전자 사업 확대", "BUSINESS 전략과 PROGRESS 보고"),
+           is_battery_scope("현대차, 신차 공개", "전기차 판매 호조도 언급"),
+           is_battery_scope("A사 실적", "리튬 가격 하락 영향 한 줄"),
+           is_battery_scope("한화 ESS 수주 확대", ""),
+           is_battery_scope("태양광 업계 동향", "ESS 연계가 늘고 있다. ESS 수주도 증가했다."),
+           is_battery_scope("전기차 판매 급감, 업계 비상", ""),
+           is_battery_scope("국내 기업 동향", "양극재 증설을 발표했다")],
+          [False, False, False, True, True, True, True])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
@@ -16343,6 +16392,12 @@ def cmd_selftest() -> int:
          "포스코 주가 코스피 상한가", _d030, _d030, "rss", "[]", "active"))
     from types import SimpleNamespace
     cmd_fixcategories(SimpleNamespace(storage=_tmp))
+    _pd_ok = True
+    try:
+        cmd_postdeploy(SimpleNamespace(storage=_tmp), run=False)     # 각 단계가 실패해도 끝까지 가야 한다(대외협력 DB 없는 임시 환경)
+    except Exception:
+        _pd_ok = False
+    check("배포 후 정리(postdeploy) — 한 단계가 실패해도 중단 없이 끝까지 실행된다", _pd_ok, True)
     check("인사·부고 기사는 태그 유지",
           jload(_tmp._one("select categories from articles where id='art-people'")["categories"], []),
           ["인사·부고"])
@@ -17410,6 +17465,7 @@ USAGE = """사용법: python backend/main.py <명령>
   presscheck 언론사명(.com·.co.kr 남은 이름)·기자명 누락 매체 점검 (읽기 전용 — 아무것도 쓰지 않음)
   fixgroups  LLM 과잉 태깅된 그룹사 재검증 (필터 정확도 — 일회성)
   regroup    원문 리드 기준으로 그룹사 태그 재판정 (오탐 정정 — 일회성, LLM 비용 0)
+  postdeploy [--run]  배포 직후 정리 한 번에: 카테고리 재태깅 → 관련성 재점검(기본 미리보기, --run 이면 보관) → 대외협력 재분석
   fixcategories 카테고리를 제목+요약 기준으로 재태깅 (필터 변별력 — 일회성)
   fixofftopic 포스코 언급 없는 기존 기사를 원문 재확인 후 보관 (일회성)
   reanalyze  분석이 끊긴 기사를 원문에서 다시 받아 재분석 (일회성)
@@ -17499,6 +17555,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_regroup(ctx)
     elif command == "fixcategories":
         cmd_fixcategories(ctx)
+    elif command == "postdeploy":
+        cmd_postdeploy(ctx, run="--run" in argv[2:])
     elif command == "fixofftopic":
         cmd_fixofftopic(ctx)
     elif command == "reanalyze":
