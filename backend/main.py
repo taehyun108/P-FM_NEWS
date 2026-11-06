@@ -567,6 +567,10 @@ class Storage(ABC):
     def append_alias(self, article_id: str, url_source: str) -> None: ...
 
     @abstractmethod
+    def find_by_alias(self, url_source: str) -> dict | None:
+        """이 주소를 '같은 사건의 다른 주소(별칭)'로 흡수한 기사 하나(id·title·status·is_representative). 없으면 None."""
+
+    @abstractmethod
     def find_by_content_hash(self, content_hash: str) -> dict | None: ...
 
     @abstractmethod
@@ -621,6 +625,14 @@ class Storage(ABC):
 
     @abstractmethod
     def prune_url_ledger(self, older_than_days: int) -> int: ...
+
+    @abstractmethod
+    def ledger_reason(self, url_source: str) -> str:
+        """수집 원장에 기록된 제외 사유(off_topic·extract_failed·stale·no_pubdate …). 없으면 ''."""
+
+    @abstractmethod
+    def delete_ledger_url(self, url_source: str) -> int:
+        """수집 원장에서 이 주소의 제외 기록 하나를 지운다(다음 수집 때 다시 판정). 지운 건수."""
 
     @abstractmethod
     def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
@@ -1043,6 +1055,11 @@ class SqliteStorage(Storage):
         sets = ",".join(f"{k}=?" for k in data)
         self._exec(f"update articles set {sets} where id=?", list(data.values()) + [article_id])
 
+    def find_by_alias(self, url_source: str) -> dict | None:
+        return self._one(
+            "select id, title, status, is_representative, press_name from articles where url_source_aliases like ? limit 1",
+            (f'%"{url_source}"%',))
+
     def append_alias(self, article_id: str, url_source: str) -> None:
         row = self._one("select url_source_aliases from articles where id=?", (article_id,))
         if row is None:
@@ -1190,6 +1207,14 @@ class SqliteStorage(Storage):
     def prune_url_ledger(self, older_than_days: int) -> int:
         cutoff = iso(now_utc() - timedelta(days=older_than_days))
         cur = self._exec("delete from url_ledger where first_seen < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def ledger_reason(self, url_source: str) -> str:
+        row = self._one("select reason from url_ledger where url_source=?", (url_source,))
+        return (row or {}).get("reason") or ""
+
+    def delete_ledger_url(self, url_source: str) -> int:
+        cur = self._exec("delete from url_ledger where url_source=?", (url_source,))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
@@ -1810,6 +1835,14 @@ class SupabaseStorage(Storage):
         if patch:
             self._t("articles").update(patch).eq("id", article_id).execute()
 
+    def find_by_alias(self, url_source: str) -> dict | None:
+        try:
+            rows = (self._t("articles").select("id,title,status,is_representative,press_name")
+                    .contains("url_source_aliases", [url_source]).limit(1).execute().data)
+        except Exception:
+            return None
+        return rows[0] if rows else None
+
     def append_alias(self, article_id: str, url_source: str) -> None:
         rows = self._t("articles").select("url_source_aliases").eq("id", article_id).execute().data
         if not rows:
@@ -1977,6 +2010,14 @@ class SupabaseStorage(Storage):
     def prune_url_ledger(self, older_than_days: int) -> int:
         cutoff = iso(now_utc() - timedelta(days=older_than_days))
         res = self._t("url_ledger").delete().lt("first_seen", cutoff).execute()
+        return len(res.data or [])
+
+    def ledger_reason(self, url_source: str) -> str:
+        rows = self._t("url_ledger").select("reason").eq("url_source", url_source).limit(1).execute().data
+        return (rows[0].get("reason") or "") if rows else ""
+
+    def delete_ledger_url(self, url_source: str) -> int:
+        res = self._t("url_ledger").delete().eq("url_source", url_source).execute()
         return len(res.data or [])
 
     def clear_ledger(self, reasons: Sequence[str], since_days: int) -> int:
@@ -12188,8 +12229,19 @@ def cmd_trace(ctx: Context, url: str) -> dict:
                 log.info("     ↳ draft 는 'URL로 포토카드 만들기'에서 미리보기만 만들고 등록을 안 누른 임시 저장입니다. 목록에 안 뜨고, 같은 주소의 자동 수집도 막습니다(24시간 뒤 자동 삭제, postdeploy 는 1시간 지난 것을 바로 삭제).")
         seen = ctx.storage.seen_url_sources([norm])
         if norm in seen and not row:
-            res["ledger"] = "원장/별칭에 있음"
-            log.info("  ① 수집 원장(제외 기록)이나 별칭에 있음 → 이미 한 번 본 주소라 다시 안 받음. 제외 사유는 원장에 사유만 남고 기사는 없음")
+            owner = ctx.storage.find_by_alias(norm) if not ctx.storage.ledger_reason(norm) else None
+            if owner:
+                res["ledger"] = "별칭"
+                res["alias_of"] = owner.get("id")
+                log.info("  ① 이 주소는 '같은 사건의 다른 기사'에 흡수된 별칭입니다 ← 중복 판정(제목·본문 유사)이 이 기사를 다른 기사의 같은 사건으로 봤다는 뜻")
+                log.info("     ↳ 흡수한 기사: [%s] %s · 상태 %s · 대표 %s", (owner.get("press_name") or "")[:10],
+                         (owner.get("title") or "")[:46], owner.get("status"), owner.get("is_representative"))
+            res["ledger"] = res["ledger"] or ctx.storage.ledger_reason(norm) or "별칭"
+            why_l = {"별칭": "같은 사건 기사에 흡수(위 줄 참고)", "off_topic": "무관 기사로 판정돼 제외", "extract_failed": "원문 접속·추출에 실패해 제외",
+                     "stale": "발행이 오래돼 제외", "no_pubdate": "발행시각을 못 읽어 제외"}.get(res["ledger"], res["ledger"])
+            log.info("  ① 수집 원장(제외 기록)이나 별칭에 있음 → 이미 한 번 본 주소라 다시 안 받음. 제외 사유: %s", why_l)
+            if res["ledger"] in ("off_topic", "extract_failed", "no_pubdate", "stale"):
+                log.info("     ↳ 규칙·접속이 지금은 통과하는데 옛 기록 때문에 막힌 것이면: reopen --url <기사주소> 로 이 기록만 지우고 worker 를 다시 시작하세요.")
         elif not row:
             log.info("  ① 저장도 원장 기록도 없음 → 수집기가 이 주소를 한 번도 후보로 못 본 것(검색 결과에 안 나왔거나 아직 순서가 안 옴)")
     except Exception as exc:
@@ -12912,6 +12964,30 @@ def cmd_fixpfm(ctx: Context, dry: bool = False) -> None:
         ctx.storage.update_article(r["id"], {"group_companies": groups})
         log.info("  - 태그 제거: %s", (r.get("title") or "")[:50])
     log.info("포스코퓨처엠 태그 정리 완료: %d건 (언론사 탭·필터는 최대 몇 분 뒤 반영)", len(bad))
+
+
+def cmd_reopen_url(ctx: Context, url: str, dry: bool = False) -> dict:
+    """기사 주소 한 건의 제외 기록(수집 원장)만 지워 다음 수집 회차에 다시 판정하게 한다.
+
+    사유(무관·접속 실패·오래됨·발행시각 없음)를 먼저 알려 준다. 지운 뒤 worker 를 다시 시작해야 메모리 캐시에서도 빠진다.
+    """
+    url = (url or "").strip()
+    norm = normalize_url(url) if url.startswith(("http://", "https://")) else ""
+    out = {"url": norm, "reason": "", "deleted": 0}
+    if not norm:
+        log.warning("사용법: reopen --url <기사 주소 전체>")
+        return out
+    out["reason"] = ctx.storage.ledger_reason(norm)
+    if not out["reason"]:
+        log.info("[제외 기록 해제] 원장에 이 주소의 기록이 없습니다(별칭·저장 상태일 수 있음 — trace 로 확인): %s", norm)
+        return out
+    log.info("[제외 기록 해제] 사유 '%s' 기록 발견: %s", out["reason"], norm)
+    if dry:
+        log.info("  (미리보기 — 지우지 않음)")
+        return out
+    out["deleted"] = ctx.storage.delete_ledger_url(norm)
+    log.info("  → %d건 지움. worker 를 다시 시작하면 다음 수집 회차에 이 기사를 다시 판정합니다.", out["deleted"])
+    return out
 
 
 def cmd_reopen(ctx: Context, days: int = 3, dry: bool = False) -> None:
@@ -16667,6 +16743,13 @@ def cmd_selftest() -> int:
     finally:
         HttpClient.get = _old_get2
     check("구글 RSS 링크 변환 — 옛 형식 토큰이면 실제 기사 주소로 받아 온다", _canon.startswith("https://www.leadeconomy.co.kr/news/articleView.html"), True)
+    _lt2 = _tmp
+    _lt2.upsert_ledger("https://www.hansbiz.co.kr/news/articleView.html?idxno=880576", "stale")
+    _ro = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576", dry=True)
+    _ro2 = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576")
+    _ro3 = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576")
+    check("reopen --url — 사유를 알려 주고(미리보기는 안 지움), 실행하면 그 한 건만 지우며, 없으면 0건",
+          (_ro["reason"], _ro["deleted"], _ro2["deleted"], _ro3["reason"], _ro3["deleted"]), ("stale", 0, 1, "", 0))
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
           (True, "포스코퓨처엠", "통과", True))
@@ -17713,6 +17796,7 @@ USAGE = """사용법: python backend/main.py <명령>
   reexcerpt [--dry]  보관 본문(30일)으로 포스코퓨처엠 언급 발췌를 새 방식(문단 단위·맥락 포함)으로 다시 만들기 (LLM 0)
   retranslate [N] [--dry]  저장된 영어 기사(제목·발췌)를 한국어로 번역 (AI 호출 최대 N회, 기본 50)
   fixpfm [--dry]  포스코퓨처엠 태그가 붙었지만 제목·본문에 언급이 없는 기사에서 태그 제거 (먼저 pfmtone 으로 발췌 채우기)
+  reopen --url <기사주소> [--dry]  그 기사 한 건의 제외 기록만 지워 다시 판정(사유도 알려 줌)
   reopen [일수] [--dry]  규칙을 넓힌 뒤 최근 며칠(기본 3일)의 '무관'·'접속 실패' 제외 기록을 지워 다시 판정(실행 후 worker 재시작)
   tagassoc [--dry]  이미 저장된 기사에 빠진 그룹사 태그 보충('배터리협회'·'포스코퓨처엠', 띄어쓴 표기 포함, 일회성)
   addkw <분류> <키워드>...  수집 키워드 추가 (예: addkw 그룹사 배터리협회 KBIA — 이미 있으면 건너뜀.
@@ -17855,6 +17939,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_retranslate(ctx, nums[0] if nums else 50, dry="--dry" in argv[2:])
     elif command == "fixpfm":
         cmd_fixpfm(ctx, dry="--dry" in argv[2:])
+    elif command == "reopen" and "--url" in argv[2:]:
+        _ru = [a for a in argv[2:] if a not in ("--url", "--dry")]
+        cmd_reopen_url(ctx, _ru[0] if _ru else "", dry="--dry" in argv[2:])
     elif command == "reopen":
         nums = [int(a) for a in argv[2:] if a.isdigit()]
         cmd_reopen(ctx, nums[0] if nums else 3, dry="--dry" in argv[2:])
