@@ -3508,6 +3508,11 @@ def is_trade_topic(title: str, extra: str = "") -> bool:
     """
     if _kw_hit_any(title, TRADE_MACRO_KW):
         return True
+    # 제목에 관세·수출통제·무역전쟁·FTA 등 통상 낱말이 있으면 업종 낱말이 없어도 통상 기사로 수집한다
+    #   (사용자 지정 2026-11-06: 대외협력 '통상 기사'에서 보려는 기사. 연합뉴스 '트럼프, "美에 공장 안 지으면 300%까지 관세"'가
+    #   분류(카테고리)는 통상인데 이 수집 관문에서 막혀 누락됐다). 포스코·배터리와 무관하면 메인 목록에서는 숨겨진다.
+    if _TARIFF_TITLE_RE.search(title or ""):
+        return True
     # 자국 중심 공급망 '이니셔티브'형 정책 기사 — 조치명은 제목에 없지만 본문 리드에 대중국 견제·관세가 명시된다
     #   (미주중앙일보 '배터리 제조 이니셔티브 발표…조지아 한국기업들 촉각', 사용자 지적 2026-10-29)
     if (_kw_hit_any(title, TRADE_INITIATIVE_TITLE_KW) and _kw_hit_any(title, TRADE_INDUSTRY_KW)
@@ -14393,7 +14398,9 @@ def cmd_selftest() -> int:
           is_trade_topic("포스코 노사, 타협점 찾아야", "철강업계는 반덤핑 관세와 중국산 저가재로 삼중고"), False)
     check("일반 무역 트렌드어(공급망 재편)는 통상환경 아님",
           is_trade_topic("종합상사 부활…공급망 재편 수혜"), False)
-    check("조치명만 있고 산업어 없으면 아님", is_trade_topic("美, 對中 반도체 301조 관세"), False)
+    # 2026-11-06 방침 변경: 대외협력 '통상 기사'용으로 제목에 관세 등 통상 낱말이 있으면 업종 낱말이 없어도 수집한다
+    check("제목에 관세가 있으면 업종 낱말이 없어도 통상 기사(대외협력 통상 기사용)", is_trade_topic("美, 對中 반도체 301조 관세"), True)
+    check("통상 낱말이 하나도 없으면 아님", is_trade_topic("美, 반도체 신규 공장 착공"), False)
     check("산업어만 있고 조치명 없으면 아님", is_trade_topic("포스코 철강 신제품 출시"), False)
     # EU 산업·탈탄소 입법 (2026 누락 사례) — 조치명은 제목, 산업어는 본문에 있어도 인정
     check("EU 산업가속화법 + 본문 철강 → 통상환경",
@@ -14417,8 +14424,8 @@ def cmd_selftest() -> int:
         check(f"통상환경(업종 없이 통과): {_t[:16]}", is_trade_topic(_t), True)
     check("거시 통상어 기사는 카테고리도 글로벌 통상환경",
           "글로벌 통상환경" in detect_categories("트럼프, 대미투자 압박 강화"), True)
-    check("301조처럼 업종이 필요한 조치어는 여전히 산업어가 있어야 한다",
-          is_trade_topic("美, 對中 반도체 301조 관세"), False)
+    check("301조는 이제 통상 낱말(업종 없어도 통상 기사) — 단 일반 기업 소식은 아니다",
+          [is_trade_topic("美, 對中 반도체 301조 조사"), is_trade_topic("美 반도체 기업 신규 채용 확대")], [True, False])
     check("통상 키워드 검색 결과 — 제목에 '대미투자'만 있어도 통과",
           _naver_item_relevant("트럼프 '韓 대미투자 약속 이행하라'", "통상", "트럼프 관세"), True)
     check("무관 기사(코스피)는 여전히 제외", is_trade_topic("코스피 7100선 돌파"), False)
@@ -14750,6 +14757,12 @@ def cmd_selftest() -> int:
            sorted(gate_categories("산업장관, EU 산업가속화법 우려 전달", "철강 배터리 업계 영향")),
            gate_categories("주말 날씨 맑음", "")],
           [["정부/정책"], ["글로벌 통상환경"], []])
+    check("통상 관문 — 제목에 관세 등 통상 낱말이 있으면 업종 낱말이 없어도 수집, 관세청·텍사스 데이터센터는 아니다",
+          [is_trade_topic("트럼프, 선거참패 이틀 뒤 \"美에 공장 안 지으면 300%까지 관세\"", "트럼프 대통령은 5일 공장을 짓지 않는 기업에 관세"),
+           is_trade_topic("농심, 美 정부 상대 '트럼프 관세' 환급 소송 제기", ""),
+           is_trade_topic("관세청, 밀수 단속 강화", ""),
+           is_trade_topic("텍사스주지사 당선인 \"데이터센터 관련 업무 중단해야\"", "")],
+          [True, True, False, False])
     check("통상환경 분류(확장) — 통상 압박·무역장벽·FTA·WTO·보호무역·301조·FEOC 등은 통상환경, 일반 문장·영문 단어 속 FTA는 아니다",
           [TRADE_CATEGORY in detect_categories(t, "") for t in (
               "미국 통상 압박 강화에 업계 긴장", "무역전쟁 재점화 우려", "비관세장벽 해소 위한 한미 협의", "한-EU FTA 개정 논의",

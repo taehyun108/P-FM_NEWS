@@ -2427,6 +2427,8 @@ function init() {
       $('grid').hidden = false;
       const more = document.querySelector('.more-wrap');
       if (more) more.hidden = false;
+      const ua = document.querySelector('.url-add');      // 대외협력 기사 카테고리에서도 URL 직접 등록을 쓸 수 있게
+      if (ua) ua.hidden = false;
       refresh(true);
     },
     leave() {
@@ -2439,6 +2441,8 @@ function init() {
         $('grid').hidden = true;
         const more = document.querySelector('.more-wrap');
         if (more) more.hidden = true;
+        const ua = document.querySelector('.url-add');
+        if (ua) ua.hidden = true;
       }
     },
   };
