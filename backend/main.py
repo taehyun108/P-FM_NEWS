@@ -12342,6 +12342,48 @@ def cmd_queuestat(ctx: Context) -> dict:
     return out
 
 
+def cmd_drainnow(ctx: Context, limit: int = 16, run: bool = False) -> dict:
+    """메타만 저장된(deferred) 기사 중 가장 오래된 limit 건이 왜 분석 안 되는지 하나씩 보여 준다.
+
+    기본은 미리보기: 본문을 받아 보고 '본문 길이 · 24시간 지나 보관 대상 · 관련성 통과 여부'만 알려 주며 아무것도 저장하지 않는다.
+    --run 이면 실제 드레인(본문 확보→관련성 재검→AI 분석)을 지금 한 번 실행한다(AI 호출 발생).
+    """
+    storage, http = ctx.storage, ctx.http if getattr(ctx, "http", None) else HttpClient()
+    pending = storage.deferred_articles(max(1, min(limit, 40)))
+    res = {"pending": len(pending), "no_body": 0, "irrelevant": 0, "ok": 0, "stale": 0}
+    log.info("[드레인 점검] 가장 오래된 deferred %d건%s", len(pending), "" if not run else " — 실제 실행")
+    kst = timezone(timedelta(hours=9))
+    targets = {a["id"]: (a.get("url_original") or a.get("url_canonical") or a.get("url_source")) for a in pending}
+    fetched = prefetch_articles(http, [u for u in targets.values() if u])
+    for art in pending:
+        target = targets.get(art["id"])
+        canonical, html = fetched.get(target, ("", "")) if target else ("", "")
+        body = extract_body(html) if html else ""
+        coll = parse_dt(art.get("collected_at"))
+        age_h = (now_utc() - coll).total_seconds() / 3600 if coll else -1
+        title = art.get("title") or ""
+        if len(body) < 200:
+            tag = "본문 못 받음(%d자)" % len(body) + (" · 24시간 넘어 보관 대상" if age_h > DEFER_MAX_AGE_HOURS else " · 다음 회차 재시도")
+            res["no_body"] += 1
+            res["stale"] += 1 if age_h > DEFER_MAX_AGE_HOURS else 0
+        else:
+            groups = detect_group_companies(f"{title}\n{group_lead_text(body)}")
+            rel = (posco_relevant(title, "", body, groups) or is_battery_scope(title, body[:1500])
+                   or is_gov_industry_news(title, body[:1500]) or is_trade_topic(title, body[:1500]))
+            tag = "본문 %d자 · %s" % (len(body), "관련성 통과 → 분석 대상" if rel else "관련성 탈락 → 보관 대상")
+            res["ok" if rel else "irrelevant"] += 1
+        pub = parse_dt(art.get("published_at"))
+        log.info("  · %s | 발행 %s | 수집 후 %.0f시간 | %s", title[:34], pub.astimezone(kst).strftime("%m-%d %H:%M") if pub else "?", age_h, tag)
+    log.info("[드레인 점검] 요약 — 분석 대상 %d · 관련성 탈락 %d · 본문 못 받음 %d(그중 24시간 초과 %d)",
+             res["ok"], res["irrelevant"], res["no_body"], res["stale"])
+    if run:
+        dedup = storage.recent_articles_for_dedup(now_utc() - timedelta(hours=DEDUP_WINDOW_HOURS + 1))
+        n = _drain_deferred(ctx, min(limit, DEFER_DRAIN_PER_RUN), dedup, people_llm=0)
+        log.info("[드레인 점검] 실제 드레인 결과: %d건 분석", n)
+        res["drained"] = n
+    return res
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16752,6 +16794,9 @@ def cmd_selftest() -> int:
     finally:
         HttpClient.get = _old_get3
     check("피드 점검(feedtest) — 피드 2건 중 키워드 통과 1건, 새 후보 1건", (_fts[0]["items"], _fts[0]["passed"], _fts[0]["new"]), (2, 1, 1))
+    _dn = cmd_drainnow(SimpleNamespace(storage=_tmp, http=HttpClient()), 5)
+    check("드레인 점검(drainnow) — 하나씩 점검해 합계가 대기 건수와 같다(미리보기는 아무것도 저장하지 않는다)",
+          _dn["ok"] + _dn["irrelevant"] + _dn["no_body"] == _dn["pending"], True)
     _qs = cmd_queuestat(SimpleNamespace(storage=_tmp, cfg=SimpleNamespace(llm_daily_limit=1500, llm_per_run=6)))
     check("분석 대기열(queuestat) — 대기·호출 수를 숫자로 돌려준다", all(k in _qs for k in ("unanalyzed", "deferred", "llm_today")), True)
     _ss = cmd_sourcestat(SimpleNamespace(storage=_tmp), 72)
@@ -17828,6 +17873,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  drainnow [N] [--run]  가장 오래된 deferred N건이 왜 분석 안 되는지 하나씩 점검(기본 미리보기, --run 이면 지금 드레인 실행)
   queuestat  AI 분석 대기열 상태(대기 건수·오늘 AI 호출/상한·오래 밀린 기사, 읽기 전용)
   feedtest [피드이름]  언론사 RSS 를 지금 받아 '피드→키워드 통과→이미 처리→새 후보' 건수를 보여 줌(읽기 전용, 예: feedtest 한스경제)
   sourcestat [시간]  최근 수집 기사를 수집 경로(naver_api·google_rss·manual …)·시간대별로 센다(읽기 전용, 기본 24시간)
@@ -17920,6 +17966,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "drainnow":
+        _dn = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_drainnow(ctx, _dn[0] if _dn else 16, run="--run" in argv[2:])
     elif command == "queuestat":
         cmd_queuestat(ctx)
     elif command == "feedtest":
