@@ -3620,10 +3620,22 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
 
     이 범위면 포스코 미언급이어도 수집한다 — 전방 수요·경쟁 동향이 사업에 직결된다.
     지명과 겹치는 짧은 회사명은 battery_company_hit 이 가드와 함께 판정한다.
+
+    회사명만 있는 경우(사용자 지적 2026-11-06: 'LG전자 美 밴더빌트대 체험공간' 기사가 본문의
+    LG에너지솔루션·LG화학 언급으로 수집됨)는 ① 제목에 회사명이 있거나 ② 서로 다른 배터리 회사가 2곳 이상이거나
+    ③ 배터리·전기차·소재 낱말이 제목·리드에 함께 있을 때만 인정한다.
     """
     probe = f"{title}\n{extra}"
-    return (_kw_hit_any(probe, BATTERY_SCOPE_KW) or _kw_hit_any(title or "", BATTERY_TITLE_KW)
-            or battery_company_hit(probe))
+    if _kw_hit_any(probe, _BATTERY_TOPIC_KW) or _kw_hit_any(title or "", BATTERY_TITLE_KW):
+        return True
+    names = {k for k in _BATTERY_NAME_KW if _battery_name_in(probe, k)}
+    if not names:
+        return False
+    if any(_battery_name_in(title or "", k) for k in names):
+        return True
+    if len({k.split()[0] for k in names}) >= 2:
+        return True
+    return _kw_hit_any(probe, _BATTERY_CONTEXT_KW)
 
 
 # 배터리 생태계 '회사명'만 추린 고정밀 신호.
@@ -3646,6 +3658,27 @@ BATTERY_COMPANY_FALSE_HINTS: dict[str, list[str]] = {
     "금양": ["금양읍", "금양면", "금양리", "금양동", "금양초", "금양중", "금양고", "금양역"],
     "천보": ["천보산", "천보사", "천보루"],
 }
+
+
+# BATTERY_SCOPE_KW 안의 '회사명' — 스치듯 한 번 나온 것만으로는 배터리 기사로 보지 않는다(아래 is_battery_scope).
+_BATTERY_NAME_KW = frozenset(BATTERY_COMPANY_KW) | frozenset({
+    "테슬라", "Tesla", "리비안", "루시드", "에코프로", "엘앤에프", "코스모신소재", "대주전자재료", "나노신소재", "한솔케미칼",
+    "샨산", "롱바이", "스미토모금속광산", "니치아", "에코프로비엠", "에코프로머티리얼즈", "성일하이텍", "새빗켐", "탑머티리얼",
+    "SK아이이테크놀로지", "더블유씨피", "동화일렉트로라이트", "엔켐", "솔루스첨단소재", "LG화학 양극재", "LG화학 첨단소재"})
+_BATTERY_TOPIC_KW = [k for k in BATTERY_SCOPE_KW if k not in _BATTERY_NAME_KW]
+# 회사명이 있어도 이 낱말이 제목·리드에 함께 있어야 '배터리 기사'로 본다 — 'LG에너지솔루션·LG화학 등 채용 연계' 같은 스침 방지
+_BATTERY_CONTEXT_KW = ("배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "전기차", "전고체", "리튬", "니켈", "코발트",
+                       "흑연", "ESS", "에너지저장", "셀 ", "충전")
+
+
+def _battery_name_in(text: str, kw: str) -> bool:
+    """회사명 kw 가 text 에 실제 회사 언급으로 들어 있는가(지명·학교명 형태는 제외)."""
+    t = text or ""
+    if kw not in t:
+        return False
+    for h in BATTERY_COMPANY_FALSE_HINTS.get(kw, ()):
+        t = t.replace(h, "")
+    return kw in t
 
 
 def battery_company_which(text: str) -> str:
@@ -14475,6 +14508,13 @@ def cmd_selftest() -> int:
     check("배터리 회사명 판별 — 어떤 회사명이 걸렸는지 돌려주고, 지명 형태·없는 경우는 빈 값",
           [battery_company_which("LG전자 소식, 삼성SDI 협력"), battery_company_which("부산 금양읍 도시계획"), battery_company_which("LG전자 체험공간")],
           ["삼성SDI", "", ""])
+    check("배터리 범위 — 회사명이 스치듯 나온 기사(LG에너지솔루션·LG화학 채용 연계)는 아니고, 제목 회사명·배터리 낱말 동반·회사 2곳 이상은 맞다",
+          [is_battery_scope("LG전자, 美 밴더빌트대에 브랜드 체험공간 개관", "LG에너지솔루션, LG화학 등 LG 계열사와 채용 연계도 추진한다"),
+           is_battery_scope("SK온, 美 공장 가동 연기", ""),
+           is_battery_scope("미국 대학 체험공간 개관", "LG에너지솔루션과 삼성SDI 등이 참여한다"),
+           is_battery_scope("현지 인재 확보 나선 기업들", "LG에너지솔루션이 배터리 인력 채용을 늘린다"),
+           is_battery_scope("테슬라 3분기 인도량 사상 최대")],
+          [False, True, True, True, True])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
