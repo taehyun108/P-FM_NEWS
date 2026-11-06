@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
     import external_affairs as ea_mod
@@ -4777,6 +4777,82 @@ def collect_rss_feeds(http: HttpClient, feeds: Sequence[dict]) -> list[RawItem]:
 
 GOOGLE_HOSTS = ("news.google.com", "google.com")
 
+# ── 구글 뉴스 RSS 링크 → 실제 기사 주소 ────────────────────────────────────
+# 구글 RSS 항목의 링크(news.google.com/rss/articles/<토큰>)는 더 이상 GET 으로 따라가면 기사로 이동하지 않는다
+# (2026-11-06 서버 점검: 같은 결과 5건 중 변환 성공 0건 → 구글 전용 기사 전부 누락). 토큰 안에 주소가 들어 있는
+# 옛 형식은 직접 풀고, 새 형식(AU_yqL…)은 구글의 batchexecute 응답으로 푼다. 새 라이브러리는 쓰지 않는다.
+_GNEWS_TOKEN_RE = re.compile(r"/(?:rss/)?articles/([A-Za-z0-9_\-]+)")
+
+
+def gnews_token(url: str) -> str:
+    m = _GNEWS_TOKEN_RE.search(urlsplit(url or "").path)
+    return m.group(1) if m else ""
+
+
+def decode_gnews_token_legacy(token: str) -> str:
+    """토큰에 기사 주소가 그대로 들어 있는 옛 형식을 푼다. 못 풀거나 새 형식이면 ''."""
+    import base64
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    except Exception:
+        return ""
+    prefix, suffix = b"\x08\x13\x22", b"\xd2\x01\x00"
+    if raw.startswith(prefix):
+        raw = raw[len(prefix):]
+    if raw.endswith(suffix):
+        raw = raw[:-len(suffix)]
+    if not raw:
+        return ""
+    length = raw[0]
+    if length >= 0x80 and len(raw) > 1:
+        body = raw[2:length + 1]
+    else:
+        body = raw[1:length + 1]
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return text if text.startswith(("http://", "https://")) else ""
+
+
+def parse_gnews_batch_response(text: str) -> str:
+    """batchexecute 응답 본문에서 실제 기사 주소를 꺼낸다. 못 꺼내면 ''."""
+    try:
+        chunk = text.split("\n\n", 1)[1] if "\n\n" in text else text
+        data = json.loads(chunk)
+        inner = json.loads(data[0][2])
+        url = inner[1]
+        return url if isinstance(url, str) and url.startswith(("http://", "https://")) else ""
+    except Exception:
+        return ""
+
+
+def resolve_gnews_url(http: "HttpClient", url: str) -> str:
+    """구글 뉴스 RSS 링크의 실제 기사 주소. 실패하면 ''."""
+    token = gnews_token(url)
+    if not token:
+        return ""
+    real = decode_gnews_token_legacy(token)
+    if real:
+        return real
+    try:
+        page = http.get(f"https://news.google.com/rss/articles/{token}", allow_redirects=True, timeout=8)
+        html = page.text
+        sg = re.search(r'data-n-a-sg="([^"]+)"', html)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', html)
+        if not (sg and ts):
+            return ""
+        inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+                                "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], token, ts.group(1), sg.group(1)]
+        payload = [[["Fbv4je", json.dumps(inner), None, "generic"]]]
+        resp = http.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                         headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+                         data="f.req=" + quote(json.dumps(payload)), timeout=10)
+        return parse_gnews_batch_response(resp.text)
+    except Exception as exc:
+        log.debug("구글 뉴스 링크 변환 실패 %s: %s", url[:60], exc)
+        return ""
+
 
 def decode_html(resp: Any) -> str:
     """응답 바이트를 올바른 인코딩으로 디코드한다.
@@ -4822,6 +4898,10 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
 
     반환: (정규화된 canonical URL, HTML 본문). 실패 시 ("", "").
     """
+    if (urlsplit(url).hostname or "").lower().endswith("news.google.com") and gnews_token(url):
+        real = resolve_gnews_url(http, url)
+        if real:
+            url = real
     try:
         # 본문 페이지는 8초 안에 응답 없으면 포기한다. 느린 사이트 하나가
         # 1회 실행 전체를 지연시키지 않게 한다. (PRD §6 실행 시간)
@@ -12171,6 +12251,31 @@ def cmd_trace(ctx: Context, url: str) -> dict:
     return res
 
 
+def cmd_retitle(ctx: Context, url: str) -> dict:
+    """저장된 기사 한 건의 제목을 원문에서 다시 읽어 바로잡는다(예전 제목 추출 오류로 잘린 제목 정정).
+
+    주소로 기사를 찾아 원문 제목이 지금 저장된 제목과 다르고 더 길 때만 고친다.
+    """
+    url = (url or "").strip()
+    out = {"found": False, "changed": False, "old": "", "new": ""}
+    if not url.startswith(("http://", "https://")):
+        log.warning("사용법: retitle <기사 주소 전체>")
+        return out
+    row = ctx.storage.find_by_canonical(normalize_url(url))
+    if not row:
+        log.info("[제목 정정] 저장된 기사가 없습니다: %s", url)
+        return out
+    out["found"], out["old"] = True, row.get("title") or ""
+    _final, html = resolve_canonical(HttpClient(), url)
+    new = extract_title(html) if html else ""
+    out["new"] = new
+    if new and new != out["old"] and len(new) >= len(out["old"]):
+        ctx.storage.update_article(row["id"], {"title": new})
+        out["changed"] = True
+    log.info("[제목 정정] %s → %s%s", out["old"][:40], new[:50] or "(원문 제목 못 읽음)", "" if out["changed"] else " (변경 없음)")
+    return out
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16528,6 +16633,27 @@ def cmd_selftest() -> int:
            extract_title("<meta content='LG전자, 美 대학에 \"체험공간\" 개관 - 워크투데이' property='og:title'>"),
            extract_title("<title>일반 제목입니다 | 언론사</title>")],
           ["포스코퓨처엠 '깜짝 실적'은 보상금 착시…LFP 전환이 진짜 시험대", 'LG전자, 美 대학에 "체험공간" 개관', "일반 제목입니다"])
+    import base64 as _b64
+    _real = "https://www.leadeconomy.co.kr/news/articleView.html?idxno=10977"
+    _tok_old = _b64.urlsafe_b64encode(b"\x08\x13\x22" + bytes([len(_real)]) + _real.encode() + b"\xd2\x01\x00").decode().rstrip("=")
+    _tok_new = _b64.urlsafe_b64encode(b"\x08\x13\x22" + bytes([14]) + b"AU_yqLabcdefgh" + b"\xd2\x01\x00").decode().rstrip("=")
+    check("구글 링크 토큰 — 옛 형식은 주소를 바로 풀고, 새 형식·깨진 토큰은 ''(batchexecute 로 넘어감)",
+          [decode_gnews_token_legacy(_tok_old), decode_gnews_token_legacy(_tok_new), decode_gnews_token_legacy("!!!"),
+           gnews_token("https://news.google.com/rss/articles/CBMiABC123?oc=5"), gnews_token("https://example.com/a")],
+          [_real, "", "", "CBMiABC123", ""])
+    check("구글 batchexecute 응답 — 실제 기사 주소를 꺼내고, 형식이 다르면 ''",
+          [parse_gnews_batch_response(")]}'\n\n" + json.dumps([["wrb.fr", "Fbv4je", json.dumps(["garturlres", _real, 1])]])),
+           parse_gnews_batch_response("엉뚱한 응답")], [_real, ""])
+    _g2 = globals()
+    _old_get2 = HttpClient.get
+    try:
+        HttpClient.get = lambda self, u, **k: SimpleNamespace(
+            url=u, status_code=200, text="<html><title>제목입니다 시험</title></html>", content="<html><title>제목입니다 시험</title></html>".encode(),
+            encoding="utf-8", apparent_encoding="utf-8", headers={"content-type": "text/html; charset=utf-8"}, raise_for_status=lambda: None)
+        _canon, _h = resolve_canonical(HttpClient(), "https://news.google.com/rss/articles/" + _tok_old + "?oc=5")
+    finally:
+        HttpClient.get = _old_get2
+    check("구글 RSS 링크 변환 — 옛 형식 토큰이면 실제 기사 주소로 받아 온다", _canon.startswith("https://www.leadeconomy.co.kr/news/articleView.html"), True)
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
           (True, "포스코퓨처엠", "통과", True))
@@ -17594,6 +17720,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  retitle <기사주소>  저장된 기사의 잘린 제목을 원문에서 다시 읽어 바로잡기
   trace <기사주소>  그 기사가 왜 수집되지 않았는지 끝까지 추적(저장·원장·원문·관문·구글 RSS, 읽기 전용)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
   fillauthors [N] [--dry]  기자명이 빈 최근 기사 N건(기본 150)의 원문을 다시 받아 기자명 채우기
@@ -17682,6 +17809,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "retitle":
+        cmd_retitle(ctx, " ".join(argv[2:]))
     elif command == "trace":
         cmd_trace(ctx, " ".join(argv[2:]))
     elif command == "why":
