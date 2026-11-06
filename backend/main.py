@@ -12237,7 +12237,7 @@ def cmd_trace(ctx: Context, url: str) -> dict:
                 log.info("     ↳ 흡수한 기사: [%s] %s · 상태 %s · 대표 %s", (owner.get("press_name") or "")[:10],
                          (owner.get("title") or "")[:46], owner.get("status"), owner.get("is_representative"))
             res["ledger"] = res["ledger"] or ctx.storage.ledger_reason(norm) or "별칭"
-            why_l = {"별칭": "같은 사건 기사에 흡수(위 줄 참고)", "off_topic": "무관 기사로 판정돼 제외", "extract_failed": "원문 접속·추출에 실패해 제외",
+            why_l = {"별칭": "정확한 곳을 못 찾음(제목 검색 결과 ⑤ 참고)", "off_topic": "무관 기사로 판정돼 제외", "extract_failed": "원문 접속·추출에 실패해 제외",
                      "stale": "발행이 오래돼 제외", "no_pubdate": "발행시각을 못 읽어 제외"}.get(res["ledger"], res["ledger"])
             log.info("  ① 수집 원장(제외 기록)이나 별칭에 있음 → 이미 한 번 본 주소라 다시 안 받음. 제외 사유: %s", why_l)
             if res["ledger"] in ("off_topic", "extract_failed", "no_pubdate", "stale"):
@@ -12257,6 +12257,19 @@ def cmd_trace(ctx: Context, url: str) -> dict:
         return res
     res["fetched"] = True
     log.info("  ② 원문 확보 — 제목: %s | 본문 %d자 | 발행 %s", title[:50], len(body), pub.isoformat()[:16] if pub else "읽지 못함(발행시각 없으면 수집 제외 사유)")
+    # ②-b 제목으로 저장된 기사 찾기 — 주소 표기(http/https·www)가 달라 ①에서 못 찾은 같은 기사를 잡는다
+    try:
+        key = title[:12].strip()          # 제목 앞 12자 그대로(부분 일치)
+        same = ctx.storage.find_articles_any_status(key, 6) if key else []
+        res["same_title"] = [(r.get("id"), r.get("status"), r.get("is_representative")) for r in same]
+        if same:
+            for r in same:
+                log.info("  ②-b 제목 비슷한 저장 기사 · [%s] %s · 상태 %s · 대표 %s · 수집 %s", (r.get("press_name") or "")[:8],
+                         (r.get("title") or "")[:40], r.get("status"), r.get("is_representative"), str(r.get("collected_at") or "")[:16])
+        else:
+            log.info("  ②-b 제목 앞부분 '%s' 로 저장된 기사 없음", key[:20])
+    except Exception as exc:
+        log.info("  ②-b 제목 검색 실패: %s", _brief_error(exc))
     # ③ 관문
     groups = normalize_group_list(detect_group_companies(f"{title}\n{group_lead_text(body)}"))
     gates = [
@@ -16750,6 +16763,7 @@ def cmd_selftest() -> int:
     _ro3 = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576")
     check("reopen --url — 사유를 알려 주고(미리보기는 안 지움), 실행하면 그 한 건만 지우며, 없으면 0건",
           (_ro["reason"], _ro["deleted"], _ro2["deleted"], _ro3["reason"], _ro3["deleted"]), ("stale", 0, 1, "", 0))
+    check("수집 추적(trace) — 제목 비슷한 저장 기사(②-b)도 함께 찾는다", isinstance(_tr.get("same_title"), list), True)
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
           (True, "포스코퓨처엠", "통과", True))
