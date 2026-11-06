@@ -2561,6 +2561,9 @@ SEED_FEEDS: list[tuple[str, str, str, bool]] = [
     ("rss", "아시아경제", "https://www.asiae.co.kr/rss/stock.htm", True),
     ("rss", "뉴시스 경제", "https://newsis.com/RSS/economy.xml", True),
     ("rss", "전기신문", "https://www.electimes.com/rss/allArticle.xml", True),
+    # 네이버·다음에 안 잡히는 매체 보강 (2026-11-06 사용자 지적: 한스경제 '포스코홀딩스…', 리드경제 '포스코퓨처엠 깜짝 실적' 누락)
+    ("rss", "한스경제", "http://www.hansbiz.co.kr/rss/allArticle.xml", True),
+    ("rss", "리드경제", "https://www.leadeconomy.co.kr/rss/allArticle.xml", True),
     # 인사·부고 전용 스트림 (다른 매체의 [부고]·[인사] 는 위 피드·네이버에서 제목으로 잡힌다)
     ("rss", "연합뉴스 인물", "https://www.yna.co.kr/rss/people.xml", True),
 ]
@@ -2682,7 +2685,7 @@ SEED_PRESS: dict[str, tuple[str, int]] = {
     "financialreview.co.kr": ("파이낸셜리뷰", 3), "dealsite.co.kr": ("딜사이트", 2),
     "autotimes.co.kr": ("오토타임즈", 3), "businesskorea.co.kr": ("비즈니스코리아", 3),
     "businesspost.co.kr": ("비즈니스포스트", 2), "dailycar.co.kr": ("데일리카", 3),
-    "dongascience.com": ("동아사이언스", 2), "hansbiz.co.kr": ("한스경제", 3),
+    "dongascience.com": ("동아사이언스", 2), "hansbiz.co.kr": ("한스경제", 3), "leadeconomy.co.kr": ("리드경제", 3),
     "industrynews.co.kr": ("인더스트리뉴스", 3), "mediawatch.kr": ("미디어워치", 3),
     "newsworker.co.kr": ("뉴스워커", 3), "the-biz.co.kr": ("더비즈온", 3),
     "srtimes.kr": ("SR타임스", 3), "ulsanpress.net": ("울산신문", 3),
@@ -4823,82 +4826,6 @@ def collect_rss_feeds(http: HttpClient, feeds: Sequence[dict]) -> list[RawItem]:
 
 GOOGLE_HOSTS = ("news.google.com", "google.com")
 
-# ── 구글 뉴스 RSS 링크 → 실제 기사 주소 ────────────────────────────────────
-# 구글 RSS 항목의 링크(news.google.com/rss/articles/<토큰>)는 더 이상 GET 으로 따라가면 기사로 이동하지 않는다
-# (2026-11-06 서버 점검: 같은 결과 5건 중 변환 성공 0건 → 구글 전용 기사 전부 누락). 토큰 안에 주소가 들어 있는
-# 옛 형식은 직접 풀고, 새 형식(AU_yqL…)은 구글의 batchexecute 응답으로 푼다. 새 라이브러리는 쓰지 않는다.
-_GNEWS_TOKEN_RE = re.compile(r"/(?:rss/)?articles/([A-Za-z0-9_\-]+)")
-
-
-def gnews_token(url: str) -> str:
-    m = _GNEWS_TOKEN_RE.search(urlsplit(url or "").path)
-    return m.group(1) if m else ""
-
-
-def decode_gnews_token_legacy(token: str) -> str:
-    """토큰에 기사 주소가 그대로 들어 있는 옛 형식을 푼다. 못 풀거나 새 형식이면 ''."""
-    import base64
-    try:
-        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-    except Exception:
-        return ""
-    prefix, suffix = b"\x08\x13\x22", b"\xd2\x01\x00"
-    if raw.startswith(prefix):
-        raw = raw[len(prefix):]
-    if raw.endswith(suffix):
-        raw = raw[:-len(suffix)]
-    if not raw:
-        return ""
-    length = raw[0]
-    if length >= 0x80 and len(raw) > 1:
-        body = raw[2:length + 1]
-    else:
-        body = raw[1:length + 1]
-    try:
-        text = body.decode("utf-8")
-    except UnicodeDecodeError:
-        return ""
-    return text if text.startswith(("http://", "https://")) else ""
-
-
-def parse_gnews_batch_response(text: str) -> str:
-    """batchexecute 응답 본문에서 실제 기사 주소를 꺼낸다. 못 꺼내면 ''."""
-    try:
-        chunk = text.split("\n\n", 1)[1] if "\n\n" in text else text
-        data = json.loads(chunk)
-        inner = json.loads(data[0][2])
-        url = inner[1]
-        return url if isinstance(url, str) and url.startswith(("http://", "https://")) else ""
-    except Exception:
-        return ""
-
-
-def resolve_gnews_url(http: "HttpClient", url: str) -> str:
-    """구글 뉴스 RSS 링크의 실제 기사 주소. 실패하면 ''."""
-    token = gnews_token(url)
-    if not token:
-        return ""
-    real = decode_gnews_token_legacy(token)
-    if real:
-        return real
-    try:
-        page = http.get(f"https://news.google.com/rss/articles/{token}", allow_redirects=True, timeout=8)
-        html = page.text
-        sg = re.search(r'data-n-a-sg="([^"]+)"', html)
-        ts = re.search(r'data-n-a-ts="([^"]+)"', html)
-        if not (sg and ts):
-            return ""
-        inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
-                                "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], token, ts.group(1), sg.group(1)]
-        payload = [[["Fbv4je", json.dumps(inner), None, "generic"]]]
-        resp = http.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
-                         headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
-                         data="f.req=" + quote(json.dumps(payload)), timeout=10)
-        return parse_gnews_batch_response(resp.text)
-    except Exception as exc:
-        log.debug("구글 뉴스 링크 변환 실패 %s: %s", url[:60], exc)
-        return ""
-
 
 def decode_html(resp: Any) -> str:
     """응답 바이트를 올바른 인코딩으로 디코드한다.
@@ -4944,10 +4871,6 @@ def resolve_canonical(http: HttpClient, url: str) -> tuple[str, str]:
 
     반환: (정규화된 canonical URL, HTML 본문). 실패 시 ("", "").
     """
-    if (urlsplit(url).hostname or "").lower().endswith("news.google.com") and gnews_token(url):
-        real = resolve_gnews_url(http, url)
-        if real:
-            url = real
     try:
         # 본문 페이지는 8초 안에 응답 없으면 포기한다. 느린 사이트 하나가
         # 1회 실행 전체를 지연시키지 않게 한다. (PRD §6 실행 시간)
@@ -12298,25 +12221,6 @@ def cmd_trace(ctx: Context, url: str) -> dict:
                  or host in str((e.get("source", {}) or {}).get("href", ""))]
         res["rss"].append((q, len(ents), len(found)))
         log.info("  ④ 구글 RSS '%s' → 결과 %d건 중 이 기사 %s", q[:24], len(ents), "있음" if found else "없음")
-        if found and not res.get("rss_link_checked"):
-            # 구글 RSS 항목은 news.google.com 중간 링크라, 수집기가 이 링크를 실제 기사 주소로 바꿔야 본문을 받는다.
-            res["rss_link_checked"] = True
-            lk = found[0].get("link", "")
-            nlk = normalize_url(lk)
-            try:
-                already = nlk in ctx.storage.seen_url_sources([nlk])
-            except Exception:
-                already = False
-            real, _h = resolve_canonical(http, lk)
-            res["rss_resolve"] = bool(real)
-            log.info("  ④-a 이 기사의 구글 링크 → 이미 처리한 주소(저장·원장) %s", "예" if already else "아니오")
-            log.info("  ④-b 구글 링크를 실제 기사 주소로 바꾸기 → %s", ("성공: " + real[:70]) if real else
-                     "실패 ← 이러면 수집기가 본문을 못 받고 이 기사를 버립니다(구글 링크는 제목만으로 이어가지 않음)")
-            # 같은 결과 앞쪽 5건도 시험해 '이 기사만의 문제인지, 전체가 그런지' 본다
-            sample = [e for e in ents if e.get("link")][:5]
-            okc = sum(1 for e in sample if resolve_canonical(http, e["link"])[0])
-            res["rss_sample"] = (okc, len(sample))
-            log.info("  ④-c 같은 결과 앞쪽 %d건 중 구글 링크 변환 성공 %d건", len(sample), okc)
     log.info("[수집 추적] 끝 — ①에서 기록이 없고 ④가 '없음'이면 검색 결과에 안 나온 것, ④가 '있음'인데 ①이 비면 수집 순서·접속 문제입니다.")
     return res
 
@@ -16764,27 +16668,6 @@ def cmd_selftest() -> int:
            extract_title("<meta content='LG전자, 美 대학에 \"체험공간\" 개관 - 워크투데이' property='og:title'>"),
            extract_title("<title>일반 제목입니다 | 언론사</title>")],
           ["포스코퓨처엠 '깜짝 실적'은 보상금 착시…LFP 전환이 진짜 시험대", 'LG전자, 美 대학에 "체험공간" 개관', "일반 제목입니다"])
-    import base64 as _b64
-    _real = "https://www.leadeconomy.co.kr/news/articleView.html?idxno=10977"
-    _tok_old = _b64.urlsafe_b64encode(b"\x08\x13\x22" + bytes([len(_real)]) + _real.encode() + b"\xd2\x01\x00").decode().rstrip("=")
-    _tok_new = _b64.urlsafe_b64encode(b"\x08\x13\x22" + bytes([14]) + b"AU_yqLabcdefgh" + b"\xd2\x01\x00").decode().rstrip("=")
-    check("구글 링크 토큰 — 옛 형식은 주소를 바로 풀고, 새 형식·깨진 토큰은 ''(batchexecute 로 넘어감)",
-          [decode_gnews_token_legacy(_tok_old), decode_gnews_token_legacy(_tok_new), decode_gnews_token_legacy("!!!"),
-           gnews_token("https://news.google.com/rss/articles/CBMiABC123?oc=5"), gnews_token("https://example.com/a")],
-          [_real, "", "", "CBMiABC123", ""])
-    check("구글 batchexecute 응답 — 실제 기사 주소를 꺼내고, 형식이 다르면 ''",
-          [parse_gnews_batch_response(")]}'\n\n" + json.dumps([["wrb.fr", "Fbv4je", json.dumps(["garturlres", _real, 1])]])),
-           parse_gnews_batch_response("엉뚱한 응답")], [_real, ""])
-    _g2 = globals()
-    _old_get2 = HttpClient.get
-    try:
-        HttpClient.get = lambda self, u, **k: SimpleNamespace(
-            url=u, status_code=200, text="<html><title>제목입니다 시험</title></html>", content="<html><title>제목입니다 시험</title></html>".encode(),
-            encoding="utf-8", apparent_encoding="utf-8", headers={"content-type": "text/html; charset=utf-8"}, raise_for_status=lambda: None)
-        _canon, _h = resolve_canonical(HttpClient(), "https://news.google.com/rss/articles/" + _tok_old + "?oc=5")
-    finally:
-        HttpClient.get = _old_get2
-    check("구글 RSS 링크 변환 — 옛 형식 토큰이면 실제 기사 주소로 받아 온다", _canon.startswith("https://www.leadeconomy.co.kr/news/articleView.html"), True)
     _lt2 = _tmp
     _lt2.upsert_ledger("https://www.hansbiz.co.kr/news/articleView.html?idxno=880576", "stale")
     _ro = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576", dry=True)
@@ -16795,6 +16678,10 @@ def cmd_selftest() -> int:
     _ss = cmd_sourcestat(SimpleNamespace(storage=_tmp), 72)
     check("수집 경로 통계(sourcestat) — 경로별 합계가 전체와 같다", sum(_ss["by_source"].values()) == _ss["total"], True)
     check("수집 추적(trace) — 제목 비슷한 저장 기사(②-b)도 함께 찾는다", isinstance(_tr.get("same_title"), list), True)
+    check("피드 시드 — 한스경제·리드경제 RSS 가 켜진 채로 들어 있고, 구글 RSS 는 꺼져 있다(PRD §7-4)",
+          ({(t, n): (u, en) for t, n, u, en in SEED_FEEDS}.get(("rss", "한스경제"), ("", False))[1],
+           {(t, n): (u, en) for t, n, u, en in SEED_FEEDS}.get(("rss", "리드경제"), ("", False))[1],
+           [en for t, n, u, en in SEED_FEEDS if t == "google_rss"]), (True, True, [False]))
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
           (True, "포스코퓨처엠", "통과", True))
