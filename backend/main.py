@@ -12279,6 +12279,39 @@ def cmd_sourcestat(ctx: Context, hours: int = 24) -> dict:
     return {"total": len(rows), "by_source": dict(by_src), "by_hour": {k: dict(v) for k, v in by_hour.items()}}
 
 
+def cmd_feedtest(ctx: Context, name: str = "") -> list[dict]:
+    """언론사 RSS 피드를 지금 한 번 받아 보고 '피드 전체 몇 건 → 키워드 통과 몇 건 → 이미 처리 몇 건 → 새로 들어올 몇 건'을 알려 준다.
+
+    읽기 전용(아무것도 저장하지 않는다). name 을 주면 이름에 그 말이 든 피드만 본다(예: 한스경제).
+    새 RSS 를 추가한 뒤 실제로 후보가 들어오는지 확인하는 용도다.
+    """
+    http = ctx.http if getattr(ctx, "http", None) else HttpClient()
+    feeds = [f for f in ctx.storage.enabled_feeds() if f.get("source_type") == "rss"
+             and (not name or name in (f.get("name") or ""))]
+    kws = [k["keyword"] for k in ctx.storage.enabled_keywords()]
+    out: list[dict] = []
+    if not feeds:
+        log.info("[피드 점검] 켜진 언론사 RSS 가 없습니다%s", f" ('{name}' 이름 포함)" if name else "")
+        return out
+    for f in feeds:
+        items = collect_rss_feeds(http, [f])
+        passed = [i for i in items if matches_keywords(f"{i.title} {i.snippet}", kws) or people_news_kind(i.url_source, i.title)]
+        try:
+            seen = ctx.storage.seen_url_sources([i.url_source for i in passed]) if passed else set()
+        except Exception:
+            seen = set()
+        fresh = [i for i in passed if i.url_source not in seen]
+        rec = {"name": f.get("name"), "items": len(items), "passed": len(passed), "seen": len(seen), "new": len(fresh)}
+        out.append(rec)
+        log.info("[피드 점검] %s — 피드 %d건 → 키워드 통과 %d건 → 이미 처리 %d건 → 새로 들어올 후보 %d건",
+                 rec["name"], rec["items"], rec["passed"], rec["seen"], rec["new"])
+        for i in passed[:6]:
+            log.info("    · %s | %s", "처리됨" if i.url_source in seen else "새 후보", (i.title or "")[:50])
+        if not items:
+            log.info("    ↳ 피드를 못 받았거나 비어 있습니다(주소·접속 확인 필요)")
+    return out
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16675,6 +16708,20 @@ def cmd_selftest() -> int:
     _ro3 = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576")
     check("reopen --url — 사유를 알려 주고(미리보기는 안 지움), 실행하면 그 한 건만 지우며, 없으면 0건",
           (_ro["reason"], _ro["deleted"], _ro2["deleted"], _ro3["reason"], _ro3["deleted"]), ("stale", 0, 1, "", 0))
+    _fh = SimpleNamespace(content=("<?xml version='1.0'?><rss><channel>"
+                                   "<item><title>포스코홀딩스 3분기 실적</title><link>https://www.hansbiz.co.kr/news/articleView.html?idxno=1</link></item>"
+                                   "<item><title>무관한 지역 소식</title><link>https://www.hansbiz.co.kr/news/articleView.html?idxno=2</link></item>"
+                                   "</channel></rss>").encode("utf-8"), status_code=200, raise_for_status=lambda: None)
+    _old_get3 = HttpClient.get
+    try:
+        HttpClient.get = lambda self, u, **k: _fh
+        _tmp.upsert_keyword = getattr(_tmp, "upsert_keyword", None)
+        _fts = cmd_feedtest(SimpleNamespace(storage=SimpleNamespace(
+            enabled_feeds=lambda: [{"source_type": "rss", "name": "한스경제", "url": "http://x.test/rss"}],
+            enabled_keywords=lambda: [{"keyword": "포스코홀딩스"}], seen_url_sources=lambda urls: set()), http=HttpClient()), "한스경제")
+    finally:
+        HttpClient.get = _old_get3
+    check("피드 점검(feedtest) — 피드 2건 중 키워드 통과 1건, 새 후보 1건", (_fts[0]["items"], _fts[0]["passed"], _fts[0]["new"]), (2, 1, 1))
     _ss = cmd_sourcestat(SimpleNamespace(storage=_tmp), 72)
     check("수집 경로 통계(sourcestat) — 경로별 합계가 전체와 같다", sum(_ss["by_source"].values()) == _ss["total"], True)
     check("수집 추적(trace) — 제목 비슷한 저장 기사(②-b)도 함께 찾는다", isinstance(_tr.get("same_title"), list), True)
@@ -17749,6 +17796,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  feedtest [피드이름]  언론사 RSS 를 지금 받아 '피드→키워드 통과→이미 처리→새 후보' 건수를 보여 줌(읽기 전용, 예: feedtest 한스경제)
   sourcestat [시간]  최근 수집 기사를 수집 경로(naver_api·google_rss·manual …)·시간대별로 센다(읽기 전용, 기본 24시간)
   retitle <기사주소>  저장된 기사의 잘린 제목을 원문에서 다시 읽어 바로잡기
   trace <기사주소>  그 기사가 왜 수집되지 않았는지 끝까지 추적(저장·원장·원문·관문·구글 RSS, 읽기 전용)
@@ -17839,6 +17887,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "feedtest":
+        cmd_feedtest(ctx, " ".join(argv[2:]))
     elif command == "sourcestat":
         _hn = [int(a) for a in argv[2:] if a.isdigit()]
         cmd_sourcestat(ctx, _hn[0] if _hn else 24)
