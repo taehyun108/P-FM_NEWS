@@ -12312,6 +12312,36 @@ def cmd_feedtest(ctx: Context, name: str = "") -> list[dict]:
     return out
 
 
+def cmd_queuestat(ctx: Context) -> dict:
+    """AI 분석 대기열 상태 — 수집은 됐는데 분석이 안 끝나 화면에 안 뜨는 기사가 얼마나 쌓였는지 본다(읽기 전용).
+
+    ① 본문 확보 후 분석 대기 ② 메타만 저장된(deferred) 대기 ③ 오늘 AI 호출 수 / 일일 상한 ④ 대기 중 오래된 기사 샘플.
+    분석이 끝나야 목록에 뜨므로, 대기열이 줄지 않으면 '누락처럼' 보인다.
+    """
+    cfg = getattr(ctx, "cfg", None)
+    out: dict = {}
+    try:
+        out["unanalyzed"] = ctx.storage.unanalyzed_count()
+        out["deferred"] = ctx.storage.deferred_count()
+        out["llm_today"] = ctx.storage.llm_calls_today()
+    except Exception as exc:
+        log.warning("[분석 대기열] 조회 실패: %s", _brief_error(exc))
+        return out
+    lim = getattr(cfg, "llm_daily_limit", None)
+    per = getattr(cfg, "llm_per_run", None)
+    log.info("[분석 대기열] 분석 대기(본문 확보됨) %d건 · 메타만 저장(deferred) %d건 · 오늘 AI 호출 %d회 / 일일 상한 %s · 회차당 분석 %s건",
+             out["unanalyzed"], out["deferred"], out["llm_today"], lim if lim is not None else "?", per if per is not None else "?")
+    if lim and out["llm_today"] >= lim:
+        log.info("  ⚠ 오늘 AI 호출이 일일 상한에 도달했습니다 → 새 기사 분석이 내일까지 멈춰 있고, 그동안 기사는 저장만 되고 목록에는 안 뜹니다.")
+    kst = timezone(timedelta(hours=9))
+    for label, rows in (("분석 대기", ctx.storage.unanalyzed_articles(8)), ("deferred", ctx.storage.deferred_articles(8))):
+        for r in rows[:8]:
+            pub = parse_dt(r.get("published_at"))
+            log.info("  · [%s] %s | 발행 %s | 점수 %s", label, (r.get("title") or "")[:44],
+                     pub.astimezone(kst).strftime("%m-%d %H:%M") if pub else "?", r.get("importance_score"))
+    return out
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16722,6 +16752,8 @@ def cmd_selftest() -> int:
     finally:
         HttpClient.get = _old_get3
     check("피드 점검(feedtest) — 피드 2건 중 키워드 통과 1건, 새 후보 1건", (_fts[0]["items"], _fts[0]["passed"], _fts[0]["new"]), (2, 1, 1))
+    _qs = cmd_queuestat(SimpleNamespace(storage=_tmp, cfg=SimpleNamespace(llm_daily_limit=1500, llm_per_run=6)))
+    check("분석 대기열(queuestat) — 대기·호출 수를 숫자로 돌려준다", all(k in _qs for k in ("unanalyzed", "deferred", "llm_today")), True)
     _ss = cmd_sourcestat(SimpleNamespace(storage=_tmp), 72)
     check("수집 경로 통계(sourcestat) — 경로별 합계가 전체와 같다", sum(_ss["by_source"].values()) == _ss["total"], True)
     check("수집 추적(trace) — 제목 비슷한 저장 기사(②-b)도 함께 찾는다", isinstance(_tr.get("same_title"), list), True)
@@ -17796,6 +17828,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  queuestat  AI 분석 대기열 상태(대기 건수·오늘 AI 호출/상한·오래 밀린 기사, 읽기 전용)
   feedtest [피드이름]  언론사 RSS 를 지금 받아 '피드→키워드 통과→이미 처리→새 후보' 건수를 보여 줌(읽기 전용, 예: feedtest 한스경제)
   sourcestat [시간]  최근 수집 기사를 수집 경로(naver_api·google_rss·manual …)·시간대별로 센다(읽기 전용, 기본 24시간)
   retitle <기사주소>  저장된 기사의 잘린 제목을 원문에서 다시 읽어 바로잡기
@@ -17887,6 +17920,8 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "queuestat":
+        cmd_queuestat(ctx)
     elif command == "feedtest":
         cmd_feedtest(ctx, " ".join(argv[2:]))
     elif command == "sourcestat":
