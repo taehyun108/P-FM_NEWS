@@ -5190,20 +5190,36 @@ def extract_thumbnail(html: str) -> str:
     return html_mod.unescape(m.group(1)) if m else ""
 
 
+def _meta_content(html: str, attr: str, name: str) -> str:
+    """<meta attr="name" content="..."> 의 content. 따옴표 종류를 맞춰 읽는다 — 제목 속 작은따옴표('깜짝 실적')에서 잘리지 않게.
+
+    예전엔 [^"']+ 로 읽어서 content="포스코퓨처엠 '깜짝 실적'은…" 이 '포스코퓨처엠 ' 에서 끊겼다(2026-11-06 리드경제 기사 누락·제목 오류).
+    속성 순서(content 가 앞)도 함께 본다.
+    """
+    h = html or ""
+    for pat in (
+        rf'<meta[^>]+{attr}=(["\'])\s*{re.escape(name)}\s*\1[^>]*?\scontent=(["\'])(.*?)\2',
+        rf'<meta[^>]+content=(["\'])(.*?)\1[^>]*?\s{attr}=(["\'])\s*{re.escape(name)}\s*\3',
+    ):
+        m = re.search(pat, h, re.I | re.S)
+        if m:
+            return m.group(3) if m.re.pattern.startswith("<meta[^>]+" + attr) else m.group(2)
+    return ""
+
+
 def extract_title(html: str) -> str:
     """수동 URL 등록용 — 피드 제목이 없을 때 HTML 에서 제목을 뽑는다."""
-    for pattern in (
-        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+name=["\']title["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<title[^>]*>([^<]+)</title>',
-    ):
-        m = re.search(pattern, html or "", re.I)
-        if m:
-            title = clean_text(m.group(1))
-            # ' - 언론사' 같은 사이트명 꼬리 정리
-            title = re.sub(r'\s*[|·\-–—]\s*[^|·\-–—]{1,25}$', '', title).strip()
-            if len(title) >= 5:
-                return title
+    cands = [_meta_content(html, "property", "og:title"), _meta_content(html, "name", "title")]
+    m = re.search(r'<title[^>]*>([^<]+)</title>', html or "", re.I)
+    cands.append(m.group(1) if m else "")
+    for raw in cands:
+        if not raw:
+            continue
+        title = clean_text(raw)
+        # ' - 언론사' 같은 사이트명 꼬리 정리
+        title = re.sub(r'\s*[|·\-–—]\s*[^|·\-–—]{1,25}$', '', title).strip()
+        if len(title) >= 5:
+            return title
     return ""
 
 
@@ -12083,6 +12099,8 @@ def cmd_trace(ctx: Context, url: str) -> dict:
         if row:
             res["stored"] = True
             log.info("  ① 이미 저장됨 — 상태 %s · 대표 %s · 제목 %s", row.get("status"), row.get("is_representative"), (row.get("title") or "")[:40])
+            if row.get("status") == "draft":
+                log.info("     ↳ draft 는 'URL로 포토카드 만들기'에서 미리보기만 만들고 등록을 안 누른 임시 저장입니다. 목록에 안 뜨고, 같은 주소의 자동 수집도 막습니다(24시간 뒤 자동 삭제, postdeploy 는 1시간 지난 것을 바로 삭제).")
         seen = ctx.storage.seen_url_sources([norm])
         if norm in seen and not row:
             res["ledger"] = "원장/별칭에 있음"
@@ -12502,7 +12520,12 @@ def cmd_postdeploy(ctx: Context, run: bool = False, ea_limit: int = 40) -> None:
     ① 카테고리 재태깅(정부/정책·통상환경 복원 포함) → ② 관련성 재점검(기본 미리보기, --run 이면 보관 처리)
     → ③ 대외협력 3줄 요약·시사점 재분석(하루 AI 상한 안에서). 각 단계는 서로 독립이라 하나가 실패해도 다음으로 간다.
     """
+    def _drafts() -> None:
+        n = ctx.storage.purge_stale_drafts(1)     # 등록도 취소도 안 한 미리보기는 같은 주소의 자동 수집을 막는다
+        log.info("등록 안 한 미리보기(draft) 정리: %d건", n)
+
     steps: list[tuple[str, Any]] = [
+        ("미리보기(draft) 정리", _drafts),
         ("카테고리 재태깅", lambda: cmd_fixcategories(ctx)),
         ("관련성 재점검" + ("" if run else "(미리보기)"), lambda: cmd_fixrelevance(ctx, dry=not run)),
     ]
@@ -16481,6 +16504,11 @@ def cmd_selftest() -> int:
         _tr = cmd_trace(SimpleNamespace(storage=_tmp), "https://www.leadeconomy.co.kr/news/articleView.html?idxno=1")
     finally:
         _g["resolve_canonical"], HttpClient.get = _old_rc, _old_get
+    check("제목 추출 — 제목 속 작은따옴표에서 잘리지 않고, 속성 순서가 바뀌어도 읽는다",
+          [extract_title('<meta property="og:title" content="포스코퓨처엠 \'깜짝 실적\'은 보상금 착시…LFP 전환이 진짜 시험대 - 리드경제"/>'),
+           extract_title("<meta content='LG전자, 美 대학에 \"체험공간\" 개관 - 워크투데이' property='og:title'>"),
+           extract_title("<title>일반 제목입니다 | 언론사</title>")],
+          ["포스코퓨처엠 '깜짝 실적'은 보상금 착시…LFP 전환이 진짜 시험대", 'LG전자, 美 대학에 "체험공간" 개관', "일반 제목입니다"])
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
           (True, "포스코퓨처엠", "통과", True))
