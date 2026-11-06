@@ -3648,8 +3648,8 @@ BATTERY_COMPANY_FALSE_HINTS: dict[str, list[str]] = {
 }
 
 
-def battery_company_hit(text: str) -> bool:
-    """배터리 생태계 회사명이 실제로 언급됐는가 (지명·학교명 오탐 제외)."""
+def battery_company_which(text: str) -> str:
+    """언급된 배터리 생태계 회사명(처음 걸린 하나). 없으면 ''. (지명·학교명 오탐 제외)"""
     t = text or ""
     for kw in BATTERY_COMPANY_KW:
         if kw not in t:
@@ -3661,8 +3661,13 @@ def battery_company_hit(text: str) -> bool:
                 stripped = stripped.replace(h, "")
             if kw not in stripped:
                 continue   # 지명·기관명 형태로만 나왔다 — 회사 언급 아님
-        return True
-    return False
+        return kw
+    return ""
+
+
+def battery_company_hit(text: str) -> bool:
+    """배터리 생태계 회사명이 실제로 언급됐는가 (지명·학교명 오탐 제외)."""
+    return bool(battery_company_which(text))
 
 
 # ── 인사·부고 (포스코 관점 없이 공지 원문만 요약) ───────────────────────
@@ -11988,8 +11993,13 @@ def cmd_why(ctx: Context, term: str) -> list[dict]:
             where = "제목" if POSCO_MENTION_RE.search(title) else ("요약" if POSCO_MENTION_RE.search(summary) else "본문")
             ctx_txt = re.sub(r"\s+", " ", probe[max(0, m.start() - 40): m.end() + 40])
             reasons.append(f"'{m.group(0)}' 언급({where}): …{ctx_txt}…")
-        if battery_company_hit(probe):
-            reasons.append("배터리 회사명 언급")
+        lead_probe = f"{title}\n{summary}\n{body[:1500]}"      # 실제 수집 관문이 보는 범위(제목·요약·본문 앞부분)
+        bc = battery_company_which(probe)
+        if bc:
+            where = "제목·리드" if battery_company_which(lead_probe) else "본문 뒤쪽(수집 관문은 안 보는 범위)"
+            at = probe.find(bc)
+            ctx_b = re.sub(r"\s+", " ", probe[max(0, at - 30): at + len(bc) + 30])
+            reasons.append(f"배터리 회사명 '{bc}' 언급({where}): …{ctx_b}…")
         if is_battery_scope(title, summary):
             reasons.append("배터리·이차전지 주제")
         if is_trade_topic(title, summary) or _kw_hit_any(title, TRADE_MEASURE_KW):
@@ -14462,6 +14472,9 @@ def cmd_selftest() -> int:
               ("탄소중립 로드맵 수정안 공개", ""), ("에너지 전환 속도 조절 논의", ""), ("금융위, 정책자금 5조 투입", ""),
               ("포스코퓨처엠 3분기 실적", "국무회의 언급"), ("주말 날씨 맑음", ""))],
           [True, True, True, True, True, True, False, False])
+    check("배터리 회사명 판별 — 어떤 회사명이 걸렸는지 돌려주고, 지명 형태·없는 경우는 빈 값",
+          [battery_company_which("LG전자 소식, 삼성SDI 협력"), battery_company_which("부산 금양읍 도시계획"), battery_company_which("LG전자 체험공간")],
+          ["삼성SDI", "", ""])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
