@@ -12148,6 +12148,25 @@ def cmd_trace(ctx: Context, url: str) -> dict:
                  or host in str((e.get("source", {}) or {}).get("href", ""))]
         res["rss"].append((q, len(ents), len(found)))
         log.info("  ④ 구글 RSS '%s' → 결과 %d건 중 이 기사 %s", q[:24], len(ents), "있음" if found else "없음")
+        if found and not res.get("rss_link_checked"):
+            # 구글 RSS 항목은 news.google.com 중간 링크라, 수집기가 이 링크를 실제 기사 주소로 바꿔야 본문을 받는다.
+            res["rss_link_checked"] = True
+            lk = found[0].get("link", "")
+            nlk = normalize_url(lk)
+            try:
+                already = nlk in ctx.storage.seen_url_sources([nlk])
+            except Exception:
+                already = False
+            real, _h = resolve_canonical(http, lk)
+            res["rss_resolve"] = bool(real)
+            log.info("  ④-a 이 기사의 구글 링크 → 이미 처리한 주소(저장·원장) %s", "예" if already else "아니오")
+            log.info("  ④-b 구글 링크를 실제 기사 주소로 바꾸기 → %s", ("성공: " + real[:70]) if real else
+                     "실패 ← 이러면 수집기가 본문을 못 받고 이 기사를 버립니다(구글 링크는 제목만으로 이어가지 않음)")
+            # 같은 결과 앞쪽 5건도 시험해 '이 기사만의 문제인지, 전체가 그런지' 본다
+            sample = [e for e in ents if e.get("link")][:5]
+            okc = sum(1 for e in sample if resolve_canonical(http, e["link"])[0])
+            res["rss_sample"] = (okc, len(sample))
+            log.info("  ④-c 같은 결과 앞쪽 %d건 중 구글 링크 변환 성공 %d건", len(sample), okc)
     log.info("[수집 추적] 끝 — ①에서 기록이 없고 ④가 '없음'이면 검색 결과에 안 나온 것, ④가 '있음'인데 ①이 비면 수집 순서·접속 문제입니다.")
     return res
 
