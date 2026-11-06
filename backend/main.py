@@ -12346,6 +12346,35 @@ def cmd_retitle(ctx: Context, url: str) -> dict:
     return out
 
 
+def cmd_sourcestat(ctx: Context, hours: int = 24) -> dict:
+    """최근 수집 기사를 수집 경로(naver_api·google_rss·daum·manual …)별·시간대별로 센다 — 읽기 전용.
+
+    구글 링크 변환을 고친 뒤 구글 경로(google_rss)로 기사가 다시 들어오는지, 경로별로 끊긴 시간대가 없는지 본다.
+    시간은 한국시간(KST) 기준이다.
+    """
+    hours = max(1, min(hours, 72))
+    since = now_utc() - timedelta(hours=hours)
+    rows = _retry(lambda: ctx.storage.list_articles(5000, 0, since, ""))
+    kst = timezone(timedelta(hours=9))
+    by_src: Counter = Counter()
+    by_hour: dict[str, Counter] = {}
+    for r in rows:
+        src = r.get("source_type") or "?"
+        by_src[src] += 1
+        ts = parse_iso_dt(r.get("collected_at")) if "parse_iso_dt" in globals() else None
+        if ts is None:
+            try:
+                ts = datetime.fromisoformat(str(r.get("collected_at")).replace("Z", "+00:00"))
+            except Exception:
+                continue
+        hk = ts.astimezone(kst).strftime("%m-%d %H시")
+        by_hour.setdefault(hk, Counter())[src] += 1
+    log.info("[수집 경로 통계] 최근 %d시간 수집 %d건 — %s", hours, len(rows), ", ".join(f"{k} {v}" for k, v in by_src.most_common()))
+    for hk in sorted(by_hour):
+        log.info("  %s  %s", hk, ", ".join(f"{k} {v}" for k, v in by_hour[hk].most_common()))
+    return {"total": len(rows), "by_source": dict(by_src), "by_hour": {k: dict(v) for k, v in by_hour.items()}}
+
+
 def cmd_find(ctx: Context, term: str) -> list[dict]:
     """제목에 term 이 든 기사를 '상태와 상관없이' 찾아 왜 목록에 안 보이는지 알려 준다 — 읽기 전용.
 
@@ -16763,6 +16792,8 @@ def cmd_selftest() -> int:
     _ro3 = cmd_reopen_url(SimpleNamespace(storage=_lt2), "https://www.hansbiz.co.kr/news/articleView.html?idxno=880576")
     check("reopen --url — 사유를 알려 주고(미리보기는 안 지움), 실행하면 그 한 건만 지우며, 없으면 0건",
           (_ro["reason"], _ro["deleted"], _ro2["deleted"], _ro3["reason"], _ro3["deleted"]), ("stale", 0, 1, "", 0))
+    _ss = cmd_sourcestat(SimpleNamespace(storage=_tmp), 72)
+    check("수집 경로 통계(sourcestat) — 경로별 합계가 전체와 같다", sum(_ss["by_source"].values()) == _ss["total"], True)
     check("수집 추적(trace) — 제목 비슷한 저장 기사(②-b)도 함께 찾는다", isinstance(_tr.get("same_title"), list), True)
     check("수집 추적(trace) — 원문 확보·관문 판정·구글 RSS 포함 여부까지 보고한다",
           (_tr["fetched"], dict(_tr["gates"]).get("그룹사 칩"), dict(_tr["gates"]).get("포스코 관련성"), bool(_tr["rss"]) and _tr["rss"][0][2] >= 1),
@@ -17831,6 +17862,7 @@ USAGE = """사용법: python backend/main.py <명령>
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
+  sourcestat [시간]  최근 수집 기사를 수집 경로(naver_api·google_rss·manual …)·시간대별로 센다(읽기 전용, 기본 24시간)
   retitle <기사주소>  저장된 기사의 잘린 제목을 원문에서 다시 읽어 바로잡기
   trace <기사주소>  그 기사가 왜 수집되지 않았는지 끝까지 추적(저장·원장·원문·관문·구글 RSS, 읽기 전용)
   why <말>   제목에 그 말이 든 기사가 왜 수집됐는지 점검 (읽기 전용, 예: why 포스텍)
@@ -17920,6 +17952,9 @@ def main(argv: Sequence[str]) -> int:
         cmd_fixnoise(ctx, dry="--run" not in argv[2:])
     elif command == "find":
         cmd_find(ctx, " ".join(argv[2:]))
+    elif command == "sourcestat":
+        _hn = [int(a) for a in argv[2:] if a.isdigit()]
+        cmd_sourcestat(ctx, _hn[0] if _hn else 24)
     elif command == "retitle":
         cmd_retitle(ctx, " ".join(argv[2:]))
     elif command == "trace":
