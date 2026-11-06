@@ -6769,6 +6769,18 @@ _DRAIN_FAILS: dict[str, tuple[int, float]] = {}
 DRAIN_FAIL_COOLDOWN_BASE_SEC = 600      # 실패 1회당 10분씩 쉬었다 다시, 최대 1시간
 
 
+DRAIN_FALLBACK_AFTER_FAILS = 3     # 본문을 이만큼 연속 못 받으면 제목·요약(메타 설명)만으로라도 분석한다
+
+
+def meta_description(html: str) -> str:
+    """HTML 의 og:description / meta description — 본문 추출이 안 되는 사이트(JS 렌더·차단)의 리드 대용."""
+    for attr, name in (("property", "og:description"), ("name", "description"), ("name", "twitter:description")):
+        d = clean_text(_meta_content(html, attr, name))
+        if len(d) >= 40:
+            return d
+    return ""
+
+
 def _drain_cooling(aid: str) -> bool:
     n, last = _DRAIN_FAILS.get(aid, (0, 0.0))
     return n >= 2 and (time.monotonic() - last) < min(3600, DRAIN_FAIL_COOLDOWN_BASE_SEC * n)
@@ -6824,6 +6836,13 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
                 _DRAIN_FAILS.pop(aid, None)
             else:
                 _drain_note_fail(aid)      # 연속 실패는 잠시 건너뛴다
+                if _DRAIN_FAILS.get(aid, (0, 0.0))[0] >= DRAIN_FALLBACK_AFTER_FAILS:
+                    # 계속 본문을 못 받는 사이트(403 차단·JS 렌더·접속 시간초과) — 수집 때 막힌 기사와 똑같이
+                    # '제목+메타 설명'만으로 분석해 화면에서 사라지지 않게 한다(요약 출처는 snippet).
+                    lead = meta_description(html) if html else ""
+                    storage.save_body(aid, lead or art["title"], "snippet")
+                    _DRAIN_FAILS.pop(aid, None)
+                    log.info("본문 확보 실패 %d회 → 제목·요약만으로 분석 대기로 전환: %s", DRAIN_FALLBACK_AFTER_FAILS, art["title"][:40])
             continue   # 다음 회차 재시도
         _DRAIN_FAILS.pop(aid, None)
 
@@ -16507,6 +16526,18 @@ def cmd_selftest() -> int:
         _drain_deferred(_hctx, 3, [])
     check("드레인 앞줄 막힘 방지 — 본문 못 받는 오래된 기사가 앞에 있어도 8회차 안에 뒤의 정상 기사가 분석된다",
           _tmp._one("select analyzed_at from articles where id='hl-good'")["analyzed_at"] is not None, True)
+    # 3회 연속 실패한 기사는 제목·요약만으로라도 분석 대기(snippet)로 넘어간다
+    _DRAIN_FAILS["hl-f5"] = (DRAIN_FALLBACK_AFTER_FAILS - 1, time.monotonic() - 99999)   # 쉬는 시간은 이미 지났다고 가정
+    _hctx2 = Context(cfg=_pcfg, storage=_tmp, http=_FakeHttpDrain(_pages))
+    _hctx2._llm = _StubAnalyzeLLM()
+    _drain_deferred(_hctx2, 40, [])
+    _fb = _tmp._one("select summary_source, body from article_bodies where article_id='hl-f5'")
+    check("드레인 대체 경로 — 본문을 3회 연속 못 받으면 제목만으로 snippet 분석 대기로 넘어간다",
+          (_fb or {}).get("summary_source"), "snippet")
+    check("meta_description — og:description 을 리드로 쓰고, 너무 짧으면 빈 값",
+          (meta_description('<meta property="og:description" content="포스코퓨처엠이 양극재 신규 라인을 증설한다고 6일 밝혔다. 투자 규모는 비공개다.">'),
+           meta_description('<meta property="og:description" content="짧음">')),
+          ("포스코퓨처엠이 양극재 신규 라인을 증설한다고 6일 밝혔다. 투자 규모는 비공개다.", ""))
     _DRAIN_FAILS.clear()
 
     print("\n[7-3] 네이버 키워드 교대 조회 — 일일 무료 한도 대응 (2026-09-15)")
