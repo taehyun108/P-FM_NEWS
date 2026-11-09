@@ -3684,6 +3684,11 @@ def is_battery_scope(title: str, extra: str = "") -> bool:
     if weak_hits >= 2:
         return True
     names = {k for k in _BATTERY_NAME_KW if _battery_name_in(probe, k)}
+    # 다른 뜻으로도 흔히 쓰이는 이름(테슬라 = 소맥 '테라+참이슬' 별명 등)은 전기차·배터리 맥락 낱말이 함께 있어야 한다.
+    #   사용자 지적 2026-11-09: 하이트진로 '"테슬라" 소맥' 기사가 제목의 '테슬라' 때문에 수집됨.
+    if names & _BATTERY_AMBIGUOUS_NAMES:
+        if not _kw_hit_any(probe, _BATTERY_CONTEXT_KW + _BATTERY_EV_CONTEXT_KW):
+            names = names - _BATTERY_AMBIGUOUS_NAMES
     if not names:
         return False
     if any(_battery_name_in(title or "", k) for k in names):
@@ -3729,6 +3734,9 @@ _BATTERY_ESS_RE = re.compile(r"(?<![A-Za-z])B?ESS(?![A-Za-z])")
 _BATTERY_TOPIC_KW = [k for k in BATTERY_SCOPE_KW
                      if k not in _BATTERY_NAME_KW and k not in _BATTERY_WEAK_TOPIC_KW and k not in ("ESS", "BESS")]
 # 회사명이 있어도 이 낱말이 제목·리드에 함께 있어야 '배터리 기사'로 본다 — 'LG에너지솔루션·LG화학 등 채용 연계' 같은 스침 방지
+_BATTERY_AMBIGUOUS_NAMES = frozenset({"테슬라", "Tesla", "리비안", "루시드", "파나소닉"})
+_BATTERY_EV_CONTEXT_KW = ("인도량", "인도 대수", "판매량", "자율주행", "로보택시", "사이버트럭", "사이버캡", "FSD", "슈퍼차저",
+                          "머스크", "전기 픽업", "주행거리", "kWh", "EV ", "모델Y", "모델 Y", "모델3", "모델 3", "오토파일럿")
 _BATTERY_CONTEXT_KW = ("배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "전기차", "전고체", "리튬", "니켈", "코발트",
                        "흑연", "ESS", "에너지저장", "셀 ", "충전")
 
@@ -14981,6 +14989,13 @@ def cmd_selftest() -> int:
            is_battery_scope("전기차 판매 급감, 업계 비상", ""),
            is_battery_scope("국내 기업 동향", "양극재 증설을 발표했다")],
           [False, False, False, True, True, True, True])
+    check("배터리 범위(모호한 이름) — 소맥 별명 '테슬라' 기사는 아니고, 테슬라 인도량·사이버캡 배터리 기사는 맞다",
+          [is_battery_scope("'테슬라' 소맥인데 이름은 '테라&참이슬'…하이트진로의 속사정", "하이트진로가 소비자 별칭 소맥을 캔 완제품으로 출시한다. 485mL 알코올 6.0도"),
+           is_battery_scope("테슬라 3분기 인도량 사상 최대"),
+           is_battery_scope("일론 머스크 \"사이버캡, 배터리 용량 줄이고 새로운 색상도 추가\"", ""),
+           is_battery_scope("파나소닉 신형 TV 출시", "올레드 화질을 개선했다"),
+           is_battery_scope("파나소닉, 미국 배터리 공장 증설", "")],
+          [False, True, True, False, True])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
