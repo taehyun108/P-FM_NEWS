@@ -3717,6 +3717,9 @@ BATTERY_COMPANY_KW = [
 BATTERY_COMPANY_FALSE_HINTS: dict[str, list[str]] = {
     "금양": ["금양읍", "금양면", "금양리", "금양동", "금양초", "금양중", "금양고", "금양역"],
     "천보": ["천보산", "천보사", "천보루"],
+    # 'SK온라인 게임'·'에코프로젝트'처럼 다른 단어의 앞부분일 뿐인 경우
+    "SK온": ["SK온라인", "SK온누리"],
+    "에코프로": ["에코프로젝트"],
 }
 
 
@@ -3734,7 +3737,9 @@ _BATTERY_ESS_RE = re.compile(r"(?<![A-Za-z])B?ESS(?![A-Za-z])")
 _BATTERY_TOPIC_KW = [k for k in BATTERY_SCOPE_KW
                      if k not in _BATTERY_NAME_KW and k not in _BATTERY_WEAK_TOPIC_KW and k not in ("ESS", "BESS")]
 # 회사명이 있어도 이 낱말이 제목·리드에 함께 있어야 '배터리 기사'로 본다 — 'LG에너지솔루션·LG화학 등 채용 연계' 같은 스침 방지
-_BATTERY_AMBIGUOUS_NAMES = frozenset({"테슬라", "Tesla", "리비안", "루시드", "파나소닉"})
+# 사람 이름·일상어와 겹치는 이름('천보 스님'·'샨샨 가수')도 배터리 문맥이 있어야 통과
+_BATTERY_AMBIGUOUS_NAMES = frozenset({"테슬라", "Tesla", "리비안", "루시드", "파나소닉",
+                                      "금양", "천보", "샨샨", "샨산"})
 _BATTERY_EV_CONTEXT_KW = ("인도량", "인도 대수", "판매량", "자율주행", "로보택시", "사이버트럭", "사이버캡", "FSD", "슈퍼차저",
                           "머스크", "전기 픽업", "주행거리", "kWh", "EV ", "모델Y", "모델 Y", "모델3", "모델 3", "오토파일럿")
 _BATTERY_CONTEXT_KW = ("배터리", "이차전지", "2차전지", "양극재", "음극재", "전구체", "전기차", "전고체", "리튬", "니켈", "코발트",
@@ -3748,6 +3753,9 @@ def _battery_name_in(text: str, kw: str) -> bool:
         return False
     for h in BATTERY_COMPANY_FALSE_HINTS.get(kw, ()):
         t = t.replace(h, "")
+    # 영문 이름(BYD·CATL·BTR…)은 다른 영문자·숫자 옆에 붙어 있으면 회사 언급이 아니다 — 'BYDG' 같은 것
+    if kw.isascii() and re.fullmatch(r"[A-Za-z0-9]+", kw):
+        return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])", t))
     return kw in t
 
 
@@ -3755,16 +3763,8 @@ def battery_company_which(text: str) -> str:
     """언급된 배터리 생태계 회사명(처음 걸린 하나). 없으면 ''. (지명·학교명 오탐 제외)"""
     t = text or ""
     for kw in BATTERY_COMPANY_KW:
-        if kw not in t:
-            continue
-        hints = BATTERY_COMPANY_FALSE_HINTS.get(kw)
-        if hints:
-            stripped = t
-            for h in hints:
-                stripped = stripped.replace(h, "")
-            if kw not in stripped:
-                continue   # 지명·기관명 형태로만 나왔다 — 회사 언급 아님
-        return kw
+        if _battery_name_in(t, kw):   # 지명·기관명·다른 단어의 일부는 회사 언급이 아니다
+            return kw
     return ""
 
 
@@ -14997,6 +14997,17 @@ def cmd_selftest() -> int:
            is_battery_scope("파나소닉, 미국 배터리 공장 증설", "")],
           [False, True, True, False, True])
     check("SK이노베이션 — 배터리 회사명으로 인정", battery_company_hit("SK이노베이션, 3분기 실적 발표"), True)
+    check("배터리 회사명 글자 겹침 — 다른 단어의 일부·사람 이름은 회사 언급이 아니고, 배터리 문맥이 있으면 맞다",
+          [is_battery_scope("SK온라인 게임 신작 출시", "SK온라인 새 게임이 나왔다"),
+           is_battery_scope("에코프로젝트 마을 만들기 사업 선정", "주민 설명회"),
+           is_battery_scope("천보 스님 입적", "천보 스님 장례"),
+           is_battery_scope("BYDG 주식 급등", ""),
+           is_battery_scope("샨샨 가수 콘서트", ""),
+           is_battery_scope("BYD, 신형 전기차 발표", "배터리 용량 확대"),
+           is_battery_scope("금양, 배터리 셀 증설 발표", "이차전지 셀 생산라인을 늘린다"),
+           is_battery_scope("에코프로, 양극재 증설", "배터리 소재 증설"),
+           is_battery_scope("SK온, 미국 배터리 공장 가동", "")],
+          [False, False, False, False, False, True, True, True, True])
     check("정부 소식 판정(강화) — 일반 기관어(정부·국회)는 제목에 핵심 산업어가 있어야 하고, 국회의원·정부예산·본문 속 반도체만으로는 안 들어온다",
           [is_gov_industry_news(t, e) for t, e, _ in _gnew], [x for *_, x in _gnew])
     for _rid, _rt, _rb, _rg in (("fr1", "[국정감사 결산] 수원 지역 국회의원 5인, 현안 대응 성과", "수원 현안 반도체 벨트 이야기. " * 30, "[]"),
