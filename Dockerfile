@@ -14,6 +14,13 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
+# playwright 최신 버전은 내부 실행 파일(node)이 libatomic.so.1 을 요구하는데 slim 이미지에는 없다.
+# "playwright install --with-deps" 는 의존 패키지를 깔기 전에 이 node 부터 실행하므로,
+# 그 전에 libatomic1 을 먼저 설치해야 한다(2026-11-22 AWS 빌드가 exit 127 로 실패했던 원인).
+# libatomic1 은 데비안 trixie 의 amd64·arm64 에 모두 있다.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # 동적 사이트(KOTRA 등) 수집용 브라우저(Chromium)와 시스템 라이브러리. 이미지가 수백 MB 커진다.
 # 브라우저 경로를 고정해 두면 실행 계정과 상관없이 같은 곳을 쓴다.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
