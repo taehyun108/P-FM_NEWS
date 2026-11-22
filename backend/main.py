@@ -12724,12 +12724,13 @@ def cmd_fixentities(ctx: Context, dry: bool = True) -> dict:
     return {"rows": len(rows), "fixed": fixed_rows, "kinds": dict(kinds), "summary_defects": summ}
 
 
-def cmd_fixrelevance(ctx: Context, dry: bool = True, limit: int = 3000) -> dict:
+def cmd_fixrelevance(ctx: Context, dry: bool = True, limit: int = 3000, show_all: bool = False) -> dict:
     """이미 쌓인 기사 중 **지금 수집 기준으로는 안 들어올** 기사를 보관(archived) 처리한다 — 기본은 미리보기(--run 이면 실행).
 
     수원 국정감사·분양 목록·한국씨티은행처럼 포스코·배터리와 무관한데 예전(느슨한) 기준으로 들어온 기사를 정리한다.
     보관 본문(30일)이 있는 기사만 다시 판정하고(없으면 건드리지 않음), 직접 등록·정책브리핑·인사·부고와
     그룹사 칩이 이미 붙은 기사는 제외한다. 보관은 되돌릴 수 있다.
+    미리보기는 기본 15건만 보여 주며, show_all(--all)이면 대상 전체를 보여 줘 지우기 전에 빠짐없이 확인할 수 있다.
     """
     since = now_utc() - timedelta(days=45)
     rows = _retry(lambda: ctx.storage.list_articles(max(limit, 100), 0, since, ""))
@@ -12755,15 +12756,18 @@ def cmd_fixrelevance(ctx: Context, dry: bool = True, limit: int = 3000) -> dict:
         hits.append((r, "현재 기준 밖(포스코·배터리·통상·정부 산업 소식 아님)"))
     log.info("[관련성 재점검] 최근 45일 %d건 중 본문으로 다시 본 기사 %d건 · 본문 없어 건너뜀 %d건 — 현재 기준 밖 %d건%s",
              len(rows), checked, nobody, len(hits), " (미리보기)" if dry else "")
-    for r, why in hits[:15]:
+    shown = hits if show_all else hits[:15]
+    for r, why in shown:
         log.info("  · [%s] %s | %s", (r.get("press_name") or "")[:8], (r.get("title") or "")[:46], ", ".join(jload(r.get("categories"), [])) or "-")
+    if len(shown) < len(hits):
+        log.info("  … 나머지 %d건은 생략 — 전체를 보려면 --all 을 붙이세요", len(hits) - len(shown))
     done = 0
     if not dry:
         for r, _ in hits:
             ctx.storage.update_article(r["id"], {"status": "archived"})
             done += 1
         log.info("관련성 재점검: %d건 보관 처리", done)
-    return {"checked": checked, "targets": len(hits), "archived": done, "nobody": nobody}
+    return {"checked": checked, "targets": len(hits), "archived": done, "nobody": nobody, "listed": len(shown)}
 
 
 def cmd_restore(ctx: Context, term: str, run: bool = False) -> list[dict]:
@@ -15014,7 +15018,8 @@ def cmd_selftest() -> int:
                                  ("fr2", "삼성SDI, 양극재 증설 발표", "배터리 소재 증설 소식. " * 30, "[]"),
                                  ("fr3", "강남 3구는 내리고 강북은 뛰고", "분양 단지 소개 문장이 길게 이어진다. " * 40 + "포스코이앤씨는 더샵을 선보인다. 포스코이앤씨는 부산에서도 선보인다.", "[]"),   # 앞 700자 밖에서만 나옴
                                  ("fr4", "분양 소식 칩있음", "분양 이야기만 있다. " * 30, '["포스코이앤씨"]'),
-                                 ("fr5", "한국씨티은행, 새 점포 개설", "점포 개설 소식. " * 30, "[]")):
+                                 ("fr5", "한국씨티은행, 새 점포 개설", "점포 개설 소식. " * 30, "[]"),
+                                 *[(f"frx{_i}", f"동네 행사 소식 {_i}", "동네 행사 이야기만 있다. " * 30, "[]") for _i in range(16)]):
         _et._exec("insert into articles (id,url_source,url_canonical,url_original,title,published_at,collected_at,"
                   "source_type,importance_score,group_companies,categories,press_name,analyzed_at,status,"
                   "is_representative) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -15024,6 +15029,10 @@ def cmd_selftest() -> int:
         _et.save_body(_rid, _rb, "fulltext")
     _fr0 = cmd_fixrelevance(_ectx, dry=True)
     check("fixrelevance 미리보기 — 현재 기준 밖 기사만 세고 쓰지 않는다", (_fr0["targets"] >= 3, _et.article_detail("fr1")["status"]), (True, "active"))
+    _fr0a = cmd_fixrelevance(_ectx, dry=True, show_all=True)
+    check("fixrelevance --all — 기본 미리보기는 15건까지만, --all 이면 대상 전체를 보여 주고 둘 다 쓰지는 않는다",
+          (_fr0["listed"], _fr0a["listed"] == _fr0a["targets"], _fr0a["targets"] >= 19, _et.article_detail("frx0")["status"]),
+          (15, True, True, "active"))
     cmd_fixrelevance(_ectx, dry=False)
     check("fixrelevance — 수원 국감·분양 목록(동작 없는 2회)·씨티은행은 보관, 배터리 소재·칩이 있는 기사는 그대로",
           [_et.article_detail(x)["status"] for x in ("fr1", "fr2", "fr3", "fr4", "fr5")],
@@ -17996,7 +18005,7 @@ USAGE = """사용법: python backend/main.py <명령>
   pfmgap [N]  '포스코퓨처엠 언급' 발췌는 있는데 그룹사 칩에 퓨처엠이 없는 기사 점검 (읽기 전용, N건 예시)
   fixgroupexcerpt [N] [--dry]  포스코홀딩스·포스코DX 등 그룹사 태그 기사에 '○○ 언급' 발췌 채우기 (기본 200건)
   fixentities [--run]  제목·기자명·언론사명·발췌에 남은 글자 깨짐(&hellip; 등) 점검·복구 (기본 미리보기, --run 이면 수정)
-  fixrelevance [--run]  지금 수집 기준으로는 안 들어올 기사(수원 국감·분양 목록 등)를 보관 처리 (기본 미리보기, 본문 있는 기사만)
+  fixrelevance [--run] [--all]  지금 수집 기준으로는 안 들어올 기사(수원 국감·분양 목록 등)를 보관 처리 (기본 미리보기 15건만 표시, --all 이면 전체 표시, 본문 있는 기사만)
   restore <말> [--run]  보관 처리된 기사 중 제목에 그 말이 든 것을 다시 보이게 (기본 미리보기, 예: restore 산업부)
   fixnoise [--run]  주식·시세·수상 잡음 기사 정리 (기본 미리보기, --run 이면 보관 처리 — 되돌릴 수 있음)
   find <말>  제목에 그 말이 든 기사의 상태(보관·임시저장·중복·분석 대기)를 점검 (읽기 전용, 예: find 전기차)
@@ -18086,7 +18095,7 @@ def main(argv: Sequence[str]) -> int:
     elif command == "fixentities":
         cmd_fixentities(ctx, dry="--run" not in argv[2:])
     elif command == "fixrelevance":
-        cmd_fixrelevance(ctx, dry="--run" not in argv[2:])
+        cmd_fixrelevance(ctx, dry="--run" not in argv[2:], show_all="--all" in argv[2:])
     elif command == "restore":
         cmd_restore(ctx, " ".join(a for a in argv[2:] if a != "--run"), run="--run" in argv[2:])
     elif command == "fixnoise":
