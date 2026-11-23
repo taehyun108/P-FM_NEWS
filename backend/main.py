@@ -7996,18 +7996,39 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     }
 
 
+# 분석이 실패한 기사는 본문을 바로 지우지 않고 다시 시도한다 — analyze() 안의 재시도(1·2초 간격)는 몇 초짜리
+# 일시 오류(504 등)만 넘기므로, 몇 분 가는 장애에서는 기사가 영구히 '링크·제목만' 남던 문제(2026-11-23).
+ANALYZE_FAIL_ROUNDS_MAX = 3      # 분석을 실제로 시도하는 최대 횟수(이 횟수째 실패하면 포기하고 본문 삭제)
+ANALYZE_RETRY_WAIT_SEC = 600     # 실패한 기사를 다시 시도하기 전 쉬는 시간(초)
+_ANALYZE_FAIL: dict[str, tuple[int, float]] = {}   # 기사 id → (실패 횟수, 마지막 실패 시각 monotonic)
+
+
 def analyze_and_save(ctx: Context, article_id: str, row: dict, body: str, summary_source: str) -> int | None:
     """LLM 분석 결과를 저장하고, 갱신된 중요도 점수를 돌려준다.
 
-    analyze() 가 내부적으로 3회 재시도하므로, 여기서 실패하면 재처리해도 같은 결과다.
-    임시 본문은 성공·실패와 무관하게 삭제한다(§7-3 최소 보관). 실패 기사는
-    본문이 없으므로 백로그 큐에서 빠지고, 링크·제목만 남는다. (PRD F4.5 취지)
+    analyze() 가 내부적으로 3회 재시도하지만 몇 초 간격이라, 몇 분 가는 장애에서는 같이 실패한다.
+    그래서 실패해도 임시 본문을 남겨 ANALYZE_RETRY_WAIT_SEC 뒤 백로그에서 다시 분석하고,
+    ANALYZE_FAIL_ROUNDS_MAX 번째 실패에서야 본문을 지운다(§7-3 최소 보관). 그때는 링크·제목만 남는다. (PRD F4.5 취지)
+    쉬는 중인 기사는 AI 를 부르지 않고 바로 None 을 돌려준다(본문은 그대로).
     """
+    prev = _ANALYZE_FAIL.get(article_id)
+    if prev and (time.monotonic() - prev[1]) < ANALYZE_RETRY_WAIT_SEC:
+        return None   # 방금 실패한 기사 — 다음 회차에 다시
     analysis = ctx.llm.analyze(row["title"], row.get("press_name") or "", body)
     if not analysis.ok:
+        n = (prev[0] if prev else 0) + 1
+        if n < ANALYZE_FAIL_ROUNDS_MAX:
+            if len(_ANALYZE_FAIL) > 5000:   # 메모리가 불어나지 않게 상한
+                _ANALYZE_FAIL.clear()
+            _ANALYZE_FAIL[article_id] = (n, time.monotonic())
+            log.warning("분석 실패(%d/%d회) — 본문을 남기고 %d분 뒤 다시 분석합니다: %s",
+                        n, ANALYZE_FAIL_ROUNDS_MAX, ANALYZE_RETRY_WAIT_SEC // 60, row["title"][:40])
+            return None
+        _ANALYZE_FAIL.pop(article_id, None)
         log.warning("분석 실패 — 링크·제목만 저장합니다: %s", row["title"][:40])
         ctx.storage.delete_body(article_id)
         return None
+    _ANALYZE_FAIL.pop(article_id, None)
 
     # 룰 기반 그룹사가 1순위. (PRD F4.2)
     # LLM 은 '이차전지·공급망 뉴스니까 포스코퓨처엠' 식으로 본문에 없는 계열사를
@@ -14778,6 +14799,37 @@ def cmd_selftest() -> int:
                      "포스코퓨처엠은 양극재 증설을 발표했다. 국내 배터리 업계가 주목한다. " * 10, "fulltext")
     check("원문에 실제로 있으면 정상적으로 붙는다",
           jload(_gt._one("select group_companies from articles where id='g1'")["group_companies"], []), ["포스코퓨처엠"])
+
+    # ── 분석 실패 기사: 본문을 남기고 쉬었다 다시 분석, 3번째 실패에서 본문 삭제 ──
+    class _FailStubLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyze(self, title: str, press: str, body: str) -> Analysis:
+            self.calls += 1
+            return Analysis(ok=False)
+
+    _fl = _FailStubLLM()
+    _gctx._llm = _fl
+    _frow = {"id": "g1", "title": "배터리 업계 동향", "press_id": None, "press_name": "연합뉴스",
+             "importance_score": 10, "group_companies": []}
+    _ANALYZE_FAIL.clear()
+    _gt.save_body("g1", "분석이 실패하는 본문. " * 30, "fulltext")
+    _kept = []
+    for _round in range(3):
+        _res = analyze_and_save(_gctx, "g1", dict(_frow), "분석이 실패하는 본문. " * 30, "fulltext")
+        _kept.append((_res, bool(_gt.body_of("g1"))))
+        if "g1" in _ANALYZE_FAIL:
+            _ANALYZE_FAIL["g1"] = (_ANALYZE_FAIL["g1"][0], -1e9)   # 쉬는 시간이 지났다고 가정
+    check("분석 실패 — 1·2번째는 본문을 남기고, 3번째 실패에서 본문을 지운다(AI 호출은 3번)",
+          (_kept, _fl.calls), ([(None, True), (None, True), (None, False)], 3))
+    _gt.save_body("g1", "분석이 실패하는 본문. " * 30, "fulltext")
+    analyze_and_save(_gctx, "g1", dict(_frow), "분석이 실패하는 본문. " * 30, "fulltext")
+    _c_before = _fl.calls
+    analyze_and_save(_gctx, "g1", dict(_frow), "분석이 실패하는 본문. " * 30, "fulltext")
+    check("방금 실패한 기사는 쉬는 동안 AI 를 다시 부르지 않고 본문은 그대로 둔다",
+          (_fl.calls - _c_before, bool(_gt.body_of("g1"))), (0, True))
+    _ANALYZE_FAIL.clear()
 
     # 2026-10-01: 포스코퓨처엠 언급 발췌가 맥락 없이 끊겨 읽힌다는 지적, 영어 기사 한글 번역
     print("\n[8-2c5] 포스코퓨처엠 언급 발췌 — 맥락 · 영어 기사 번역")
