@@ -354,7 +354,7 @@ def load_config() -> Config:
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
         nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
         gemini_api_key=get_env("GEMINI_API_KEY", ""),
-        gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-2.5-flash-lite"),
+        gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-3.1-flash-lite"),
         xai_api_key=get_env("XAI_API_KEY", ""),
         xai_llm_model=get_env("XAI_LLM_MODEL", "grok-4-fast"),
         db_backend=backend,
@@ -6007,6 +6007,29 @@ def _make_gemini_client(api_key: str):
     return openai.OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
 
 
+# ── AI 호출이 느리거나 설정이 틀렸을 때 수집이 멈추지 않게 하는 안전장치 (2026-11-23) ─────────────
+# 사고 사례: OpenAI 키 401·Gemini 모델 404 가 매 호출마다 반복되고 마지막 NVIDIA 가 느려(504)
+# 한 회차가 104분 걸려 사이트가 2시간씩 갱신되지 않았다.
+RUN_LLM_TIME_CAP_SEC = 900       # 한 회차에서 AI 분석을 '새로 시작'할 수 있는 시간(초). 넘으면 저장만 하고 다음 회차로
+LLM_PERM_COOLDOWN_SEC = 1800     # 키·모델 이름이 틀린 AI(401·403·404)를 건너뛰는 시간(초)
+_LLM_PERM_STATUS = (401, 403, 404)
+
+
+def llm_time_up(started: float, now: float | None = None) -> bool:
+    """이번 회차가 RUN_LLM_TIME_CAP_SEC 를 넘겨 AI 분석을 더 시작하면 안 되는가."""
+    cur = time.monotonic() if now is None else now
+    return (cur - started) > RUN_LLM_TIME_CAP_SEC
+
+
+def _is_permanent_llm_error(exc: Exception) -> bool:
+    """키·권한·모델 이름 문제(401·403·404)면 True — 잠깐 기다린다고 낫지 않는 오류다(504·429 등은 일시적)."""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code in _LLM_PERM_STATUS
+    m = re.search(r"Error code:\s*(\d{3})", str(exc))
+    return bool(m and int(m.group(1)) in _LLM_PERM_STATUS)
+
+
 class LLMClient:
     def __init__(self, cfg: Config) -> None:
         _hush_libraries()  # openai/httpx 가 import 시 로깅을 다시 켜는 경우 대비
@@ -6086,14 +6109,34 @@ class LLMClient:
                           "_nvidia_supports_json_mode", f"NVIDIA({self.nvidia_llm_model})"))
         return chain
 
-    def _chat(self, system: str, user: str) -> tuple[str, dict]:
+    def _active_chain(self) -> list[tuple[Any, str, str, str]]:
+        """쉬는 중(설정 오류로 건너뛰는)인 AI 를 뺀 채팅 체인. 전부 쉬는 중이면 전부 다시 시도한다."""
         chain = self._chat_chain()
+        down = self.__dict__.setdefault("_down_until", {})
+        now = time.monotonic()
+        live = [c for c in chain if down.get(c[3], 0.0) <= now]
+        return live or chain
+
+    def _mark_failure(self, label: str, exc: Exception) -> None:
+        """키·모델 이름 오류면 일정 시간 건너뛰고, 처음 걸릴 때 한 번만 '설정 확인 필요'를 남긴다."""
+        if not _is_permanent_llm_error(exc):
+            return
+        down = self.__dict__.setdefault("_down_until", {})
+        now = time.monotonic()
+        if down.get(label, 0.0) <= now:
+            log.warning("%s 설정 오류(%s) — %d분간 건너뜁니다. API 키·모델 이름을 확인하세요.",
+                        label, str(exc)[:80], LLM_PERM_COOLDOWN_SEC // 60)
+        down[label] = now + LLM_PERM_COOLDOWN_SEC
+
+    def _chat(self, system: str, user: str) -> tuple[str, dict]:
+        chain = self._active_chain()
         last_exc: Exception | None = None
         for i, (client, model, flag, label) in enumerate(chain):
             try:
                 return self._chat_once(client, model, flag, system, user)
             except Exception as exc:
                 last_exc = exc
+                self._mark_failure(label, exc)
                 if i + 1 < len(chain):
                     log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
         assert last_exc is not None
@@ -6239,7 +6282,7 @@ class LLMClient:
     def chat_text(self, system: str, user: str) -> str:
         """일반 텍스트 응답(JSON 강제 없음). 텔레그램 챗봇 질의응답용."""
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        chain = self._chat_chain()
+        chain = self._active_chain()
         last_exc: Exception | None = None
         for i, (client, model, _flag, label) in enumerate(chain):
             try:
@@ -6247,6 +6290,7 @@ class LLMClient:
                 return resp.choices[0].message.content or ""
             except Exception as exc:
                 last_exc = exc
+                self._mark_failure(label, exc)
                 if i + 1 < len(chain):
                     log.warning("%s 채팅 호출 실패, %s로 대체: %s", label, chain[i + 1][3], exc)
         assert last_exc is not None
@@ -7740,7 +7784,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # ── G6: LLM 분석 (과금 지점) ─────────────────────────────────
         # 이번 실행 예산 안에서만 즉시 분석하고, 나머지는 아래 드레인 단계나
         # 다음 실행에서 처리한다. 60초 주기를 지키기 위한 조치다.
-        if llm_budget > 0:
+        if llm_budget > 0 and not llm_time_up(started):
             llm_budget -= 1
             analyzed = analyze_and_save(ctx, article_id, dict(row), body, summary_source)
             if analyzed is not None:
@@ -7784,10 +7828,12 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # 항목끼리 서로 참조하지 않는 독립적인 LLM 호출이라 병렬로 돌려도 안전하다
     # (dedup 판정이 껴 있는 _drain_deferred 와 달리 여긴 순서 의존이 없다).
     analyzed_backlog = 0
-    if llm_budget > 0:
+    if llm_budget > 0 and not llm_time_up(started):
         pendings = storage.unanalyzed_with_body(llm_budget)
 
         def _analyze_pending(pending: dict) -> bool:
+            if llm_time_up(started):   # 병렬 작업 도중 시간이 넘으면 남은 항목은 다음 회차로
+                return False
             row = {
                 "id": pending["id"], "title": pending["title"],
                 "press_id": pending.get("press_id"), "press_name": pending.get("press_name"),
@@ -7812,8 +7858,11 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     # ── 메타만 저장된(deferred) 기사 드레인 — 본문 확보 → 관련성 재검 → 분석 ──
     # 예약해 둔 defer_budget + 앞 단계에서 남은 예산을 함께 쓴다.
     drain_budget = defer_budget + max(0, llm_budget)
+    if llm_time_up(started):
+        log.warning("이번 회차가 %d초를 넘어 AI 분석을 더 시작하지 않습니다 — 남은 기사는 다음 회차에 처리합니다.",
+                    RUN_LLM_TIME_CAP_SEC)
     drained = _drain_deferred(ctx, min(drain_budget, DEFER_DRAIN_PER_RUN), dedup_candidates,
-                              people_llm=people_llm_left) if drain_budget else 0
+                              people_llm=people_llm_left) if (drain_budget and not llm_time_up(started)) else 0
     if drained:
         log.info("메타 저장분 분석 %d건 (예약 예산 %d)", drained, defer_budget)
 
@@ -16403,6 +16452,67 @@ def cmd_selftest() -> int:
     _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
     check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
           _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
+
+    # ── 키·모델 이름 오류(401·403·404)가 난 AI 는 일정 시간 건너뛴다 — 한 회차가 104분 걸린 사고 방지 ──
+    class _PermErr(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"Error code: {code} - test")
+            self.status_code = code
+
+    check("영구 오류 판정 — 401·403·404 는 True, 504·429·일반 예외는 False (문구만 있어도 판정)",
+          [_is_permanent_llm_error(e) for e in (_PermErr(401), _PermErr(403), _PermErr(404), _PermErr(504), _PermErr(429),
+                                                RuntimeError("timeout"), RuntimeError("Error code: 404 - not found"))],
+          [True, True, True, False, False, False, True])
+    _llm3 = LLMClient(_lcfg_with_fallback)
+    _c3 = {"openai": 0, "gemini": 0}
+
+    def _openai_401(**_kw: Any) -> Any:
+        _c3["openai"] += 1
+        raise _PermErr(401)
+
+    def _gemini_ok(**_kw: Any) -> Any:
+        _c3["gemini"] += 1
+        return _FakeChatResp('{"ok":"gemini"}')
+
+    _llm3.client.chat.completions.create = _openai_401
+    _llm3.gemini_llm_client.chat.completions.create = _gemini_ok
+    _r31, _r32, _r33 = _llm3._chat("s", "u"), _llm3._chat("s", "u"), _llm3.chat_text("s", "u")
+    check("키 오류(401)가 난 AI 는 쉬는 동안 다시 부르지 않고 다음 AI(Gemini)가 바로 처리한다",
+          (_r31[0], _r32[0], _r33, _c3["openai"], _c3["gemini"]),
+          ('{"ok":"gemini"}', '{"ok":"gemini"}', '{"ok":"gemini"}', 1, 3))
+    _llm3._down_until["OpenAI"] = 0.0   # 쉬는 시간이 지났다고 가정
+    _llm3._chat("s", "u")
+    check("쉬는 시간이 지나면 OpenAI 를 다시 시도한다", _c3["openai"], 2)
+    _llm4 = LLMClient(_lcfg_with_fallback)
+    _c4 = {"n": 0}
+
+    def _openai_504(**_kw: Any) -> Any:
+        _c4["n"] += 1
+        raise _PermErr(504)
+
+    _llm4.client.chat.completions.create = _openai_504
+    _llm4.gemini_llm_client.chat.completions.create = _gemini_ok
+    _llm4._chat("s", "u")
+    _llm4._chat("s", "u")
+    check("일시 오류(504)는 건너뛰지 않고 매번 다시 시도한다", _c4["n"], 2)
+    _llm5 = LLMClient(_lcfg_with_fallback)
+    _c5 = {"n": 0}
+
+    def _all_401(**_kw: Any) -> Any:
+        _c5["n"] += 1
+        raise _PermErr(401)
+
+    for _cl in (_llm5.client, _llm5.gemini_llm_client, _llm5.xai_llm_client, _llm5.nvidia_llm_client):
+        _cl.chat.completions.create = _all_401
+    for _ in range(2):
+        try:
+            _llm5._chat("s", "u")
+        except Exception:
+            pass
+    check("전부 설정 오류여도 포기하지 않고 매번 전부 다시 시도한다(첫 회 4 + 둘째 회 4)", _c5["n"], 8)
+    check("한 회차 AI 분석 시간 상한 — 상한 이내·정확히 상한이면 False, 넘으면 True",
+          (llm_time_up(0.0, 100.0), llm_time_up(0.0, RUN_LLM_TIME_CAP_SEC + 1.0), llm_time_up(5.0, 5.0 + RUN_LLM_TIME_CAP_SEC)),
+          (False, True, False))
 
     _llm2 = LLMClient(_lcfg_no_fallback)
     check("NVIDIA 키 없으면 임베딩 대체 클라이언트도 없다", _llm2.nvidia_embed_client, None)
