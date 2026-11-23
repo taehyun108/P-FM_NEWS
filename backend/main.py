@@ -6013,6 +6013,7 @@ def _make_gemini_client(api_key: str):
 RUN_LLM_TIME_CAP_SEC = 900       # 한 회차에서 AI 분석을 '새로 시작'할 수 있는 시간(초). 넘으면 저장만 하고 다음 회차로
 LLM_PERM_COOLDOWN_SEC = 1800     # 키·모델 이름이 틀린 AI(401·403·404)를 건너뛰는 시간(초)
 _LLM_PERM_STATUS = (401, 403, 404)
+_EMBED_LABEL = "OpenAI(임베딩)"   # 임베딩도 채팅과 같은 '설정 오류 건너뛰기'를 쓴다(쉬는 시간 기록 이름)
 
 
 def llm_time_up(started: float, now: float | None = None) -> bool:
@@ -6347,21 +6348,30 @@ class LLMClient:
         if self._embed_calls >= self.max_embed_per_run:
             return None  # 이번 실행 임베딩 예산 소진 — 3단계 문자열 유사도까지만 적용된다
         self._embed_calls += 1
-        try:
-            resp = self.client.embeddings.create(model=self.embedding_model, input=text[:2000])
-            return list(resp.data[0].embedding)
-        except Exception as exc:
-            log.warning("OpenAI 임베딩 생성 실패: %s", exc)
-            if self.nvidia_embed_client is None:
-                return None
+        # OpenAI 키가 틀린(401 등) 동안은 대체(NVIDIA)가 있으면 OpenAI 를 건너뛰고 바로 대체로 간다 —
+        # 매 호출마다 실패 경고가 쌓이고 호출이 낭비되는 것을 막는다. 대체가 없으면 계속 시도한다.
+        resting = self.__dict__.setdefault("_down_until", {}).get(_EMBED_LABEL, 0.0) > time.monotonic()
+        skip_openai = resting and self.nvidia_embed_client is not None
+        if not skip_openai:
             try:
-                resp = self.nvidia_embed_client.embeddings.create(
-                    model=self.nvidia_embed_model, input=text[:2000])
-                log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
+                resp = self.client.embeddings.create(model=self.embedding_model, input=text[:2000])
                 return list(resp.data[0].embedding)
-            except Exception as exc2:
-                log.warning("NVIDIA 임베딩도 실패: %s", exc2)
-                return None
+            except Exception as exc:
+                if _is_permanent_llm_error(exc):
+                    self._mark_failure(_EMBED_LABEL, exc)   # 처음 걸릴 때만 '설정 확인 필요' 한 줄
+                else:
+                    log.warning("OpenAI 임베딩 생성 실패: %s", exc)
+                if self.nvidia_embed_client is None:
+                    return None
+        try:
+            resp = self.nvidia_embed_client.embeddings.create(
+                model=self.nvidia_embed_model, input=text[:2000])
+            if not skip_openai:
+                log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
+            return list(resp.data[0].embedding)
+        except Exception as exc2:
+            log.warning("NVIDIA 임베딩도 실패: %s", exc2)
+            return None
 
 
 def _parse_json_object(content: str) -> dict | None:
@@ -16510,6 +16520,25 @@ def cmd_selftest() -> int:
         except Exception:
             pass
     check("전부 설정 오류여도 포기하지 않고 매번 전부 다시 시도한다(첫 회 4 + 둘째 회 4)", _c5["n"], 8)
+    _llm6 = LLMClient(_lcfg_with_fallback)
+    _c6 = {"openai": 0, "nvidia": 0}
+
+    def _embed_openai_401(**_kw: Any) -> Any:
+        _c6["openai"] += 1
+        raise _PermErr(401)
+
+    def _embed_nvidia_ok(**_kw: Any) -> Any:
+        _c6["nvidia"] += 1
+        return _FakeEmbResp([0.7, 0.8, 0.9])
+
+    _llm6.client.embeddings.create = _embed_openai_401
+    _llm6.nvidia_embed_client.embeddings.create = _embed_nvidia_ok
+    _e6 = [_llm6.embed("테스트 문장") for _ in range(3)]
+    check("임베딩도 키 오류(401)가 나면 OpenAI 를 쉬고 NVIDIA 로 바로 간다 — 3회 모두 성공, OpenAI 는 1번만 시도",
+          (_e6, _c6["openai"], _c6["nvidia"]), ([[0.7, 0.8, 0.9]] * 3, 1, 3))
+    _llm6._down_until[_EMBED_LABEL] = 0.0   # 쉬는 시간이 지났다고 가정
+    _llm6.embed("테스트 문장")
+    check("임베딩 쉬는 시간이 지나면 OpenAI 를 다시 시도한다", _c6["openai"], 2)
     check("한 회차 AI 분석 시간 상한 — 상한 이내·정확히 상한이면 False, 넘으면 True",
           (llm_time_up(0.0, 100.0), llm_time_up(0.0, RUN_LLM_TIME_CAP_SEC + 1.0), llm_time_up(5.0, 5.0 + RUN_LLM_TIME_CAP_SEC)),
           (False, True, False))
