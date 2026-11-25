@@ -6015,8 +6015,9 @@ def _make_gemini_client(api_key: str):
 # 사고 사례: OpenAI 키 401·Gemini 모델 404 가 매 호출마다 반복되고 마지막 NVIDIA 가 느려(504)
 # 한 회차가 104분 걸려 사이트가 2시간씩 갱신되지 않았다.
 RUN_LLM_TIME_CAP_SEC = 900       # 한 회차에서 AI 분석을 '새로 시작'할 수 있는 시간(초). 넘으면 저장만 하고 다음 회차로
-LLM_PERM_COOLDOWN_SEC = 1800     # 키·모델 이름이 틀린 AI(401·403·404)를 건너뛰는 시간(초)
-_LLM_PERM_STATUS = (401, 403, 404)
+LLM_PERM_COOLDOWN_SEC = 1800     # 키·모델 이름이 틀린 AI(401·403·404·410)를 건너뛰는 시간(초)
+# 410 = 모델이 사라짐(2026-11-25 NVIDIA gemma-4-31b-it 가 410 을 돌려줘 분석이 멈춘 사고)
+_LLM_PERM_STATUS = (401, 403, 404, 410)
 _EMBED_LABEL = "OpenAI(임베딩)"   # 임베딩도 채팅과 같은 '설정 오류 건너뛰기'를 쓴다(쉬는 시간 기록 이름)
 
 
@@ -6027,7 +6028,7 @@ def llm_time_up(started: float, now: float | None = None) -> bool:
 
 
 def _is_permanent_llm_error(exc: Exception) -> bool:
-    """키·권한·모델 이름 문제(401·403·404)면 True — 잠깐 기다린다고 낫지 않는 오류다(504·429 등은 일시적)."""
+    """키·권한·모델 이름 문제(401·403·404·410)면 True — 잠깐 기다린다고 낫지 않는 오류다(504·429 등은 일시적)."""
     code = getattr(exc, "status_code", None)
     if isinstance(code, int):
         return code in _LLM_PERM_STATUS
@@ -16536,10 +16537,11 @@ def cmd_selftest() -> int:
             super().__init__(f"Error code: {code} - test")
             self.status_code = code
 
-    check("영구 오류 판정 — 401·403·404 는 True, 504·429·일반 예외는 False (문구만 있어도 판정)",
+    check("영구 오류 판정 — 401·403·404·410 은 True, 504·429·일반 예외는 False (문구만 있어도 판정)",
           [_is_permanent_llm_error(e) for e in (_PermErr(401), _PermErr(403), _PermErr(404), _PermErr(504), _PermErr(429),
-                                                RuntimeError("timeout"), RuntimeError("Error code: 404 - not found"))],
-          [True, True, True, False, False, False, True])
+                                                RuntimeError("timeout"), RuntimeError("Error code: 404 - not found"),
+                                                _PermErr(410), RuntimeError("Error code: 410 - gone"))],
+          [True, True, True, False, False, False, True, True, True])
     _llm3 = LLMClient(_lcfg_with_fallback)
     _c3 = {"openai": 0, "gemini": 0}
 
