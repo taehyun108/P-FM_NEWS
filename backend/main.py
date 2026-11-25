@@ -352,7 +352,7 @@ def load_config() -> Config:
         nvidia_embed_api_key=get_env("NVIDIA_EMBED_API_KEY", ""),
         nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
-        nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "google/gemma-4-31b-it"),
+        nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         gemini_api_key=get_env("GEMINI_API_KEY", ""),
         gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-3.1-flash-lite"),
         xai_api_key=get_env("XAI_API_KEY", ""),
@@ -6019,6 +6019,16 @@ LLM_PERM_COOLDOWN_SEC = 1800     # 키·모델 이름이 틀린 AI(401·403·404
 # 410 = 모델이 사라짐(2026-11-25 NVIDIA gemma-4-31b-it 가 410 을 돌려줘 분석이 멈춘 사고)
 _LLM_PERM_STATUS = (401, 403, 404, 410)
 _EMBED_LABEL = "OpenAI(임베딩)"   # 임베딩도 채팅과 같은 '설정 오류 건너뛰기'를 쓴다(쉬는 시간 기록 이름)
+# '생각 과정'을 먼저 쓰는 모델은 글자 수를 생각에 다 써서 답이 빈 값이 되고 느리다(6초 vs 0.6초).
+# 이런 모델에는 생각 끄기 옵션을 붙인다(2026-11-25 NVIDIA 대체 모델 시험으로 확인).
+_NO_THINK_MODEL_HINTS = ("nemotron-3.5-lightning",)
+
+
+def _llm_extra_body(model: str) -> dict:
+    """모델별 추가 요청 옵션. 생각 끄기가 필요한 모델만 옵션을 돌려주고, 나머지는 빈 dict."""
+    if any(h in (model or "") for h in _NO_THINK_MODEL_HINTS):
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
 
 
 def llm_time_up(started: float, now: float | None = None) -> bool:
@@ -6084,6 +6094,9 @@ class LLMClient:
         }
         if getattr(self, supports_json_attr):
             kwargs["response_format"] = {"type": "json_object"}
+        extra = _llm_extra_body(model)
+        if extra:
+            kwargs["extra_body"] = extra
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as exc:
@@ -6292,7 +6305,9 @@ class LLMClient:
         last_exc: Exception | None = None
         for i, (client, model, _flag, label) in enumerate(chain):
             try:
-                resp = client.chat.completions.create(model=model, messages=messages)
+                extra = _llm_extra_body(model)
+                kw: dict[str, Any] = {"extra_body": extra} if extra else {}
+                resp = client.chat.completions.create(model=model, messages=messages, **kw)
                 return resp.choices[0].message.content or ""
             except Exception as exc:
                 last_exc = exc
@@ -16530,6 +16545,25 @@ def cmd_selftest() -> int:
     _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
     check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
           _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
+
+    # ── 생각 과정을 먼저 쓰는 모델(nemotron-3.5-lightning)은 '생각 끄기' 옵션을 붙인다 ──
+    check("생각 끄기 옵션 — lightning 만 붙고 다른 모델은 빈 옵션",
+          [_llm_extra_body("nvidia/nemotron-3.5-lightning-30b-a3b"), _llm_extra_body("nvidia/nemotron-3.5-bolt-e4b"),
+           _llm_extra_body("gemini-3.1-flash-lite"), _llm_extra_body("")],
+          [{"chat_template_kwargs": {"enable_thinking": False}}, {}, {}, {}])
+    _nt_seen: list[dict] = []
+    _nt_llm = LLMClient(_lcfg_with_fallback)
+    _nt_llm.nvidia_llm_model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+    _nt_llm.client.chat.completions.create = _openai_down
+    _nt_llm.gemini_llm_client.chat.completions.create = _openai_down
+    _nt_llm.xai_llm_client.chat.completions.create = _openai_down
+    _nt_llm.nvidia_llm_client.chat.completions.create = (
+        lambda **_kw: (_nt_seen.append(_kw), _FakeChatResp('{"ok":"nv"}'))[1])
+    _nt_llm._chat("s", "u")
+    _nt_llm.chat_text("s", "u")
+    check("NVIDIA lightning 호출(_chat·chat_text 모두)에 생각 끄기 옵션이 실린다",
+          [k.get("extra_body") for k in _nt_seen],
+          [{"chat_template_kwargs": {"enable_thinking": False}}] * 2)
 
     # ── 키·모델 이름 오류(401·403·404)가 난 AI 는 일정 시간 건너뛴다 — 한 회차가 104분 걸린 사고 방지 ──
     class _PermErr(Exception):
