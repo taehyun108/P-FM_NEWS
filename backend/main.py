@@ -213,6 +213,10 @@ class Config:
     gemini_llm_model: str
     xai_api_key: str
     xai_llm_model: str
+    # 시도 순서 지정(쉼표 목록, 비우면 기본 순서). 예: LLM_CHAIN_ORDER=nvidia,gemini,openai
+    # → 무료(NVIDIA·Gemini)를 먼저 쓰고 유료(OpenAI)는 마지막 예비로 둔다. 목록에 없는 공급자는 뒤에 기본 순서로 붙는다.
+    llm_chain_order: str
+    embed_order: str
     # DB
     db_backend: str
     sqlite_path: str
@@ -357,6 +361,8 @@ def load_config() -> Config:
         gemini_llm_model=get_env("GEMINI_LLM_MODEL", "gemini-3.1-flash-lite"),
         xai_api_key=get_env("XAI_API_KEY", ""),
         xai_llm_model=get_env("XAI_LLM_MODEL", "grok-4-fast"),
+        llm_chain_order=get_env("LLM_CHAIN_ORDER", ""),
+        embed_order=get_env("EMBED_ORDER", ""),
         db_backend=backend,
         sqlite_path=sqlite_path,
         supabase_url=supabase_url,
@@ -6049,6 +6055,18 @@ def llm_time_up(started: float, now: float | None = None) -> bool:
 
 
 LLM_RATE_COOLDOWN_SEC = 60   # 한도(429)에 걸린 AI 를 건너뛰는 시간(초) — 풀리면 자동으로 다시 쓴다
+LLM_CHAIN_DEFAULT = ("openai", "gemini", "xai", "nvidia")   # 채팅 기본 시도 순서
+EMBED_ORDER_DEFAULT = ("openai", "nvidia")                  # 임베딩 기본 시도 순서
+
+
+def _parse_order(spec: str, default: tuple[str, ...]) -> list[str]:
+    """'nvidia,gemini,openai' 같은 순서 지정을 목록으로. 모르는 이름은 무시하고,
+    목록에 빠진 공급자는 기본 순서대로 뒤에 붙인다(공급자가 통째로 사라지는 실수를 막는다)."""
+    out: list[str] = []
+    for w in (spec or "").replace(" ", "").lower().split(","):
+        if w in default and w not in out:
+            out.append(w)
+    return out + [d for d in default if d not in out]
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -6083,6 +6101,8 @@ class LLMClient:
         self.nvidia_embed_client = (
             _make_nvidia_client(cfg.nvidia_embed_api_key) if cfg.nvidia_embed_api_key else None)
         self.nvidia_embed_model = cfg.nvidia_embed_model
+        self.chain_order = _parse_order(getattr(cfg, "llm_chain_order", ""), LLM_CHAIN_DEFAULT)
+        self.embed_order = _parse_order(getattr(cfg, "embed_order", ""), EMBED_ORDER_DEFAULT)
         # 채팅(분석·요약·주간레포트·챗봇 응답)이 실패할 때만 쓰는 대체 경로들.
         # 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA — 키가 없는 단계는 건너뛴다.
         # 마찬가지로 전부 실패하면 OpenAI 실패가 곧 최종 실패가 되는 기존 동작 유지.
@@ -6138,18 +6158,20 @@ class LLMClient:
         return (resp.choices[0].message.content or ""), usage
 
     def _chat_chain(self) -> list[tuple[Any, str, str, str]]:
-        """채팅 대체 순서: OpenAI(기본) → Gemini → Grok(xAI) → NVIDIA. 키 없는 단계는 뺀다."""
-        chain = [(self.client, self.model, "_supports_json_mode", "OpenAI")]
+        """채팅 시도 순서. 기본은 OpenAI → Gemini → Grok(xAI) → NVIDIA, LLM_CHAIN_ORDER 로 바꿀 수 있다.
+        키 없는 단계는 뺀다."""
+        avail: dict[str, tuple[Any, str, str, str]] = {
+            "openai": (self.client, self.model, "_supports_json_mode", "OpenAI")}
         if self.gemini_llm_client is not None:
-            chain.append((self.gemini_llm_client, self.gemini_llm_model,
-                          "_gemini_supports_json_mode", f"Gemini({self.gemini_llm_model})"))
+            avail["gemini"] = (self.gemini_llm_client, self.gemini_llm_model,
+                               "_gemini_supports_json_mode", f"Gemini({self.gemini_llm_model})")
         if self.xai_llm_client is not None:
-            chain.append((self.xai_llm_client, self.xai_llm_model,
-                          "_xai_supports_json_mode", f"Grok({self.xai_llm_model})"))
+            avail["xai"] = (self.xai_llm_client, self.xai_llm_model,
+                            "_xai_supports_json_mode", f"Grok({self.xai_llm_model})")
         if self.nvidia_llm_client is not None:
-            chain.append((self.nvidia_llm_client, self.nvidia_llm_model,
-                          "_nvidia_supports_json_mode", f"NVIDIA({self.nvidia_llm_model})"))
-        return chain
+            avail["nvidia"] = (self.nvidia_llm_client, self.nvidia_llm_model,
+                               "_nvidia_supports_json_mode", f"NVIDIA({self.nvidia_llm_model})")
+        return [avail[n] for n in self.chain_order if n in avail]
 
     def _active_chain(self) -> list[tuple[Any, str, str, str]]:
         """쉬는 중(설정 오류로 건너뛰는)인 AI 를 뺀 채팅 체인. 전부 쉬는 중이면 전부 다시 시도한다."""
@@ -6392,36 +6414,57 @@ class LLMClient:
             log.warning("주간 브리핑 생성 실패 (%s/%s): %s", kind, name, exc)
             return {}
 
-    def embed(self, text: str) -> list[float] | None:
-        if self._embed_calls >= self.max_embed_per_run:
-            return None  # 이번 실행 임베딩 예산 소진 — 3단계 문자열 유사도까지만 적용된다
-        self._embed_calls += 1
-        # OpenAI 키가 틀린(401 등) 동안은 대체(NVIDIA)가 있으면 OpenAI 를 건너뛰고 바로 대체로 간다 —
-        # 매 호출마다 실패 경고가 쌓이고 호출이 낭비되는 것을 막는다. 대체가 없으면 계속 시도한다.
-        resting = self.__dict__.setdefault("_down_until", {}).get(_EMBED_LABEL, 0.0) > time.monotonic()
-        skip_openai = resting and self.nvidia_embed_client is not None
-        if not skip_openai:
-            try:
-                resp = self.client.embeddings.create(model=self.embedding_model, input=text[:2000])
-                return list(resp.data[0].embedding)
-            except Exception as exc:
-                if _is_permanent_llm_error(exc):
-                    self._mark_failure(_EMBED_LABEL, exc)   # 처음 걸릴 때만 '설정 확인 필요' 한 줄
-                else:
-                    log.warning("OpenAI 임베딩 생성 실패: %s", exc)
-                if self.nvidia_embed_client is None:
-                    return None
+    def _embed_openai(self, text: str) -> list[float] | None:
+        """OpenAI 임베딩 한 번. 실패하면 None(키·권한 오류는 한 번만 '설정 확인 필요'를 남기고 쉰다)."""
+        try:
+            resp = self.client.embeddings.create(model=self.embedding_model, input=text[:2000])
+            return list(resp.data[0].embedding)
+        except Exception as exc:
+            if _is_permanent_llm_error(exc):
+                self._mark_failure(_EMBED_LABEL, exc)   # 처음 걸릴 때만 '설정 확인 필요' 한 줄
+            else:
+                log.warning("OpenAI 임베딩 생성 실패: %s", exc)
+            return None
+
+    def _embed_nvidia(self, text: str) -> list[float] | None:
+        """NVIDIA 임베딩 한 번. 실패하면 None."""
         try:
             extra = _embed_extra_body(self.nvidia_embed_model)
             kw: dict[str, Any] = {"extra_body": extra} if extra else {}
             resp = self.nvidia_embed_client.embeddings.create(
                 model=self.nvidia_embed_model, input=text[:2000], **kw)
-            if not skip_openai:
-                log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
             return list(resp.data[0].embedding)
         except Exception as exc2:
             log.warning("NVIDIA 임베딩도 실패: %s", exc2)
             return None
+
+    def embed(self, text: str) -> list[float] | None:
+        if self._embed_calls >= self.max_embed_per_run:
+            return None  # 이번 실행 임베딩 예산 소진 — 3단계 문자열 유사도까지만 적용된다
+        self._embed_calls += 1
+        has_nv = self.nvidia_embed_client is not None
+        # OpenAI 키가 틀린(401 등) 동안은 대체(NVIDIA)가 있으면 OpenAI 를 건너뛰고 바로 대체로 간다 —
+        # 매 호출마다 실패 경고가 쌓이고 호출이 낭비되는 것을 막는다. 대체가 없으면 계속 시도한다.
+        resting = self.__dict__.setdefault("_down_until", {}).get(_EMBED_LABEL, 0.0) > time.monotonic()
+        # 순서가 NVIDIA 우선(EMBED_ORDER=nvidia,openai)이면 무료인 NVIDIA 를 먼저 쓰고 OpenAI 는 예비다.
+        # 같은 종류의 벡터만 쌓여야 중복 판정(벡터 길이가 다르면 '비슷하지 않음' 처리)이 깨지지 않는다.
+        if has_nv and self.embed_order[0] == "nvidia":
+            vec = self._embed_nvidia(text)
+            if vec is not None:
+                return vec
+            return None if resting else self._embed_openai(text)
+        # 기본: OpenAI → NVIDIA
+        skip_openai = resting and has_nv
+        if not skip_openai:
+            vec = self._embed_openai(text)
+            if vec is not None:
+                return vec
+            if not has_nv:
+                return None
+        vec = self._embed_nvidia(text)
+        if vec is not None and not skip_openai:
+            log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
+        return vec
 
 
 def _parse_json_object(content: str) -> dict | None:
@@ -16738,6 +16781,63 @@ def cmd_selftest() -> int:
     _lr._down_until["Gemini(gemini-test)"] = 0.0    # 쉬는 시간이 끝난 것처럼
     _lr._chat("s", "u")
     check("쉬는 시간이 끝나면 Gemini 를 다시 시도한다", (_cr["gemini"], _cr["nvidia"]), (2, 4))
+
+    # ── 시도 순서 지정(LLM_CHAIN_ORDER·EMBED_ORDER) — 무료 우선, 유료(OpenAI)는 마지막 예비 ──
+    check("순서 해석 — 모르는 이름·중복은 무시, 빠진 공급자는 기본 순서로 뒤에 붙는다",
+          [_parse_order("", LLM_CHAIN_DEFAULT), _parse_order("nvidia,gemini,openai", LLM_CHAIN_DEFAULT),
+           _parse_order(" NVIDIA , foo, nvidia ", LLM_CHAIN_DEFAULT), _parse_order("nvidia", EMBED_ORDER_DEFAULT)],
+          [["openai", "gemini", "xai", "nvidia"], ["nvidia", "gemini", "openai", "xai"],
+           ["nvidia", "openai", "gemini", "xai"], ["nvidia", "openai"]])
+    _ocfg = Config(**{**_lcfg_with_fallback.__dict__, "llm_chain_order": "nvidia,gemini,openai",
+                      "embed_order": "nvidia,openai"})
+    _lo = LLMClient(_ocfg)
+    check("LLM_CHAIN_ORDER=nvidia,gemini,openai → 채팅 순서가 NVIDIA→Gemini→OpenAI→Grok",
+          [c[3] for c in _lo._chat_chain()],
+          ["NVIDIA(nvm)", "Gemini(gemini-test)", "OpenAI", "Grok(grok-test)"])
+    check("순서를 안 정하면 기본(OpenAI→Gemini→Grok→NVIDIA) 그대로",
+          [c[3] for c in LLMClient(_lcfg_with_fallback)._chat_chain()],
+          ["OpenAI", "Gemini(gemini-test)", "Grok(grok-test)", "NVIDIA(nvm)"])
+    _co = {"openai": 0, "gemini": 0, "xai": 0, "nvidia": 0}
+
+    def _mk(name: str, fail: bool) -> Any:
+        def _f(**_kw: Any) -> Any:
+            _co[name] += 1
+            if fail:
+                raise _PermErr(504)
+            return _FakeChatResp('{"ok":"%s"}' % name)
+        return _f
+
+    _lo.client.chat.completions.create = _mk("openai", False)
+    _lo.gemini_llm_client.chat.completions.create = _mk("gemini", False)
+    _lo.xai_llm_client.chat.completions.create = _mk("xai", False)
+    _lo.nvidia_llm_client.chat.completions.create = _mk("nvidia", False)
+    _lo._chat("s", "u")
+    _lo._chat("s", "u")
+    check("NVIDIA 가 정상이면 유료 OpenAI 는 한 번도 호출되지 않는다", (_co["nvidia"], _co["openai"]), (2, 0))
+    _lo.nvidia_llm_client.chat.completions.create = _mk("nvidia", True)
+    _lo.gemini_llm_client.chat.completions.create = _mk("gemini", True)
+    check("NVIDIA·Gemini 가 둘 다 실패하면 마지막 예비로 OpenAI 가 받는다",
+          (_lo._chat("s", "u")[0], _co["openai"]), ('{"ok":"openai"}', 1))
+    # 임베딩: NVIDIA 우선이면 무료를 먼저, 실패할 때만 OpenAI
+    _ce = {"openai": 0, "nvidia": 0}
+
+    def _emb(name: str, fail: bool, vec: list[float]) -> Any:
+        def _f(**_kw: Any) -> Any:
+            _ce[name] += 1
+            if fail:
+                raise _PermErr(504)
+            return _FakeEmbResp(vec)
+        return _f
+
+    _lo.client.embeddings.create = _emb("openai", False, [1.0])
+    _lo.nvidia_embed_client.embeddings.create = _emb("nvidia", False, [2.0])
+    check("EMBED_ORDER=nvidia,openai — NVIDIA 가 정상이면 OpenAI 임베딩은 호출 안 함",
+          (_lo.embed("제목"), _ce["nvidia"], _ce["openai"]), ([2.0], 1, 0))
+    _lo.nvidia_embed_client.embeddings.create = _emb("nvidia", True, [])
+    check("NVIDIA 임베딩이 실패하면 OpenAI 로 이어받는다",
+          (_lo.embed("제목"), _ce["nvidia"], _ce["openai"]), ([1.0], 2, 1))
+    check("기본 임베딩 순서는 그대로(OpenAI 먼저)",
+          LLMClient(_lcfg_with_fallback).embed_order, ["openai", "nvidia"])
     _llm3 = LLMClient(_lcfg_with_fallback)
     _c3 = {"openai": 0, "gemini": 0}
 
