@@ -6048,6 +6048,18 @@ def llm_time_up(started: float, now: float | None = None) -> bool:
     return (cur - started) > RUN_LLM_TIME_CAP_SEC
 
 
+LLM_RATE_COOLDOWN_SEC = 60   # 한도(429)에 걸린 AI 를 건너뛰는 시간(초) — 풀리면 자동으로 다시 쓴다
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """한도 초과(429)면 True — 잠깐만 건너뛰면 되는 일시 오류다(2026-11-26 Gemini 무료 한도 429 가 매 호출 반복)."""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code == 429
+    m = re.search(r"Error code:\s*(\d{3})", str(exc))
+    return bool(m and int(m.group(1)) == 429)
+
+
 def _is_permanent_llm_error(exc: Exception) -> bool:
     """키·권한·모델 이름 문제(401·403·404·410)면 True — 잠깐 기다린다고 낫지 않는 오류다(504·429 등은 일시적)."""
     code = getattr(exc, "status_code", None)
@@ -6149,10 +6161,15 @@ class LLMClient:
 
     def _mark_failure(self, label: str, exc: Exception) -> None:
         """키·모델 이름 오류면 일정 시간 건너뛰고, 처음 걸릴 때 한 번만 '설정 확인 필요'를 남긴다."""
-        if not _is_permanent_llm_error(exc):
-            return
         down = self.__dict__.setdefault("_down_until", {})
         now = time.monotonic()
+        if not _is_permanent_llm_error(exc):
+            # 한도(429)는 잠깐만 쉬고 바로 다음 AI 로 간다 — 매 호출마다 먼저 두드려 실패하는 낭비를 막는다.
+            # 쉬는 중에 이미 이 AI 가 쉬고 있었다면 시간을 늘리지 않는다(풀릴 기회를 준다).
+            if _is_rate_limit_error(exc) and down.get(label, 0.0) <= now:
+                down[label] = now + LLM_RATE_COOLDOWN_SEC
+                log.info("%s 한도(429) — %d초간 건너뜁니다.", label, LLM_RATE_COOLDOWN_SEC)
+            return
         if down.get(label, 0.0) <= now:
             log.warning("%s 설정 오류(%s) — %d분간 건너뜁니다. API 키·모델 이름을 확인하세요.",
                         label, str(exc)[:80], LLM_PERM_COOLDOWN_SEC // 60)
@@ -6727,6 +6744,7 @@ PEOPLE_PER_RUN = 30
 # 참조하지 않는 독립 호출이라 prefetch_articles 와 같은 이유로 병렬화한다 —
 # 순차 처리하면 20건에 100초 넘게 걸려 PRD §6(1회 실행 20초 목표)를 크게 넘긴다.
 LLM_ANALYZE_WORKERS = 5
+BACKLOG_RESERVE_PER_RUN = 6   # 한 회차에서 쌓인 분석 대기 기사에 먼저 떼어 두는 예산(건)
 # 그 중 사람별 구조 요약(LLM)에 쓸 수 있는 최대 호출 수. 나머지는 규칙 기반으로 저장되고
 # 나중에 `repeople` 로 채울 수 있다. 일일 상한(LLM_DAILY_LIMIT)도 함께 적용된다.
 PEOPLE_LLM_PER_RUN = get_env_int("PEOPLE_LLM_PER_RUN", 12, 0)
@@ -7429,6 +7447,39 @@ def press_display_name(name: str, url: str = "") -> str:
     return nm
 
 
+def _plan_backlog_reserve(llm_budget: int, unanalyzed: int) -> int:
+    """새 기사 분석보다 먼저 쌓인 대기 기사에 떼어 둘 예산(건). 대기가 없으면 0, 예산보다 클 수 없다."""
+    return max(0, min(BACKLOG_RESERVE_PER_RUN, unanalyzed, llm_budget))
+
+
+def _analyze_new_articles(ctx: Context, jobs: list[dict], cap: int, started: float,
+                          analyzer: Any = None) -> tuple[dict[str, int | None], int]:
+    """새 기사 분석을 병렬(LLM_ANALYZE_WORKERS)로 돌린다. 앞에서부터 cap 건까지만.
+
+    반환: ({기사id: 분석 결과 점수 또는 None}, 시도한 건수). 개별 실패는 None 으로 두고 나머지는 계속한다.
+    시간 상한(llm_time_up)을 넘기면 아직 시작 안 한 항목은 건너뛰고 다음 회차로 넘긴다.
+    """
+    run_one = analyzer or analyze_and_save
+    todo = jobs[:max(0, cap)] if not llm_time_up(started) else []
+    scores: dict[str, int | None] = {}
+    if not todo:
+        return scores, 0
+
+    def _one(job: dict) -> int | None:
+        if llm_time_up(started):   # 병렬 작업 도중 시간이 넘으면 남은 항목은 다음 회차로
+            return None
+        try:
+            return run_one(ctx, job["id"], dict(job["row"]), job["body"], job["summary_source"])
+        except Exception as exc:
+            log.warning("신규 기사 분석 실패(개별 항목, 나머지는 계속): %s — %s", job["id"], exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(LLM_ANALYZE_WORKERS, len(todo))) as pool:
+        for job, res in zip(todo, pool.map(_one, todo)):
+            scores[job["id"]] = res
+    return scores, len(todo)
+
+
 def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False) -> dict:
     """수집 → 게이트 → 분석 → 저장 → 알림 큐 적재를 1회 수행한다.
 
@@ -7597,6 +7648,9 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     defer_pending = storage.deferred_count()
     defer_budget = min(6, defer_pending, max(1, llm_budget // 4)) if defer_pending else 0
     llm_budget = max(0, llm_budget - defer_budget)
+    # 본문까지 저장됐지만 분석만 밀린 기사(백로그)용 예산을 새 기사 분석보다 먼저 떼어 둔다.
+    # 신규가 매 회차 예산을 다 쓰면 백로그가 영영 안 빠진다(2026-11-26 분석 대기 520건 사고).
+    backlog_reserve = _plan_backlog_reserve(llm_budget, storage.unanalyzed_count())
 
     # 인사·부고는 점수 경쟁에서 빼고 항상 처리한다 — 제목 점수가 0이라 일반 큐에 두면
     # 영원히 상한에 밀린다. (사용자 지정) 사람별 구조 요약은 LLM 을 쓰되, 이번 회차·오늘
@@ -7653,6 +7707,39 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
     trade_notify_kws = [k for k in jload(state.get("trade_notify_keywords"), []) if k]
     trade_required_kws = [k for k in jload(state.get("trade_required_keywords"), []) if k]
     trade_exclude_kws = [k for k in jload(state.get("trade_exclude_keywords"), []) if k]
+
+    # 새 기사 분석(G6)은 루프 안에서 한 건씩 하지 않고, 루프가 끝난 뒤 병렬로 모아서 돌린다(2026-11-26).
+    # 건당 약 10초를 직렬로 쓰면 신규 24건만으로 회차가 길어지고, 쌓인 대기 기사에 차례가 가지 않았다.
+    analysis_jobs: list[dict] = []
+
+    def _notify_entry(job: dict, score_now: int) -> dict:
+        """분석이 끝난 뒤 알림 판정용 항목을 만든다(점수는 분석 결과를 반영한 값)."""
+        title_j = job["title"]
+        # 우선 알림: '항상 발송 키워드' 매칭 또는 '무조건 발송 점수' 이상이면
+        # 임계값·야간 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
+        # '항상 발송 키워드' 는 **제목 + 판정된 주체 그룹사**로만 본다 — 본문 전체를 훑으면
+        # 포스코 그룹 기사 대부분에 '포스코홀딩스'·'포스코퓨처엠'이 스치듯 등장해
+        # 사실상 모든 그룹 기사가 야간에도 발송된다(파업 기사 오발송 사례, 2026-09-08).
+        priority_probe = f"{title_j}\n{' '.join(job['rule_groups'])}"
+        excluded = _kw_hit_any(title_j, exclude_kws)   # 제목에 제외 키워드 → 무조건 알림 안 함
+        is_priority = (not excluded) and (
+            kw_rules_hit_any(priority_probe, always_kws)
+            or (hard_score > 0 and score_now >= hard_score))
+        # 특수 주제 발송 조건: 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수, 비면 발송 안 함).
+        # 제목에 그 주제의 제외 키워드가 있으면 뺀다.
+        probe = job["probe"]
+        policy_ok = (_kw_hit_any(probe, policy_notify_kws)
+                     and _kw_hit_any(probe, policy_required_kws)
+                     and not _kw_hit_any(title_j, policy_exclude_kws))
+        trade_ok = (_kw_hit_any(probe, trade_notify_kws)
+                    and _kw_hit_any(probe, trade_required_kws)
+                    and not _kw_hit_any(title_j, trade_exclude_kws))
+        return {
+            "id": job["id"], "score": score_now, "is_backfill": job["is_backfill"],
+            "published_at": job["published_at"], "priority": is_priority, "excluded": excluded,
+            "policy": (job["is_policy"], policy_ok),
+            "trade": (job["is_trade"], trade_ok),
+        }
 
     # ── G3: 리다이렉트 해제 + HTML 확보 (병렬) ───────────────────────
     prefetched = prefetch_articles(http, [item.url_original for item, _ in fresh])
@@ -7824,39 +7911,24 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
         # 본문은 분석 전까지만 임시 보관한다 (§7-3). 분석 완료 시 삭제된다.
         storage.save_body(article_id, body, summary_source)
 
-        # ── G6: LLM 분석 (과금 지점) ─────────────────────────────────
-        # 이번 실행 예산 안에서만 즉시 분석하고, 나머지는 아래 드레인 단계나
-        # 다음 실행에서 처리한다. 60초 주기를 지키기 위한 조치다.
-        if llm_budget > 0 and not llm_time_up(started):
-            llm_budget -= 1
-            analyzed = analyze_and_save(ctx, article_id, dict(row), body, summary_source)
-            if analyzed is not None:
-                score = analyzed
-        probe = f"{item.title}\n{body}"
-        # 우선 알림: '항상 발송 키워드' 매칭 또는 '무조건 발송 점수' 이상이면
-        # 임계값·야간 게이트를 우회한다. (포스코퓨처엠 특례는 폐지 — 키워드로 추가)
-        # '항상 발송 키워드' 는 **제목 + 판정된 주체 그룹사**로만 본다 — 본문 전체를 훑으면
-        # 포스코 그룹 기사 대부분에 '포스코홀딩스'·'포스코퓨처엠'이 스치듯 등장해
-        # 사실상 모든 그룹 기사가 야간에도 발송된다(파업 기사 오발송 사례, 2026-09-08).
-        priority_probe = f"{item.title}\n{' '.join(rule_groups)}"
-        excluded = _kw_hit_any(item.title, exclude_kws)   # 제목에 제외 키워드 → 무조건 알림 안 함
-        is_priority = (not excluded) and (
-            kw_rules_hit_any(priority_probe, always_kws)
-            or (hard_score > 0 and score >= hard_score))
-        # 특수 주제 발송 조건: 관심 키워드 하나 AND 필수 공통 키워드 하나 (둘 다 필수, 비면 발송 안 함).
-        # 제목에 그 주제의 제외 키워드가 있으면 뺀다.
-        policy_ok = (_kw_hit_any(probe, policy_notify_kws)
-                     and _kw_hit_any(probe, policy_required_kws)
-                     and not _kw_hit_any(item.title, policy_exclude_kws))
-        trade_ok = (_kw_hit_any(probe, trade_notify_kws)
-                    and _kw_hit_any(probe, trade_required_kws)
-                    and not _kw_hit_any(item.title, trade_exclude_kws))
-        saved_for_notify.append({
-            "id": article_id, "score": score, "is_backfill": is_backfill,
-            "published_at": item.published_at, "priority": is_priority, "excluded": excluded,
-            "policy": (is_policy, policy_ok),
-            "trade": (is_trade, trade_ok),
+        # ── G6: LLM 분석 (과금 지점) — 여기서는 '할 일 목록'에만 담고, 루프 뒤에서 병렬로 돌린다 ──
+        analysis_jobs.append({
+            "id": article_id, "row": row, "body": body, "summary_source": summary_source,
+            "score": score, "title": item.title, "probe": f"{item.title}\n{body}",
+            "rule_groups": rule_groups, "is_backfill": is_backfill, "published_at": item.published_at,
+            "is_policy": is_policy, "is_trade": is_trade,
         })
+
+    # ── 새 기사 분석: 병렬(백로그 분석과 같은 방식) + 쌓인 대기 기사용 예산을 먼저 떼어 둔다 ──
+    # 이번 실행 예산 안에서만 즉시 분석하고, 나머지는 아래 백로그·드레인 단계나 다음 실행에서 처리한다.
+    # 쌓인 기사(backlog_reserve 건)는 새 기사가 많아도 매 회차 최소한은 빠지도록 예산을 남겨 둔다.
+    new_cap = max(0, llm_budget - backlog_reserve)
+    analysis_scores, used_now = _analyze_new_articles(ctx, analysis_jobs, new_cap, started)
+    llm_budget -= used_now
+    # 알림 판정은 원래 순서대로, 분석 결과 점수(없으면 분석 전 점수)로 만든다.
+    for job in analysis_jobs:
+        got = analysis_scores.get(job["id"])
+        saved_for_notify.append(_notify_entry(job, got if got is not None else job["score"]))
 
     # ── 넘친 신선 후보를 메타데이터만 저장한다 (본문·LLM 없음, 비용 0) ──
     # '수집' 단계에서 관련 기사를 절대 잃지 않기 위한 장치. 아래 _drain_deferred 가
@@ -16559,6 +16631,39 @@ def cmd_selftest() -> int:
     check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
           _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
 
+    # ── 새 기사 분석 병렬화 + 쌓인 대기 기사용 예산 보장 (2026-11-26) ──
+    _cc = {"now": 0, "max": 0}
+    _cc_lock = threading.Lock()
+
+    def _slow_analyzer(_ctx: Any, aid: str, _row: dict, _body: str, _src: str) -> int | None:
+        with _cc_lock:
+            _cc["now"] += 1
+            _cc["max"] = max(_cc["max"], _cc["now"])
+        time.sleep(0.15)
+        with _cc_lock:
+            _cc["now"] -= 1
+        if aid == "j2":
+            raise RuntimeError("개별 실패 시뮬레이션")
+        return int(aid[1:]) * 10
+
+    _jobs = [{"id": f"j{i}", "row": {}, "body": "b", "summary_source": "x"} for i in range(1, 9)]
+    _t0 = time.monotonic()
+    _sc, _used = _analyze_new_articles(None, _jobs, 6, time.monotonic(), analyzer=_slow_analyzer)
+    _el = time.monotonic() - _t0
+    check("새 기사 분석 — 앞에서 cap(6)건만, 개별 실패(j2)는 None 으로 두고 나머지는 계속",
+          (_used, _sc), (6, {"j1": 10, "j2": None, "j3": 30, "j4": 40, "j5": 50, "j6": 60}))
+    check("새 기사 분석 — 동시에 2건 이상 돌았고(병렬), 직렬(0.9초)보다 빨랐다",
+          (_cc["max"] >= 2, _el < 0.7), (True, True))
+    check("새 기사 분석 — cap 0 이면 아무것도 안 돈다",
+          _analyze_new_articles(None, _jobs, 0, time.monotonic(), analyzer=_slow_analyzer), ({}, 0))
+    check("새 기사 분석 — 이번 회차 시간 상한을 넘겼으면 시작하지 않는다",
+          _analyze_new_articles(None, _jobs, 6, time.monotonic() - RUN_LLM_TIME_CAP_SEC - 10,
+                                analyzer=_slow_analyzer), ({}, 0))
+    check("대기 기사 예산 보장 — 대기·예산·상한(6) 중 가장 작은 값",
+          [_plan_backlog_reserve(20, 500), _plan_backlog_reserve(20, 2), _plan_backlog_reserve(3, 500),
+           _plan_backlog_reserve(20, 0), _plan_backlog_reserve(0, 500)],
+          [6, 2, 3, 0, 0])
+
     # ── NVIDIA 3.5 임베딩은 input_type 이 필수 — 해당 모델에만 옵션을 붙인다 ──
     check("임베딩 옵션 — 3.5 임베딩 모델만 input_type 이 붙고 나머지는 빈 옵션",
           [_embed_extra_body("nvidia/nemotron-3.5-embed-1b"), _embed_extra_body("text-embedding-3-small"), _embed_extra_body("")],
@@ -16603,6 +16708,36 @@ def cmd_selftest() -> int:
                                                 RuntimeError("timeout"), RuntimeError("Error code: 404 - not found"),
                                                 _PermErr(410), RuntimeError("Error code: 410 - gone"))],
           [True, True, True, False, False, False, True, True, True])
+    check("한도 오류 판정 — 429 만 True (문구만 있어도 판정), 504·401·일반 예외는 False",
+          [_is_rate_limit_error(e) for e in (_PermErr(429), _PermErr(504), _PermErr(401), RuntimeError("timeout"),
+                                             RuntimeError("Error code: 429 - quota"))],
+          [True, False, False, False, True])
+    _lr = LLMClient(_lcfg_with_fallback)
+    _cr = {"gemini": 0, "nvidia": 0}
+
+    def _r_openai(**_kw: Any) -> Any:
+        raise _PermErr(504)
+
+    def _r_gemini(**_kw: Any) -> Any:
+        _cr["gemini"] += 1
+        raise _PermErr(429)
+
+    def _r_nvidia(**_kw: Any) -> Any:
+        _cr["nvidia"] += 1
+        return _FakeChatResp('{"ok":"nv"}')
+
+    _lr.client.chat.completions.create = _r_openai
+    _lr.gemini_llm_client.chat.completions.create = _r_gemini
+    _lr.xai_llm_client.chat.completions.create = _r_openai
+    _lr.nvidia_llm_client.chat.completions.create = _r_nvidia
+    _lr._chat("s", "u")
+    _lr._chat("s", "u")
+    _lr._chat("s", "u")
+    check("한도(429)가 난 Gemini 는 쉬는 동안 건너뛴다 — 3번 호출해도 Gemini 는 1번만 두드림",
+          (_cr["gemini"], _cr["nvidia"]), (1, 3))
+    _lr._down_until["Gemini(gemini-test)"] = 0.0    # 쉬는 시간이 끝난 것처럼
+    _lr._chat("s", "u")
+    check("쉬는 시간이 끝나면 Gemini 를 다시 시도한다", (_cr["gemini"], _cr["nvidia"]), (2, 4))
     _llm3 = LLMClient(_lcfg_with_fallback)
     _c3 = {"openai": 0, "gemini": 0}
 
