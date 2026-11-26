@@ -31,3 +31,6 @@
 
 [참고]
 - 자세한 기획 내용은 PRD.md 를 참고할 것
+- 텔레그램 봇 (2026-11-26 서버에서 getMe 로 확인. 토큰은 .env 에만 있고 이름은 공개 정보):
+  - 부서용(일반) 봇 = TELEGRAM_BOT_TOKEN: @P_FM_NEWS_BOT (표시이름 P-FM_NEWS)
+  - 공개용 봇 = TELEGRAM_PUBLIC_BOT_TOKEN: @PoscoFUtureM_Bot (표시이름 FutureM)
