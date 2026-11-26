@@ -350,7 +350,7 @@ def load_config() -> Config:
         embedding_model=get_env("EMBEDDING_MODEL", "text-embedding-3-small"),
         # 선택 항목 — 비어 있으면 대체 없이 기존처럼 OpenAI 실패를 그냥 넘어간다.
         nvidia_embed_api_key=get_env("NVIDIA_EMBED_API_KEY", ""),
-        nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3-embed-1b"),
+        nvidia_embed_model=get_env("NVIDIA_EMBED_MODEL", "nvidia/nemotron-3.5-embed-1b"),
         nvidia_llm_api_key=get_env("NVIDIA_LLM_API_KEY", ""),
         nvidia_llm_model=get_env("NVIDIA_LLM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         gemini_api_key=get_env("GEMINI_API_KEY", ""),
@@ -6024,6 +6024,17 @@ _EMBED_LABEL = "OpenAI(임베딩)"   # 임베딩도 채팅과 같은 '설정 오
 _NO_THINK_MODEL_HINTS = ("nemotron-3.5-lightning",)
 
 
+# NVIDIA 3.5 임베딩 모델은 input_type 이 필수다(없으면 400). 기사 제목끼리 비교하므로 항상 같은 값("query")으로 통일한다.
+_EMBED_INPUT_TYPE_HINTS = ("nemotron-3.5-embed",)
+
+
+def _embed_extra_body(model: str) -> dict:
+    """임베딩 호출의 추가 옵션. input_type 이 필요한 모델만 옵션을 돌려주고, 나머지는 빈 dict."""
+    if any(h in (model or "") for h in _EMBED_INPUT_TYPE_HINTS):
+        return {"input_type": "query", "truncate": "END"}
+    return {}
+
+
 def _llm_extra_body(model: str) -> dict:
     """모델별 추가 요청 옵션. 생각 끄기가 필요한 모델만 옵션을 돌려주고, 나머지는 빈 dict."""
     if any(h in (model or "") for h in _NO_THINK_MODEL_HINTS):
@@ -6384,8 +6395,10 @@ class LLMClient:
                 if self.nvidia_embed_client is None:
                     return None
         try:
+            extra = _embed_extra_body(self.nvidia_embed_model)
+            kw: dict[str, Any] = {"extra_body": extra} if extra else {}
             resp = self.nvidia_embed_client.embeddings.create(
-                model=self.nvidia_embed_model, input=text[:2000])
+                model=self.nvidia_embed_model, input=text[:2000], **kw)
             if not skip_openai:
                 log.info("NVIDIA 임베딩으로 대체했습니다 (model=%s)", self.nvidia_embed_model)
             return list(resp.data[0].embedding)
@@ -16545,6 +16558,20 @@ def cmd_selftest() -> int:
     _llm1.nvidia_llm_client.chat.completions.create = lambda **_kw: _FakeChatResp('{"ok":"nvidia"}')
     check("OpenAI·Gemini·Grok 셋 다 실패 → NVIDIA 로 대체(4단계 체인 끝까지)",
           _llm1._chat("s", "u"), ('{"ok":"nvidia"}', {}))
+
+    # ── NVIDIA 3.5 임베딩은 input_type 이 필수 — 해당 모델에만 옵션을 붙인다 ──
+    check("임베딩 옵션 — 3.5 임베딩 모델만 input_type 이 붙고 나머지는 빈 옵션",
+          [_embed_extra_body("nvidia/nemotron-3.5-embed-1b"), _embed_extra_body("text-embedding-3-small"), _embed_extra_body("")],
+          [{"input_type": "query", "truncate": "END"}, {}, {}])
+    _emb_seen: list[dict] = []
+    _emb_llm = LLMClient(_lcfg_with_fallback)
+    _emb_llm.nvidia_embed_model = "nvidia/nemotron-3.5-embed-1b"
+    _emb_llm.client.embeddings.create = _openai_down
+    _emb_llm.nvidia_embed_client.embeddings.create = (
+        lambda **_kw: (_emb_seen.append(_kw), _FakeEmbResp([0.1, 0.2]))[1])
+    check("OpenAI 임베딩 실패 → NVIDIA 3.5 임베딩 호출에 input_type 이 실린다",
+          (_emb_llm.embed("테스트"), _emb_seen[0].get("extra_body")),
+          ([0.1, 0.2], {"input_type": "query", "truncate": "END"}))
 
     # ── 생각 과정을 먼저 쓰는 모델(nemotron-3.5-lightning)은 '생각 끄기' 옵션을 붙인다 ──
     check("생각 끄기 옵션 — lightning 만 붙고 다른 모델은 빈 옵션",

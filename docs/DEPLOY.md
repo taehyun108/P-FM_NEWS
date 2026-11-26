@@ -151,7 +151,7 @@ aws ecs create-cluster --cluster-name pfm-news
       {"name": "PORT", "value": "8000"},
       {"name": "LLM_MODEL", "value": "gpt-5.6-luna"},
       {"name": "EMBEDDING_MODEL", "value": "text-embedding-3-small"},
-      {"name": "NVIDIA_EMBED_MODEL", "value": "nvidia/nemotron-3-embed-1b"},
+      {"name": "NVIDIA_EMBED_MODEL", "value": "nvidia/nemotron-3.5-embed-1b"},
       {"name": "NVIDIA_LLM_MODEL", "value": "nvidia/nemotron-3.5-lightning-30b-a3b"}
     ],
     "secrets": [
