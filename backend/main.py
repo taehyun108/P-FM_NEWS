@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 try:   # 대외협력(대관) 모듈 — 없거나 깨져도 기존 수집·API 는 그대로 동작한다
     import external_affairs as ea_mod
@@ -5250,9 +5250,37 @@ NON_AUTHOR_WORDS = {
 }
 
 
-def extract_thumbnail(html: str) -> str:
-    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html or "", re.I)
-    return html_mod.unescape(m.group(1)) if m else ""
+def extract_thumbnail(html: str, base_url: str = "") -> str:
+    """기사 대표 이미지 주소. 못 찾으면 "".
+
+    og:image → og:image:secure_url → og:image:url → twitter:image → <link rel="image_src"> 순으로 본다.
+    메타 태그는 속성 순서(property↔content)·따옴표 종류에 상관없이 읽는다 — 예전엔 property 가
+    content 앞에 올 때만 읽어서 순서가 다른 사이트의 사진이 통째로 빠졌다(2026-11-27).
+    '//cdn…' 은 https 로, '/data/…' 같은 상대 주소는 base_url(기사 주소)로 완성한다. data: 주소는 버린다.
+    """
+    h = html or ""
+    cands = [_meta_content(h, "property", "og:image"),
+             _meta_content(h, "property", "og:image:secure_url"),
+             _meta_content(h, "property", "og:image:url"),
+             _meta_content(h, "name", "twitter:image"),
+             _meta_content(h, "property", "twitter:image"),
+             _meta_content(h, "name", "twitter:image:src")]
+    m = re.search(r'<link[^>]+rel=["\']image_src["\'][^>]*?\shref=["\']([^"\']+)["\']', h, re.I)
+    if m:
+        cands.append(m.group(1))
+    for raw in cands:
+        u = html_mod.unescape((raw or "").strip())
+        if not u or u.lower().startswith("data:"):
+            continue
+        if u.startswith("//"):
+            u = "https:" + u
+        elif not re.match(r"https?://", u, re.I):
+            if not base_url:
+                continue
+            u = urljoin(base_url, u)
+        if re.match(r"https?://", u, re.I):
+            return u
+    return ""
 
 
 def _meta_content(html: str, attr: str, name: str) -> str:
@@ -7055,7 +7083,7 @@ def _drain_deferred(ctx: Context, limit: int, dedup_candidates: list[dict],
             "url_canonical": canonical or art["url_canonical"],
             "press_id": press_id, "press_name": press_name,
             "author": extract_author(html, body, press_name),
-            "content_hash": content_hash, "thumbnail_url": extract_thumbnail(html),
+            "content_hash": content_hash, "thumbnail_url": extract_thumbnail(html, canonical or target),
             "importance_score": score_article(art["title"], body, rule_groups, press_tier,
                                               score_overrides, score_customs),
         })
@@ -7107,7 +7135,7 @@ def _save_people_news(ctx: Context, item: RawItem, canonical: str, html: str, bo
         "title": item.title, "press_id": press_id, "press_name": press_name,
         "author": extract_author(html, body, press_name),
         "published_at": iso(item.published_at), "collected_at": iso(now_utc()),
-        "source_type": item.source_type, "thumbnail_url": extract_thumbnail(html),
+        "source_type": item.source_type, "thumbnail_url": extract_thumbnail(html, canonical or item.url_source),
         "content_hash": sha256(body), "dedup_group_id": aid, "is_representative": True,
         "is_backfill": is_backfill, "importance_score": SCORE_PEOPLE_NEWS,
         "sentiment": "중립", "keywords": [], "group_companies": [],
@@ -7850,7 +7878,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
                     "press_name": press_name,
                     "author": author,
                 }
-                new_thumb = extract_thumbnail(html)
+                new_thumb = extract_thumbnail(html, canonical)
                 if new_thumb:
                     promo["thumbnail_url"] = new_thumb
                 storage.update_article(existing["id"], promo)
@@ -7925,7 +7953,7 @@ def run_once(ctx: Context, max_llm: int | None = None, force_naver: bool = False
             "published_at": iso(item.published_at),
             "collected_at": iso(now_utc()),
             "source_type": item.source_type,
-            "thumbnail_url": extract_thumbnail(html),
+            "thumbnail_url": extract_thumbnail(html, canonical),
             "content_hash": content_hash,
             "dedup_group_id": article_id,
             "is_representative": True,
@@ -8413,7 +8441,7 @@ def analyze_url(ctx: Context, raw_url: str, activate: bool = True) -> dict:
         "url_canonical": canonical, "url_original": raw_url, "title": title,
         "press_id": press_id, "press_name": press_name, "author": author,
         "published_at": iso(published), "collected_at": iso(now_utc()),
-        "source_type": "manual", "thumbnail_url": extract_thumbnail(html),
+        "source_type": "manual", "thumbnail_url": extract_thumbnail(html, canonical),
         "content_hash": content_hash, "dedup_group_id": article_id,
         "is_representative": True,
         "is_backfill": (now_utc() - published) > timedelta(hours=ctx.cfg.fresh_cutoff_hours),
@@ -14143,6 +14171,43 @@ def cmd_selftest() -> int:
         _js = open(_front, encoding="utf-8").read()
         check("프런트 chipKey 가 유니코드 클래스를 쓴다",
               "[^\\p{L}\\p{N}]+" in _js and "[\\s\\W_]+" not in _js, True)
+        check("프런트 카드 썸네일은 리퍼러를 보내지 않고 http 를 https 로 올린다(신문사 핫링크 차단 회피)",
+              ("img.referrerPolicy = 'no-referrer';" in _js
+               and "String(item.thumbnail_url).replace(/^http:\\/\\//i, 'https://')" in _js), True)
+
+    # ── 대표 이미지 주소 추출 (2026-11-27: 속성 순서·대체 메타·상대 주소 보강) ──
+    _T = "https://news.example.com/a/1.html"
+    check("썸네일 — og:image 가 property→content 순서",
+          extract_thumbnail('<meta property="og:image" content="https://i.example.com/a.jpg">'),
+          "https://i.example.com/a.jpg")
+    check("썸네일 — content→property 순서도 읽는다(예전엔 놓침)",
+          extract_thumbnail('<meta content="https://i.example.com/b.jpg" property="og:image" />'),
+          "https://i.example.com/b.jpg")
+    check("썸네일 — 작은따옴표와 &amp; 해제",
+          extract_thumbnail("<meta property='og:image' content='https://i.example.com/c.jpg?a=1&amp;b=2'>"),
+          "https://i.example.com/c.jpg?a=1&b=2")
+    check("썸네일 — og:image 가 없으면 twitter:image 로 대체",
+          extract_thumbnail('<meta name="twitter:image" content="https://i.example.com/t.jpg">'),
+          "https://i.example.com/t.jpg")
+    check("썸네일 — og:image:secure_url 로 대체",
+          extract_thumbnail('<meta property="og:image:secure_url" content="https://i.example.com/s.jpg">'),
+          "https://i.example.com/s.jpg")
+    check("썸네일 — link rel=image_src 로 대체",
+          extract_thumbnail('<link rel="image_src" href="https://i.example.com/l.jpg">'),
+          "https://i.example.com/l.jpg")
+    check("썸네일 — //cdn 은 https 로, /data/x.jpg 는 기사 주소 기준으로 완성",
+          [extract_thumbnail('<meta property="og:image" content="//cdn.example.com/p.jpg">'),
+           extract_thumbnail('<meta property="og:image" content="/data/x.jpg">', _T)],
+          ["https://cdn.example.com/p.jpg", "https://news.example.com/data/x.jpg"])
+    check("썸네일 — 기사 주소가 없으면 상대 주소는 버린다",
+          extract_thumbnail('<meta property="og:image" content="/data/x.jpg">'), "")
+    check("썸네일 — data: 주소는 건너뛰고 다음 후보를 쓴다",
+          extract_thumbnail('<meta property="og:image" content="data:image/png;base64,AAAA">'
+                            '<meta name="twitter:image" content="https://i.example.com/n.jpg">'),
+          "https://i.example.com/n.jpg")
+    check("썸네일 — og:image:width 같은 옆 태그를 사진으로 착각하지 않는다·태그 없으면 빈 문자열",
+          [extract_thumbnail('<meta property="og:image:width" content="1024">'), extract_thumbnail(""),
+           extract_thumbnail(None)], ["", "", ""])
 
     print("\n[5] 그룹사 판정 (PRD F4.2)")
     check("퓨처엠 단독", detect_group_companies("포스코퓨처엠이 증설한다"), ["포스코퓨처엠"])

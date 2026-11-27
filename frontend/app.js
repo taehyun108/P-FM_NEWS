@@ -561,7 +561,10 @@ function buildCard(item) {
   if (item.thumbnail_url) {
     const thumb = el('div', 'card-thumb');
     const img = el('img');
-    img.src = item.thumbnail_url;
+    // 신문사 이미지 서버는 다른 사이트 화면에서 가져가는 요청(리퍼러)을 막는 곳이 많다 — 리퍼러를 보내지 않는다.
+    // http 주소는 https 화면에서 막히므로 https 로 올려 요청한다(안 되면 아래 error 로 로고 배지로 대체).
+    img.referrerPolicy = 'no-referrer';
+    img.src = String(item.thumbnail_url).replace(/^http:\/\//i, 'https://');
     img.alt = '';
     img.loading = 'lazy';
     img.decoding = 'async';   // 디코딩을 메인 스레드에서 떼어내 스크롤 끊김을 줄인다
